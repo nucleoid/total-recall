@@ -10,25 +10,25 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      CLIENTS                                 │
-│                                                              │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐       │
-│  │ OpenClaw │ │ Cursor   │ │ Work AI  │ │ Future   │       │
-│  │ (home)   │ │ (dev)    │ │ (HoT)    │ │ Agents   │       │
-│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘       │
-│       │             │            │             │              │
-│       └──────┬──────┴─────┬──────┘             │              │
-│              │            │                    │              │
-│         ┌────┴────┐  ┌────┴──────┐             │              │
-│         │  Local  │  │ Cloudflare│◄────────────┘              │
-│         │  MCP    │  │  Tunnel   │  (external access)        │
-│         └────┬────┘  └────┬──────┘                           │
-│              │            │                                   │
-│              └──────┬─────┘                                   │
-│                     │                                         │
-└─────────────────────┼─────────────────────────────────────────┘
+│                      CLIENTS                                │
+│                                                             │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐        │
+│  │ OpenClaw │ │ Cursor   │ │ Work AI  │ │ Future   │        │
+│  │ (home)   │ │ (dev)    │ │ (HoT)    │ │ Agents   │        │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘        │
+│       │            │            │            │              │
+│       └──────┬─────┴─────┬──────┘            │              │
+│              │            │                  │              │
+│         ┌────┴────┐  ┌────┴──────┐           │              │
+│         │  Local  │  │ Cloudflare│◄──────────┘              │
+│         │  MCP    │  │  Tunnel   │  (external access)       │
+│         └────┬────┘  └────┬──────┘                          │
+│              │            │                                 │
+│              └──────┬─────┘                                 │
+│                     │                                       │
+└─────────────────────┼───────────────────────────────────────┘
                       │
-        ┌─────────────┴──────────────┐
+        ┌─────────────┴───────────────┐
         │     MCP Memory Server       │
         │                             │
         │  Tools:                     │
@@ -44,7 +44,7 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
         │  └───────────┘  └────────┘  │
         └─────────────┬───────────────┘
                       │
-        ┌─────────────┴──────────────┐
+        ┌─────────────┴───────────────┐
         │    PostgreSQL + pgvector    │
         │                             │
         │  ┌─────────────────────┐    │
@@ -60,10 +60,10 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
         │  │ document_id UUID FK │    │
         │  │ chunk_index INT     │    │
         │  │ source_key  TEXT UQ │    │
-        │  │ created_at  TS     │    │
-        │  │ updated_at  TS     │    │
-        │  │ accessed_at TS     │    │
-        │  │ access_count INT   │    │
+        │  │ created_at  TS      │    │
+        │  │ updated_at  TS      │    │
+        │  │ accessed_at TS      │    │
+        │  │ access_count INT    │    │
         │  └─────────────────────┘    │
         │                             │
         │  ┌─────────────────────┐    │
@@ -75,7 +75,7 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
         │  │ namespace   TEXT    │    │
         │  │ tags        TEXT[]  │    │
         │  │ chunk_count INT     │    │
-        │  │ created_at  TS     │    │
+        │  │ created_at  TS      │    │
         │  └─────────────────────┘    │
         │                             │
         │  ┌─────────────────────┐    │
@@ -83,9 +83,9 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
         │  │ ─────────────────── │    │
         │  │ file_path   TEXT PK │    │
         │  │ content_hash TEXT   │    │
-        │  │ last_synced  TS    │    │
+        │  │ last_synced  TS     │    │
         │  └─────────────────────┘    │
-        └────────────────────────────┘
+        └─────────────────────────────┘
 ```
 
 ## MCP Tools
