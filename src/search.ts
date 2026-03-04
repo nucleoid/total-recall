@@ -80,8 +80,8 @@ export async function hybridSearch(
         COALESCE(t.text_score, 0) AS text_score,
         (c.vec_score * 0.3 + COALESCE(t.text_score, 0) * 0.7 + CASE WHEN COALESCE(t.text_score, 0) > 0 THEN 0.5 ELSE 0 END) AS base_score,
         calculate_relevance(c.relevance_score, c.decay_rate, c.accessed_at, c.access_count) AS relevance,
-        (c.vec_score * 0.3 + COALESCE(t.text_score, 0) * 0.7 + CASE WHEN COALESCE(t.text_score, 0) > 0 THEN 0.5 ELSE 0 END)
-          * calculate_relevance(c.relevance_score, c.decay_rate, c.accessed_at, c.access_count) AS final_score
+        (c.vec_score * 0.3 + COALESCE(t.text_score, 0) * 0.7 + CASE WHEN COALESCE(t.text_score, 0) > 0 THEN 2.0 ELSE 0 END)
+          * LEAST(calculate_relevance(c.relevance_score, c.decay_rate, c.accessed_at, c.access_count), 2.0) AS final_score
       FROM combined c
       LEFT JOIN text_scores t ON c.id = t.id
       WHERE c.vec_score >= ${pThreshold} OR t.text_score > 0
