@@ -1,0 +1,48 @@
+import { z } from 'zod';
+import { query } from '../db.js';
+import { embed } from '../embedding.js';
+import type { AuthContext } from '../types.js';
+import { checkPermission, filterNamespaces } from '../auth.js';
+
+export const storeSchema = z.object({
+  content: z.string().min(1).max(100000),
+  namespace: z.string().default('shared'),
+  source: z.string().optional(),
+  tags: z.array(z.string()).default([]),
+  metadata: z.record(z.unknown()).default({}),
+  access_level: z.enum(['normal', 'sensitive', 'secret']).default('normal'),
+});
+
+export async function memoryStore(
+  params: z.infer<typeof storeSchema>,
+  auth: AuthContext
+): Promise<{ id: string; namespace: string }> {
+  checkPermission(auth, 'write');
+
+  const ns = params.namespace;
+  const allowed = filterNamespaces([ns], auth.namespaces);
+  if (allowed.length === 0) {
+    throw new Error(`Access denied to namespace '${ns}'`);
+  }
+
+  const embedding = await embed(params.content);
+  const vecStr = `[${embedding.join(',')}]`;
+
+  const res = await query(
+    `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id)
+     VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8)
+     RETURNING id, namespace`,
+    [
+      params.content,
+      vecStr,
+      params.source || auth.name,
+      ns,
+      params.tags,
+      JSON.stringify(params.metadata),
+      params.access_level,
+      auth.keyId,
+    ]
+  );
+
+  return res.rows[0];
+}
