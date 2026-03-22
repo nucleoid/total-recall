@@ -200,7 +200,7 @@ Deduplicator (skip if >0.92 cosine similarity to existing)
     ↓
 Namespace Tagger (auto-classify or rule-based)
     ↓
-Embedder (local nomic-embed-text via Ollama)
+Embedder (Gemini Embedding 2 via API, fallback to Ollama nomic-embed-text)
     ↓
 PostgreSQL + pgvector (upsert)
 ```
@@ -214,7 +214,7 @@ PostgreSQL + pgvector (upsert)
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
 | Database | PostgreSQL + pgvector | Battle-tested, vector search built-in, no extra service |
-| Embedding | nomic-embed-text (Ollama) | Privacy-first, no API dependency, zero marginal cost |
+| Embedding | Gemini Embedding 2 (gemini-embedding-2-preview) | High quality, free tier, 768d vectors. Falls back to Ollama nomic-embed-text if no API key |
 | MCP Server | TypeScript/Node.js | MCP SDK is TypeScript-first, matches existing stack |
 | Auth | API keys + namespace ACLs | Simple, auditable, per-client scoping |
 | External Access | Cloudflare Tunnel | No open ports, TLS, access policies, already have CF |

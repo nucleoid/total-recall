@@ -136,12 +136,14 @@ ON CONFLICT (source_key) DO UPDATE SET
 
 async function getStoredHash(filePath: string): Promise<string | null> {
   const pool = getPool();
+  await pool.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
   const res = await pool.query('SELECT content_hash FROM sync_state WHERE file_path = $1', [filePath]);
   return res.rows[0]?.content_hash ?? null;
 }
 
 async function updateHash(filePath: string, hash: string): Promise<void> {
   const pool = getPool();
+  await pool.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
   await pool.query(
     `INSERT INTO sync_state (file_path, content_hash, last_synced) VALUES ($1, $2, NOW())
      ON CONFLICT (file_path) DO UPDATE SET content_hash = $2, last_synced = NOW()`,
@@ -168,6 +170,8 @@ async function processFile(filePath: string): Promise<void> {
   if (chunks.length === 0) return;
 
   const pool = getPool();
+  // Set RLS context for each batch of writes
+  await pool.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
   for (const chunk of chunks) {
     const embedding = await embed(chunk.content.slice(0, 8000));
     const vectorStr = `[${embedding.join(',')}]`;
