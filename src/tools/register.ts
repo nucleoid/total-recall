@@ -29,7 +29,10 @@ const agentListSchema = z.object({});
 const TOOL_DEFINITIONS = [
   {
     name: 'memory_store',
-    description: 'Store a memory with automatic embedding generation.',
+    description:
+      'Store a memory with automatic embedding generation. ' +
+      'For accurate provenance, pass agent_name identifying the agent storing this memory ' +
+      '(e.g. "openclaw", "cursor-dev"). When omitted, the API key name is used as a fallback.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -39,6 +42,16 @@ const TOOL_DEFINITIONS = [
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags for categorization' },
         metadata: { type: 'object', description: 'Additional metadata' },
         access_level: { type: 'string', enum: ['normal', 'sensitive', 'secret'] },
+        agent_name: {
+          type: 'string',
+          description:
+            'Name of the agent storing this memory (e.g. "openclaw", "cursor-dev"). ' +
+            'Strongly recommended for provenance. Falls back to the API key name if omitted.',
+        },
+        agent_type: { type: 'string', description: 'Agent type: llm, system, human, tool (default: llm when agent_name explicit)' },
+        agent_model: { type: 'string', description: 'LLM model identifier (e.g. "claude-opus-4-7")' },
+        agent_runtime: { type: 'string', description: 'Runtime environment (e.g. "claude-code", "openclaw")' },
+        session_id: { type: 'string', description: 'Optional session/conversation ID for grouping related operations' },
       },
       required: ['content'],
     },
@@ -60,7 +73,10 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_search',
-    description: 'Hybrid vector + full-text search across memories.',
+    description:
+      'Hybrid vector + full-text search across memories. ' +
+      'For accurate provenance and recall trace logging, pass agent_name identifying the agent ' +
+      'performing the search. When omitted, the API key name is used as a fallback.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -72,6 +88,13 @@ const TOOL_DEFINITIONS = [
         source: { type: 'string', description: 'Filter by source' },
         after: { type: 'string', description: 'Filter: created after ISO date' },
         before: { type: 'string', description: 'Filter: created before ISO date' },
+        agent_name: {
+          type: 'string',
+          description:
+            'Name of the agent performing this search (e.g. "openclaw", "cursor-dev"). ' +
+            'Strongly recommended for trace logging. Falls back to the API key name if omitted.',
+        },
+        session_id: { type: 'string', description: 'Optional session/conversation ID for grouping related operations' },
       },
       required: ['query'],
     },

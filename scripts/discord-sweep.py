@@ -215,6 +215,9 @@ def store_memory(content, namespace, tags, channel):
         "namespace": namespace,
         "tags": tags,
         "source": f"discord-sweep:#{channel}",
+        "agent_name": "discord-sweep",
+        "agent_type": "system",
+        "agent_runtime": "cron",
     }
     try:
         result = subprocess.run(

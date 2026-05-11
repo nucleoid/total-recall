@@ -28,10 +28,22 @@ export async function memorySearch(
     return [];
   }
 
-  let agentId: string | undefined;
-  if (params.agent_name) {
-    agentId = await resolveAgent(params.agent_name, undefined, undefined, undefined, undefined, auth.keyId);
+  const explicitAgent = !!params.agent_name;
+  const agentName = params.agent_name || auth.name;
+  if (!explicitAgent) {
+    console.warn(
+      `[total-recall] memory_search called without agent_name; defaulting to api_key name "${auth.name}". ` +
+      `Pass agent_name explicitly for accurate provenance.`
+    );
   }
+  const agentId = await resolveAgent(
+    agentName,
+    explicitAgent ? 'llm' : 'system',
+    undefined,
+    undefined,
+    undefined,
+    auth.keyId
+  );
 
   const start = Date.now();
   const results = await hybridSearch(params, namespaces);

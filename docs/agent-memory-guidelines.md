@@ -43,6 +43,30 @@ your actual long-term brain. Searching is cheap; wrong assumptions are expensive
 here. Your stored memories are your institutional knowledge — use them.
 ```
 
+## Agent Identity (Provenance)
+
+Every `memory_store` and `memory_search` call should pass `agent_name` so the operation is attributed to the agent performing it. Without this, every memory looks like it came from the same anonymous source.
+
+**Pass these fields on every call:**
+- **`agent_name`** *(strongly recommended)* — unique identifier for the agent (e.g. `"openclaw"`, `"cursor-dev"`, `"claude-code-mobile"`)
+- **`agent_runtime`** *(optional)* — the platform running the agent (e.g. `"claude-code"`, `"cursor"`, `"openclaw"`)
+- **`agent_model`** *(optional)* — the LLM model (e.g. `"claude-opus-4-7"`)
+- **`session_id`** *(optional)* — groups related operations within a conversation
+
+Total Recall will fall back to the API key's name if `agent_name` is missing, but explicit values give cleaner provenance and let you track multiple sub-agents under one key.
+
+```bash
+# Example: explicit agent identity
+mcporter call total-recall.memory_store --args '{
+  "content": "Decided to use Postgres pgvector over Pinecone",
+  "namespace": "projects",
+  "tags": ["architecture", "database"],
+  "agent_name": "my-coding-agent",
+  "agent_runtime": "claude-code",
+  "agent_model": "claude-opus-4-7"
+}'
+```
+
 ## Storage Guidelines
 
 Add these rules to ensure agents store important context incrementally, not just at session end.

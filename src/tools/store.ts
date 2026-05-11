@@ -31,17 +31,23 @@ export async function memoryStore(
     throw new Error(`Access denied to namespace '${ns}'`);
   }
 
-  let agentId: string | null = null;
-  if (params.agent_name) {
-    agentId = await resolveAgent(
-      params.agent_name,
-      params.agent_type,
-      params.agent_model,
-      params.agent_runtime,
-      undefined,
-      auth.keyId
+  const explicitAgent = !!params.agent_name;
+  const agentName = params.agent_name || auth.name;
+  const agentType = params.agent_type || (explicitAgent ? 'llm' : 'system');
+  if (!explicitAgent) {
+    console.warn(
+      `[total-recall] memory_store called without agent_name; defaulting to api_key name "${auth.name}". ` +
+      `Pass agent_name explicitly for accurate provenance.`
     );
   }
+  const agentId = await resolveAgent(
+    agentName,
+    agentType,
+    params.agent_model,
+    params.agent_runtime,
+    undefined,
+    auth.keyId
+  );
 
   const embedding = await embed(params.content);
   const vecStr = `[${embedding.join(',')}]`;
