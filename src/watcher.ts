@@ -4,6 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { getPool, setNamespaceContext, shutdown } from './db.js';
 import { embed } from './embedding.js';
+import { resolveAgent } from './agents.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -122,8 +123,8 @@ function chunkMarkdown(content: string, source: string, relPath: string): Chunk[
 }
 
 const UPSERT_SQL = `
-INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key)
-VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'file-sync', $7)
+INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, agent_id)
+VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'file-sync', $7, $8)
 ON CONFLICT (source_key) DO UPDATE SET
   content = EXCLUDED.content,
   embedding = EXCLUDED.embedding,
@@ -131,8 +132,11 @@ ON CONFLICT (source_key) DO UPDATE SET
   namespace = EXCLUDED.namespace,
   tags = EXCLUDED.tags,
   metadata = EXCLUDED.metadata,
+  agent_id = EXCLUDED.agent_id,
   updated_at = NOW()
 `;
+
+let watcherAgentId: string | null = null;
 
 async function getStoredHash(filePath: string): Promise<string | null> {
   const pool = getPool();
@@ -177,7 +181,7 @@ async function processFile(filePath: string): Promise<void> {
     const vectorStr = `[${embedding.join(',')}]`;
     await pool.query(UPSERT_SQL, [
       chunk.content, vectorStr, spec.source, spec.namespace,
-      chunk.tags, JSON.stringify(chunk.metadata), chunk.sourceKey,
+      chunk.tags, JSON.stringify(chunk.metadata), chunk.sourceKey, watcherAgentId,
     ]);
   }
 
@@ -202,6 +206,7 @@ function debouncedProcess(filePath: string): void {
 
 async function main() {
   await setNamespaceContext(['personal', 'work', 'projects', 'financial', 'shared']);
+  watcherAgentId = await resolveAgent('file-watcher', 'system', undefined, 'total-recall-watcher');
 
   const watchPaths = WATCH_SPECS.flatMap(s => s.paths);
   console.log(`[watcher] Starting file sync watcher...`);
