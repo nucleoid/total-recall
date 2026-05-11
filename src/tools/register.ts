@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import {
   CallToolRequestSchema,
@@ -12,6 +13,18 @@ import { recallSchema, memoryRecall } from './recall.js';
 import { listNamespacesSchema, memoryListNamespaces } from './list-namespaces.js';
 import { listSchema, memoryList } from './list.js';
 import { statsSchema, memoryStats } from './stats.js';
+import { upsertAgent, listAgents } from '../agents.js';
+
+const agentRegisterSchema = z.object({
+  name: z.string().min(1),
+  type: z.string().default('llm'),
+  model: z.string().optional(),
+  runtime: z.string().optional(),
+  parent_agent_name: z.string().optional(),
+  metadata: z.record(z.unknown()).default({}),
+});
+
+const agentListSchema = z.object({});
 
 const TOOL_DEFINITIONS = [
   {
@@ -104,6 +117,30 @@ const TOOL_DEFINITIONS = [
       properties: {},
     },
   },
+  {
+    name: 'agent_register',
+    description: 'Register or update an AI agent for provenance tracking.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        name: { type: 'string', description: 'Unique agent name' },
+        type: { type: 'string', description: 'Agent type: llm, system, human, tool (default: llm)' },
+        model: { type: 'string', description: 'Model identifier (e.g. claude-opus-4-6)' },
+        runtime: { type: 'string', description: 'Runtime environment (e.g. openclaw, claude-code)' },
+        parent_agent_name: { type: 'string', description: 'Name of the parent agent' },
+        metadata: { type: 'object', description: 'Additional metadata' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'agent_list',
+    description: 'List all registered agents with memory counts and last activity.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+    },
+  },
 ];
 
 type AuthResolver = () => Promise<AuthContext>;
@@ -153,6 +190,19 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
         case 'memory_stats': {
           const params = statsSchema.parse(args);
           const result = await memoryStats(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        }
+        case 'agent_register': {
+          const params = agentRegisterSchema.parse(args);
+          const result = await upsertAgent({
+            ...params,
+            api_key_id: auth.keyId,
+          });
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
+        case 'agent_list': {
+          agentListSchema.parse(args);
+          const result = await listAgents();
           return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
         }
         default:

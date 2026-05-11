@@ -7,10 +7,21 @@ export async function logAudit(params: {
   memoryId?: string;
   queryText?: string;
   resultCount?: number;
+  agentId?: string;
+  sessionId?: string;
 }): Promise<void> {
   await query(
-    `INSERT INTO audit_log (client_id, action, namespace, memory_id, query_text, result_count) 
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [params.clientId, params.action, params.namespace ?? null, params.memoryId ?? null, params.queryText ?? null, params.resultCount ?? null]
+    `INSERT INTO audit_log (client_id, action, namespace, memory_id, query_text, result_count, agent_id, session_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      params.clientId,
+      params.action,
+      params.namespace ?? null,
+      params.memoryId ?? null,
+      params.queryText ?? null,
+      params.resultCount ?? null,
+      params.agentId ?? null,
+      params.sessionId ?? null,
+    ]
   );
 }

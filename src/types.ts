@@ -76,3 +76,39 @@ export interface AuthContext {
   namespaces: string[];
   permissions: string[];
 }
+
+export interface Agent {
+  id: string;
+  name: string;
+  type: string;
+  model: string | null;
+  runtime: string | null;
+  parent_agent_id: string | null;
+  api_key_id: string | null;
+  metadata: Record<string, unknown>;
+  first_seen_at: Date;
+  last_seen_at: Date;
+}
+
+export interface AgentParams {
+  name: string;
+  type?: string;
+  model?: string;
+  runtime?: string;
+  parent_agent_name?: string;
+  api_key_id?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RecallTrace {
+  id: string;
+  session_id: string | null;
+  agent_id: string | null;
+  client_id: string | null;
+  query_text: string;
+  memory_ids: string[];
+  result_count: number;
+  scores: unknown[];
+  duration_ms: number | null;
+  created_at: Date;
+}

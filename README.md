@@ -30,13 +30,28 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
                       │
         ┌─────────────┴───────────────┐
         │     MCP Memory Server       │
+        │     + Express REST API      │
         │                             │
-        │  Tools:                     │
+        │  MCP Tools:                 │
         │  • memory_store             │
         │  • memory_store_document    │
         │  • memory_search            │
         │  • memory_recall            │
+        │  • memory_list              │
         │  • memory_list_namespaces   │
+        │  • memory_stats             │
+        │  • agent_register           │
+        │  • agent_list               │
+        │                             │
+        │  REST API:                  │
+        │  • POST /api/search         │
+        │  • POST /api/store          │
+        │  • POST /api/store-document │
+        │  • GET  /api/stats          │
+        │  • GET  /api/agents         │
+        │  • POST /api/agents         │
+        │  • GET  /api/traces         │
+        │  • GET  /api/audit          │
         │                             │
         │  ┌───────────┐  ┌────────┐  │
         │  │ Auth/ACL  │  │ Embed  │  │
@@ -57,6 +72,8 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
         │  │ namespace   TEXT    │    │
         │  │ tags        TEXT[]  │    │
         │  │ metadata    JSONB   │    │
+        │  │ agent_id    UUID FK │    │
+        │  │ session_id  TEXT    │    │
         │  │ document_id UUID FK │    │
         │  │ chunk_index INT     │    │
         │  │ source_key  TEXT UQ │    │
@@ -67,23 +84,40 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
         │  └─────────────────────┘    │
         │                             │
         │  ┌─────────────────────┐    │
-        │  │ documents           │    │
+        │  │ agents              │    │
         │  │ ─────────────────── │    │
         │  │ id          UUID PK │    │
-        │  │ title       TEXT    │    │
-        │  │ source      TEXT    │    │
-        │  │ namespace   TEXT    │    │
-        │  │ tags        TEXT[]  │    │
-        │  │ chunk_count INT     │    │
+        │  │ name        TEXT UQ │    │
+        │  │ type        TEXT    │    │
+        │  │ model       TEXT    │    │
+        │  │ runtime     TEXT    │    │
+        │  │ parent_id   UUID FK │    │
+        │  │ api_key_id  UUID FK │    │
+        │  │ metadata    JSONB   │    │
+        │  │ first_seen  TS      │    │
+        │  │ last_seen   TS      │    │
+        │  └─────────────────────┘    │
+        │                             │
+        │  ┌─────────────────────┐    │
+        │  │ recall_traces       │    │
+        │  │ ─────────────────── │    │
+        │  │ id          UUID PK │    │
+        │  │ session_id  TEXT    │    │
+        │  │ agent_id    UUID FK │    │
+        │  │ client_id   TEXT    │    │
+        │  │ query_text  TEXT    │    │
+        │  │ memory_ids  UUID[]  │    │
+        │  │ result_count INT    │    │
+        │  │ scores      JSONB   │    │
+        │  │ duration_ms INT     │    │
         │  │ created_at  TS      │    │
         │  └─────────────────────┘    │
         │                             │
         │  ┌─────────────────────┐    │
+        │  │ documents           │    │
+        │  │ audit_log           │    │
+        │  │ api_keys            │    │
         │  │ sync_state          │    │
-        │  │ ─────────────────── │    │
-        │  │ file_path   TEXT PK │    │
-        │  │ content_hash TEXT   │    │
-        │  │ last_synced  TS     │    │
         │  └─────────────────────┘    │
         └─────────────────────────────┘
 ```
@@ -91,13 +125,15 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
 ## MCP Tools
 
 ### `memory_store`
-Store a single memory/fact with metadata.
+Store a single memory/fact with metadata. Optionally track which agent stored it.
 ```json
 {
   "content": "Mitch prefers Besu+Lodestar for ETH validation (minority clients)",
   "source": "openclaw-conversation",
   "namespace": "personal",
-  "tags": ["ethereum", "staking", "preference"]
+  "tags": ["ethereum", "staking", "preference"],
+  "agent_name": "openclaw",
+  "session_id": "conv-123"
 }
 ```
 
@@ -112,24 +148,95 @@ Chunk and store a full document. Auto-splits by headings (markdown) or paragraph
   "source": "manual"
 }
 ```
-Use case: copy/paste a document into any LLM prompt and call this tool to store it.
 
 ### `memory_search`
-Hybrid semantic + keyword search with filters.
+Hybrid semantic + keyword search with filters. Every search is logged as a recall trace with timing data.
 ```json
 {
   "query": "what validator clients does Mitch use",
-  "namespace": "personal",
+  "namespaces": ["personal"],
   "limit": 5,
-  "min_score": 0.7
+  "threshold": 0.3,
+  "agent_name": "cursor",
+  "session_id": "dev-session-42"
 }
 ```
 
 ### `memory_recall`
 Get a specific memory by ID, or all chunks of a document by `document_id`.
 
+### `memory_list`
+Browse/paginate memories with optional filters (no vector search).
+
 ### `memory_list_namespaces`
 List available namespaces and their memory counts.
+
+### `memory_stats`
+Admin-only statistics: total memories, breakdown by namespace and source, document count, date range.
+
+### `agent_register`
+Register or update an AI agent in the provenance system.
+```json
+{
+  "name": "cursor-dev",
+  "type": "llm",
+  "model": "claude-sonnet-4-6",
+  "runtime": "cursor",
+  "parent_agent_name": "openclaw"
+}
+```
+
+### `agent_list`
+List all registered agents with memory counts and last activity.
+
+## Agent Provenance Model
+
+Every memory can be linked to the agent that created it. Agents are identified by name and auto-registered on first interaction.
+
+**Agent fields:**
+- `name` — unique identifier (e.g., "openclaw", "cursor-dev", "claude-work")
+- `type` — `llm`, `system`, `human`, or `tool`
+- `model` — the LLM model used (e.g., "claude-opus-4-6")
+- `runtime` — the tool/platform running the agent (e.g., "openclaw", "cursor", "claude-code")
+- `parent_agent_id` — for spawned sub-agents, links to the parent
+
+**How it works:**
+1. When `memory_store` or `memory_search` is called with `agent_name`, the agent is resolved (created if new, updated if existing)
+2. The `agent_id` is stored on the memory record for provenance
+3. Use `agent_list` to see all registered agents and their memory counts
+
+## Recall Trace Auditing
+
+Every search operation is automatically logged as a recall trace, enabling full audit of how memories are accessed.
+
+**Trace fields:**
+- `query_text` — what was searched
+- `agent_id` — which agent performed the search
+- `session_id` — groups traces within a conversation/session
+- `memory_ids` — which memories were returned
+- `scores` — per-result scoring breakdown (vector, text, final)
+- `duration_ms` — how long the search took
+
+**REST API for traces:**
+```
+GET /api/traces?limit=20&offset=0&agent_id=<uuid>&session_id=<string>
+```
+
+## REST API
+
+All endpoints require authentication via `Authorization: Bearer tr_<key>`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| POST | `/api/search` | Hybrid semantic + keyword search |
+| POST | `/api/store` | Store a single memory |
+| POST | `/api/store-document` | Store a chunked document |
+| GET | `/api/stats` | Memory statistics (admin) |
+| GET | `/api/agents` | List registered agents |
+| POST | `/api/agents` | Register/update an agent |
+| GET | `/api/traces` | Paginated recall traces |
+| GET | `/api/audit` | Paginated audit log |
 
 ## Data Sources & Sync Model
 
@@ -149,41 +256,15 @@ Key files are monitored for changes, diffed by content hash, chunked, and upsert
 - On change: re-chunk, re-embed, **upsert** (deterministic ID from `source_file + heading_path`)
 - No duplicates, no stale entries
 
-**Explicitly excluded:**
-- Task deliverables (credentials, API keys, sensitive outputs)
-- `.env` files, token/secret files
-- Anything in `.git/`
-
 ### Pre-Seed (one-time bulk import)
 Bootstrap from existing AI conversation history across platforms.
 
-**Phase 1: OpenClaw / Cass** (richest, most structured)
-- Sources: `MEMORY.md`, `USER.md`, `TOOLS.md`, `memory/*.md`, `second-brain/`
-- Chunking: heading-based splits (each `##` = a memory, `###` stays grouped unless >500 tokens)
-- Daily logs get timestamp metadata for temporal queries
-- Deduplicate: MEMORY.md (curated) takes priority over daily files (raw)
-
-**Phase 2: ChatGPT** (best export format)
-- Export: Settings → Data Controls → Export Data → `conversations.json`
-- Parse turn-pairs, filter by information density (skip mechanical debugging loops)
-- OpenAI's "remembered facts" are gold — pure distilled preferences, highest priority
-- Namespace auto-classification by conversation topic
-
-**Phase 3: Claude** (Anthropic)
-- Export: claude.ai → Settings → Export Data → JSON dump
-- Same turn-pair extraction and density filtering
-- No structured "memories" feature to extract (yet)
-
-**Phase 4: Gemini** (Google)
-- Export: Google Takeout → Gemini Apps → HTML files per conversation
-- HTML parser needed (messiest format)
-- Gemini's memory/facts feature may or may not be in the export
-
-### Manual (CLI — ad hoc)
-```bash
-recall ingest <file>           # One-off file import
-recall ingest --dir <path>     # Bulk directory import
-```
+| Source | Script | Format | Status |
+|--------|--------|--------|--------|
+| OpenClaw | `preseed-openclaw.ts` | Markdown files | Done |
+| ChatGPT | `preseed-chatgpt.ts` | JSON export | Done |
+| Claude | `preseed-claude.ts` | JSON export | Done |
+| Gemini | `preseed-gemini.ts` | HTML export | Done |
 
 ### Ingestion Pipeline (shared by all sources)
 
@@ -205,21 +286,18 @@ Embedder (Gemini Embedding 2 via API, fallback to Ollama nomic-embed-text)
 PostgreSQL + pgvector (upsert)
 ```
 
-### Conflict Resolution
-- **Latest timestamp wins** — most recent preference/fact is authoritative
-- Source platform stored in metadata for provenance tracking
-
 ## Tech Stack
 
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
-| Database | PostgreSQL + pgvector | Battle-tested, vector search built-in, no extra service |
-| Embedding | Gemini Embedding 2 (gemini-embedding-2-preview) | High quality, free tier, 768d vectors. Falls back to Ollama nomic-embed-text if no API key |
-| MCP Server | TypeScript/Node.js | MCP SDK is TypeScript-first, matches existing stack |
-| Auth | API keys + namespace ACLs | Simple, auditable, per-client scoping |
-| External Access | Cloudflare Tunnel | No open ports, TLS, access policies, already have CF |
+| Database | PostgreSQL 16 + pgvector | Battle-tested, vector search built-in, HNSW indexes |
+| Embedding | Gemini Embedding 2 (768d) | High quality, free tier. Fallback: Ollama nomic-embed-text |
+| Protocol | MCP (Model Context Protocol) | Standard for LLM tool integration |
+| REST API | Express 5 | For non-MCP consumers (Cortex dashboard, Custom GPTs) |
+| Auth | API keys + namespace ACLs + RLS | Per-client scoping with row-level security |
+| External Access | Cloudflare Tunnel | No open ports, TLS, access policies |
 | File Watcher | chokidar (Node.js) | Efficient inotify-based, handles nested dirs |
-| Deployment | systemd service | Consistent with Cortex, simple, reliable |
+| Deployment | systemd (user services) | Simple, reliable, auto-restart |
 
 ## Namespace Design
 
@@ -233,24 +311,37 @@ PostgreSQL + pgvector (upsert)
 
 ## Security Model
 
-1. **API keys** — unique per client, revocable
-2. **Namespace ACLs** — each key can only access permitted namespaces
-3. **Encryption at rest** — Postgres TDE or application-level for sensitive namespaces
-4. **Encryption in transit** — TLS via Cloudflare Tunnel (external) or local UNIX socket
-5. **Audit log** — every read/write logged with client ID and timestamp
-6. **Rate limiting** — per-client rate limits to prevent abuse
-7. **No open ports** — Cloudflare Tunnel for external, localhost/VPN for internal
+1. **API keys** — unique per client (`tr_` prefix), revocable, SHA256 hashed at rest
+2. **Namespace ACLs** — each key bound to specific namespaces
+3. **Row-Level Security** — PostgreSQL RLS policies enforce namespace isolation at the database level
+4. **Audit log** — every read/write logged with client ID, agent ID, and timestamp
+5. **Recall traces** — every search operation logged with query, results, and timing
+6. **No open ports** — Cloudflare Tunnel for external, localhost for internal
 
-## Development Phases
+## Cortex Dashboard
 
-- [ ] **Phase 1:** Postgres + pgvector setup, schema, basic CRUD
-- [ ] **Phase 2:** Embedding model selection and pipeline (nomic-embed-text)
-- [ ] **Phase 3:** MCP server with core tools (store, search, store_document)
-- [ ] **Phase 4:** Auth layer, API keys, namespace ACLs
-- [ ] **Phase 5:** Pre-seed pipeline (OpenClaw → ChatGPT → Claude → Gemini)
-- [ ] **Phase 6:** File sync watcher (MEMORY.md, Cortex content, daily logs)
-- [ ] **Phase 7:** Cloudflare Tunnel for external access
-- [ ] **Phase 8:** Advanced features (decay, consolidation, dedup, CLI)
+Total Recall has a dedicated dashboard in Cortex (the personal ops dashboard) at `/memory`:
+
+- **Overview** — Stats, namespace breakdown, source distribution, recent activity
+- **Search** — Semantic search with namespace filters
+- **Agents** — Agent provenance view (registered agents, memory counts, relationships)
+- **Traces** — Recall trace audit trail (queries, results, timing)
+
+## Development Status
+
+- [x] PostgreSQL + pgvector setup, schema, basic CRUD
+- [x] Embedding pipeline (Gemini Embedding 2 + Ollama fallback)
+- [x] MCP server with core tools (store, search, recall, list, stats)
+- [x] Auth layer, API keys, namespace ACLs, row-level security
+- [x] Pre-seed pipeline (OpenClaw, ChatGPT, Claude, Gemini)
+- [x] File sync watcher (MEMORY.md, Cortex content, daily logs)
+- [x] Cloudflare Tunnel for external access
+- [x] Memory decay and relevance scoring
+- [x] Audit logging
+- [x] REST API for non-MCP consumers
+- [x] Agent provenance model
+- [x] Recall trace auditing
+- [x] Cortex dashboard integration
 
 ## Links
 - **Discord:** Total Recall category (general, dev, security, research)

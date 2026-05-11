@@ -1,7 +1,9 @@
 import { z } from 'zod';
 import { hybridSearch } from '../search.js';
-import type { AuthContext } from '../types.js';
+import type { AuthContext, SearchResult } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
+import { resolveAgent } from '../agents.js';
+import { logTrace } from '../traces.js';
 
 export const searchSchema = z.object({
   query: z.string().min(1),
@@ -12,16 +14,39 @@ export const searchSchema = z.object({
   source: z.string().optional(),
   after: z.string().optional(),
   before: z.string().optional(),
+  agent_name: z.string().optional(),
+  session_id: z.string().optional(),
 });
 
 export async function memorySearch(
   params: z.infer<typeof searchSchema>,
   auth: AuthContext
-) {
+): Promise<SearchResult[]> {
   checkPermission(auth, 'read');
   const namespaces = filterNamespaces(params.namespaces, auth.namespaces);
   if (namespaces.length === 0) {
     return [];
   }
-  return hybridSearch(params, namespaces);
+
+  let agentId: string | undefined;
+  if (params.agent_name) {
+    agentId = await resolveAgent(params.agent_name, undefined, undefined, undefined, undefined, auth.keyId);
+  }
+
+  const start = Date.now();
+  const results = await hybridSearch(params, namespaces);
+  const durationMs = Date.now() - start;
+
+  logTrace({
+    sessionId: params.session_id,
+    agentId,
+    clientId: auth.keyId,
+    queryText: params.query,
+    memoryIds: results.map((r) => r.id),
+    resultCount: results.length,
+    scores: results.map((r) => ({ id: r.id, vec: r.vec_score, text: r.text_score, final: r.final_score })),
+    durationMs,
+  }).catch((err) => console.error('[total-recall] trace log error:', err.message));
+
+  return results;
 }

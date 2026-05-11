@@ -4,14 +4,16 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import express from 'express';
 import dotenv from 'dotenv';
-import { shutdown } from './db.js';
+import { shutdown, setNamespaceContext, query } from './db.js';
 import { validateKey } from './auth.js';
 import type { AuthContext } from './types.js';
 import { registerTools } from './tools/register.js';
-import { setNamespaceContext } from './db.js';
 import { memorySearch, searchSchema } from './tools/search.js';
 import { memoryStore, storeSchema } from './tools/store.js';
 import { memoryStoreDocument, storeDocumentSchema } from './tools/store-document.js';
+import { memoryStats } from './tools/stats.js';
+import { upsertAgent, listAgents } from './agents.js';
+import { listTraces } from './traces.js';
 
 dotenv.config();
 
@@ -218,6 +220,101 @@ app.post('/api/store-document', async (req, res) => {
       console.error('[total-recall] /api/store-document error:', err);
       res.status(500).json({ error: err.message || 'Internal server error' });
     }
+  }
+});
+
+app.get('/api/stats', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const result = await memoryStats({}, auth);
+    res.json(result);
+  } catch (err: any) {
+    console.error('[total-recall] /api/stats error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+app.get('/api/agents', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const result = await listAgents();
+    res.json({ agents: result });
+  } catch (err: any) {
+    console.error('[total-recall] /api/agents error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+app.post('/api/agents', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const { name, type, model, runtime, parent_agent_name, metadata } = req.body;
+    if (!name) {
+      res.status(400).json({ error: 'name is required' });
+      return;
+    }
+    const result = await upsertAgent({
+      name,
+      type,
+      model,
+      runtime,
+      parent_agent_name,
+      api_key_id: auth.keyId,
+      metadata,
+    });
+    res.json(result);
+  } catch (err: any) {
+    console.error('[total-recall] /api/agents POST error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+app.get('/api/traces', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const limit = Math.min(parseInt(req.query.limit as string, 10) || 20, 100);
+    const offset = parseInt(req.query.offset as string, 10) || 0;
+    const agentId = req.query.agent_id as string | undefined;
+    const sessionId = req.query.session_id as string | undefined;
+    const result = await listTraces(limit, offset, agentId, sessionId);
+    res.json({ traces: result });
+  } catch (err: any) {
+    console.error('[total-recall] /api/traces error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+app.get('/api/audit', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 200);
+    const offset = parseInt(req.query.offset as string, 10) || 0;
+    const action = req.query.action as string | undefined;
+    const agentId = req.query.agent_id as string | undefined;
+
+    const conditions: string[] = [];
+    const values: unknown[] = [];
+    let idx = 0;
+    const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
+
+    if (action) conditions.push(`action = ${p(action)}`);
+    if (agentId) conditions.push(`agent_id = ${p(agentId)}`);
+
+    const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    const result = await query(
+      `SELECT * FROM audit_log ${where} ORDER BY created_at DESC LIMIT ${p(limit)} OFFSET ${p(offset)}`,
+      values
+    );
+    res.json({ audit: result.rows });
+  } catch (err: any) {
+    console.error('[total-recall] /api/audit error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 

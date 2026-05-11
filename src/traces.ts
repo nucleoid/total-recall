@@ -1,0 +1,67 @@
+import { query } from './db.js';
+import type { RecallTrace } from './types.js';
+
+export async function logTrace(params: {
+  sessionId?: string;
+  agentId?: string;
+  clientId?: string;
+  queryText: string;
+  memoryIds?: string[];
+  resultCount?: number;
+  scores?: unknown[];
+  durationMs?: number;
+}): Promise<void> {
+  await query(
+    `INSERT INTO recall_traces (session_id, agent_id, client_id, query_text, memory_ids, result_count, scores, duration_ms)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      params.sessionId ?? null,
+      params.agentId ?? null,
+      params.clientId ?? null,
+      params.queryText,
+      params.memoryIds ?? [],
+      params.resultCount ?? 0,
+      JSON.stringify(params.scores ?? []),
+      params.durationMs ?? null,
+    ]
+  );
+}
+
+export async function listTraces(
+  limit = 20,
+  offset = 0,
+  agentId?: string,
+  sessionId?: string
+): Promise<RecallTrace[]> {
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+  let idx = 0;
+  const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
+
+  if (agentId) conditions.push(`rt.agent_id = ${p(agentId)}`);
+  if (sessionId) conditions.push(`rt.session_id = ${p(sessionId)}`);
+
+  const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  const res = await query<RecallTrace>(
+    `SELECT rt.*, a.name AS agent_name
+     FROM recall_traces rt
+     LEFT JOIN agents a ON a.id = rt.agent_id
+     ${where}
+     ORDER BY rt.created_at DESC
+     LIMIT ${p(limit)} OFFSET ${p(offset)}`,
+    values
+  );
+  return res.rows;
+}
+
+export async function getTrace(id: string): Promise<RecallTrace | null> {
+  const res = await query<RecallTrace>(
+    `SELECT rt.*, a.name AS agent_name
+     FROM recall_traces rt
+     LEFT JOIN agents a ON a.id = rt.agent_id
+     WHERE rt.id = $1`,
+    [id]
+  );
+  return res.rows[0] ?? null;
+}

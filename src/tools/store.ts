@@ -3,6 +3,7 @@ import { query } from '../db.js';
 import { embed } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
+import { resolveAgent } from '../agents.js';
 
 export const storeSchema = z.object({
   content: z.string().min(1).max(100000),
@@ -11,6 +12,11 @@ export const storeSchema = z.object({
   tags: z.array(z.string()).default([]),
   metadata: z.record(z.unknown()).default({}),
   access_level: z.enum(['normal', 'sensitive', 'secret']).default('normal'),
+  agent_name: z.string().optional(),
+  agent_type: z.string().optional(),
+  agent_model: z.string().optional(),
+  agent_runtime: z.string().optional(),
+  session_id: z.string().optional(),
 });
 
 export async function memoryStore(
@@ -25,12 +31,24 @@ export async function memoryStore(
     throw new Error(`Access denied to namespace '${ns}'`);
   }
 
+  let agentId: string | null = null;
+  if (params.agent_name) {
+    agentId = await resolveAgent(
+      params.agent_name,
+      params.agent_type,
+      params.agent_model,
+      params.agent_runtime,
+      undefined,
+      auth.keyId
+    );
+  }
+
   const embedding = await embed(params.content);
   const vecStr = `[${embedding.join(',')}]`;
 
   const res = await query(
-    `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id)
-     VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id)
+     VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING id, namespace`,
     [
       params.content,
@@ -41,6 +59,8 @@ export async function memoryStore(
       JSON.stringify(params.metadata),
       params.access_level,
       auth.keyId,
+      agentId,
+      params.session_id ?? null,
     ]
   );
 
