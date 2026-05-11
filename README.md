@@ -128,11 +128,11 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
 Store a single memory/fact with metadata. Optionally track which agent stored it.
 ```json
 {
-  "content": "Mitch prefers Besu+Lodestar for ETH validation (minority clients)",
-  "source": "openclaw-conversation",
+  "content": "User prefers Besu+Lodestar for ETH validation (minority clients)",
+  "source": "agent-conversation",
   "namespace": "personal",
   "tags": ["ethereum", "staking", "preference"],
-  "agent_name": "openclaw",
+  "agent_name": "my-agent",
   "session_id": "conv-123"
 }
 ```
@@ -153,7 +153,7 @@ Chunk and store a full document. Auto-splits by headings (markdown) or paragraph
 Hybrid semantic + keyword search with filters. Every search is logged as a recall trace with timing data.
 ```json
 {
-  "query": "what validator clients does Mitch use",
+  "query": "what validator clients are preferred",
   "namespaces": ["personal"],
   "limit": 5,
   "threshold": 0.3,
@@ -304,7 +304,7 @@ PostgreSQL + pgvector (upsert)
 | Namespace | Contents | Access |
 |-----------|----------|--------|
 | `personal` | Life context, preferences, history | Home agents only |
-| `work` | HoT-related, professional context | Work + home agents |
+| `work` | Professional context, employer-related | Work + home agents |
 | `projects` | Project-specific technical memories | All agents |
 | `financial` | Staking, retirement, sensitive | Home agents, restricted |
 | `shared` | General knowledge, non-sensitive | All agents |
@@ -327,6 +327,25 @@ Total Recall has a dedicated dashboard in Cortex (the personal ops dashboard) at
 - **Agents** — Agent provenance view (registered agents, memory counts, relationships)
 - **Traces** — Recall trace audit trail (queries, results, timing)
 
+## Agent Memory Discipline
+
+Getting agents to *reliably* use memory is harder than building the memory system itself. Total Recall includes guidelines and tooling to close this gap.
+
+**[Agent Memory Guidelines](docs/agent-memory-guidelines.md)** — Copy-paste rules for your agent's system prompt that enforce:
+- **Search before guessing** — query Total Recall before making assumptions
+- **Store before moving on** — save decisions, preferences, and facts incrementally
+- **Self-check before session ends** — review whether key takeaways were stored
+
+**[Discord Sweep](scripts/discord-sweep.py)** — Automated safety net that periodically re-reads Discord channel logs, extracts noteworthy items via LLM, and stores them. Run as a cron job to catch anything that in-session storage missed.
+
+```bash
+# Dry run to see what would be stored
+python3 scripts/discord-sweep.py --hours 12 --dry-run
+
+# Production cron (every 6 hours, 1h overlap buffer)
+0 */6 * * * python3 /path/to/discord-sweep.py --hours 7 >> /tmp/discord-sweep.log 2>&1
+```
+
 ## Development Status
 
 - [x] PostgreSQL + pgvector setup, schema, basic CRUD
@@ -342,6 +361,8 @@ Total Recall has a dedicated dashboard in Cortex (the personal ops dashboard) at
 - [x] Agent provenance model
 - [x] Recall trace auditing
 - [x] Cortex dashboard integration
+- [x] Agent memory guidelines (search/store discipline)
+- [x] Discord conversation sweep (automated memory extraction)
 
 ## Links
 - **Discord:** Total Recall category (general, dev, security, research)
