@@ -237,6 +237,10 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | POST | `/api/agents` | Register/update an agent |
 | GET | `/api/traces` | Paginated recall traces |
 | GET | `/api/audit` | Paginated audit log |
+| POST | `/api/media/search` | Vector search over media (viewing/listening) history |
+| POST | `/api/media/events` | Upsert media events (used by connectors) |
+| GET | `/api/media/events` | List structured media events with filters |
+| POST | `/api/media/rollup` | Trigger pending events → summary memories |
 
 ## Data Sources & Sync Model
 
@@ -308,6 +312,7 @@ PostgreSQL + pgvector (upsert)
 | `projects` | Project-specific technical memories | All agents |
 | `financial` | Staking, retirement, sensitive | Home agents, restricted |
 | `shared` | General knowledge, non-sensitive | All agents |
+| `media` | Viewing/listening history rollups from connectors | Home agents |
 
 ## Security Model
 
@@ -363,6 +368,11 @@ python3 scripts/discord-sweep.py --hours 12 --dry-run
 - [x] Cortex dashboard integration
 - [x] Agent memory guidelines (search/store discipline)
 - [x] Discord conversation sweep (automated memory extraction)
+- [x] Media connector framework + `media_events` table + rollup job + `media_search` (Phase 1)
+- [ ] Spotify connector (Phase 2)
+- [ ] Plex connector via plex.tv account (Phase 2)
+- [ ] YouTube Music connector + Takeout import (Phase 3)
+- [ ] Netflix quarterly Takeout importer (Phase 4)
 
 ## Links
 - **Discord:** Total Recall category (general, dev, security, research)

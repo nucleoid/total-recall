@@ -12,8 +12,11 @@ import { memorySearch, searchSchema } from './tools/search.js';
 import { memoryStore, storeSchema } from './tools/store.js';
 import { memoryStoreDocument, storeDocumentSchema } from './tools/store-document.js';
 import { memoryStats } from './tools/stats.js';
+import { mediaSearch, mediaSearchSchema } from './tools/media-search.js';
 import { upsertAgent, listAgents } from './agents.js';
 import { listTraces } from './traces.js';
+import { upsertMediaEvents, listMediaEvents, type MediaEventInput } from './media.js';
+import { rollupPendingEvents } from './rollup.js';
 
 dotenv.config();
 
@@ -314,6 +317,80 @@ app.get('/api/audit', async (req, res) => {
     res.json({ audit: result.rows });
   } catch (err: any) {
     console.error('[total-recall] /api/audit error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+// === Media endpoints ===
+
+app.post('/api/media/search', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const params = mediaSearchSchema.parse(req.body);
+    const results = await mediaSearch(params, auth);
+    res.json({ results });
+  } catch (err: any) {
+    if (err.name === 'ZodError') {
+      res.status(400).json({ error: 'Invalid request', details: err.errors });
+    } else {
+      console.error('[total-recall] /api/media/search error:', err);
+      res.status(500).json({ error: err.message || 'Internal server error' });
+    }
+  }
+});
+
+app.post('/api/media/events', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const body = req.body as { events?: MediaEventInput[] };
+    if (!Array.isArray(body.events)) {
+      res.status(400).json({ error: 'events array required' });
+      return;
+    }
+    const enriched = body.events.map((e) => ({
+      ...e,
+      client_id: e.client_id ?? auth.keyId,
+    }));
+    const result = await upsertMediaEvents(enriched);
+    res.json(result);
+  } catch (err: any) {
+    console.error('[total-recall] /api/media/events error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+app.get('/api/media/events', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 500);
+    const offset = parseInt(req.query.offset as string, 10) || 0;
+    const events = await listMediaEvents({
+      service: req.query.service as string | undefined,
+      event_type: req.query.event_type as string | undefined,
+      played_after: req.query.played_after as string | undefined,
+      played_before: req.query.played_before as string | undefined,
+      limit,
+      offset,
+    });
+    res.json({ events });
+  } catch (err: any) {
+    console.error('[total-recall] /api/media/events GET error:', err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+});
+
+app.post('/api/media/rollup', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const batchSize = Math.min(parseInt((req.body?.batch_size as string) ?? '50', 10) || 50, 500);
+    const result = await rollupPendingEvents(batchSize);
+    res.json(result);
+  } catch (err: any) {
+    console.error('[total-recall] /api/media/rollup error:', err);
     res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });

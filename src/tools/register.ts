@@ -13,6 +13,7 @@ import { recallSchema, memoryRecall } from './recall.js';
 import { listNamespacesSchema, memoryListNamespaces } from './list-namespaces.js';
 import { listSchema, memoryList } from './list.js';
 import { statsSchema, memoryStats } from './stats.js';
+import { mediaSearchSchema, mediaSearch } from './media-search.js';
 import { upsertAgent, listAgents } from '../agents.js';
 
 const agentRegisterSchema = z.object({
@@ -141,6 +142,29 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'media_search',
+    description:
+      'Vector + text search over media activity (viewing/listening history) rolled up from third-party services. ' +
+      'Filter by service (spotify, plex, ytmusic, netflix, neon), event type, or date range. ' +
+      'Returns rolled-up summary memories from the "media" namespace.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: { type: 'string', description: 'Natural-language search query' },
+        services: { type: 'array', items: { type: 'string' }, description: 'Filter by services (e.g. ["spotify","plex"])' },
+        event_types: { type: 'array', items: { type: 'string' }, description: 'Filter by event types (e.g. ["watch","play"])' },
+        played_after: { type: 'string', description: 'ISO date: only return events on/after this date' },
+        played_before: { type: 'string', description: 'ISO date: only return events on/before this date' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Extra tag filters (AND)' },
+        limit: { type: 'number', description: 'Max results (default 10, max 50)' },
+        threshold: { type: 'number', description: 'Min similarity threshold (default 0.3)' },
+        agent_name: { type: 'string', description: 'Agent performing the search; falls back to API key name' },
+        session_id: { type: 'string', description: 'Session/conversation ID for grouping operations' },
+      },
+      required: ['query'],
+    },
+  },
+  {
     name: 'agent_register',
     description: 'Register or update an AI agent for provenance tracking.',
     inputSchema: {
@@ -214,6 +238,11 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
           const params = statsSchema.parse(args);
           const result = await memoryStats(params, auth);
           return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        }
+        case 'media_search': {
+          const params = mediaSearchSchema.parse(args);
+          const results = await mediaSearch(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
         }
         case 'agent_register': {
           const params = agentRegisterSchema.parse(args);
