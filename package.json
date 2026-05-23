@@ -17,7 +17,9 @@
     "start:watcher": "node dist/watcher.js",
     "preseed:chatgpt": "tsx scripts/preseed-chatgpt.ts",
     "decay:update": "tsx scripts/decay-update.ts",
-    "reembed": "tsx scripts/reembed-all.ts"
+    "reembed": "tsx scripts/reembed-all.ts",
+    "spotify:auth": "tsx scripts/spotify-auth.ts",
+    "spotify:sync": "tsx scripts/spotify-sync.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

@@ -369,7 +369,7 @@ python3 scripts/discord-sweep.py --hours 12 --dry-run
 - [x] Agent memory guidelines (search/store discipline)
 - [x] Discord conversation sweep (automated memory extraction)
 - [x] Media connector framework + `media_events` table + rollup job + `media_search` (Phase 1)
-- [ ] Spotify connector (Phase 2)
+- [x] Spotify connector ([setup](docs/connectors/spotify.md)) (Phase 2)
 - [ ] Plex connector via plex.tv account (Phase 2)
 - [ ] YouTube Music connector + Takeout import (Phase 3)
 - [ ] Netflix quarterly Takeout importer (Phase 4)
