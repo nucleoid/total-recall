@@ -17,8 +17,9 @@ For a one-time backfill of years of history, request a "Stream history" from Spo
 1. Go to <https://developer.spotify.com/dashboard>
 2. Click **Create app**
 3. Settings:
-   - **Redirect URIs**: `http://localhost:8888/callback`
-   - **Which API/SDKs are you planning to use?**: Web API
+   - **Redirect URIs**: `http://127.0.0.1:8888/callback`
+     (Spotify rejects the `localhost` hostname; use the loopback IP instead.)
+   - **Which API/SDKs are you planning to use?**: tick **Web API** (not Web Playback SDK — different product)
 4. Save and copy the **Client ID** and **Client secret**
 
 ### 2. Set env vars
@@ -28,8 +29,8 @@ Add these to your environment (e.g. systemd unit, `.env`, or shell profile):
 ```bash
 export SPOTIFY_CLIENT_ID=your-client-id
 export SPOTIFY_CLIENT_SECRET=your-client-secret
-# Optional overrides:
-# export SPOTIFY_REDIRECT_URI=http://localhost:8888/callback
+# Optional overrides (defaults shown):
+# export SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 # export SPOTIFY_AUTH_PORT=8888
 ```
 
@@ -87,6 +88,6 @@ These are embedded and searchable via `media_search` or any other consumer of th
 
 **401 from Spotify on sync** — Refresh token revoked. Re-run `npm run spotify:auth`.
 
-**"Invalid redirect URI"** — The URI in the env (`SPOTIFY_REDIRECT_URI`) must exactly match one registered in your Spotify dev app.
+**"Invalid redirect URI"** — The URI in the env (`SPOTIFY_REDIRECT_URI`) must exactly match one registered in your Spotify dev app. Note Spotify (as of April 2025) rejects the `localhost` hostname for redirect URIs — use `127.0.0.1` or `[::1]` instead.
 
 **Cron not picking up new plays** — Check `last_event_at` in `connector_sync_state`. If it's wrong (e.g. stuck in the future), `UPDATE connector_sync_state SET last_event_at = NULL WHERE service = 'spotify'` and re-run.

@@ -21,7 +21,7 @@ export interface SpotifyCreds {
 function getClientConfig(): { clientId: string; clientSecret: string; redirectUri: string } {
   const clientId = process.env.SPOTIFY_CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
-  const redirectUri = process.env.SPOTIFY_REDIRECT_URI || 'http://localhost:8888/callback';
+  const redirectUri = process.env.SPOTIFY_REDIRECT_URI || 'http://127.0.0.1:8888/callback';
   if (!clientId || !clientSecret) {
     throw new Error('SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set in the environment');
   }
