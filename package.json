@@ -19,7 +19,9 @@
     "decay:update": "tsx scripts/decay-update.ts",
     "reembed": "tsx scripts/reembed-all.ts",
     "spotify:auth": "tsx scripts/spotify-auth.ts",
-    "spotify:sync": "tsx scripts/spotify-sync.ts"
+    "spotify:sync": "tsx scripts/spotify-sync.ts",
+    "ytmusic:auth": "tsx scripts/ytmusic-auth.ts",
+    "ytmusic:sync": "tsx scripts/ytmusic-sync.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
