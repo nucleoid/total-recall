@@ -60,7 +60,43 @@ def cmd_auth(args):
         # reconstruct without them being passed on every call.
         token["_client_id"] = args.client_id
         token["_client_secret"] = args.client_secret
+        token["_auth_type"] = "oauth"
         sys.stdout.write(json.dumps(token))
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def cmd_auth_browser(args):
+    """Read raw browser request headers from stdin and produce a config blob.
+
+    ytmusicapi.setup() expects a 'headers_raw' string of the form copied
+    from DevTools (one 'Name: value' per line). It returns the JSON config
+    needed for subsequent YTMusic() calls.
+    """
+    try:
+        import ytmusicapi
+    except ImportError:
+        _eprint({"error": "ytmusicapi not installed. Run: pip install ytmusicapi"})
+        sys.exit(2)
+
+    headers_raw = sys.stdin.read()
+    if not headers_raw.strip():
+        _eprint({"error": "no headers supplied on stdin"})
+        sys.exit(2)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        temp_path = f.name
+
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            ytmusicapi.setup(filepath=temp_path, headers_raw=headers_raw)
+        with open(temp_path) as f:
+            config = json.load(f)
+        config["_auth_type"] = "browser"
+        sys.stdout.write(json.dumps(config))
     finally:
         try:
             os.unlink(temp_path)
@@ -78,20 +114,26 @@ def cmd_fetch(args):
     with open(args.token_file) as f:
         token = json.load(f)
 
-    client_id = token.pop("_client_id", None) or args.client_id
-    client_secret = token.pop("_client_secret", None) or args.client_secret
-    if not client_id or not client_secret:
-        _eprint({"error": "client_id/client_secret not stored in token and not provided"})
-        sys.exit(2)
+    auth_type = token.pop("_auth_type", None) or "oauth"
 
-    # ytmusicapi expects a token file path, not a dict. Write a clean copy.
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(token, f)
-        clean_token_path = f.name
+    if auth_type == "browser":
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(token, f)
+            clean_token_path = f.name
+        creds = None
+    else:
+        client_id = token.pop("_client_id", None) or args.client_id
+        client_secret = token.pop("_client_secret", None) or args.client_secret
+        if not client_id or not client_secret:
+            _eprint({"error": "client_id/client_secret not stored in token and not provided"})
+            sys.exit(2)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(token, f)
+            clean_token_path = f.name
+        creds = OAuthCredentials(client_id=client_id, client_secret=client_secret)
 
     try:
-        creds = OAuthCredentials(client_id=client_id, client_secret=client_secret)
-        yt = YTMusic(clean_token_path, oauth_credentials=creds)
+        yt = YTMusic(clean_token_path, oauth_credentials=creds) if creds else YTMusic(clean_token_path)
 
         items = yt.get_history() or []
 
@@ -118,15 +160,18 @@ def cmd_fetch(args):
 
         # If the token was refreshed during the call, re-emit it via stderr
         # in a structured "TOKEN_UPDATE" line so the Node side can persist.
-        try:
-            with open(clean_token_path) as f:
-                refreshed = json.load(f)
-            if refreshed != token:
-                refreshed["_client_id"] = client_id
-                refreshed["_client_secret"] = client_secret
-                _eprint({"token_update": refreshed})
-        except (IOError, json.JSONDecodeError):
-            pass
+        # Only OAuth tokens refresh; browser headers stay static.
+        if auth_type == "oauth":
+            try:
+                with open(clean_token_path) as f:
+                    refreshed = json.load(f)
+                if refreshed != token:
+                    refreshed["_client_id"] = client_id
+                    refreshed["_client_secret"] = client_secret
+                    refreshed["_auth_type"] = "oauth"
+                    _eprint({"token_update": refreshed})
+            except (IOError, json.JSONDecodeError):
+                pass
 
         sys.stdout.write(json.dumps({
             "items": filtered,
@@ -147,6 +192,8 @@ def main():
     p_auth.add_argument("--client-id", required=True)
     p_auth.add_argument("--client-secret", required=True)
 
+    sub.add_parser("auth-browser", help="Read browser request headers from stdin and emit config JSON")
+
     p_fetch = sub.add_parser("fetch", help="Fetch get_history() using a stored token")
     p_fetch.add_argument("--token-file", required=True)
     p_fetch.add_argument("--since", default=None, help="ISO timestamp; only return items played after")
@@ -158,6 +205,8 @@ def main():
     try:
         if args.cmd == "auth":
             cmd_auth(args)
+        elif args.cmd == "auth-browser":
+            cmd_auth_browser(args)
         elif args.cmd == "fetch":
             cmd_fetch(args)
     except Exception as exc:

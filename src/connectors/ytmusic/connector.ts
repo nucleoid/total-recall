@@ -27,10 +27,12 @@ interface ChildResult {
   code: number;
 }
 
-function runPython(args: string[], inheritStdio = false): Promise<ChildResult> {
+function runPython(args: string[], inheritStdio = false, stdinPayload?: string): Promise<ChildResult> {
   return new Promise((resolve, reject) => {
+    const stdinMode = stdinPayload !== undefined ? 'pipe' : (inheritStdio ? 'inherit' : 'pipe');
+    const stderrMode = inheritStdio ? 'inherit' : 'pipe';
     const child = spawn(PYTHON, [helperPath(), ...args], {
-      stdio: inheritStdio ? ['inherit', 'pipe', 'inherit'] : 'pipe',
+      stdio: [stdinMode, 'pipe', stderrMode],
     });
     let stdout = '';
     let stderr = '';
@@ -38,6 +40,10 @@ function runPython(args: string[], inheritStdio = false): Promise<ChildResult> {
     child.stderr?.on('data', (b) => (stderr += b.toString()));
     child.on('error', reject);
     child.on('close', (code) => resolve({ stdout, stderr, code: code ?? -1 }));
+    if (stdinPayload !== undefined && child.stdin) {
+      child.stdin.write(stdinPayload);
+      child.stdin.end();
+    }
   });
 }
 
@@ -45,9 +51,13 @@ export class YtmusicConnector extends BaseConnector {
   readonly service = 'ytmusic';
 
   /**
-   * One-time auth flow. Runs the Python helper with inherited stdio so the
-   * user can see the verification URL + device code and the helper can block
-   * waiting for them to complete it.
+   * One-time OAuth auth flow. Runs the Python helper with inherited stdio
+   * so the user can see the verification URL + device code and the helper
+   * can block waiting for them to complete it.
+   *
+   * Note: OAuth auth currently fails on YouTube Music's backend for most
+   * users (Google rejects the device-code client type for music API calls).
+   * Prefer `authorizeBrowser` until/unless Google fixes this.
    */
   async authorize(clientId: string, clientSecret: string): Promise<void> {
     const result = await runPython(
@@ -59,6 +69,21 @@ export class YtmusicConnector extends BaseConnector {
     }
     const token = JSON.parse(result.stdout);
     await setConnectorCredentials(this.service, token);
+  }
+
+  /**
+   * Browser-headers auth. The caller supplies the raw request headers
+   * copied from a real YouTube Music browser session (DevTools → Network
+   * → any browse request → Copy → request headers). This bypasses OAuth
+   * entirely and uses the same session as the web app.
+   */
+  async authorizeBrowser(rawHeaders: string): Promise<void> {
+    const result = await runPython(['auth-browser'], false, rawHeaders);
+    if (result.code !== 0) {
+      throw new Error(`ytmusic browser auth failed: ${result.stderr || 'exit ' + result.code}`);
+    }
+    const config = JSON.parse(result.stdout);
+    await setConnectorCredentials(this.service, config);
   }
 
   protected async fetchSince(since: Date | null): Promise<{

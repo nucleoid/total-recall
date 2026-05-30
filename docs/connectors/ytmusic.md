@@ -8,8 +8,9 @@ Pulls your YouTube Music play history into `media_events` and rolls it up into e
 - **History depth** — `get_history()` returns whatever YouTube remembers (typically last few hundred plays). For deeper backfill, use a Google Takeout export of "YouTube and YouTube Music" data — not yet automated.
 - **Premium not required** — a regular YouTube Music account works; Premium just gives ad-free playback.
 - **Account separation** — log into the Google account that has your YouTube Music history. If you use a brand account, make sure it's a personal one (brand accounts can be flaky).
+- **OAuth currently broken for YT Music** — Google rejects device-code OAuth clients on YouTube Music's backend with HTTP 400 ("invalid argument") for browse/library/history endpoints. As of writing, **only browser-headers auth reliably works**. Use the browser flow below; the OAuth flow is retained in case Google fixes it.
 
-## One-time setup
+## One-time setup (browser headers — recommended)
 
 ### 1. Install ytmusicapi on the host
 
@@ -23,45 +24,41 @@ python3 -m venv .venv
 
 Then set `YTMUSIC_PYTHON` to the venv's interpreter (see step 3). On older systems where `pip install --user ytmusicapi` works, you can skip the venv and leave `YTMUSIC_PYTHON` unset.
 
-### 2. Create a Google Cloud OAuth client
-
-YouTube's device-code flow requires an OAuth client of type **TVs and Limited Input devices**. Standard "Web" or "Desktop" clients won't work for this.
-
-1. Go to <https://console.cloud.google.com/> and create (or pick) a project.
-2. **APIs & Services → Library** → search for **YouTube Data API v3** → **Enable**.
-3. **APIs & Services → OAuth consent screen** — configure as "External", add yourself as a Test user.
-4. **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
-5. Application type: **TVs and Limited Input devices**. Give it any name.
-6. Copy the **Client ID** and **Client Secret**.
-
-### 3. Set env vars
+### 2. Set the Python path env var
 
 In `/home/fuego/projects/total-recall/.env`:
 
 ```bash
-YTMUSIC_CLIENT_ID=your-google-client-id
-YTMUSIC_CLIENT_SECRET=your-google-client-secret
-# Path to the python3 with ytmusicapi installed (the venv from step 1).
 YTMUSIC_PYTHON=/home/fuego/projects/total-recall/.venv/bin/python3
 ```
 
+### 3. Capture browser request headers
+
+1. Open <https://music.youtube.com> in a regular browser, signed into the Google account whose history you want.
+2. Open **DevTools** (F12) → **Network** tab. Make sure recording is on.
+3. Refresh the page or navigate around so requests appear.
+4. In the request list, click any request whose path contains `/youtubei/v1/browse` (you can filter by typing `browse` in the filter box).
+5. In the request details panel:
+   - **Chrome/Edge**: Right-click the request → **Copy** → **Copy request headers**.
+   - **Firefox**: open the **Headers** tab in the right panel, right-click anywhere in the "Request Headers" section → **Copy Request Headers**.
+6. You should now have many lines like `Cookie: ...`, `Authorization: SAPISIDHASH ...`, `X-Goog-AuthUser: 0`, etc. in your clipboard.
+
 ### 4. Run the auth flow
+
+On fuego:
 
 ```bash
 cd /home/fuego/projects/total-recall
-npm run ytmusic:auth
+npm run ytmusic:auth-browser
 ```
 
-You'll see something like:
+The script waits for you to paste the headers on stdin. Paste them, then press **Ctrl+D** (Linux/macOS) to signal end-of-input. The script saves the extracted config to `connector_credentials`.
 
+You can also pipe headers in directly if you've saved them to a file:
+
+```bash
+npm run ytmusic:auth-browser < /path/to/headers.txt
 ```
-Please go to https://www.google.com/device
-and enter code XXX-XXX-XXX
-```
-
-Open that URL **on any device** (laptop, phone), sign in with the Google account that has your YouTube Music, paste the code, and approve. The script blocks until you finish, then stores the refresh token in `connector_credentials`.
-
-Headless boxes are fine — there's no callback URL or local web server involved.
 
 ### 5. First sync
 
@@ -83,6 +80,20 @@ Recommended: hourly. YouTube only retains a finite history window, but you only 
 0 * * * * cd /home/fuego/projects/total-recall && /usr/bin/node dist/scripts/ytmusic-sync.js >> /tmp/ytmusic-sync.log 2>&1
 ```
 
+## Alternative: OAuth setup (currently broken)
+
+The OAuth device-code flow returns HTTP 400 from YouTube Music for browse / library / history calls as of early 2026. The code is retained in case Google fixes it. If you want to try anyway:
+
+1. Create a Google Cloud project, enable **YouTube Data API v3**.
+2. **Credentials → Create OAuth client ID** → type **TVs and Limited Input devices**.
+3. Add to `.env`:
+   ```bash
+   YTMUSIC_CLIENT_ID=...
+   YTMUSIC_CLIENT_SECRET=...
+   ```
+4. Run `npm run ytmusic:auth`, complete the device-code prompt.
+5. Run `npm run ytmusic:sync` — currently fails with `Server returned HTTP 400`. If your run succeeds, please open an issue.
+
 ## What gets stored
 
 Each play becomes one `media_events` row with:
@@ -99,14 +110,16 @@ Each event rolls up to a summary memory like:
 
 ## Troubleshooting
 
-**`ytmusicapi not installed`** — `pip install --user ytmusicapi` (matching the python3 in your PATH or `YTMUSIC_PYTHON`).
+**`ytmusicapi not installed`** — install into the venv and set `YTMUSIC_PYTHON` to its python3 binary.
 
-**`Device-code authorization expired`** — you took too long to enter the code. Just re-run `npm run ytmusic:auth`.
+**`Server returned HTTP 400: Bad Request. Request contains an invalid argument.`** — you're using OAuth auth. Switch to browser-headers (`npm run ytmusic:auth-browser`).
 
-**`invalid_client` or `unauthorized_client`** — the OAuth client type is wrong. It must be "TVs and Limited Input devices", not Web or Desktop.
+**`no headers supplied on stdin`** — you ran `ytmusic:auth-browser` but didn't paste headers, or didn't press Ctrl+D. Try again, paste, press Ctrl+D.
 
-**History is empty** — make sure you're signed into the right Google account. If you use multiple Google accounts, the brand account distinction matters — pick the personal one that actually owns the YouTube Music history.
+**`Cookie` header is missing or auth seems weak** — make sure you copied the request headers, not the response headers. Look for `Cookie:`, `Authorization: SAPISIDHASH`, `X-Goog-AuthUser`, and similar.
 
-**Token revoked / 401 errors** — re-run `npm run ytmusic:auth`. Google may revoke OAuth tokens if the consent screen is in "Testing" mode after 7 days; promoting it to "Production" extends this.
+**History is empty** — confirm you're capturing headers from the right browser profile / Google account. Multiple-account quirks bite here.
 
-**Cron has no PATH for python3** — set `YTMUSIC_PYTHON=/usr/bin/python3` in `.env`.
+**Headers stop working after a while** — YouTube Music sessions roll over occasionally (every few weeks typically). Re-capture and re-run `npm run ytmusic:auth-browser`.
+
+**Cron has no PATH for python3** — keep `YTMUSIC_PYTHON` set to the absolute venv path in `.env`.
