@@ -18,6 +18,7 @@ Requires:  pip install ytmusicapi
 """
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -43,12 +44,16 @@ def cmd_auth(args):
         # setup_oauth prints "Go to https://... and enter code XXX-XXX-XXX"
         # then blocks until the user completes. open_browser=False keeps it
         # purely terminal-driven (works on headless boxes).
-        ytmusicapi.setup_oauth(
-            client_id=args.client_id,
-            client_secret=args.client_secret,
-            filepath=temp_path,
-            open_browser=False,
-        )
+        # We redirect stdout to stderr so the verification URL is visible to
+        # the user via the Node parent (which inherits stderr), and the final
+        # JSON token alone goes to stdout for parsing.
+        with contextlib.redirect_stdout(sys.stderr):
+            ytmusicapi.setup_oauth(
+                client_id=args.client_id,
+                client_secret=args.client_secret,
+                filepath=temp_path,
+                open_browser=False,
+            )
         with open(temp_path) as f:
             token = json.load(f)
         # Include the client creds in the persisted blob so fetch can
