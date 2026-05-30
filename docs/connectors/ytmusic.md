@@ -13,12 +13,15 @@ Pulls your YouTube Music play history into `media_events` and rolls it up into e
 
 ### 1. Install ytmusicapi on the host
 
+Modern Debian/Ubuntu enforce [PEP 668](https://peps.python.org/pep-0668/) and reject system-wide `pip install`. Use a project-local venv:
+
 ```bash
-pip install --user ytmusicapi
-# or: sudo pip install ytmusicapi
+cd /home/fuego/projects/total-recall
+python3 -m venv .venv
+.venv/bin/pip install ytmusicapi
 ```
 
-If `python3` is not in your `PATH`, set `YTMUSIC_PYTHON` to the absolute path of the right interpreter.
+Then set `YTMUSIC_PYTHON` to the venv's interpreter (see step 3). On older systems where `pip install --user ytmusicapi` works, you can skip the venv and leave `YTMUSIC_PYTHON` unset.
 
 ### 2. Create a Google Cloud OAuth client
 
@@ -38,8 +41,8 @@ In `/home/fuego/projects/total-recall/.env`:
 ```bash
 YTMUSIC_CLIENT_ID=your-google-client-id
 YTMUSIC_CLIENT_SECRET=your-google-client-secret
-# Optional: full path to python3 if it's not in PATH for cron
-# YTMUSIC_PYTHON=/usr/bin/python3
+# Path to the python3 with ytmusicapi installed (the venv from step 1).
+YTMUSIC_PYTHON=/home/fuego/projects/total-recall/.venv/bin/python3
 ```
 
 ### 4. Run the auth flow
