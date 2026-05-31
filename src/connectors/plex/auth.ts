@@ -43,7 +43,9 @@ interface PinResponse {
 }
 
 async function createPin(clientIdentifier: string): Promise<PinResponse> {
-  const res = await fetch(`${PLEX_TV}/api/v2/pins?strong=true`, {
+  // strong=false returns the short 4-character code that plex.tv/link expects.
+  // strong=true returns a long redirect-only code that the manual flow can't use.
+  const res = await fetch(`${PLEX_TV}/api/v2/pins?strong=false`, {
     method: 'POST',
     headers: clientHeaders(clientIdentifier),
   });
@@ -78,7 +80,9 @@ export async function pinFlow(prompt: (link: string, code: string) => void): Pro
   const clientIdentifier = existing?.client_identifier ?? randomUUID();
 
   const pin = await createPin(clientIdentifier);
-  const link = `https://plex.tv/link?code=${pin.code}`;
+  // Hand the user the bare /link URL — they enter the 4-character code on
+  // that page. Pre-filling via `?code=` only works for `strong=true` PINs.
+  const link = 'https://plex.tv/link';
   prompt(link, pin.code);
 
   const authToken = await pollPin(pin.id, clientIdentifier);
