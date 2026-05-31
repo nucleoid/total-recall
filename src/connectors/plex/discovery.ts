@@ -25,6 +25,8 @@ export interface PlexResource {
   owned: boolean;
   provides: string;             // "server,player" etc; we want anything that includes "server"
   publicAddressMatches: boolean;
+  /** Per-resource access token. Required for shared (non-owned) servers. */
+  accessToken?: string;
   connections: PlexConnection[];
 }
 
@@ -81,12 +83,16 @@ async function tryConnection(uri: string, headers: Record<string, string>): Prom
  * Picks the first reachable connection for a server. Prefers local LAN
  * connections (lowest latency), then public direct, then relay as a
  * fallback for friend-server scenarios behind NAT.
+ *
+ * Uses the resource's per-server `accessToken` when present (required for
+ * shared/non-owned servers) instead of the plex.tv user token.
  */
 export async function pickReachableUri(
   resource: PlexResource,
   creds: PlexCreds
-): Promise<string | null> {
-  const headers = plexHeaders(creds);
+): Promise<{ uri: string; token: string } | null> {
+  const token = resource.accessToken || creds.auth_token;
+  const headers = { ...plexHeaders(creds), 'X-Plex-Token': token };
   const sorted = [...resource.connections].sort((a, b) => {
     const score = (c: PlexConnection) =>
       (c.local ? 0 : 1) + (c.relay ? 2 : 0) + (c.protocol === 'https' ? 0 : 0.5);
@@ -94,7 +100,7 @@ export async function pickReachableUri(
   });
   for (const conn of sorted) {
     if (await tryConnection(`${conn.uri}/identity`, headers)) {
-      return conn.uri;
+      return { uri: conn.uri, token };
     }
   }
   return null;
