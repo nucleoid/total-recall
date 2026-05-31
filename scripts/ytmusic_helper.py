@@ -21,9 +21,31 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime, timezone
+
+
+_CURL_H_RE = re.compile(r"-H\s+(['\"])(.*?)\1", re.DOTALL)
+
+
+def _curl_to_raw_headers(text: str) -> str:
+    """Convert a "Copy as cURL" command into raw "Name: value" header lines.
+
+    Chrome/Firefox both emit headers as `-H 'Name: value'` (single quotes on
+    *nix flavour) or `-H "Name: value"` (Windows cmd flavour). We pull every
+    occurrence and emit one header per line.
+    """
+    matches = _CURL_H_RE.findall(text)
+    if not matches:
+        return text
+    return "\n".join(value for _quote, value in matches) + "\n"
+
+
+def _looks_like_curl(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("curl ") or stripped.startswith("curl.exe ") or " -H " in stripped[:200]
 
 
 def _eprint(payload):
@@ -86,6 +108,12 @@ def cmd_auth_browser(args):
     if not headers_raw.strip():
         _eprint({"error": "no headers supplied on stdin"})
         sys.exit(2)
+
+    if _looks_like_curl(headers_raw):
+        headers_raw = _curl_to_raw_headers(headers_raw)
+        if not headers_raw.strip():
+            _eprint({"error": "input looked like a cURL command but no -H headers were found"})
+            sys.exit(2)
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         temp_path = f.name
