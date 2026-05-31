@@ -7,6 +7,7 @@
  */
 import dotenv from 'dotenv';
 import { YtmusicConnector } from '../src/connectors/ytmusic/connector.js';
+import { resolveConnectorAttribution } from '../src/connectors/attribution.js';
 import { rollupPendingEvents } from '../src/rollup.js';
 import { shutdown } from '../src/db.js';
 
@@ -16,8 +17,9 @@ async function main(): Promise<void> {
   const started = new Date().toISOString();
   console.log(`[${started}] ytmusic-sync: starting`);
 
+  const { apiKeyId, agentId } = await resolveConnectorAttribution('ytmusic');
   const connector = new YtmusicConnector();
-  const sync = await connector.sync();
+  const sync = await connector.sync({ apiKeyId, agentId });
 
   console.log(
     `[ytmusic-sync] ${sync.events_ingested} ingested, ${sync.events_skipped} skipped, ${sync.duration_ms}ms`

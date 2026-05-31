@@ -11,6 +11,7 @@ import {
   setConnectorCredentials,
   type MediaEventInput,
 } from '../../media.js';
+import { query } from '../../db.js';
 import { toMediaEvent, type YtHistoryItem } from './transform.js';
 
 const PYTHON = process.env.YTMUSIC_PYTHON || 'python3';
@@ -125,7 +126,22 @@ export class YtmusicConnector extends BaseConnector {
         .map(toMediaEvent)
         .filter((e): e is MediaEventInput => e !== null);
 
-      return { events };
+      // YouTube Music returns relative "played" buckets that drift across
+      // syncs ("Today" → "Yesterday" the next day). Without extra dedup
+      // we'd insert a fresh row every time a bucket rolls. Suppress any
+      // event whose videoId already exists in media_events for this service.
+      if (events.length === 0) return { events };
+
+      const videoIds = [...new Set(events.map((e) => e.service_id).filter(Boolean))] as string[];
+      const existingRows = await query<{ service_id: string }>(
+        `SELECT DISTINCT service_id FROM media_events
+         WHERE service = 'ytmusic' AND service_id = ANY($1)`,
+        [videoIds]
+      );
+      const seen = new Set(existingRows.rows.map((r) => r.service_id));
+      const fresh = events.filter((e) => e.service_id && !seen.has(e.service_id));
+
+      return { events: fresh };
     } finally {
       // We also read the file back so the Python helper's refreshed token
       // is captured even if it didn't emit the stderr notice (some

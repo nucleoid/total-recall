@@ -24,23 +24,89 @@ import os
 import re
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+
+_RELATIVE_TIME_RE = re.compile(
+    r"^\s*(?P<n>\d+)\s+(?P<unit>minute|hour|day|week|month|year)s?\s+ago\s*$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_played_at(raw: str | None, now: datetime) -> str | None:
+    """Convert YouTube Music's fuzzy "played" string to an ISO timestamp.
+
+    YouTube returns relative buckets ("Today", "Yesterday", "Last week",
+    "5 hours ago", etc) instead of exact timestamps. We map each bucket to
+    a representative datetime so the same bucket on consecutive syncs lands
+    on the same row. Precision is the bucket itself — we don't claim more.
+    """
+    if not raw:
+        return None
+    s = raw.strip().lower()
+
+    if s in ("today", "just now"):
+        return now.isoformat()
+    if s in ("yesterday",):
+        return (now - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+    if s in ("last week", "a week ago"):
+        return (now - timedelta(weeks=1)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+    if s in ("last month", "a month ago"):
+        return (now - timedelta(days=30)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+    if s in ("last year", "a year ago"):
+        return (now - timedelta(days=365)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+
+    m = _RELATIVE_TIME_RE.match(s)
+    if m:
+        n = int(m.group("n"))
+        unit = m.group("unit").lower()
+        delta = {
+            "minute": timedelta(minutes=n),
+            "hour": timedelta(hours=n),
+            "day": timedelta(days=n),
+            "week": timedelta(weeks=n),
+            "month": timedelta(days=30 * n),
+            "year": timedelta(days=365 * n),
+        }[unit]
+        ts = now - delta
+        if unit in ("day", "week", "month", "year"):
+            ts = ts.replace(hour=12, minute=0, second=0, microsecond=0)
+        return ts.isoformat()
+
+    # Try treating it as an actual ISO timestamp (older ytmusicapi versions).
+    try:
+        return datetime.fromisoformat(s.replace("z", "+00:00")).isoformat()
+    except ValueError:
+        return None
 
 
 _CURL_H_RE = re.compile(r"-H\s+(['\"])(.*?)\1", re.DOTALL)
+# Chrome's "Copy as cURL" puts cookies in `-b 'key=v; key=v'` rather than a
+# `cookie:` header. Cover both -b and --cookie.
+_CURL_COOKIE_RE = re.compile(r"(?:-b|--cookie)\s+(['\"])(.*?)\1", re.DOTALL)
 
 
 def _curl_to_raw_headers(text: str) -> str:
     """Convert a "Copy as cURL" command into raw "Name: value" header lines.
 
     Chrome/Firefox both emit headers as `-H 'Name: value'` (single quotes on
-    *nix flavour) or `-H "Name: value"` (Windows cmd flavour). We pull every
-    occurrence and emit one header per line.
+    *nix flavour) or `-H "Name: value"` (Windows cmd flavour). They put
+    session cookies in `-b 'k=v; k=v'` rather than a `cookie:` header — we
+    promote those to a synthesised `cookie: ...` line.
     """
-    matches = _CURL_H_RE.findall(text)
-    if not matches:
+    h_matches = _CURL_H_RE.findall(text)
+    b_matches = _CURL_COOKIE_RE.findall(text)
+    if not h_matches and not b_matches:
         return text
-    return "\n".join(value for _quote, value in matches) + "\n"
+
+    lines = [value for _quote, value in h_matches]
+    # Only synthesise a cookie header if one wasn't already supplied via -H.
+    has_cookie_header = any(line.lower().startswith("cookie:") for line in lines)
+    if b_matches and not has_cookie_header:
+        cookies = "; ".join(v for _q, v in b_matches if v.strip())
+        if cookies:
+            lines.append(f"cookie: {cookies}")
+    return "\n".join(lines) + "\n"
 
 
 def _looks_like_curl(text: str) -> bool:
@@ -172,18 +238,30 @@ def cmd_fetch(args):
             except ValueError:
                 pass
 
+        now = datetime.now(timezone.utc)
         filtered = []
         for item in items:
             played_raw = item.get("played")
-            played_ts = None
-            if played_raw:
-                try:
-                    # YouTube returns ISO 8601 timestamps
-                    played_ts = datetime.fromisoformat(played_raw.replace("Z", "+00:00"))
-                except ValueError:
-                    pass
-            if since_ts and played_ts and played_ts <= since_ts:
+            played_iso = _resolve_played_at(played_raw, now)
+            if played_iso:
+                # Replace the human-readable bucket with the ISO timestamp
+                # so the Node transform can pass it straight through.
+                item["played_raw"] = played_raw
+                item["played"] = played_iso
+            else:
+                # Couldn't parse — drop so we don't poison the DB with a
+                # malformed timestamptz. Logged for visibility.
+                _eprint({"skipped": {"reason": "unparsable played bucket", "played": played_raw, "videoId": item.get("videoId")}})
                 continue
+
+            if since_ts:
+                try:
+                    played_ts = datetime.fromisoformat(played_iso)
+                except ValueError:
+                    played_ts = None
+                if played_ts and played_ts <= since_ts:
+                    continue
+
             filtered.append(item)
 
         # If the token was refreshed during the call, re-emit it via stderr

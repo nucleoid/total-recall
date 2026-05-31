@@ -10,6 +10,7 @@
  */
 import dotenv from 'dotenv';
 import { SpotifyConnector } from '../src/connectors/spotify/connector.js';
+import { resolveConnectorAttribution } from '../src/connectors/attribution.js';
 import { rollupPendingEvents } from '../src/rollup.js';
 import { shutdown } from '../src/db.js';
 
@@ -19,8 +20,9 @@ async function main(): Promise<void> {
   const started = new Date().toISOString();
   console.log(`[${started}] spotify-sync: starting`);
 
+  const { apiKeyId, agentId } = await resolveConnectorAttribution('spotify');
   const connector = new SpotifyConnector();
-  const sync = await connector.sync();
+  const sync = await connector.sync({ apiKeyId, agentId });
 
   console.log(
     `[spotify-sync] ${sync.events_ingested} ingested, ${sync.events_skipped} skipped, ${sync.duration_ms}ms`
