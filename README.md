@@ -371,7 +371,7 @@ python3 scripts/discord-sweep.py --hours 12 --dry-run
 - [x] Media connector framework + `media_events` table + rollup job + `media_search` (Phase 1)
 - [x] Spotify connector ([setup](docs/connectors/spotify.md)) (Phase 2) — *requires Spotify Premium for the app owner*
 - [x] YouTube Music connector via `ytmusicapi` ([setup](docs/connectors/ytmusic.md)) (Phase 3)
-- [ ] Plex connector via plex.tv account (Phase 2)
+- [x] Plex connector via plex.tv account ([setup](docs/connectors/plex.md)) (Phase 2)
 - [ ] Netflix quarterly Takeout importer (Phase 4)
 
 ## Links
