@@ -104,6 +104,31 @@ Each play becomes one `media_events` row with:
 - `title`, `artist` (joined from `artists[]`), `album`, `duration_ms`, `played_at`
 - `metadata` with `video_id`, watch URL, thumbnail, like status, etc.
 
+YouTube Music often returns history positions as labels rather than exact
+instants. The connector accepts exact offset-aware ISO timestamps and these
+English bucket labels:
+
+- `This week` -> Wednesday 12:00 UTC of the current Monday-based week.
+- `This month` -> day 15 12:00 UTC of the current month.
+- Full English month names and standard three-letter abbreviations -> day 15
+  12:00 UTC of the most recent occurrence whose month has begun.
+- A bare four-digit year -> July 2 12:00 UTC of that year.
+
+These timestamps are deterministic UTC representatives, not exact play times.
+The helper preserves the original label as `played_raw` and records
+`played_precision`, `played_bucket`, and `played_cursor_eligible` in event
+metadata so downstream users can audit the approximation and the sync cursor
+does not advance from future-dated representatives.
+
+Incremental sync uses an overlapping cursor for coarse buckets. A new item in
+an already-seen bucket such as `This week` is still eligible for ingestion even
+when the bucket representative timestamp is equal to the previous cursor.
+Offset-aware exact timestamps continue to be filtered by `--since`.
+
+Unsupported localized or malformed labels are not guessed. The helper emits a
+structured `unparsable played bucket` diagnostic for the item and skips only
+that row.
+
 Each event rolls up to a summary memory like:
 
 > Listened to "Punisher" by Phoebe Bridgers from "Punisher" on 2026-05-22 via ytmusic.

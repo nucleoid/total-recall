@@ -28,6 +28,10 @@ export interface YtHistoryItem {
   feedbackToken?: string;
   videoType?: string;
   likeStatus?: string;
+  played_raw?: string;
+  played_precision?: string;
+  played_bucket?: string;
+  played_cursor_eligible?: boolean;
 }
 
 function parseDurationSeconds(item: YtHistoryItem): number | undefined {
@@ -75,6 +79,10 @@ export function toMediaEvent(item: YtHistoryItem): MediaEventInput | null {
       thumbnail: item.thumbnails?.[0]?.url,
       like_status: item.likeStatus,
       feedback_token: item.feedbackToken,
+      played_raw: item.played_raw,
+      played_precision: item.played_precision,
+      played_bucket: item.played_bucket,
+      played_cursor_eligible: item.played_cursor_eligible,
     },
   };
 }
