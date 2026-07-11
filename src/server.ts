@@ -242,7 +242,7 @@ app.get('/api/agents', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const result = await listAgents();
+    const result = await listAgents(auth.keyId);
     res.json({ agents: result });
   } catch (err: any) {
     console.error('[total-recall] /api/agents error:', err);

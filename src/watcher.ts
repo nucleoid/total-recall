@@ -4,7 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { getPool, setNamespaceContext, shutdown } from './db.js';
 import { embed } from './embedding.js';
-import { resolveAgent } from './agents.js';
+import { upsertSystemAgent } from './agents.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -206,7 +206,12 @@ function debouncedProcess(filePath: string): void {
 
 async function main() {
   await setNamespaceContext(['personal', 'work', 'projects', 'financial', 'shared']);
-  watcherAgentId = await resolveAgent('file-watcher', 'system', undefined, 'total-recall-watcher');
+  const watcherAgent = await upsertSystemAgent({
+    name: 'file-watcher',
+    type: 'system',
+    runtime: 'total-recall-watcher',
+  });
+  watcherAgentId = watcherAgent.id;
 
   const watchPaths = WATCH_SPECS.flatMap(s => s.paths);
   console.log(`[watcher] Starting file sync watcher...`);

@@ -254,7 +254,7 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
         }
         case 'agent_list': {
           agentListSchema.parse(args);
-          const result = await listAgents();
+          const result = await listAgents(auth.keyId);
           return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
         }
         default:

@@ -96,7 +96,15 @@ export interface AgentParams {
   model?: string;
   runtime?: string;
   parent_agent_name?: string;
-  api_key_id?: string;
+  api_key_id: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SystemAgentParams {
+  name: string;
+  type?: string;
+  model?: string;
+  runtime?: string;
   metadata?: Record<string, unknown>;
 }
 
