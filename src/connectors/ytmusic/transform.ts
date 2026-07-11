@@ -25,6 +25,11 @@ export interface YtHistoryItem {
   duration_seconds?: number;
   thumbnails?: YtThumbnail[];
   played?: string;               // ISO timestamp from ytmusicapi
+  played_raw?: string;
+  played_precision?: string;
+  played_bucket?: string;
+  played_bucket_start?: string;
+  played_bucket_end?: string;
   feedbackToken?: string;
   videoType?: string;
   likeStatus?: string;
@@ -75,6 +80,11 @@ export function toMediaEvent(item: YtHistoryItem): MediaEventInput | null {
       thumbnail: item.thumbnails?.[0]?.url,
       like_status: item.likeStatus,
       feedback_token: item.feedbackToken,
+      played_raw: item.played_raw,
+      played_precision: item.played_precision,
+      played_bucket: item.played_bucket,
+      played_bucket_start: item.played_bucket_start,
+      played_bucket_end: item.played_bucket_end,
     },
   };
 }

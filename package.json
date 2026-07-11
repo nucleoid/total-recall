@@ -24,7 +24,8 @@
     "ytmusic:auth-browser": "tsx scripts/ytmusic-auth-browser.ts",
     "ytmusic:sync": "tsx scripts/ytmusic-sync.ts",
     "plex:auth": "tsx scripts/plex-auth.ts",
-    "plex:sync": "tsx scripts/plex-sync.ts"
+    "plex:sync": "tsx scripts/plex-sync.ts",
+    "test": "node --import tsx --test \"test/**/*.test.ts\" && python -B -m unittest discover -s test -p \"*_test.py\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

@@ -8,16 +8,17 @@ import { dirname } from 'node:path';
 import { BaseConnector } from '../base.js';
 import {
   getConnectorCredentials,
+  previewMediaEventUpserts,
   setConnectorCredentials,
   type MediaEventInput,
+  type MediaEventUpsertPreview,
 } from '../../media.js';
-import { query } from '../../db.js';
 import { toMediaEvent, type YtHistoryItem } from './transform.js';
 
 const PYTHON = process.env.YTMUSIC_PYTHON || 'python3';
 
 function helperPath(): string {
-  // src/connectors/ytmusic/connector.ts  →  scripts/ytmusic_helper.py
+  // src/connectors/ytmusic/connector.ts -> scripts/ytmusic_helper.py
   const here = dirname(fileURLToPath(import.meta.url));
   return join(here, '..', '..', '..', 'scripts', 'ytmusic_helper.py');
 }
@@ -28,9 +29,19 @@ interface ChildResult {
   code: number;
 }
 
-function runPython(args: string[], inheritStdio = false, stdinPayload?: string): Promise<ChildResult> {
+export type YtmusicHelperRunner = (
+  args: string[],
+  inheritStdio?: boolean,
+  stdinPayload?: string
+) => Promise<ChildResult>;
+
+export interface YtmusicConnectorOptions {
+  runHelper?: YtmusicHelperRunner;
+}
+
+const runPython: YtmusicHelperRunner = (args, inheritStdio = false, stdinPayload) => {
   return new Promise((resolve, reject) => {
-    const stdinMode = stdinPayload !== undefined ? 'pipe' : (inheritStdio ? 'inherit' : 'pipe');
+    const stdinMode = stdinPayload !== undefined ? 'pipe' : inheritStdio ? 'inherit' : 'pipe';
     const stderrMode = inheritStdio ? 'inherit' : 'pipe';
     const child = spawn(PYTHON, [helperPath(), ...args], {
       stdio: [stdinMode, 'pipe', stderrMode],
@@ -46,10 +57,16 @@ function runPython(args: string[], inheritStdio = false, stdinPayload?: string):
       child.stdin.end();
     }
   });
-}
+};
 
 export class YtmusicConnector extends BaseConnector {
   readonly service = 'ytmusic';
+  private readonly runHelper: YtmusicHelperRunner;
+
+  constructor(options: YtmusicConnectorOptions = {}) {
+    super();
+    this.runHelper = options.runHelper ?? runPython;
+  }
 
   /**
    * One-time OAuth auth flow. Runs the Python helper with inherited stdio
@@ -61,7 +78,7 @@ export class YtmusicConnector extends BaseConnector {
    * Prefer `authorizeBrowser` until/unless Google fixes this.
    */
   async authorize(clientId: string, clientSecret: string): Promise<void> {
-    const result = await runPython(
+    const result = await this.runHelper(
       ['auth', '--client-id', clientId, '--client-secret', clientSecret],
       true
     );
@@ -74,12 +91,12 @@ export class YtmusicConnector extends BaseConnector {
 
   /**
    * Browser-headers auth. The caller supplies the raw request headers
-   * copied from a real YouTube Music browser session (DevTools → Network
-   * → any browse request → Copy → request headers). This bypasses OAuth
+   * copied from a real YouTube Music browser session (DevTools -> Network
+   * -> any browse request -> Copy -> request headers). This bypasses OAuth
    * entirely and uses the same session as the web app.
    */
   async authorizeBrowser(rawHeaders: string): Promise<void> {
-    const result = await runPython(['auth-browser'], false, rawHeaders);
+    const result = await this.runHelper(['auth-browser'], false, rawHeaders);
     if (result.code !== 0) {
       throw new Error(`ytmusic browser auth failed: ${result.stderr || 'exit ' + result.code}`);
     }
@@ -91,6 +108,16 @@ export class YtmusicConnector extends BaseConnector {
     events: MediaEventInput[];
     cursor?: string;
   }> {
+    const events = await this.fetchHistoryEvents(since);
+    return { events };
+  }
+
+  async previewRecovery(since: Date | null = null): Promise<MediaEventUpsertPreview> {
+    const events = await this.fetchHistoryEvents(since);
+    return previewMediaEventUpserts(this.service, events);
+  }
+
+  private async fetchHistoryEvents(_since: Date | null): Promise<MediaEventInput[]> {
     const stored = await getConnectorCredentials(this.service);
     if (!stored) {
       throw new Error('No ytmusic credentials. Run scripts/ytmusic-auth.ts first.');
@@ -103,9 +130,8 @@ export class YtmusicConnector extends BaseConnector {
       await writeFile(tokenPath, JSON.stringify(stored));
 
       const args = ['fetch', '--token-file', tokenPath];
-      if (since) args.push('--since', since.toISOString());
-
-      const result = await runPython(args);
+      if (_since) args.push('--since', _since.toISOString());
+      const result = await this.runHelper(args);
       if (result.code !== 0) {
         throw new Error(`ytmusic fetch failed: ${result.stderr || 'exit ' + result.code}`);
       }
@@ -114,7 +140,11 @@ export class YtmusicConnector extends BaseConnector {
       const refreshMatch = result.stderr
         .split('\n')
         .map((line) => {
-          try { return JSON.parse(line); } catch { return null; }
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
         })
         .find((obj) => obj && typeof obj === 'object' && 'token_update' in obj);
       if (refreshMatch?.token_update) {
@@ -122,26 +152,9 @@ export class YtmusicConnector extends BaseConnector {
       }
 
       const parsed = JSON.parse(result.stdout) as { items: YtHistoryItem[] };
-      const events = (parsed.items ?? [])
+      return (parsed.items ?? [])
         .map(toMediaEvent)
         .filter((e): e is MediaEventInput => e !== null);
-
-      // YouTube Music returns relative "played" buckets that drift across
-      // syncs ("Today" → "Yesterday" the next day). Without extra dedup
-      // we'd insert a fresh row every time a bucket rolls. Suppress any
-      // event whose videoId already exists in media_events for this service.
-      if (events.length === 0) return { events };
-
-      const videoIds = [...new Set(events.map((e) => e.service_id).filter(Boolean))] as string[];
-      const existingRows = await query<{ service_id: string }>(
-        `SELECT DISTINCT service_id FROM media_events
-         WHERE service = 'ytmusic' AND service_id = ANY($1)`,
-        [videoIds]
-      );
-      const seen = new Set(existingRows.rows.map((r) => r.service_id));
-      const fresh = events.filter((e) => e.service_id && !seen.has(e.service_id));
-
-      return { events: fresh };
     } finally {
       // We also read the file back so the Python helper's refreshed token
       // is captured even if it didn't emit the stderr notice (some

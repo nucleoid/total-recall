@@ -6,6 +6,7 @@ Pulls your YouTube Music play history into `media_events` and rolls it up into e
 
 - **Unofficial API** — `ytmusicapi` reverse-engineers YouTube Music's internal API. It can break when Google changes things. The library is well-maintained, but expect occasional churn.
 - **History depth** — `get_history()` returns whatever YouTube remembers (typically last few hundred plays). For deeper backfill, use a Google Takeout export of "YouTube and YouTube Music" data — not yet automated.
+- **Fuzzy play times** — YouTube Music usually returns labels such as `Today`, `This week`, or `Last month`, not exact play times. Total Recall stores a representative bucket timestamp plus the raw label and bucket metadata. Re-fetching the same video in the same bucket dedupes; the same video in a later bucket is kept as another play. One real occurrence can appear again when its label ages into a new bucket, and two real plays of the same video inside one coarse bucket cannot be distinguished by the provider.
 - **Premium not required** — a regular YouTube Music account works; Premium just gives ad-free playback.
 - **Account separation** — log into the Google account that has your YouTube Music history. If you use a brand account, make sure it's a personal one (brand accounts can be flaky).
 - **OAuth currently broken for YT Music** — Google rejects device-code OAuth clients on YouTube Music's backend with HTTP 400 ("invalid argument") for browse/library/history endpoints. As of writing, **only browser-headers auth reliably works**. Use the browser flow below; the OAuth flow is retained in case Google fixes it.
@@ -99,10 +100,12 @@ The OAuth device-code flow returns HTTP 400 from YouTube Music for browse / libr
 Each play becomes one `media_events` row with:
 
 - `service = 'ytmusic'`
-- `service_id = videoId` (deduplicates re-plays of the same track on the same timestamp)
+- `service_id = videoId` (deduplicates only the same track on the same stored timestamp/bucket)
 - `event_type = 'play'`
 - `title`, `artist` (joined from `artists[]`), `album`, `duration_ms`, `played_at`
-- `metadata` with `video_id`, watch URL, thumbnail, like status, etc.
+- `metadata` with `video_id`, watch URL, thumbnail, like status, `played_raw`, `played_precision`, and bucket bounds when the source time was fuzzy.
+
+The connector favors completeness over suppressing possible duplicates. It no longer treats a `videoId` as a lifetime identity, because that records at most one play per track. Existing historical rows and rolled-up memories are left untouched. A recovery dry-run can report which fetched rows would insert, conflict on the existing tuple, or look like possible legacy duplicates, but it does not write, merge, delete, or relink history automatically.
 
 Each event rolls up to a summary memory like:
 
