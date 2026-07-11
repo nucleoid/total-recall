@@ -1,5 +1,5 @@
 import { queryScoped, queryUnscoped, type DbScope } from './db.js';
-import { checkAdminPermission } from './auth.js';
+import { accessLevelSql, checkAdminPermission } from './auth.js';
 import type { Agent, AgentParams, AuthContext } from './types.js';
 
 export async function upsertAgent(params: AgentParams, scope?: DbScope): Promise<Agent> {
@@ -59,8 +59,11 @@ export async function listAgents(auth: AuthContext, scope: DbScope): Promise<any
        MAX(m.created_at) AS last_memory_at
      FROM agents a
      LEFT JOIN memories m ON m.agent_id = a.id
+       AND m.namespace = ANY($1)
+       AND ${accessLevelSql('m.access_level', '$2')}
      GROUP BY a.id
-     ORDER BY a.last_seen_at DESC`
+     ORDER BY a.last_seen_at DESC`,
+    [auth.namespaces, auth.maxAccessLevel]
   );
   return res.rows;
 }

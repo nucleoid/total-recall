@@ -48,7 +48,7 @@ export async function memorySearch(
   );
 
   const start = Date.now();
-  const results = await hybridSearch(params, namespaces, dbScopeFromAuth(auth));
+  const results = await hybridSearch(params, namespaces, dbScopeFromAuth(auth), auth.maxAccessLevel);
   const durationMs = Date.now() - start;
 
   logTrace({

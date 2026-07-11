@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
-import { checkPermission } from '../auth.js';
+import { accessLevelSql, checkPermission } from '../auth.js';
 
 export const recallSchema = z.object({
   id: z.string().uuid().optional(),
@@ -22,8 +22,8 @@ export async function memoryRecall(
     const res = await queryScoped(
       dbScopeFromAuth(auth),
       `SELECT id, content, source, namespace, tags, metadata, access_level, created_at, updated_at, document_id, chunk_index
-       FROM memories WHERE id = $1 AND namespace = ANY($2)`,
-      [params.id, namespaces]
+       FROM memories WHERE id = $1 AND namespace = ANY($2) AND ${accessLevelSql('access_level', '$3')}`,
+      [params.id, namespaces, auth.maxAccessLevel]
     );
     if (res.rows.length === 0) throw new Error('Memory not found or access denied');
     return res.rows[0];
@@ -32,9 +32,9 @@ export async function memoryRecall(
   const res = await queryScoped(
     dbScopeFromAuth(auth),
     `SELECT id, content, source, namespace, tags, metadata, access_level, created_at, updated_at, document_id, chunk_index
-     FROM memories WHERE document_id = $1 AND namespace = ANY($2)
+     FROM memories WHERE document_id = $1 AND namespace = ANY($2) AND ${accessLevelSql('access_level', '$3')}
      ORDER BY chunk_index ASC`,
-    [params.document_id, namespaces]
+    [params.document_id, namespaces, auth.maxAccessLevel]
   );
   if (res.rows.length === 0) throw new Error('Document not found or access denied');
   return res.rows;

@@ -59,7 +59,7 @@ export async function mediaSearch(
   );
 
   const start = Date.now();
-  const results = await hybridSearch(searchParams, namespaces, scope);
+  const results = await hybridSearch(searchParams, namespaces, scope, auth.maxAccessLevel);
   const durationMs = Date.now() - start;
 
   logTrace({

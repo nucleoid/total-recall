@@ -51,6 +51,7 @@ CREATE TABLE api_keys (
   name TEXT NOT NULL,
   namespaces TEXT[] NOT NULL DEFAULT '{shared}',
   permissions TEXT[] NOT NULL DEFAULT '{read,write}',
+  max_access_level TEXT NOT NULL DEFAULT 'normal',
   created_at TIMESTAMPTZ DEFAULT NOW(),
   last_used_at TIMESTAMPTZ,
   enabled BOOLEAN DEFAULT true
@@ -72,6 +73,8 @@ Store a memory with automatic embedding.
 - tags?: string[]
 - metadata?: Record<string, any>
 - access_level?: 'normal' | 'sensitive' | 'secret'
+
+The API key's `max_access_level` must be greater than or equal to the requested `access_level`. Reads compare ranks as `normal < sensitive < secret`; rows above the key ceiling are excluded from search, recall, list, namespace counts, stats, and agent memory counts before pagination or aggregation. Null legacy memory values are treated as `normal`; unknown legacy labels fail closed and are not visible to any key.
 
 ### memory_search
 Hybrid vector + full-text search.
@@ -177,9 +180,11 @@ HNSW_EF_SEARCH=200
 npm install
 npm run build
 npm run migrate
-npm run create-key -- --name "openclaw" --namespaces "personal,work,shared"
+npm run create-key -- --name "openclaw" --namespaces "personal,work,shared" --max-access-level normal
 node dist/index.js
 ```
+
+Migration `009_api_key_access_ceiling.sql` backfills existing `api_keys.max_access_level` values to `secret` to preserve upgraded installations, then sets the default for newly created keys to `normal`. Use `--max-access-level sensitive` or `--max-access-level secret` only for clients that should read and write higher-classification memories.
 
 ## Key Requirements
 1. All embedding happens server-side (client sends plain text)
