@@ -41,3 +41,7 @@ export function checkPermission(auth: AuthContext, perm: string): void {
     throw new Error(`Permission denied: requires '${perm}'`);
   }
 }
+
+export function checkAdminPermission(auth: AuthContext): void {
+  checkPermission(auth, 'admin');
+}

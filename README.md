@@ -6,6 +6,17 @@ Universal AI memory system — a single source of truth for every AI tool and ag
 
 Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolation with no shared memory. Total Recall fixes that: a centralized, vectorized memory store with an MCP interface that any LLM or AI tool can plug into. What you tell one agent, all agents can recall — with proper access controls.
 
+## Database Configuration
+
+Run migrations with a schema-owner connection and run the application with the scoped app role:
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://total_recall:total_recall_dev@localhost:5432/total_recall
+DATABASE_URL=postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall
+```
+
+`npm run migrate` uses `MIGRATION_DATABASE_URL` when it is set. The fallback only works when DATABASE_URL is an owner-capable migration connection; the runtime `total_recall_app` role is rejected before migrations run. The MCP server and REST API use `DATABASE_URL`.
+
 ## Architecture
 
 ```
@@ -187,7 +198,7 @@ Register or update an AI agent in the provenance system.
 ```
 
 ### `agent_list`
-List all registered agents with memory counts and last activity.
+List all registered agents with memory counts and last activity. Requires an API key with the `admin` permission because this is a global observability view.
 
 ## Agent Provenance Model
 
@@ -203,7 +214,7 @@ Every memory can be linked to the agent that created it. Agents are identified b
 **How it works:**
 1. When `memory_store` or `memory_search` is called with `agent_name`, the agent is resolved (created if new, updated if existing)
 2. The `agent_id` is stored on the memory record for provenance
-3. Use `agent_list` to see all registered agents and their memory counts
+3. Use `agent_list` with an `admin` API key to see all registered agents and their memory counts
 
 ## Recall Trace Auditing
 
@@ -222,6 +233,8 @@ Every search operation is automatically logged as a recall trace, enabling full 
 GET /api/traces?limit=20&offset=0&agent_id=<uuid>&session_id=<string>
 ```
 
+Agent and trace listing endpoints are admin-only global observability surfaces. Ordinary application keys can still write provenance through memory store/search paths, but cannot invoke global agent or trace listings.
+
 ## REST API
 
 All endpoints require authentication via `Authorization: Bearer tr_<key>`.
@@ -233,9 +246,9 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | POST | `/api/store` | Store a single memory |
 | POST | `/api/store-document` | Store a chunked document |
 | GET | `/api/stats` | Memory statistics (admin) |
-| GET | `/api/agents` | List registered agents |
+| GET | `/api/agents` | List registered agents (admin) |
 | POST | `/api/agents` | Register/update an agent |
-| GET | `/api/traces` | Paginated recall traces |
+| GET | `/api/traces` | Paginated recall traces (admin) |
 | GET | `/api/audit` | Paginated audit log |
 | POST | `/api/media/search` | Vector search over media (viewing/listening) history |
 | POST | `/api/media/events` | Upsert media events (used by connectors) |
