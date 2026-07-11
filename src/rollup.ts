@@ -1,6 +1,8 @@
 import { query, setNamespaceContext, getCurrentNamespaces } from './db.js';
 import { embed } from './embedding.js';
 import { getRollupPendingEvents, linkEventToMemory, type MediaEvent } from './media.js';
+import type { AuthContext } from './types.js';
+import { checkPermission } from './auth.js';
 
 const MEDIA_NAMESPACE = 'media';
 
@@ -16,14 +18,17 @@ export interface RollupResult {
  * downstream filtering. The event is linked back via memory_id so we don't
  * roll it up twice.
  */
-export async function rollupPendingEvents(batchSize = 50): Promise<RollupResult> {
+export async function rollupPendingEvents(auth: AuthContext, batchSize = 50): Promise<RollupResult> {
+  checkPermission(auth, 'write');
+  if (!auth.namespaces.includes(MEDIA_NAMESPACE)) {
+    throw new Error(`Access denied to namespace '${MEDIA_NAMESPACE}'`);
+  }
+
   const previous = getCurrentNamespaces();
-  // Need 'media' in the allowed list to satisfy RLS on insert.
-  const augmented = previous.includes(MEDIA_NAMESPACE) ? previous : [...previous, MEDIA_NAMESPACE];
-  await setNamespaceContext(augmented);
+  await setNamespaceContext(auth.namespaces);
 
   try {
-    const events = await getRollupPendingEvents(batchSize);
+    const events = await getRollupPendingEvents(auth, batchSize);
     let rolled = 0;
     let failed = 0;
     const errors: string[] = [];
@@ -69,7 +74,7 @@ export async function rollupPendingEvents(batchSize = 50): Promise<RollupResult>
           ]
         );
 
-        await linkEventToMemory(event.id, insert.rows[0].id);
+        await linkEventToMemory(event.id, insert.rows[0].id, auth);
         rolled++;
       } catch (err: any) {
         failed++;

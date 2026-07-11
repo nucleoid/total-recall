@@ -4,8 +4,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import express from 'express';
 import dotenv from 'dotenv';
-import { shutdown, setNamespaceContext, query } from './db.js';
-import { validateKey } from './auth.js';
+import { shutdown, setAuthContext } from './db.js';
+import { checkPermission, validateKey } from './auth.js';
 import type { AuthContext } from './types.js';
 import { registerTools } from './tools/register.js';
 import { memorySearch, searchSchema } from './tools/search.js';
@@ -15,6 +15,7 @@ import { memoryStats } from './tools/stats.js';
 import { mediaSearch, mediaSearchSchema } from './tools/media-search.js';
 import { upsertAgent, listAgents } from './agents.js';
 import { listTraces } from './traces.js';
+import { listAudit } from './audit.js';
 import { upsertMediaEvents, listMediaEvents, type MediaEventInput } from './media.js';
 import { rollupPendingEvents } from './rollup.js';
 
@@ -171,8 +172,67 @@ async function authenticateRequest(req: express.Request, res: express.Response):
     res.status(403).json({ error: 'Forbidden: invalid API key' });
     return null;
   }
-  await setNamespaceContext(auth.namespaces);
+  await setAuthContext(auth);
   return auth;
+}
+
+function permissionDenied(err: any): boolean {
+  const message = err?.message ?? '';
+  return (
+    typeof message === 'string' &&
+    (message.startsWith('Permission denied') ||
+      message.startsWith('Access denied') ||
+      message.includes('admin-only'))
+  );
+}
+
+function sendApiError(res: express.Response, label: string, err: any): void {
+  if (err.name === 'ZodError') {
+    res.status(400).json({ error: 'Invalid request', details: err.errors });
+  } else if (typeof err.message === 'string' && err.message.startsWith('Invalid ')) {
+    res.status(400).json({ error: err.message });
+  } else if (permissionDenied(err)) {
+    res.status(403).json({ error: err.message });
+  } else {
+    console.error(`[total-recall] ${label} error:`, err);
+    res.status(500).json({ error: err.message || 'Internal server error' });
+  }
+}
+
+function parseBoundedInteger(raw: unknown, fallback: number, min: number, max: number, name: string): number {
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return value;
+}
+
+function parseUuid(raw: unknown, name: string): string | undefined {
+  if (raw === undefined) return undefined;
+  const value = String(raw);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return value;
+}
+
+function parseDateFilter(raw: unknown, name: string): string | undefined {
+  if (raw === undefined) return undefined;
+  const value = String(raw);
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return value;
+}
+
+function parseSingleString(raw: unknown, name: string): string | undefined {
+  if (raw === undefined) return undefined;
+  if (Array.isArray(raw) || typeof raw !== 'string') {
+    throw new Error(`Invalid ${name}`);
+  }
+  return raw;
 }
 
 app.post('/api/search', async (req, res) => {
@@ -183,12 +243,7 @@ app.post('/api/search', async (req, res) => {
     const results = await memorySearch(params, auth);
     res.json({ results });
   } catch (err: any) {
-    if (err.name === 'ZodError') {
-      res.status(400).json({ error: 'Invalid request', details: err.errors });
-    } else {
-      console.error('[total-recall] /api/search error:', err);
-      res.status(500).json({ error: err.message || 'Internal server error' });
-    }
+    sendApiError(res, '/api/search', err);
   }
 });
 
@@ -200,12 +255,7 @@ app.post('/api/store', async (req, res) => {
     const result = await memoryStore(params, auth);
     res.json({ id: result.id, created: true });
   } catch (err: any) {
-    if (err.name === 'ZodError') {
-      res.status(400).json({ error: 'Invalid request', details: err.errors });
-    } else {
-      console.error('[total-recall] /api/store error:', err);
-      res.status(500).json({ error: err.message || 'Internal server error' });
-    }
+    sendApiError(res, '/api/store', err);
   }
 });
 
@@ -217,12 +267,7 @@ app.post('/api/store-document', async (req, res) => {
     const result = await memoryStoreDocument(params, auth);
     res.json({ id: result.document_id, chunks: result.chunks_stored });
   } catch (err: any) {
-    if (err.name === 'ZodError') {
-      res.status(400).json({ error: 'Invalid request', details: err.errors });
-    } else {
-      console.error('[total-recall] /api/store-document error:', err);
-      res.status(500).json({ error: err.message || 'Internal server error' });
-    }
+    sendApiError(res, '/api/store-document', err);
   }
 });
 
@@ -233,8 +278,7 @@ app.get('/api/stats', async (req, res) => {
     const result = await memoryStats({}, auth);
     res.json(result);
   } catch (err: any) {
-    console.error('[total-recall] /api/stats error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    sendApiError(res, '/api/stats', err);
   }
 });
 
@@ -242,11 +286,11 @@ app.get('/api/agents', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const result = await listAgents();
+    checkPermission(auth, 'read');
+    const result = await listAgents(auth);
     res.json({ agents: result });
   } catch (err: any) {
-    console.error('[total-recall] /api/agents error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    sendApiError(res, '/api/agents', err);
   }
 });
 
@@ -254,6 +298,7 @@ app.post('/api/agents', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
+    checkPermission(auth, 'write');
     const { name, type, model, runtime, parent_agent_name, metadata } = req.body;
     if (!name) {
       res.status(400).json({ error: 'name is required' });
@@ -265,13 +310,11 @@ app.post('/api/agents', async (req, res) => {
       model,
       runtime,
       parent_agent_name,
-      api_key_id: auth.keyId,
       metadata,
-    });
+    }, auth);
     res.json(result);
   } catch (err: any) {
-    console.error('[total-recall] /api/agents POST error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    sendApiError(res, '/api/agents POST', err);
   }
 });
 
@@ -279,15 +322,15 @@ app.get('/api/traces', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const limit = Math.min(parseInt(req.query.limit as string, 10) || 20, 100);
-    const offset = parseInt(req.query.offset as string, 10) || 0;
-    const agentId = req.query.agent_id as string | undefined;
-    const sessionId = req.query.session_id as string | undefined;
-    const result = await listTraces(limit, offset, agentId, sessionId);
+    checkPermission(auth, 'read');
+    const limit = parseBoundedInteger(req.query.limit, 20, 1, 100, 'limit');
+    const offset = parseBoundedInteger(req.query.offset, 0, 0, 10_000, 'offset');
+    const agentId = parseUuid(req.query.agent_id, 'agent_id');
+    const sessionId = parseSingleString(req.query.session_id, 'session_id');
+    const result = await listTraces(auth, limit, offset, agentId, sessionId);
     res.json({ traces: result });
   } catch (err: any) {
-    console.error('[total-recall] /api/traces error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    sendApiError(res, '/api/traces', err);
   }
 });
 
@@ -295,29 +338,15 @@ app.get('/api/audit', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 200);
-    const offset = parseInt(req.query.offset as string, 10) || 0;
+    checkPermission(auth, 'read');
+    const limit = parseBoundedInteger(req.query.limit, 50, 1, 200, 'limit');
+    const offset = parseBoundedInteger(req.query.offset, 0, 0, 10_000, 'offset');
     const action = req.query.action as string | undefined;
-    const agentId = req.query.agent_id as string | undefined;
-
-    const conditions: string[] = [];
-    const values: unknown[] = [];
-    let idx = 0;
-    const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
-
-    if (action) conditions.push(`action = ${p(action)}`);
-    if (agentId) conditions.push(`agent_id = ${p(agentId)}`);
-
-    const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-
-    const result = await query(
-      `SELECT * FROM audit_log ${where} ORDER BY created_at DESC LIMIT ${p(limit)} OFFSET ${p(offset)}`,
-      values
-    );
-    res.json({ audit: result.rows });
+    const agentId = parseUuid(req.query.agent_id, 'agent_id');
+    const result = await listAudit(auth, { limit, offset, action, agentId });
+    res.json({ audit: result });
   } catch (err: any) {
-    console.error('[total-recall] /api/audit error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    sendApiError(res, '/api/audit', err);
   }
 });
 
@@ -331,12 +360,7 @@ app.post('/api/media/search', async (req, res) => {
     const results = await mediaSearch(params, auth);
     res.json({ results });
   } catch (err: any) {
-    if (err.name === 'ZodError') {
-      res.status(400).json({ error: 'Invalid request', details: err.errors });
-    } else {
-      console.error('[total-recall] /api/media/search error:', err);
-      res.status(500).json({ error: err.message || 'Internal server error' });
-    }
+    sendApiError(res, '/api/media/search', err);
   }
 });
 
@@ -344,6 +368,7 @@ app.post('/api/media/events', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
+    checkPermission(auth, 'write');
     const body = req.body as { events?: MediaEventInput[] };
     if (!Array.isArray(body.events)) {
       res.status(400).json({ error: 'events array required' });
@@ -351,13 +376,12 @@ app.post('/api/media/events', async (req, res) => {
     }
     const enriched = body.events.map((e) => ({
       ...e,
-      client_id: e.client_id ?? auth.keyId,
+      client_id: auth.keyId,
     }));
-    const result = await upsertMediaEvents(enriched);
+    const result = await upsertMediaEvents(enriched, auth.keyId);
     res.json(result);
   } catch (err: any) {
-    console.error('[total-recall] /api/media/events error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    sendApiError(res, '/api/media/events', err);
   }
 });
 
@@ -365,20 +389,20 @@ app.get('/api/media/events', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 500);
-    const offset = parseInt(req.query.offset as string, 10) || 0;
-    const events = await listMediaEvents({
+    checkPermission(auth, 'read');
+    const limit = parseBoundedInteger(req.query.limit, 50, 1, 500, 'limit');
+    const offset = parseBoundedInteger(req.query.offset, 0, 0, 10_000, 'offset');
+    const events = await listMediaEvents(auth, {
       service: req.query.service as string | undefined,
       event_type: req.query.event_type as string | undefined,
-      played_after: req.query.played_after as string | undefined,
-      played_before: req.query.played_before as string | undefined,
+      played_after: parseDateFilter(req.query.played_after, 'played_after'),
+      played_before: parseDateFilter(req.query.played_before, 'played_before'),
       limit,
       offset,
     });
     res.json({ events });
   } catch (err: any) {
-    console.error('[total-recall] /api/media/events GET error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    sendApiError(res, '/api/media/events GET', err);
   }
 });
 
@@ -386,12 +410,12 @@ app.post('/api/media/rollup', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const batchSize = Math.min(parseInt((req.body?.batch_size as string) ?? '50', 10) || 50, 500);
-    const result = await rollupPendingEvents(batchSize);
+    checkPermission(auth, 'write');
+    const batchSize = parseBoundedInteger(req.body?.batch_size, 50, 1, 500, 'batch_size');
+    const result = await rollupPendingEvents(auth, batchSize);
     res.json(result);
   } catch (err: any) {
-    console.error('[total-recall] /api/media/rollup error:', err);
-    res.status(500).json({ error: err.message || 'Internal server error' });
+    sendApiError(res, '/api/media/rollup', err);
   }
 });
 

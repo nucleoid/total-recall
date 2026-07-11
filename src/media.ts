@@ -1,4 +1,5 @@
 import { query } from './db.js';
+import type { AuthContext } from './types.js';
 
 export interface MediaEvent {
   id: string;
@@ -64,7 +65,7 @@ export interface UpsertResult {
  * Idempotent batch upsert of media events. Conflict key is
  * (service, service_id, played_at). Events without a service_id always insert.
  */
-export async function upsertMediaEvents(events: MediaEventInput[]): Promise<UpsertResult> {
+export async function upsertMediaEvents(events: MediaEventInput[], ownerKeyId?: string): Promise<UpsertResult> {
   if (events.length === 0) return { inserted: 0, skipped: 0, ids: [] };
 
   const ids: string[] = [];
@@ -96,7 +97,7 @@ export async function upsertMediaEvents(events: MediaEventInput[]): Promise<Upse
         e.completed ?? null,
         e.played_at,
         JSON.stringify(e.metadata ?? {}),
-        e.client_id ?? null,
+        ownerKeyId ?? e.client_id ?? null,
         e.agent_id ?? null,
       ]
     );
@@ -112,10 +113,10 @@ export async function upsertMediaEvents(events: MediaEventInput[]): Promise<Upse
   return { inserted, skipped, ids };
 }
 
-export async function listMediaEvents(filters: MediaListFilters = {}): Promise<MediaEvent[]> {
-  const conditions: string[] = [];
-  const values: unknown[] = [];
-  let idx = 0;
+export async function listMediaEvents(auth: AuthContext, filters: MediaListFilters = {}): Promise<MediaEvent[]> {
+  const conditions: string[] = ['client_id = $1'];
+  const values: unknown[] = [auth.keyId];
+  let idx = 1;
   const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
 
   if (filters.service) conditions.push(`service = ${p(filters.service)}`);
@@ -136,19 +137,22 @@ export async function listMediaEvents(filters: MediaListFilters = {}): Promise<M
   return res.rows;
 }
 
-export async function getRollupPendingEvents(limit = 50): Promise<MediaEvent[]> {
+export async function getRollupPendingEvents(auth: AuthContext, limit = 50): Promise<MediaEvent[]> {
   const res = await query<MediaEvent>(
     `SELECT * FROM media_events
-     WHERE memory_id IS NULL
+     WHERE client_id = $1 AND memory_id IS NULL
      ORDER BY played_at ASC
-     LIMIT $1`,
-    [limit]
+     LIMIT $2`,
+    [auth.keyId, limit]
   );
   return res.rows;
 }
 
-export async function linkEventToMemory(eventId: string, memoryId: string): Promise<void> {
-  await query(`UPDATE media_events SET memory_id = $1 WHERE id = $2`, [memoryId, eventId]);
+export async function linkEventToMemory(eventId: string, memoryId: string, auth: AuthContext): Promise<void> {
+  const res = await query(`UPDATE media_events SET memory_id = $1 WHERE id = $2 AND client_id = $3`, [memoryId, eventId, auth.keyId]);
+  if (res.rowCount !== 1) {
+    throw new Error('Media event link failed: event not found for authenticated key');
+  }
 }
 
 // === Connector credentials ===

@@ -21,7 +21,7 @@ async function main(): Promise<void> {
   const started = new Date().toISOString();
   console.log(`[${started}] plex-sync: starting`);
 
-  const { apiKeyId, agentId } = await resolveConnectorAttribution('plex');
+  const { apiKeyId, agentId, auth } = await resolveConnectorAttribution('plex');
   const connector = new PlexConnector();
   const sync = await connector.sync({ apiKeyId, agentId });
 
@@ -33,7 +33,7 @@ async function main(): Promise<void> {
   }
 
   if (sync.events_ingested > 0) {
-    const rollup = await rollupPendingEvents(200);
+    const rollup = await rollupPendingEvents(auth, 200);
     console.log(`[plex-sync] rollup: ${rollup.rolled} memories, ${rollup.failed} failed`);
     if (rollup.errors.length) console.error('[plex-sync] rollup errors:', rollup.errors);
   }

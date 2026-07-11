@@ -20,7 +20,7 @@ async function main(): Promise<void> {
   const started = new Date().toISOString();
   console.log(`[${started}] spotify-sync: starting`);
 
-  const { apiKeyId, agentId } = await resolveConnectorAttribution('spotify');
+  const { apiKeyId, agentId, auth } = await resolveConnectorAttribution('spotify');
   const connector = new SpotifyConnector();
   const sync = await connector.sync({ apiKeyId, agentId });
 
@@ -32,7 +32,7 @@ async function main(): Promise<void> {
   }
 
   if (sync.events_ingested > 0) {
-    const rollup = await rollupPendingEvents(200);
+    const rollup = await rollupPendingEvents(auth, 200);
     console.log(`[spotify-sync] rollup: ${rollup.rolled} memories, ${rollup.failed} failed`);
     if (rollup.errors.length) console.error('[spotify-sync] rollup errors:', rollup.errors);
   }

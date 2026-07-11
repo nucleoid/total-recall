@@ -2,9 +2,10 @@ import chokidar from 'chokidar';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { getPool, setNamespaceContext, shutdown } from './db.js';
+import { getPool, query, setAuthContext, setNamespaceContext, shutdown } from './db.js';
 import { embed } from './embedding.js';
 import { resolveAgent } from './agents.js';
+import type { AuthContext } from './types.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -124,7 +125,7 @@ function chunkMarkdown(content: string, source: string, relPath: string): Chunk[
 
 const UPSERT_SQL = `
 INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, agent_id)
-VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'file-sync', $7, $8)
+VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $9, $7, $8)
 ON CONFLICT (source_key) DO UPDATE SET
   content = EXCLUDED.content,
   embedding = EXCLUDED.embedding,
@@ -137,6 +138,24 @@ ON CONFLICT (source_key) DO UPDATE SET
 `;
 
 let watcherAgentId: string | null = null;
+let watcherAuth: AuthContext | null = null;
+
+async function resolveWatcherAuth(): Promise<AuthContext> {
+  const keyName = process.env.WATCHER_API_KEY_NAME || process.env.MEDIA_DEFAULT_API_KEY_NAME || 'openclaw-v2';
+  const res = await query<{ id: string; name: string; namespaces: string[]; permissions: string[] }>(
+    `SELECT id, name, namespaces, permissions FROM api_keys WHERE name = $1 AND enabled = true LIMIT 1`,
+    [keyName]
+  );
+  if (res.rows.length === 0) {
+    throw new Error(`No enabled api_key named "${keyName}" - set WATCHER_API_KEY_NAME or create one with create-key.`);
+  }
+  return {
+    keyId: res.rows[0].id,
+    name: res.rows[0].name,
+    namespaces: res.rows[0].namespaces,
+    permissions: res.rows[0].permissions,
+  };
+}
 
 async function getStoredHash(filePath: string): Promise<string | null> {
   const pool = getPool();
@@ -176,12 +195,14 @@ async function processFile(filePath: string): Promise<void> {
   const pool = getPool();
   // Set RLS context for each batch of writes
   await pool.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
+  if (!watcherAuth) throw new Error('watcher auth has not been initialized');
+  await pool.query("SELECT set_config('app.current_key_id', $1, false)", [watcherAuth.keyId]);
   for (const chunk of chunks) {
     const embedding = await embed(chunk.content.slice(0, 8000));
     const vectorStr = `[${embedding.join(',')}]`;
     await pool.query(UPSERT_SQL, [
       chunk.content, vectorStr, spec.source, spec.namespace,
-      chunk.tags, JSON.stringify(chunk.metadata), chunk.sourceKey, watcherAgentId,
+      chunk.tags, JSON.stringify(chunk.metadata), chunk.sourceKey, watcherAgentId, watcherAuth.keyId,
     ]);
   }
 
@@ -205,8 +226,10 @@ function debouncedProcess(filePath: string): void {
 }
 
 async function main() {
-  await setNamespaceContext(['personal', 'work', 'projects', 'financial', 'shared']);
-  watcherAgentId = await resolveAgent('file-watcher', 'system', undefined, 'total-recall-watcher');
+  watcherAuth = await resolveWatcherAuth();
+  await setAuthContext(watcherAuth);
+  await setNamespaceContext(watcherAuth.namespaces);
+  watcherAgentId = await resolveAgent(watcherAuth, 'file-watcher', 'system', undefined, 'total-recall-watcher');
 
   const watchPaths = WATCH_SPECS.flatMap(s => s.paths);
   console.log(`[watcher] Starting file sync watcher...`);

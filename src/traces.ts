@@ -1,5 +1,5 @@
 import { query } from './db.js';
-import type { RecallTrace } from './types.js';
+import type { AuthContext, RecallTrace } from './types.js';
 
 export async function logTrace(params: {
   sessionId?: string;
@@ -28,14 +28,15 @@ export async function logTrace(params: {
 }
 
 export async function listTraces(
+  auth: AuthContext,
   limit = 20,
   offset = 0,
   agentId?: string,
   sessionId?: string
 ): Promise<RecallTrace[]> {
-  const conditions: string[] = [];
-  const values: unknown[] = [];
-  let idx = 0;
+  const conditions: string[] = ['rt.client_id = $1'];
+  const values: unknown[] = [auth.keyId];
+  let idx = 1;
   const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
 
   if (agentId) conditions.push(`rt.agent_id = ${p(agentId)}`);
@@ -46,7 +47,7 @@ export async function listTraces(
   const res = await query<RecallTrace>(
     `SELECT rt.*, a.name AS agent_name
      FROM recall_traces rt
-     LEFT JOIN agents a ON a.id = rt.agent_id
+     LEFT JOIN agents a ON a.id = rt.agent_id AND a.api_key_id::text = rt.client_id
      ${where}
      ORDER BY rt.created_at DESC
      LIMIT ${p(limit)} OFFSET ${p(offset)}`,
@@ -55,13 +56,13 @@ export async function listTraces(
   return res.rows;
 }
 
-export async function getTrace(id: string): Promise<RecallTrace | null> {
+export async function getTrace(id: string, auth: AuthContext): Promise<RecallTrace | null> {
   const res = await query<RecallTrace>(
     `SELECT rt.*, a.name AS agent_name
      FROM recall_traces rt
-     LEFT JOIN agents a ON a.id = rt.agent_id
-     WHERE rt.id = $1`,
-    [id]
+     LEFT JOIN agents a ON a.id = rt.agent_id AND a.api_key_id::text = rt.client_id
+     WHERE rt.id = $1 AND rt.client_id = $2`,
+    [id, auth.keyId]
   );
   return res.rows[0] ?? null;
 }

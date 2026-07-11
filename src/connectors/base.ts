@@ -74,7 +74,7 @@ export abstract class BaseConnector {
         agent_id: e.agent_id ?? ctx.agentId,
       }));
 
-      const result = await upsertMediaEvents(enriched);
+      const result = await upsertMediaEvents(enriched, ctx.apiKeyId);
       ingested = result.inserted;
       skipped = result.skipped;
 
@@ -119,7 +119,7 @@ export abstract class BaseConnector {
         client_id: e.client_id ?? ctx.apiKeyId,
         agent_id: e.agent_id ?? ctx.agentId,
       }));
-      const result = await upsertMediaEvents(enriched);
+      const result = await upsertMediaEvents(enriched, ctx.apiKeyId);
       ingested = result.inserted;
       skipped = result.skipped;
     } catch (err: any) {

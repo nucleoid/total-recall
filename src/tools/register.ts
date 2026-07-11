@@ -5,7 +5,8 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { AuthContext } from '../types.js';
-import { setNamespaceContext } from '../db.js';
+import { setAuthContext } from '../db.js';
+import { checkPermission } from '../auth.js';
 import { storeSchema, memoryStore } from './store.js';
 import { storeDocumentSchema, memoryStoreDocument } from './store-document.js';
 import { searchSchema, memorySearch } from './search.js';
@@ -200,7 +201,7 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     const auth = await getAuth();
-    await setNamespaceContext(auth.namespaces);
+    await setAuthContext(auth);
 
     try {
       switch (name) {
@@ -245,16 +246,17 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
           return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
         }
         case 'agent_register': {
+          checkPermission(auth, 'write');
           const params = agentRegisterSchema.parse(args);
           const result = await upsertAgent({
             ...params,
-            api_key_id: auth.keyId,
-          });
+          }, auth);
           return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'agent_list': {
+          checkPermission(auth, 'read');
           agentListSchema.parse(args);
-          const result = await listAgents();
+          const result = await listAgents(auth);
           return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
         }
         default:

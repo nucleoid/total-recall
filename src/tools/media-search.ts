@@ -47,12 +47,12 @@ export async function mediaSearch(
   const explicitAgent = !!params.agent_name;
   const agentName = params.agent_name || auth.name;
   const agentId = await resolveAgent(
+    auth,
     agentName,
     explicitAgent ? 'llm' : 'system',
     undefined,
     undefined,
-    undefined,
-    auth.keyId
+    undefined
   );
 
   const start = Date.now();

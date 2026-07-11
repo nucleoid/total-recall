@@ -37,12 +37,12 @@ export async function memorySearch(
     );
   }
   const agentId = await resolveAgent(
+    auth,
     agentName,
     explicitAgent ? 'llm' : 'system',
     undefined,
     undefined,
-    undefined,
-    auth.keyId
+    undefined
   );
 
   const start = Date.now();

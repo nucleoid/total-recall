@@ -41,12 +41,12 @@ export async function memoryStore(
     );
   }
   const agentId = await resolveAgent(
+    auth,
     agentName,
     agentType,
     params.agent_model,
     params.agent_runtime,
-    undefined,
-    auth.keyId
+    undefined
   );
 
   const embedding = await embed(params.content);
