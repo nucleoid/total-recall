@@ -303,6 +303,40 @@ PostgreSQL + pgvector (upsert)
 | File Watcher | chokidar (Node.js) | Efficient inotify-based, handles nested dirs |
 | Deployment | systemd (user services) | Simple, reliable, auto-restart |
 
+## Database Migrations
+
+Run all schema setup through the numbered SQL migrations:
+
+```bash
+DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run migrate
+```
+
+The migration connection must use a database owner or migration role that can create roles, grant privileges, alter tables, create functions, and manage indexes. The runtime application URL for `total_recall_app` is intentionally narrower and should not be used for DDL.
+
+Before deploying migration 007 to an existing database, check who owns the legacy decay function. Function signature: `public.calculate_relevance(double precision, double precision, timestamp with time zone, integer)`.
+
+```sql
+SELECT pg_get_userbyid(p.proowner) AS function_owner
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'calculate_relevance'
+  AND pg_get_function_identity_arguments(p.oid) =
+    'p_relevance_score double precision, p_decay_rate double precision, p_accessed_at timestamp with time zone, p_access_count integer';
+```
+
+If this returns no row, or the owner is already the migration owner, run `npm run migrate` with the owner migration connection above. If it returns `total_recall_app`, perform one owner-approved DBA remediation before migration 007:
+
+```sql
+-- Preferred when keeping the function available until migration 007 runs:
+ALTER FUNCTION public.calculate_relevance(FLOAT, FLOAT, TIMESTAMPTZ, INTEGER) OWNER TO <migration-owner>;
+
+-- Alternative when a short maintenance window can tolerate recreating it in migration 007:
+DROP FUNCTION IF EXISTS public.calculate_relevance(FLOAT, FLOAT, TIMESTAMPTZ, INTEGER);
+```
+
+Run the remediation as a database owner or equivalent DBA role. Do not grant `total_recall_app` general DDL privileges, and do not elevate the runtime app role for this migration.
+
 ## Namespace Design
 
 | Namespace | Contents | Access |

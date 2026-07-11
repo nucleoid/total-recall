@@ -7,6 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "migrate": "tsx scripts/migrate.ts",
+    "test:migrations": "tsx --test test/migrations/decay.integration.test.ts",
     "create-key": "tsx scripts/create-key.ts",
     "preseed": "tsx scripts/preseed-openclaw.ts",
     "preseed:claude": "tsx scripts/preseed-claude.ts",
