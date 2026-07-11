@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "test": "tsx --test test/**/*.test.ts",
     "start": "node dist/index.js",
     "migrate": "tsx scripts/migrate.ts",
     "create-key": "tsx scripts/create-key.ts",
@@ -41,6 +42,8 @@
   "devDependencies": {
     "@types/node": "^22.13.0",
     "@types/pg": "^8.11.11",
+    "@types/supertest": "^7.2.0",
+    "supertest": "^7.2.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }
