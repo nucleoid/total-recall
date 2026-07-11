@@ -1,5 +1,6 @@
 import { queryScoped, queryUnscoped, type DbScope } from './db.js';
-import type { Agent, AgentParams } from './types.js';
+import { checkAdminPermission } from './auth.js';
+import type { Agent, AgentParams, AuthContext } from './types.js';
 
 export async function upsertAgent(params: AgentParams, scope?: DbScope): Promise<Agent> {
   let parentAgentId: string | null = null;
@@ -48,7 +49,9 @@ export async function getAgentByName(name: string, scope?: DbScope): Promise<Age
   return res.rows[0] ?? null;
 }
 
-export async function listAgents(scope: DbScope): Promise<any[]> {
+export async function listAgents(auth: AuthContext, scope: DbScope): Promise<any[]> {
+  checkAdminPermission(auth);
+
   const res = await queryScoped(
     scope,
     `SELECT a.*,

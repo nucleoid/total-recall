@@ -246,7 +246,7 @@ app.get('/api/agents', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const result = await listAgents(dbScopeFromAuth(auth));
+    const result = await listAgents(auth, dbScopeFromAuth(auth));
     res.json({ agents: result });
   } catch (err: any) {
     console.error('[total-recall] /api/agents error:', err);
@@ -287,7 +287,7 @@ app.get('/api/traces', async (req, res) => {
     const offset = parseInt(req.query.offset as string, 10) || 0;
     const agentId = req.query.agent_id as string | undefined;
     const sessionId = req.query.session_id as string | undefined;
-    const result = await listTraces(dbScopeFromAuth(auth), limit, offset, agentId, sessionId);
+    const result = await listTraces(auth, dbScopeFromAuth(auth), limit, offset, agentId, sessionId);
     res.json({ traces: result });
   } catch (err: any) {
     console.error('[total-recall] /api/traces error:', err);

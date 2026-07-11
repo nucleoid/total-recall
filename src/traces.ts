@@ -1,5 +1,6 @@
 import { queryScoped, type DbScope } from './db.js';
-import type { RecallTrace } from './types.js';
+import { checkAdminPermission } from './auth.js';
+import type { AuthContext, RecallTrace } from './types.js';
 
 export async function logTrace(params: {
   sessionId?: string;
@@ -29,12 +30,15 @@ export async function logTrace(params: {
 }
 
 export async function listTraces(
+  auth: AuthContext,
   scope: DbScope,
   limit = 20,
   offset = 0,
   agentId?: string,
   sessionId?: string
 ): Promise<RecallTrace[]> {
+  checkAdminPermission(auth);
+
   const conditions: string[] = [];
   const values: unknown[] = [];
   let idx = 0;
@@ -58,7 +62,9 @@ export async function listTraces(
   return res.rows;
 }
 
-export async function getTrace(id: string, scope: DbScope): Promise<RecallTrace | null> {
+export async function getTrace(auth: AuthContext, id: string, scope: DbScope): Promise<RecallTrace | null> {
+  checkAdminPermission(auth);
+
   const res = await queryScoped<RecallTrace>(
     scope,
     `SELECT rt.*, a.name AS agent_name
