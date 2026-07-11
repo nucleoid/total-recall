@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "test:integration": "node --import tsx --test test/*.integration.test.ts",
     "start": "node dist/index.js",
     "migrate": "tsx scripts/migrate.ts",
     "create-key": "tsx scripts/create-key.ts",

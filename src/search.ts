@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const EF_SEARCH = parseInt(process.env.HNSW_EF_SEARCH || '200', 10);
+const ISO_TIMESTAMPTZ_PATTERN = '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$';
 
 export async function hybridSearch(
   params: SearchParams,
@@ -31,6 +32,18 @@ export async function hybridSearch(
     const conditions: string[] = [];
     if (params.tags && params.tags.length > 0) {
       conditions.push(`m.tags @> ${p(params.tags)}`);
+    }
+    if (params.mediaFilters?.services && params.mediaFilters.services.length > 0) {
+      conditions.push(`m.metadata->>'service' = ANY(${p(params.mediaFilters.services)}::text[])`);
+    }
+    if (params.mediaFilters?.eventTypes && params.mediaFilters.eventTypes.length > 0) {
+      conditions.push(`m.metadata->>'event_type' = ANY(${p(params.mediaFilters.eventTypes)}::text[])`);
+    }
+    if (params.mediaFilters?.playedAfter) {
+      conditions.push(`${playedAtExpression('m')} >= ${p(params.mediaFilters.playedAfter)}::timestamptz`);
+    }
+    if (params.mediaFilters?.playedBefore) {
+      conditions.push(`${playedAtExpression('m')} <= ${p(params.mediaFilters.playedBefore)}::timestamptz`);
     }
     if (params.source) {
       conditions.push(`m.source = ${p(params.source)}`);
@@ -101,4 +114,9 @@ export async function hybridSearch(
 
     return res.rows as SearchResult[];
   });
+}
+
+function playedAtExpression(alias: string): string {
+  return `(CASE WHEN ${alias}.metadata->>'played_at' ~ '${ISO_TIMESTAMPTZ_PATTERN}' ` +
+    `THEN (${alias}.metadata->>'played_at')::timestamptz END)`;
 }
