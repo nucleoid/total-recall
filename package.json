@@ -25,7 +25,8 @@
     "ytmusic:auth-browser": "tsx scripts/ytmusic-auth-browser.ts",
     "ytmusic:sync": "tsx scripts/ytmusic-sync.ts",
     "plex:auth": "tsx scripts/plex-auth.ts",
-    "plex:sync": "tsx scripts/plex-sync.ts"
+    "plex:sync": "tsx scripts/plex-sync.ts",
+    "test:plex": "node --test --import tsx test/connectors/plex-connector.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

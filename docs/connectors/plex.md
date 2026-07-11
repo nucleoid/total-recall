@@ -7,8 +7,8 @@ Pulls your Plex watch history into `media_events` and rolls each entry up into a
 1. PIN-based OAuth flow via plex.tv (no client ID/secret to configure — we generate a stable `X-Plex-Client-Identifier` once and persist it).
 2. `GET https://plex.tv/api/v2/user` once to capture your account `id` + `uuid`.
 3. `GET https://plex.tv/api/v2/resources` lists every server you can reach (owned + shared).
-4. For each server, pick the first reachable connection (local LAN → public direct → plex.direct relay) and call `/status/sessions/history/all?accountID={yours}&viewedAt>={since}`.
-5. Filter to entries whose `accountID` matches yours (belt + braces) and ingest.
+4. For each server, pick the first reachable connection (local LAN → public direct → plex.direct relay) and call `/status/sessions/history?accountID={expected}&viewedAt>={since}`. If that endpoint is unavailable with 401/404, retry `/status/sessions/history/all` with the same query.
+5. Choose `accountID` per server: owned servers use Plex Media Server's local owner id `1`; shared servers use your plex.tv account id. Returned rows are normalized and filtered against the same expected id before ingest.
 
 ## Caveats
 
@@ -84,4 +84,4 @@ Rolled-up memories read like:
 
 **`history fetch failed: 401`** — token revoked. Re-run `npm run plex:auth`.
 
-**Stuck at the same `last_event_at` despite watching new things** — the server owner may have disabled history tracking, or your account has multiple users on the same server and the wrong one is mapped. Open an issue with the `accountID` value from `/api/v2/user` and we can investigate.
+**Stuck at the same `last_event_at` despite watching new things** — the server owner may have disabled history tracking, or your account has multiple users on the same server and the wrong one is mapped. Owned servers should request local `accountID=1`; shared servers should request your plex.tv account id from `/api/v2/user`.
