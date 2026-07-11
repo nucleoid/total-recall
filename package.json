@@ -5,7 +5,9 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "test": "node --test --import tsx \"test/**/*.test.ts\"",
+    "test": "node --test --import tsx \"test/**/*.test.ts\" && npm run test:access-level:db",
+    "test:access-level": "tsx test/access-level.integration.test.ts",
+    "test:access-level:db": "tsx test/access-level.db.ts",
     "start": "node dist/index.js",
     "migrate": "tsx scripts/migrate.ts",
     "test:migrations": "tsx --test test/migrations/decay.integration.test.ts",

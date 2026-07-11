@@ -1,3 +1,5 @@
+export type AccessLevel = 'normal' | 'sensitive' | 'secret';
+
 export interface Memory {
   id: string;
   content: string;
@@ -6,7 +8,7 @@ export interface Memory {
   namespace: string;
   tags: string[];
   metadata: Record<string, unknown>;
-  access_level: 'normal' | 'sensitive' | 'secret';
+  access_level: AccessLevel;
   client_id: string;
   created_at: Date;
   updated_at: Date;
@@ -20,6 +22,7 @@ export interface ApiKey {
   name: string;
   namespaces: string[];
   permissions: string[];
+  max_access_level: AccessLevel;
   created_at: Date;
   last_used_at: Date | null;
   enabled: boolean;
@@ -37,7 +40,7 @@ export interface StoreParams {
   source?: string;
   tags?: string[];
   metadata?: Record<string, unknown>;
-  access_level?: 'normal' | 'sensitive' | 'secret';
+  access_level?: AccessLevel;
 }
 
 export interface SearchParams {
@@ -75,6 +78,7 @@ export interface AuthContext {
   name: string;
   namespaces: string[];
   permissions: string[];
+  maxAccessLevel: AccessLevel;
 }
 
 export interface Agent {

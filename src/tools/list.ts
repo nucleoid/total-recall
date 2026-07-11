@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
-import { checkPermission, filterNamespaces } from '../auth.js';
+import { accessLevelSql, checkPermission, filterNamespaces } from '../auth.js';
 
 export const listSchema = z.object({
   namespace: z.string().optional(),
@@ -29,6 +29,10 @@ export async function memoryList(
   const conditions: string[] = ['namespace = ANY($1)'];
   const values: any[] = [allowedNamespaces];
   let idx = 2;
+
+  conditions.push(accessLevelSql('access_level', `$${idx}`));
+  values.push(auth.maxAccessLevel);
+  idx++;
 
   if (params.source) {
     conditions.push(`source = $${idx}`);
