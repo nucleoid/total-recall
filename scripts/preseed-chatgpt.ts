@@ -2,7 +2,7 @@ import pg from 'pg';
 import fs from 'fs';
 import path from 'path';
 
-const DATABASE_URL = 'postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall';
+const DATABASE_URL = process.env.OWNER_DATABASE_URL || 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall';
 const OLLAMA_URL = 'http://localhost:11434/api/embed';
 const IMPORTS_DIR = '/home/fuego/projects/total-recall/imports/chatgpt';
 const MAX_CONTENT = 4000;
@@ -151,7 +151,6 @@ async function main() {
   console.log(`Loaded ${allConversations.length} conversations`);
 
   const client = await pool.connect();
-  await client.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
 
   let totalMemories = 0;
   let skipped = 0;

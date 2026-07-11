@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { hybridSearch } from '../search.js';
+import { dbScopeFromAuth } from '../db.js';
 import type { AuthContext, SearchResult } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
@@ -46,17 +47,19 @@ export async function mediaSearch(
 
   const explicitAgent = !!params.agent_name;
   const agentName = params.agent_name || auth.name;
+  const scope = dbScopeFromAuth(auth);
   const agentId = await resolveAgent(
     agentName,
     explicitAgent ? 'llm' : 'system',
     undefined,
     undefined,
     undefined,
-    auth.keyId
+    auth.keyId,
+    scope
   );
 
   const start = Date.now();
-  const results = await hybridSearch(searchParams, namespaces);
+  const results = await hybridSearch(searchParams, namespaces, scope);
   const durationMs = Date.now() - start;
 
   logTrace({
@@ -68,7 +71,7 @@ export async function mediaSearch(
     resultCount: results.length,
     scores: results.map((r) => ({ id: r.id, vec: r.vec_score, text: r.text_score, final: r.final_score })),
     durationMs,
-  }).catch((err) => console.error('[total-recall] trace log error:', err.message));
+  }, scope).catch((err) => console.error('[total-recall] trace log error:', err.message));
 
   return results;
 }

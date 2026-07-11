@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { query } from '../db.js';
+import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission } from '../auth.js';
 
@@ -19,26 +19,32 @@ export async function memoryStats(
   }
 
   const ns = auth.namespaces;
+  const scope = dbScopeFromAuth(auth);
 
   const [totalRes, byNsRes, bySrcRes, docsRes, oldestRes, newestRes] = await Promise.all([
-    query('SELECT COUNT(*) as total FROM memories WHERE namespace = ANY($1)', [ns]),
-    query(
+    queryScoped(scope, 'SELECT COUNT(*) as total FROM memories WHERE namespace = ANY($1)', [ns]),
+    queryScoped(
+      scope,
       'SELECT namespace, COUNT(*) as count FROM memories WHERE namespace = ANY($1) GROUP BY namespace ORDER BY count DESC',
       [ns]
     ),
-    query(
+    queryScoped(
+      scope,
       'SELECT source, COUNT(*) as count FROM memories WHERE namespace = ANY($1) GROUP BY source ORDER BY count DESC',
       [ns]
     ),
-    query(
+    queryScoped(
+      scope,
       'SELECT COUNT(DISTINCT document_id) as total FROM memories WHERE namespace = ANY($1) AND document_id IS NOT NULL',
       [ns]
     ),
-    query(
+    queryScoped(
+      scope,
       'SELECT MIN(created_at) as oldest FROM memories WHERE namespace = ANY($1)',
       [ns]
     ),
-    query(
+    queryScoped(
+      scope,
       'SELECT MAX(created_at) as newest FROM memories WHERE namespace = ANY($1)',
       [ns]
     ),

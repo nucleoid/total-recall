@@ -9,18 +9,13 @@ const DELAY_MS = 50;
 
 async function main() {
   const pool = new pg.Pool({
-    connectionString: 'postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall',
+    connectionString: process.env.OWNER_DATABASE_URL || 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall',
   });
 
   const client = await pool.connect();
   console.log('[reembed] Connected to PostgreSQL');
 
-  // Set RLS config
-  await client.query(
-    `SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)`
-  );
-
-  // Fetch all memories
+  // Owner connection intentionally bypasses RLS for full-store re-embedding.
   const { rows } = await client.query<{ id: string; content: string }>(
     `SELECT id, content FROM memories ORDER BY id`
   );

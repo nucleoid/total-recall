@@ -2,7 +2,7 @@ import pg from 'pg';
 import fs from 'fs';
 import * as cheerio from 'cheerio';
 
-const DATABASE_URL = 'postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall';
+const DATABASE_URL = process.env.OWNER_DATABASE_URL || 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall';
 const OLLAMA_URL = 'http://localhost:11434/api/embed';
 const HTML_PATH = '/home/fuego/projects/total-recall/imports/gemini-new/Takeout/My Activity/Gemini Apps/MyActivity.html';
 
@@ -140,8 +140,6 @@ async function main() {
 
   const client = await pool.connect();
   try {
-    await client.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
-
     let imported = 0, errors = 0;
     const dates: string[] = [];
 

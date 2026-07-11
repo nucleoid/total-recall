@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { query } from '../db.js';
+import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission } from '../auth.js';
 
@@ -11,7 +11,8 @@ export async function memoryListNamespaces(
 ): Promise<{ namespace: string; count: number }[]> {
   checkPermission(auth, 'read');
 
-  const res = await query(
+  const res = await queryScoped(
+    dbScopeFromAuth(auth),
     `SELECT namespace, COUNT(*)::int as count FROM memories WHERE namespace = ANY($1) GROUP BY namespace`,
     [auth.namespaces]
   );

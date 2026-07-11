@@ -1,4 +1,4 @@
-import { query } from './db.js';
+import { queryScoped, type DbScope } from './db.js';
 
 export async function logAudit(params: {
   clientId: string;
@@ -9,8 +9,9 @@ export async function logAudit(params: {
   resultCount?: number;
   agentId?: string;
   sessionId?: string;
-}): Promise<void> {
-  await query(
+}, scope: DbScope): Promise<void> {
+  await queryScoped(
+    scope,
     `INSERT INTO audit_log (client_id, action, namespace, memory_id, query_text, result_count, agent_id, session_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [

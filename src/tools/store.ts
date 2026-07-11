@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { query } from '../db.js';
+import { dbScopeFromAuth, queryScoped } from '../db.js';
 import { embed } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
@@ -46,13 +46,15 @@ export async function memoryStore(
     params.agent_model,
     params.agent_runtime,
     undefined,
-    auth.keyId
+    auth.keyId,
+    dbScopeFromAuth(auth)
   );
 
   const embedding = await embed(params.content);
   const vecStr = `[${embedding.join(',')}]`;
 
-  const res = await query(
+  const res = await queryScoped(
+    dbScopeFromAuth(auth),
     `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id)
      VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING id, namespace`,

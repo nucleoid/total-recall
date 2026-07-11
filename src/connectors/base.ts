@@ -1,4 +1,5 @@
 import type { MediaEventInput } from '../media.js';
+import type { DbScope } from '../db.js';
 import {
   upsertMediaEvents,
   getSyncState,
@@ -12,6 +13,8 @@ export interface ConnectorContext {
   apiKeyId?: string;
   /** Optional agent id to attribute events to. */
   agentId?: string;
+  /** Explicit service-key database scope for protected connector writes. */
+  scope: DbScope;
 }
 
 export interface SyncResult {
@@ -38,7 +41,7 @@ export abstract class BaseConnector {
    * service uses an opaque cursor, the connector can ignore `since` and
    * read its cursor from `getSyncState()` directly.
    */
-  protected abstract fetchSince(since: Date | null): Promise<{
+  protected abstract fetchSince(since: Date | null, ctx: ConnectorContext): Promise<{
     events: MediaEventInput[];
     cursor?: string;
   }>;
@@ -54,7 +57,7 @@ export abstract class BaseConnector {
   }
 
   /** Standard incremental sync: pulls new events since last_event_at. */
-  async sync(ctx: ConnectorContext = {}): Promise<SyncResult> {
+  async sync(ctx: ConnectorContext): Promise<SyncResult> {
     const start = Date.now();
     const errors: string[] = [];
     let ingested = 0;
@@ -65,7 +68,7 @@ export abstract class BaseConnector {
       const state = await getSyncState(this.service);
       const since = state?.last_event_at ?? null;
 
-      const { events, cursor: nextCursor } = await this.fetchSince(since);
+      const { events, cursor: nextCursor } = await this.fetchSince(since, ctx);
       cursor = nextCursor;
 
       const enriched = events.map((e) => ({
@@ -74,7 +77,7 @@ export abstract class BaseConnector {
         agent_id: e.agent_id ?? ctx.agentId,
       }));
 
-      const result = await upsertMediaEvents(enriched);
+      const result = await upsertMediaEvents(enriched, ctx.scope);
       ingested = result.inserted;
       skipped = result.skipped;
 
@@ -106,20 +109,20 @@ export abstract class BaseConnector {
    * Run a backfill over a wider window. Default impl just calls fetchSince
    * with the given date; connectors that support paging should override.
    */
-  async backfill(ctx: ConnectorContext = {}, since: Date): Promise<SyncResult> {
+  async backfill(ctx: ConnectorContext, since: Date): Promise<SyncResult> {
     const start = Date.now();
     const errors: string[] = [];
     let ingested = 0;
     let skipped = 0;
 
     try {
-      const { events } = await this.fetchSince(since);
+      const { events } = await this.fetchSince(since, ctx);
       const enriched = events.map((e) => ({
         ...e,
         client_id: e.client_id ?? ctx.apiKeyId,
         agent_id: e.agent_id ?? ctx.agentId,
       }));
-      const result = await upsertMediaEvents(enriched);
+      const result = await upsertMediaEvents(enriched, ctx.scope);
       ingested = result.inserted;
       skipped = result.skipped;
     } catch (err: any) {

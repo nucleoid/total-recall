@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { query } from '../db.js';
+import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission } from '../auth.js';
 
@@ -19,7 +19,8 @@ export async function memoryRecall(
   const namespaces = auth.namespaces;
 
   if (params.id) {
-    const res = await query(
+    const res = await queryScoped(
+      dbScopeFromAuth(auth),
       `SELECT id, content, source, namespace, tags, metadata, access_level, created_at, updated_at, document_id, chunk_index
        FROM memories WHERE id = $1 AND namespace = ANY($2)`,
       [params.id, namespaces]
@@ -28,7 +29,8 @@ export async function memoryRecall(
     return res.rows[0];
   }
 
-  const res = await query(
+  const res = await queryScoped(
+    dbScopeFromAuth(auth),
     `SELECT id, content, source, namespace, tags, metadata, access_level, created_at, updated_at, document_id, chunk_index
      FROM memories WHERE document_id = $1 AND namespace = ANY($2)
      ORDER BY chunk_index ASC`,

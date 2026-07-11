@@ -1,12 +1,19 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
+import type { AuthContext } from './types.js';
 
 dotenv.config();
 
 const { Pool } = pg;
 
 let pool: pg.Pool | null = null;
-let _currentNamespaces: string[] = [];
+
+export interface DbScope {
+  namespaces: string[];
+  keyId: string;
+}
+
+export type ScopedClient = pg.PoolClient;
 
 export function getPool(): pg.Pool {
   if (!pool) {
@@ -23,38 +30,68 @@ export function getPool(): pg.Pool {
   return pool;
 }
 
-export async function query<T extends pg.QueryResultRow = any>(
+export function dbScopeFromAuth(auth: AuthContext): DbScope {
+  return { namespaces: auth.namespaces, keyId: auth.keyId };
+}
+
+export function setPoolForTesting(testPool: pg.Pool | null): void {
+  pool = testPool;
+}
+
+export async function queryUnscoped<T extends pg.QueryResultRow = any>(
   text: string,
   params?: unknown[]
 ): Promise<pg.QueryResult<T>> {
-  const client = await getPool().connect();
-  try {
-    if (_currentNamespaces.length > 0) {
-      await client.query(
-        `SELECT set_config('app.allowed_namespaces', $1, false)`,
-        [_currentNamespaces.join(',')]
-      );
-    }
-    return await client.query<T>(text, params);
-  } finally {
-    client.release();
-  }
+  return getPool().query<T>(text, params);
 }
 
-export async function withClient<T>(
-  fn: (client: pg.PoolClient) => Promise<T>
+export async function queryScoped<T extends pg.QueryResultRow = any>(
+  scope: DbScope,
+  text: string,
+  params?: unknown[]
+): Promise<pg.QueryResult<T>> {
+  return withScopedClient(scope, (client) => client.query<T>(text, params));
+}
+
+export async function withScopedClient<T>(
+  scope: DbScope,
+  fn: (client: ScopedClient) => Promise<T>
 ): Promise<T> {
   const client = await getPool().connect();
+  let releaseError: Error | undefined;
+  let committed = false;
+  let phase: 'setup' | 'callback' | 'commit' = 'setup';
+
   try {
-    if (_currentNamespaces.length > 0) {
-      await client.query(
-        `SELECT set_config('app.allowed_namespaces', $1, false)`,
-        [_currentNamespaces.join(',')]
-      );
+    await client.query('BEGIN');
+    await client.query(
+      "SELECT set_config('app.allowed_namespaces', $1, true)",
+      [JSON.stringify(scope.namespaces)]
+    );
+    await client.query(
+      "SELECT set_config('app.api_key_id', $1, true)",
+      [scope.keyId]
+    );
+
+    phase = 'callback';
+    const result = await fn(client);
+    phase = 'commit';
+    await client.query('COMMIT');
+    committed = true;
+    return result;
+  } catch (err) {
+    const caught = err instanceof Error ? err : new Error(String(err));
+    releaseError = phase === 'callback' ? undefined : caught;
+    if (!committed) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        releaseError = caught;
+      }
     }
-    return await fn(client);
+    throw err;
   } finally {
-    client.release();
+    client.release(releaseError);
   }
 }
 
@@ -63,12 +100,4 @@ export async function shutdown(): Promise<void> {
     await pool.end();
     pool = null;
   }
-}
-
-export async function setNamespaceContext(namespaces: string[]): Promise<void> {
-  _currentNamespaces = namespaces;
-}
-
-export function getCurrentNamespaces(): string[] {
-  return _currentNamespaces;
 }

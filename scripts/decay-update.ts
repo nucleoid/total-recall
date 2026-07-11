@@ -1,14 +1,12 @@
-import pg from 'pg';
+import { shutdown, withScopedClient, type DbScope } from '../src/db.js';
 
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall';
+const DECAY_SCOPE: DbScope = {
+  keyId: 'decay-update',
+  namespaces: ['personal', 'work', 'projects', 'financial', 'shared', 'media'],
+};
 
 async function updateDecay() {
-  const client = new pg.Client({ connectionString: DATABASE_URL });
-  await client.connect();
-
-  try {
-    await client.query(`SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)`);
-
+  await withScopedClient(DECAY_SCOPE, async (client) => {
     const res = await client.query(`
       UPDATE memories
       SET relevance_score = calculate_relevance(relevance_score, decay_rate, accessed_at, access_count),
@@ -38,15 +36,15 @@ async function updateDecay() {
       else buckets['very high (>1.5)']++;
     }
 
-    console.log(`✓ Updated ${count} memories`);
+    console.log(`Updated ${count} memories`);
     console.log(`  Min: ${min} | Max: ${max} | Median: ${median} | Avg: ${avg}`);
-    console.log(`  Distribution:`, buckets);
-  } finally {
-    await client.end();
-  }
+    console.log('  Distribution:', buckets);
+  });
 }
 
-updateDecay().catch(err => {
-  console.error('Decay update failed:', err);
-  process.exit(1);
-});
+updateDecay()
+  .then(() => shutdown())
+  .catch((err) => {
+    console.error('Decay update failed:', err);
+    shutdown().finally(() => process.exit(1));
+  });

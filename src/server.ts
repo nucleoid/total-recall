@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import express from 'express';
 import dotenv from 'dotenv';
-import { shutdown, setNamespaceContext, query } from './db.js';
+import { dbScopeFromAuth, queryScoped, shutdown } from './db.js';
 import { validateKey } from './auth.js';
 import type { AuthContext } from './types.js';
 import { registerTools } from './tools/register.js';
@@ -96,8 +96,13 @@ app.post('/mcp', async (req, res) => {
         }
       };
 
-      // Each session gets its own Server with auth bound to the request key
-      const server = createServer(async () => authContext);
+      // Revalidate the session key for each tool call instead of retaining authority indefinitely.
+      const sessionApiKey = apiKey;
+      const server = createServer(async () => {
+        const fresh = await validateKey(sessionApiKey);
+        if (!fresh) throw new Error('Invalid API key');
+        return fresh;
+      });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       return;
@@ -171,7 +176,6 @@ async function authenticateRequest(req: express.Request, res: express.Response):
     res.status(403).json({ error: 'Forbidden: invalid API key' });
     return null;
   }
-  await setNamespaceContext(auth.namespaces);
   return auth;
 }
 
@@ -242,7 +246,7 @@ app.get('/api/agents', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const result = await listAgents();
+    const result = await listAgents(dbScopeFromAuth(auth));
     res.json({ agents: result });
   } catch (err: any) {
     console.error('[total-recall] /api/agents error:', err);
@@ -267,7 +271,7 @@ app.post('/api/agents', async (req, res) => {
       parent_agent_name,
       api_key_id: auth.keyId,
       metadata,
-    });
+    }, dbScopeFromAuth(auth));
     res.json(result);
   } catch (err: any) {
     console.error('[total-recall] /api/agents POST error:', err);
@@ -283,7 +287,7 @@ app.get('/api/traces', async (req, res) => {
     const offset = parseInt(req.query.offset as string, 10) || 0;
     const agentId = req.query.agent_id as string | undefined;
     const sessionId = req.query.session_id as string | undefined;
-    const result = await listTraces(limit, offset, agentId, sessionId);
+    const result = await listTraces(dbScopeFromAuth(auth), limit, offset, agentId, sessionId);
     res.json({ traces: result });
   } catch (err: any) {
     console.error('[total-recall] /api/traces error:', err);
@@ -310,7 +314,8 @@ app.get('/api/audit', async (req, res) => {
 
     const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-    const result = await query(
+    const result = await queryScoped(
+      dbScopeFromAuth(auth),
       `SELECT * FROM audit_log ${where} ORDER BY created_at DESC LIMIT ${p(limit)} OFFSET ${p(offset)}`,
       values
     );
@@ -353,7 +358,7 @@ app.post('/api/media/events', async (req, res) => {
       ...e,
       client_id: e.client_id ?? auth.keyId,
     }));
-    const result = await upsertMediaEvents(enriched);
+    const result = await upsertMediaEvents(enriched, dbScopeFromAuth(auth));
     res.json(result);
   } catch (err: any) {
     console.error('[total-recall] /api/media/events error:', err);
@@ -367,7 +372,7 @@ app.get('/api/media/events', async (req, res) => {
     if (!auth) return;
     const limit = Math.min(parseInt(req.query.limit as string, 10) || 50, 500);
     const offset = parseInt(req.query.offset as string, 10) || 0;
-    const events = await listMediaEvents({
+    const events = await listMediaEvents(dbScopeFromAuth(auth), {
       service: req.query.service as string | undefined,
       event_type: req.query.event_type as string | undefined,
       played_after: req.query.played_after as string | undefined,
@@ -387,7 +392,7 @@ app.post('/api/media/rollup', async (req, res) => {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
     const batchSize = Math.min(parseInt((req.body?.batch_size as string) ?? '50', 10) || 50, 500);
-    const result = await rollupPendingEvents(batchSize);
+    const result = await rollupPendingEvents(dbScopeFromAuth(auth), batchSize);
     res.json(result);
   } catch (err: any) {
     console.error('[total-recall] /api/media/rollup error:', err);

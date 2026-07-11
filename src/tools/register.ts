@@ -5,7 +5,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { AuthContext } from '../types.js';
-import { setNamespaceContext } from '../db.js';
+import { dbScopeFromAuth } from '../db.js';
 import { storeSchema, memoryStore } from './store.js';
 import { storeDocumentSchema, memoryStoreDocument } from './store-document.js';
 import { searchSchema, memorySearch } from './search.js';
@@ -200,7 +200,7 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     const auth = await getAuth();
-    await setNamespaceContext(auth.namespaces);
+    const scope = dbScopeFromAuth(auth);
 
     try {
       switch (name) {
@@ -249,12 +249,12 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
           const result = await upsertAgent({
             ...params,
             api_key_id: auth.keyId,
-          });
+          }, scope);
           return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'agent_list': {
           agentListSchema.parse(args);
-          const result = await listAgents();
+          const result = await listAgents(scope);
           return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
         }
         default:

@@ -175,7 +175,6 @@ async function importMemories(client: pg.PoolClient, latestDate: string): Promis
 
 async function main() {
   const client = await pool.connect();
-  await client.query("SELECT set_config('app.allowed_namespaces', 'work,shared,personal,projects,financial', true)");
 
   console.log('=== Importing Claude conversations ===');
   const convCount = await importConversations(client);

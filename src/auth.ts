@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { query } from './db.js';
+import { queryUnscoped } from './db.js';
 import type { AuthContext } from './types.js';
 
 export function hashKey(key: string): string {
@@ -12,7 +12,7 @@ export function generateKey(): string {
 
 export async function validateKey(apiKey: string): Promise<AuthContext | null> {
   const hash = hashKey(apiKey);
-  const res = await query(
+  const res = await queryUnscoped(
     `UPDATE api_keys SET last_used_at = NOW()
      WHERE key_hash = $1 AND enabled = true
      RETURNING id, name, namespaces, permissions`,
