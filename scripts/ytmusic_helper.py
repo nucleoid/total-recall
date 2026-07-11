@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 
@@ -31,30 +32,120 @@ _RELATIVE_TIME_RE = re.compile(
     r"^\s*(?P<n>\d+)\s+(?P<unit>minute|hour|day|week|month|year)s?\s+ago\s*$",
     re.IGNORECASE,
 )
+_YEAR_RE = re.compile(r"^\d{4}$")
+_MONTHS = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
 
 
-def _resolve_played_at(raw: str | None, now: datetime) -> str | None:
-    """Convert YouTube Music's fuzzy "played" string to an ISO timestamp.
+@dataclass(frozen=True)
+class PlayedAtResolution:
+    iso: str
+    precision: str
+    bucket: str | None = None
+    since_comparable: bool = False
 
-    YouTube returns relative buckets ("Today", "Yesterday", "Last week",
-    "5 hours ago", etc) instead of exact timestamps. We map each bucket to
-    a representative datetime so the same bucket on consecutive syncs lands
-    on the same row. Precision is the bucket itself — we don't claim more.
-    """
+
+def _require_utc_now(now: datetime) -> datetime:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return now.astimezone(timezone.utc)
+
+
+def _iso_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _parse_absolute(raw: str) -> PlayedAtResolution | None:
+    s = raw.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return None
+    return PlayedAtResolution(_iso_utc(dt), "instant", since_comparable=True)
+
+
+def _week_midpoint(now: datetime) -> datetime:
+    monday = (now - timedelta(days=now.weekday())).date()
+    return datetime(monday.year, monday.month, monday.day, 12, tzinfo=timezone.utc) + timedelta(days=2)
+
+
+def _month_midpoint(year: int, month: int) -> datetime:
+    return datetime(year, month, 15, 12, tzinfo=timezone.utc)
+
+
+def _year_midpoint(year: int) -> datetime:
+    return datetime(year, 7, 2, 12, tzinfo=timezone.utc)
+
+
+def _resolve_played_at_details(raw: str | None, now: datetime) -> PlayedAtResolution | None:
     if not raw:
         return None
+
+    absolute = _parse_absolute(raw)
+    if absolute:
+        return absolute
+
+    now = _require_utc_now(now)
     s = raw.strip().lower()
 
+    if s == "this week":
+        return PlayedAtResolution(_week_midpoint(now).isoformat(), "week", s)
+    if s == "this month":
+        return PlayedAtResolution(_month_midpoint(now.year, now.month).isoformat(), "month", s)
+    if s in _MONTHS:
+        month = _MONTHS[s]
+        year = now.year if month <= now.month else now.year - 1
+        return PlayedAtResolution(_month_midpoint(year, month).isoformat(), "month", s)
+    if _YEAR_RE.match(s):
+        year = int(s)
+        if year == 0:
+            return None
+        try:
+            return PlayedAtResolution(_year_midpoint(year).isoformat(), "year", s)
+        except ValueError:
+            return None
+
     if s in ("today", "just now"):
-        return now.isoformat()
+        return PlayedAtResolution(_iso_utc(now), "relative", s)
     if s in ("yesterday",):
-        return (now - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+        dt = (now - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+        return PlayedAtResolution(dt.isoformat(), "day", s)
     if s in ("last week", "a week ago"):
-        return (now - timedelta(weeks=1)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+        dt = (now - timedelta(weeks=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+        return PlayedAtResolution(dt.isoformat(), "week", s)
     if s in ("last month", "a month ago"):
-        return (now - timedelta(days=30)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+        dt = (now - timedelta(days=30)).replace(hour=12, minute=0, second=0, microsecond=0)
+        return PlayedAtResolution(dt.isoformat(), "month", s)
     if s in ("last year", "a year ago"):
-        return (now - timedelta(days=365)).replace(hour=12, minute=0, second=0, microsecond=0).isoformat()
+        dt = (now - timedelta(days=365)).replace(hour=12, minute=0, second=0, microsecond=0)
+        return PlayedAtResolution(dt.isoformat(), "year", s)
 
     m = _RELATIVE_TIME_RE.match(s)
     if m:
@@ -71,13 +162,21 @@ def _resolve_played_at(raw: str | None, now: datetime) -> str | None:
         ts = now - delta
         if unit in ("day", "week", "month", "year"):
             ts = ts.replace(hour=12, minute=0, second=0, microsecond=0)
-        return ts.isoformat()
+        return PlayedAtResolution(ts.isoformat(), unit, s, unit in ("minute", "hour"))
 
-    # Try treating it as an actual ISO timestamp (older ytmusicapi versions).
-    try:
-        return datetime.fromisoformat(s.replace("z", "+00:00")).isoformat()
-    except ValueError:
-        return None
+    return None
+
+
+def _resolve_played_at(raw: str | None, now: datetime) -> str | None:
+    """Convert YouTube Music's fuzzy "played" string to an ISO timestamp.
+
+    YouTube returns relative buckets ("Today", "Yesterday", "Last week",
+    "5 hours ago", etc) instead of exact timestamps. We map each bucket to
+    a representative datetime so the same bucket on consecutive syncs lands
+    on the same row. Precision is the bucket itself — we don't claim more.
+    """
+    resolved = _resolve_played_at_details(raw, now)
+    return resolved.iso if resolved else None
 
 
 _CURL_H_RE = re.compile(r"-H\s+(['\"])(.*?)\1", re.DOTALL)
@@ -242,21 +341,25 @@ def cmd_fetch(args):
         filtered = []
         for item in items:
             played_raw = item.get("played")
-            played_iso = _resolve_played_at(played_raw, now)
-            if played_iso:
+            played = _resolve_played_at_details(played_raw, now)
+            if played:
                 # Replace the human-readable bucket with the ISO timestamp
                 # so the Node transform can pass it straight through.
                 item["played_raw"] = played_raw
-                item["played"] = played_iso
+                item["played"] = played.iso
+                item["played_precision"] = played.precision
+                item["played_cursor_eligible"] = played.since_comparable
+                if played.bucket is not None:
+                    item["played_bucket"] = played.bucket
             else:
                 # Couldn't parse — drop so we don't poison the DB with a
                 # malformed timestamptz. Logged for visibility.
                 _eprint({"skipped": {"reason": "unparsable played bucket", "played": played_raw, "videoId": item.get("videoId")}})
                 continue
 
-            if since_ts:
+            if since_ts and played.since_comparable:
                 try:
-                    played_ts = datetime.fromisoformat(played_iso)
+                    played_ts = datetime.fromisoformat(played.iso)
                 except ValueError:
                     played_ts = None
                 if played_ts and played_ts <= since_ts:

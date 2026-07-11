@@ -26,6 +26,15 @@ export interface SyncResult {
   cursor?: string;
 }
 
+export function selectNewestCursorDate(events: MediaEventInput[]): Date | null {
+  return events.reduce<Date | null>((acc, e) => {
+    if (e.metadata?.played_cursor_eligible === false) return acc;
+    const ts = e.played_at instanceof Date ? e.played_at : new Date(e.played_at);
+    if (Number.isNaN(ts.getTime())) return acc;
+    return !acc || ts > acc ? ts : acc;
+  }, null);
+}
+
 /**
  * Base class for media connectors. Each concrete connector implements
  * `fetchSince()` which returns canonical MediaEventInput[] for any events
@@ -81,10 +90,7 @@ export abstract class BaseConnector {
       ingested = result.inserted;
       skipped = result.skipped;
 
-      const newest = events.reduce<Date | null>((acc, e) => {
-        const ts = e.played_at instanceof Date ? e.played_at : new Date(e.played_at);
-        return !acc || ts > acc ? ts : acc;
-      }, null);
+      const newest = selectNewestCursorDate(events);
 
       await setSyncState(this.service, {
         last_sync_at: new Date(),
