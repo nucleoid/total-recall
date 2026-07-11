@@ -303,6 +303,49 @@ PostgreSQL + pgvector (upsert)
 | File Watcher | chokidar (Node.js) | Efficient inotify-based, handles nested dirs |
 | Deployment | systemd (user services) | Simple, reliable, auto-restart |
 
+## Database Migrations
+
+Run all schema setup through the numbered SQL migrations:
+
+```bash
+DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run migrate
+```
+
+The migration connection must use a database owner or migration role that can create roles, grant privileges, alter tables, create functions, and manage indexes. The runtime application URL for `total_recall_app` is intentionally narrower and should not be used for DDL.
+
+Before deploying migration 007 to an existing database, check who owns the legacy decay function. Function signature: `public.calculate_relevance(double precision, double precision, timestamp with time zone, integer)`.
+
+```sql
+SELECT pg_get_userbyid(p.proowner) AS function_owner
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'calculate_relevance'
+  AND pg_get_function_identity_arguments(p.oid) =
+    'p_relevance_score double precision, p_decay_rate double precision, p_accessed_at timestamp with time zone, p_access_count integer';
+```
+
+If this returns no row, or the owner is already the migration owner, run `npm run migrate` with the owner migration connection above. If it returns `total_recall_app`, perform one owner-approved DBA remediation before migration 007:
+
+```sql
+-- Preferred when keeping the function available until migration 007 runs:
+ALTER FUNCTION public.calculate_relevance(FLOAT, FLOAT, TIMESTAMPTZ, INTEGER) OWNER TO <migration-owner>;
+
+-- Alternative when a short maintenance window can tolerate recreating it in migration 007:
+DROP FUNCTION IF EXISTS public.calculate_relevance(FLOAT, FLOAT, TIMESTAMPTZ, INTEGER);
+```
+
+Run the remediation as a database owner or equivalent DBA role. Do not grant `total_recall_app` general DDL privileges, and do not elevate the runtime app role for this migration.
+
+Migration 007 intentionally does not backfill existing `last_boosted_at` values inside the schema transaction. To repair legacy rows after the migration is applied, run the bounded operational repair with the same owner or migration connection:
+
+```bash
+DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run repair:last-boosted-at -- --dry-run
+DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run repair:last-boosted-at -- --batch-size 1000 --max-rows 10000
+```
+
+The repair is resumable: re-run it until `remainingRows` is `0`. It updates only rows where `last_boosted_at IS NULL`, setting the value to `COALESCE(accessed_at, created_at, NOW())`, and preserves existing non-null values by default. Do not overwrite non-null `last_boosted_at` values without a separate reviewed dry run and repair plan.
+
 ## Namespace Design
 
 | Namespace | Contents | Access |
