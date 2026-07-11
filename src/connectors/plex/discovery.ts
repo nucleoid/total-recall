@@ -4,13 +4,13 @@ const PLEX_TV = 'https://plex.tv';
 const CONNECT_TIMEOUT_MS = 4000;
 
 interface PlexUserResponse {
-  id: number;
-  uuid: string;
-  username: string;
+  id: unknown;
+  uuid: unknown;
+  username: unknown;
   email?: string;
 }
 
-interface PlexConnection {
+export interface PlexConnection {
   protocol: 'http' | 'https';
   address: string;
   port: number;
@@ -30,6 +30,81 @@ export interface PlexResource {
   connections: PlexConnection[];
 }
 
+function parsePositiveSafeInteger(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function parseConnection(value: unknown): PlexConnection | null {
+  if (!isRecord(value)) return null;
+  if (value.protocol !== 'http' && value.protocol !== 'https') return null;
+  if (typeof value.address !== 'string' || value.address.trim() === '') return null;
+  const port = parsePositiveSafeInteger(value.port);
+  if (port === null) return null;
+  if (typeof value.uri !== 'string' || value.uri.trim() === '') return null;
+  if (value.local !== undefined && typeof value.local !== 'boolean') return null;
+  if (value.relay !== undefined && typeof value.relay !== 'boolean') return null;
+
+  return {
+    protocol: value.protocol,
+    address: value.address,
+    port,
+    uri: value.uri,
+    local: value.local ?? false,
+    relay: value.relay ?? false,
+  };
+}
+
+function parseResource(value: unknown): PlexResource | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.provides !== 'string' || !value.provides.split(',').includes('server')) {
+    return null;
+  }
+  if (typeof value.clientIdentifier !== 'string' || value.clientIdentifier.trim() === '') {
+    return null;
+  }
+  if (typeof value.name !== 'string' || value.name.trim() === '') {
+    return null;
+  }
+  if (typeof value.owned !== 'boolean') {
+    return null;
+  }
+  if (!Array.isArray(value.connections)) {
+    return null;
+  }
+  const connections = value.connections
+    .map(parseConnection)
+    .filter((conn): conn is PlexConnection => conn !== null);
+  if (connections.length === 0) {
+    return null;
+  }
+  if (value.accessToken !== undefined && typeof value.accessToken !== 'string') {
+    return null;
+  }
+
+  return {
+    name: value.name,
+    clientIdentifier: value.clientIdentifier,
+    owned: value.owned,
+    provides: value.provides,
+    publicAddressMatches: typeof value.publicAddressMatches === 'boolean'
+      ? value.publicAddressMatches
+      : false,
+    accessToken: value.accessToken,
+    connections,
+  };
+}
+
 /**
  * Returns Plex.tv account info. Caches the uuid + numeric id on the stored
  * creds so subsequent syncs don't re-fetch.
@@ -38,17 +113,29 @@ export async function getAccount(creds: PlexCreds): Promise<{
   id: number; uuid: string; username: string;
 }> {
   if (creds.account_id && creds.account_uuid) {
-    return { id: parseInt(creds.account_id, 10), uuid: creds.account_uuid, username: '' };
+    const cachedId = parsePositiveSafeInteger(creds.account_id);
+    if (cachedId === null) {
+      throw new Error(`invalid cached Plex account_id: ${creds.account_id}`);
+    }
+    return { id: cachedId, uuid: creds.account_uuid, username: '' };
   }
   const res = await fetch(`${PLEX_TV}/api/v2/user`, { headers: plexHeaders(creds) });
   if (!res.ok) {
     throw new Error(`Plex /api/v2/user failed: ${res.status} ${await res.text()}`);
   }
   const body = await res.json() as PlexUserResponse;
-  const next: PlexCreds = { ...creds, account_id: String(body.id), account_uuid: body.uuid };
+  const id = parsePositiveSafeInteger(body.id);
+  if (id === null) {
+    throw new Error('Plex /api/v2/user returned invalid account id');
+  }
+  if (typeof body.uuid !== 'string' || body.uuid.trim() === '') {
+    throw new Error('Plex /api/v2/user returned invalid account uuid');
+  }
+  const username = typeof body.username === 'string' ? body.username : '';
+  const next: PlexCreds = { ...creds, account_id: String(id), account_uuid: body.uuid };
   await saveCreds(next);
   Object.assign(creds, next);
-  return { id: body.id, uuid: body.uuid, username: body.username };
+  return { id, uuid: body.uuid, username };
 }
 
 /**
@@ -62,8 +149,21 @@ export async function listServers(creds: PlexCreds): Promise<PlexResource[]> {
   if (!res.ok) {
     throw new Error(`Plex /api/v2/resources failed: ${res.status} ${await res.text()}`);
   }
-  const all = await res.json() as PlexResource[];
-  return all.filter((r) => r.provides?.split(',').includes('server') && r.connections?.length > 0);
+  const all = await res.json() as unknown;
+  if (!Array.isArray(all)) {
+    throw new Error('Plex /api/v2/resources returned invalid resource list');
+  }
+  const resources: PlexResource[] = [];
+  for (const raw of all) {
+    const parsed = parseResource(raw);
+    if (parsed) {
+      resources.push(parsed);
+    } else {
+      const label = isRecord(raw) && typeof raw.name === 'string' ? raw.name : '(unknown)';
+      console.warn(`[plex] skipping malformed resource "${label}"`);
+    }
+  }
+  return resources;
 }
 
 async function tryConnection(uri: string, headers: Record<string, string>): Promise<boolean> {

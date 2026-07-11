@@ -14,7 +14,7 @@ export interface PlexHistoryItem {
   year?: number;
   duration?: number;                // ms
   viewedAt: number;                 // epoch seconds
-  accountID: number;
+  accountID: unknown;
   deviceID?: number;
   librarySectionID?: number | string;
   librarySectionTitle?: string;
