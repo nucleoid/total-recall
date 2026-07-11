@@ -1,5 +1,6 @@
 import { query } from './db.js';
-import type { Agent, AgentParams } from './types.js';
+import { checkAdminPermission } from './auth.js';
+import type { Agent, AgentParams, AuthContext } from './types.js';
 
 export async function upsertAgent(params: AgentParams): Promise<Agent> {
   let parentAgentId: string | null = null;
@@ -43,7 +44,9 @@ export async function getAgentByName(name: string): Promise<Agent | null> {
   return res.rows[0] ?? null;
 }
 
-export async function listAgents(): Promise<any[]> {
+export async function listAgents(auth: AuthContext): Promise<any[]> {
+  checkAdminPermission(auth);
+
   const res = await query(
     `SELECT a.*,
        COUNT(m.id)::int AS memory_count,
