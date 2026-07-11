@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { hybridSearch } from '../search.js';
+import { dbScopeFromAuth } from '../db.js';
 import type { AuthContext, SearchResult } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
@@ -42,11 +43,12 @@ export async function memorySearch(
     undefined,
     undefined,
     undefined,
-    auth.keyId
+    auth.keyId,
+    dbScopeFromAuth(auth)
   );
 
   const start = Date.now();
-  const results = await hybridSearch(params, namespaces);
+  const results = await hybridSearch(params, namespaces, dbScopeFromAuth(auth));
   const durationMs = Date.now() - start;
 
   logTrace({
@@ -58,7 +60,7 @@ export async function memorySearch(
     resultCount: results.length,
     scores: results.map((r) => ({ id: r.id, vec: r.vec_score, text: r.text_score, final: r.final_score })),
     durationMs,
-  }).catch((err) => console.error('[total-recall] trace log error:', err.message));
+  }, dbScopeFromAuth(auth)).catch((err) => console.error('[total-recall] trace log error:', err.message));
 
   return results;
 }

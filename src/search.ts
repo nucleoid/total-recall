@@ -1,4 +1,4 @@
-import { withClient } from './db.js';
+import { withScopedClient, type DbScope } from './db.js';
 import { embed } from './embedding.js';
 import type { SearchParams, SearchResult } from './types.js';
 import dotenv from 'dotenv';
@@ -8,15 +8,16 @@ const EF_SEARCH = parseInt(process.env.HNSW_EF_SEARCH || '200', 10);
 
 export async function hybridSearch(
   params: SearchParams,
-  namespaces: string[]
+  namespaces: string[],
+  scope: DbScope
 ): Promise<SearchResult[]> {
   const embedding = await embed(params.query);
   const vecStr = `[${embedding.join(',')}]`;
   const limit = Math.min(params.limit ?? 10, 50);
   const threshold = params.threshold ?? 0.3;
 
-  return withClient(async (client) => {
-    await client.query(`SET LOCAL hnsw.ef_search = ${EF_SEARCH}`);
+  return withScopedClient(scope, async (client) => {
+    await client.query("SELECT set_config('hnsw.ef_search', $1, true)", [String(EF_SEARCH)]);
 
     const values: unknown[] = [];
     let idx = 0;

@@ -2,7 +2,7 @@ import chokidar from 'chokidar';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { getPool, setNamespaceContext, shutdown } from './db.js';
+import { queryScoped, queryUnscoped, shutdown, type DbScope } from './db.js';
 import { embed } from './embedding.js';
 import { resolveAgent } from './agents.js';
 import dotenv from 'dotenv';
@@ -11,6 +11,10 @@ dotenv.config();
 
 const WORKSPACE = '/home/fuego/.openclaw/workspace';
 const CORTEX_CONTENT = path.join(WORKSPACE, 'projects/cortex/content');
+const WATCHER_SCOPE: DbScope = {
+  keyId: 'file-sync',
+  namespaces: ['personal', 'work', 'projects', 'financial', 'shared'],
+};
 
 interface WatchSpec {
   paths: string[];
@@ -139,16 +143,12 @@ ON CONFLICT (source_key) DO UPDATE SET
 let watcherAgentId: string | null = null;
 
 async function getStoredHash(filePath: string): Promise<string | null> {
-  const pool = getPool();
-  await pool.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
-  const res = await pool.query('SELECT content_hash FROM sync_state WHERE file_path = $1', [filePath]);
+  const res = await queryUnscoped('SELECT content_hash FROM sync_state WHERE file_path = $1', [filePath]);
   return res.rows[0]?.content_hash ?? null;
 }
 
 async function updateHash(filePath: string, hash: string): Promise<void> {
-  const pool = getPool();
-  await pool.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
-  await pool.query(
+  await queryUnscoped(
     `INSERT INTO sync_state (file_path, content_hash, last_synced) VALUES ($1, $2, NOW())
      ON CONFLICT (file_path) DO UPDATE SET content_hash = $2, last_synced = NOW()`,
     [filePath, hash]
@@ -173,13 +173,10 @@ async function processFile(filePath: string): Promise<void> {
   const chunks = chunkMarkdown(content, spec.source, relPath);
   if (chunks.length === 0) return;
 
-  const pool = getPool();
-  // Set RLS context for each batch of writes
-  await pool.query("SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)");
   for (const chunk of chunks) {
     const embedding = await embed(chunk.content.slice(0, 8000));
     const vectorStr = `[${embedding.join(',')}]`;
-    await pool.query(UPSERT_SQL, [
+    await queryScoped(WATCHER_SCOPE, UPSERT_SQL, [
       chunk.content, vectorStr, spec.source, spec.namespace,
       chunk.tags, JSON.stringify(chunk.metadata), chunk.sourceKey, watcherAgentId,
     ]);
@@ -205,8 +202,15 @@ function debouncedProcess(filePath: string): void {
 }
 
 async function main() {
-  await setNamespaceContext(['personal', 'work', 'projects', 'financial', 'shared']);
-  watcherAgentId = await resolveAgent('file-watcher', 'system', undefined, 'total-recall-watcher');
+  watcherAgentId = await resolveAgent(
+    'file-watcher',
+    'system',
+    undefined,
+    'total-recall-watcher',
+    undefined,
+    undefined,
+    WATCHER_SCOPE
+  );
 
   const watchPaths = WATCH_SPECS.flatMap(s => s.paths);
   console.log(`[watcher] Starting file sync watcher...`);

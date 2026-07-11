@@ -1,4 +1,4 @@
-import { query, setNamespaceContext, getCurrentNamespaces } from './db.js';
+import { queryScoped, type DbScope } from './db.js';
 import { embed } from './embedding.js';
 import { getRollupPendingEvents, linkEventToMemory, type MediaEvent } from './media.js';
 
@@ -16,14 +16,12 @@ export interface RollupResult {
  * downstream filtering. The event is linked back via memory_id so we don't
  * roll it up twice.
  */
-export async function rollupPendingEvents(batchSize = 50): Promise<RollupResult> {
-  const previous = getCurrentNamespaces();
-  // Need 'media' in the allowed list to satisfy RLS on insert.
-  const augmented = previous.includes(MEDIA_NAMESPACE) ? previous : [...previous, MEDIA_NAMESPACE];
-  await setNamespaceContext(augmented);
+export async function rollupPendingEvents(scope: DbScope, batchSize = 50): Promise<RollupResult> {
+  if (!scope.namespaces.includes(MEDIA_NAMESPACE)) {
+    throw new Error(`Permission denied: requires '${MEDIA_NAMESPACE}' namespace`);
+  }
 
-  try {
-    const events = await getRollupPendingEvents(batchSize);
+  const events = await getRollupPendingEvents(scope, batchSize);
     let rolled = 0;
     let failed = 0;
     const errors: string[] = [];
@@ -53,7 +51,8 @@ export async function rollupPendingEvents(batchSize = 50): Promise<RollupResult>
         const vec = await embed(summary);
         const vecStr = `[${vec.join(',')}]`;
 
-        const insert = await query<{ id: string }>(
+        const insert = await queryScoped<{ id: string }>(
+          scope,
           `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, client_id, agent_id)
            VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8)
            RETURNING id`,
@@ -69,7 +68,7 @@ export async function rollupPendingEvents(batchSize = 50): Promise<RollupResult>
           ]
         );
 
-        await linkEventToMemory(event.id, insert.rows[0].id);
+        await linkEventToMemory(scope, event.id, insert.rows[0].id);
         rolled++;
       } catch (err: any) {
         failed++;
@@ -78,9 +77,6 @@ export async function rollupPendingEvents(batchSize = 50): Promise<RollupResult>
     }
 
     return { rolled, failed, errors };
-  } finally {
-    await setNamespaceContext(previous);
-  }
 }
 
 function buildSummary(e: MediaEvent): string {

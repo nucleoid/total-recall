@@ -15,14 +15,10 @@ const server = new Server(
   { capabilities: { tools: {} } }
 );
 
-let authContext: AuthContext | null = null;
-
 async function getAuth(): Promise<AuthContext> {
-  if (authContext) return authContext;
   if (!API_KEY) throw new Error('TOTAL_RECALL_API_KEY not set');
   const ctx = await validateKey(API_KEY);
   if (!ctx) throw new Error('Invalid API key');
-  authContext = ctx;
   return ctx;
 }
 

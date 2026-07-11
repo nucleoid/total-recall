@@ -1,12 +1,15 @@
 import { z } from 'zod';
-import { query } from '../db.js';
+import { dbScopeFromAuth, withScopedClient } from '../db.js';
 import { embed } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 
+const MAX_DOCUMENT_CONTENT_LENGTH = 1_000_000;
+const MAX_DOCUMENT_CHUNKS = 500;
+
 export const storeDocumentSchema = z.object({
   title: z.string().min(1),
-  content: z.string().min(1),
+  content: z.string().min(1).max(MAX_DOCUMENT_CONTENT_LENGTH),
   namespace: z.string().default('shared'),
   tags: z.array(z.string()).default([]),
   source: z.string().default('manual'),
@@ -94,42 +97,53 @@ export async function memoryStoreDocument(
     throw new Error(`Access denied to namespace '${ns}'`);
   }
 
-  const docRes = await query(
-    `INSERT INTO documents (title, source, namespace, tags)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id`,
-    [params.title, params.source, ns, params.tags]
-  );
-  const documentId = docRes.rows[0].id;
-
   const chunks = chunkContent(params.content);
-
-  for (let i = 0; i < chunks.length; i++) {
-    const embedding = await embed(chunks[i]);
-    const vecStr = `[${embedding.join(',')}]`;
-
-    await query(
-      `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, document_id, chunk_index)
-       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10)`,
-      [
-        chunks[i],
-        vecStr,
-        params.source,
-        ns,
-        params.tags,
-        '{}',
-        'normal',
-        auth.keyId,
-        documentId,
-        i,
-      ]
-    );
+  if (chunks.length > MAX_DOCUMENT_CHUNKS) {
+    throw new Error(`Document has too many chunks (${chunks.length}); maximum is ${MAX_DOCUMENT_CHUNKS}`);
   }
 
-  await query(
-    `UPDATE documents SET chunk_count = $1 WHERE id = $2`,
-    [chunks.length, documentId]
-  );
+  const embeddings: number[][] = [];
+  for (const chunk of chunks) {
+    embeddings.push(await embed(chunk));
+  }
+
+  const documentId = await withScopedClient(dbScopeFromAuth(auth), async (client) => {
+    const docRes = await client.query(
+      `INSERT INTO documents (title, source, namespace, tags)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [params.title, params.source, ns, params.tags]
+    );
+    const id = docRes.rows[0].id;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const vecStr = `[${embeddings[i].join(',')}]`;
+
+      await client.query(
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, document_id, chunk_index)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          chunks[i],
+          vecStr,
+          params.source,
+          ns,
+          params.tags,
+          '{}',
+          'normal',
+          auth.keyId,
+          id,
+          i,
+        ]
+      );
+    }
+
+    await client.query(
+      `UPDATE documents SET chunk_count = $1 WHERE id = $2`,
+      [chunks.length, id]
+    );
+
+    return id;
+  });
 
   return { document_id: documentId, chunks_stored: chunks.length, title: params.title };
 }

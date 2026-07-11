@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { query } from '../db.js';
+import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 
@@ -44,7 +44,9 @@ export async function memoryList(
 
   const where = conditions.join(' AND ');
 
-  const countRes = await query(
+  const scope = dbScopeFromAuth(auth);
+  const countRes = await queryScoped(
+    scope,
     `SELECT COUNT(*) as total FROM memories WHERE ${where}`,
     values
   );
@@ -54,7 +56,8 @@ export async function memoryList(
   values.push(params.limit);
   values.push(params.offset);
 
-  const res = await query(
+  const res = await queryScoped(
+    scope,
     `SELECT id, content, source, namespace, tags, metadata, document_id, chunk_index, created_at
      FROM memories WHERE ${where}
      ORDER BY created_at DESC

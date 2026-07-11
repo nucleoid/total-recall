@@ -1,4 +1,4 @@
-import { query } from './db.js';
+import { queryScoped, queryUnscoped, type DbScope } from './db.js';
 
 export interface MediaEvent {
   id: string;
@@ -64,7 +64,7 @@ export interface UpsertResult {
  * Idempotent batch upsert of media events. Conflict key is
  * (service, service_id, played_at). Events without a service_id always insert.
  */
-export async function upsertMediaEvents(events: MediaEventInput[]): Promise<UpsertResult> {
+export async function upsertMediaEvents(events: MediaEventInput[], scope: DbScope): Promise<UpsertResult> {
   if (events.length === 0) return { inserted: 0, skipped: 0, ids: [] };
 
   const ids: string[] = [];
@@ -72,7 +72,8 @@ export async function upsertMediaEvents(events: MediaEventInput[]): Promise<Upse
   let skipped = 0;
 
   for (const e of events) {
-    const res = await query<{ id: string; inserted: boolean }>(
+    const res = await queryScoped<{ id: string; inserted: boolean }>(
+      scope,
       `INSERT INTO media_events
          (service, service_id, event_type, title, artist, album, show, season, episode, year,
           genres, duration_ms, played_ms, completed, played_at, metadata, client_id, agent_id)
@@ -112,7 +113,7 @@ export async function upsertMediaEvents(events: MediaEventInput[]): Promise<Upse
   return { inserted, skipped, ids };
 }
 
-export async function listMediaEvents(filters: MediaListFilters = {}): Promise<MediaEvent[]> {
+export async function listMediaEvents(scope: DbScope, filters: MediaListFilters = {}): Promise<MediaEvent[]> {
   const conditions: string[] = [];
   const values: unknown[] = [];
   let idx = 0;
@@ -127,7 +128,8 @@ export async function listMediaEvents(filters: MediaListFilters = {}): Promise<M
   const limit = Math.min(filters.limit ?? 50, 500);
   const offset = filters.offset ?? 0;
 
-  const res = await query<MediaEvent>(
+  const res = await queryScoped<MediaEvent>(
+    scope,
     `SELECT * FROM media_events ${where}
      ORDER BY played_at DESC
      LIMIT ${p(limit)} OFFSET ${p(offset)}`,
@@ -136,8 +138,9 @@ export async function listMediaEvents(filters: MediaListFilters = {}): Promise<M
   return res.rows;
 }
 
-export async function getRollupPendingEvents(limit = 50): Promise<MediaEvent[]> {
-  const res = await query<MediaEvent>(
+export async function getRollupPendingEvents(scope: DbScope, limit = 50): Promise<MediaEvent[]> {
+  const res = await queryScoped<MediaEvent>(
+    scope,
     `SELECT * FROM media_events
      WHERE memory_id IS NULL
      ORDER BY played_at ASC
@@ -147,14 +150,14 @@ export async function getRollupPendingEvents(limit = 50): Promise<MediaEvent[]> 
   return res.rows;
 }
 
-export async function linkEventToMemory(eventId: string, memoryId: string): Promise<void> {
-  await query(`UPDATE media_events SET memory_id = $1 WHERE id = $2`, [memoryId, eventId]);
+export async function linkEventToMemory(scope: DbScope, eventId: string, memoryId: string): Promise<void> {
+  await queryScoped(scope, `UPDATE media_events SET memory_id = $1 WHERE id = $2`, [memoryId, eventId]);
 }
 
 // === Connector credentials ===
 
 export async function getConnectorCredentials(service: string): Promise<Record<string, unknown> | null> {
-  const res = await query<{ data: Record<string, unknown> }>(
+  const res = await queryUnscoped<{ data: Record<string, unknown> }>(
     `SELECT data FROM connector_credentials WHERE service = $1`,
     [service]
   );
@@ -165,7 +168,7 @@ export async function setConnectorCredentials(
   service: string,
   data: Record<string, unknown>
 ): Promise<void> {
-  await query(
+  await queryUnscoped(
     `INSERT INTO connector_credentials (service, data, updated_at)
      VALUES ($1, $2, NOW())
      ON CONFLICT (service) DO UPDATE
@@ -186,7 +189,7 @@ export interface ConnectorSyncState {
 }
 
 export async function getSyncState(service: string): Promise<ConnectorSyncState | null> {
-  const res = await query<ConnectorSyncState>(
+  const res = await queryUnscoped<ConnectorSyncState>(
     `SELECT * FROM connector_sync_state WHERE service = $1`,
     [service]
   );
@@ -197,7 +200,7 @@ export async function setSyncState(
   service: string,
   patch: Partial<Omit<ConnectorSyncState, 'service' | 'updated_at'>>
 ): Promise<void> {
-  await query(
+  await queryUnscoped(
     `INSERT INTO connector_sync_state (service, last_sync_at, last_event_at, cursor, metadata, updated_at)
      VALUES ($1, $2, $3, $4, $5, NOW())
      ON CONFLICT (service) DO UPDATE SET

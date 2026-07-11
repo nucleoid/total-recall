@@ -1,4 +1,4 @@
-import { query } from '../db.js';
+import { queryUnscoped, type DbScope } from '../db.js';
 import { upsertAgent } from '../agents.js';
 
 /**
@@ -13,9 +13,10 @@ import { upsertAgent } from '../agents.js';
 export async function resolveConnectorAttribution(service: string): Promise<{
   apiKeyId: string;
   agentId: string;
+  scope: DbScope;
 }> {
   const keyName = process.env.MEDIA_DEFAULT_API_KEY_NAME || 'openclaw-v2';
-  const keyRow = await query<{ id: string; namespaces: string[] }>(
+  const keyRow = await queryUnscoped<{ id: string; namespaces: string[] }>(
     `SELECT id, namespaces FROM api_keys WHERE name = $1 AND enabled = true LIMIT 1`,
     [keyName]
   );
@@ -23,13 +24,17 @@ export async function resolveConnectorAttribution(service: string): Promise<{
     throw new Error(`No enabled api_key named "${keyName}" — set MEDIA_DEFAULT_API_KEY_NAME or create one with create-key.`);
   }
   const apiKeyId = keyRow.rows[0].id;
+  const scope = { keyId: apiKeyId, namespaces: keyRow.rows[0].namespaces };
+  if (!scope.namespaces.includes('media')) {
+    throw new Error(`api_key "${keyName}" must include the media namespace for connector jobs.`);
+  }
 
   const agent = await upsertAgent({
     name: `${service}-connector`,
     type: 'system',
     runtime: 'cron',
     api_key_id: apiKeyId,
-  });
+  }, scope);
 
-  return { apiKeyId, agentId: agent.id };
+  return { apiKeyId, agentId: agent.id, scope };
 }

@@ -1,14 +1,12 @@
 import pg from 'pg';
 
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall';
+const DATABASE_URL = process.env.OWNER_DATABASE_URL || 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall';
 
 async function migrate() {
   const client = new pg.Client({ connectionString: DATABASE_URL });
   await client.connect();
 
   try {
-    await client.query(`SELECT set_config('app.allowed_namespaces', 'personal,work,projects,financial,shared', false)`);
-
     await client.query(`
       ALTER TABLE memories
         ADD COLUMN IF NOT EXISTS relevance_score FLOAT DEFAULT 1.0,

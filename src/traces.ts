@@ -1,4 +1,4 @@
-import { query } from './db.js';
+import { queryScoped, type DbScope } from './db.js';
 import type { RecallTrace } from './types.js';
 
 export async function logTrace(params: {
@@ -10,8 +10,9 @@ export async function logTrace(params: {
   resultCount?: number;
   scores?: unknown[];
   durationMs?: number;
-}): Promise<void> {
-  await query(
+}, scope: DbScope): Promise<void> {
+  await queryScoped(
+    scope,
     `INSERT INTO recall_traces (session_id, agent_id, client_id, query_text, memory_ids, result_count, scores, duration_ms)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [
@@ -28,6 +29,7 @@ export async function logTrace(params: {
 }
 
 export async function listTraces(
+  scope: DbScope,
   limit = 20,
   offset = 0,
   agentId?: string,
@@ -43,7 +45,8 @@ export async function listTraces(
 
   const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-  const res = await query<RecallTrace>(
+  const res = await queryScoped<RecallTrace>(
+    scope,
     `SELECT rt.*, a.name AS agent_name
      FROM recall_traces rt
      LEFT JOIN agents a ON a.id = rt.agent_id
@@ -55,8 +58,9 @@ export async function listTraces(
   return res.rows;
 }
 
-export async function getTrace(id: string): Promise<RecallTrace | null> {
-  const res = await query<RecallTrace>(
+export async function getTrace(id: string, scope: DbScope): Promise<RecallTrace | null> {
+  const res = await queryScoped<RecallTrace>(
+    scope,
     `SELECT rt.*, a.name AS agent_name
      FROM recall_traces rt
      LEFT JOIN agents a ON a.id = rt.agent_id

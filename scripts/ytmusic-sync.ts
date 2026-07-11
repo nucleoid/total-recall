@@ -17,9 +17,9 @@ async function main(): Promise<void> {
   const started = new Date().toISOString();
   console.log(`[${started}] ytmusic-sync: starting`);
 
-  const { apiKeyId, agentId } = await resolveConnectorAttribution('ytmusic');
+  const { apiKeyId, agentId, scope } = await resolveConnectorAttribution('ytmusic');
   const connector = new YtmusicConnector();
-  const sync = await connector.sync({ apiKeyId, agentId });
+  const sync = await connector.sync({ apiKeyId, agentId, scope });
 
   console.log(
     `[ytmusic-sync] ${sync.events_ingested} ingested, ${sync.events_skipped} skipped, ${sync.duration_ms}ms`
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   }
 
   if (sync.events_ingested > 0) {
-    const rollup = await rollupPendingEvents(200);
+    const rollup = await rollupPendingEvents(scope, 200);
     console.log(`[ytmusic-sync] rollup: ${rollup.rolled} memories, ${rollup.failed} failed`);
     if (rollup.errors.length) console.error('[ytmusic-sync] rollup errors:', rollup.errors);
   }

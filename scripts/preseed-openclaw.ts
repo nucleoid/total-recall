@@ -159,7 +159,6 @@ async function main() {
   let totalFiles = 0;
 
   const client = await pool.connect();
-  await client.query("SET app.allowed_namespaces = 'personal,projects,shared'");
 
   for (const spec of FILE_SPECS) {
     const files = await glob(spec.pattern, { cwd: spec.base, absolute: true });

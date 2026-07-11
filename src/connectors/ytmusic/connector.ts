@@ -11,7 +11,8 @@ import {
   setConnectorCredentials,
   type MediaEventInput,
 } from '../../media.js';
-import { query } from '../../db.js';
+import { queryScoped } from '../../db.js';
+import type { ConnectorContext } from '../base.js';
 import { toMediaEvent, type YtHistoryItem } from './transform.js';
 
 const PYTHON = process.env.YTMUSIC_PYTHON || 'python3';
@@ -87,7 +88,7 @@ export class YtmusicConnector extends BaseConnector {
     await setConnectorCredentials(this.service, config);
   }
 
-  protected async fetchSince(since: Date | null): Promise<{
+  protected async fetchSince(since: Date | null, ctx: ConnectorContext): Promise<{
     events: MediaEventInput[];
     cursor?: string;
   }> {
@@ -133,7 +134,8 @@ export class YtmusicConnector extends BaseConnector {
       if (events.length === 0) return { events };
 
       const videoIds = [...new Set(events.map((e) => e.service_id).filter(Boolean))] as string[];
-      const existingRows = await query<{ service_id: string }>(
+      const existingRows = await queryScoped<{ service_id: string }>(
+        ctx.scope,
         `SELECT DISTINCT service_id FROM media_events
          WHERE service = 'ytmusic' AND service_id = ANY($1)`,
         [videoIds]
