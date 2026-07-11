@@ -1,5 +1,6 @@
 import { query } from './db.js';
-import type { Agent, AgentParams } from './types.js';
+import { accessLevelSql } from './auth.js';
+import type { Agent, AgentParams, AuthContext } from './types.js';
 
 export async function upsertAgent(params: AgentParams): Promise<Agent> {
   let parentAgentId: string | null = null;
@@ -43,15 +44,18 @@ export async function getAgentByName(name: string): Promise<Agent | null> {
   return res.rows[0] ?? null;
 }
 
-export async function listAgents(): Promise<any[]> {
+export async function listAgents(auth: AuthContext): Promise<any[]> {
   const res = await query(
     `SELECT a.*,
        COUNT(m.id)::int AS memory_count,
        MAX(m.created_at) AS last_memory_at
      FROM agents a
      LEFT JOIN memories m ON m.agent_id = a.id
+       AND m.namespace = ANY($1)
+       AND ${accessLevelSql('m.access_level', '$2')}
      GROUP BY a.id
-     ORDER BY a.last_seen_at DESC`
+     ORDER BY a.last_seen_at DESC`,
+    [auth.namespaces, auth.maxAccessLevel]
   );
   return res.rows;
 }

@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { query } from '../db.js';
 import { embed } from '../embedding.js';
 import type { AuthContext } from '../types.js';
-import { checkPermission, filterNamespaces } from '../auth.js';
+import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
 
 export const storeSchema = z.object({
@@ -30,6 +30,7 @@ export async function memoryStore(
   if (allowed.length === 0) {
     throw new Error(`Access denied to namespace '${ns}'`);
   }
+  ensureAccessLevelAllowed(params.access_level, auth.maxAccessLevel);
 
   const explicitAgent = !!params.agent_name;
   const agentName = params.agent_name || auth.name;

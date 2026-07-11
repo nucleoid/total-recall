@@ -1,6 +1,7 @@
 import { withClient } from './db.js';
 import { embed } from './embedding.js';
-import type { SearchParams, SearchResult } from './types.js';
+import { accessLevelSql } from './auth.js';
+import type { AccessLevel, SearchParams, SearchResult } from './types.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -8,7 +9,8 @@ const EF_SEARCH = parseInt(process.env.HNSW_EF_SEARCH || '200', 10);
 
 export async function hybridSearch(
   params: SearchParams,
-  namespaces: string[]
+  namespaces: string[],
+  maxAccessLevel: AccessLevel
 ): Promise<SearchResult[]> {
   const embedding = await embed(params.query);
   const vecStr = `[${embedding.join(',')}]`;
@@ -27,6 +29,8 @@ export async function hybridSearch(
     const pQuery = p(params.query);
     const pLimit = p(limit);
     const pThreshold = p(threshold);
+    const pMaxAccessLevel = p(maxAccessLevel);
+    const accessWhere = `AND ${accessLevelSql('m.access_level', pMaxAccessLevel)}`;
 
     const conditions: string[] = [];
     if (params.tags && params.tags.length > 0) {
@@ -50,7 +54,7 @@ export async function hybridSearch(
           updated_at, accessed_at, access_count, access_level, client_id,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
-        WHERE namespace = ANY(${pNs}) ${extraWhere}
+        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
         ORDER BY embedding <=> ${pVec}::vector
         LIMIT 50
       ),
@@ -59,7 +63,7 @@ export async function hybridSearch(
           updated_at, accessed_at, access_count, access_level, client_id,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
-        WHERE namespace = ANY(${pNs}) ${extraWhere}
+        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
           AND id NOT IN (SELECT id FROM vector_results)
         LIMIT 20
@@ -73,7 +77,7 @@ export async function hybridSearch(
         SELECT id,
           ts_rank_cd(to_tsvector('english', content), plainto_tsquery(${pQuery})) AS text_score
         FROM memories m
-        WHERE namespace = ANY(${pNs}) ${extraWhere}
+        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
       )
       SELECT c.*,

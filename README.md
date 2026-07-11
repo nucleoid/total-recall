@@ -137,6 +137,8 @@ Store a single memory/fact with metadata. Optionally track which agent stored it
 }
 ```
 
+`access_level` defaults to `normal` and may be `normal`, `sensitive`, or `secret`. The caller's API key must have a `max_access_level` at least as high as the memory being stored.
+
 ### `memory_store_document`
 Chunk and store a full document. Auto-splits by headings (markdown) or paragraphs (plain text), embeds each chunk, links them with a shared `document_id` for full-doc retrieval.
 ```json
@@ -145,9 +147,11 @@ Chunk and store a full document. Auto-splits by headings (markdown) or paragraph
   "content": "<full document text>",
   "namespace": "personal",
   "tags": ["tax", "nz", "immigration"],
-  "source": "manual"
+  "source": "manual",
+  "access_level": "sensitive"
 }
 ```
+Document chunks use the supplied `access_level`, defaulting to `normal`, and are subject to the caller's `max_access_level`.
 
 ### `memory_search`
 Hybrid semantic + keyword search with filters. Every search is logged as a recall trace with timing data.
@@ -315,6 +319,16 @@ PostgreSQL + pgvector (upsert)
 | `media` | Viewing/listening history rollups from connectors | Home agents |
 
 ## Security Model
+
+Access levels are enforced in addition to namespace ACLs. Each key has `max_access_level` (`normal < sensitive < secret`); search, recall, list, namespace counts, stats, and agent memory counts hide rows above that ceiling before pagination or aggregation.
+
+Migration `009_api_key_access_ceiling.sql` preserves existing API key behavior by backfilling existing keys to `secret`, while new keys default to `normal`. Create elevated keys explicitly:
+
+```bash
+npm run create-key -- --name "trusted-agent" --namespaces "personal,shared" --max-access-level secret
+```
+
+Null legacy memory access levels are normalized to `normal`. Unknown legacy labels are hidden from every key until operators remediate them; the migration adds a `NOT VALID` constraint so new writes must use one of the supported values.
 
 1. **API keys** — unique per client (`tr_` prefix), revocable, SHA256 hashed at rest
 2. **Namespace ACLs** — each key bound to specific namespaces

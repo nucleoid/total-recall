@@ -68,6 +68,7 @@ const TOOL_DEFINITIONS = [
         namespace: { type: 'string', description: 'Namespace (default: shared)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags for categorization' },
         source: { type: 'string', description: 'Source identifier (default: manual)' },
+        access_level: { type: 'string', enum: ['normal', 'sensitive', 'secret'], description: 'Access level for every stored chunk (default: normal)' },
       },
       required: ['title', 'content'],
     },
@@ -254,7 +255,7 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
         }
         case 'agent_list': {
           agentListSchema.parse(args);
-          const result = await listAgents();
+          const result = await listAgents(auth);
           return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
         }
         default:

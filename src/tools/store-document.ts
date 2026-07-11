@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { query } from '../db.js';
 import { embed } from '../embedding.js';
 import type { AuthContext } from '../types.js';
-import { checkPermission, filterNamespaces } from '../auth.js';
+import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 
 export const storeDocumentSchema = z.object({
   title: z.string().min(1),
@@ -10,6 +10,7 @@ export const storeDocumentSchema = z.object({
   namespace: z.string().default('shared'),
   tags: z.array(z.string()).default([]),
   source: z.string().default('manual'),
+  access_level: z.enum(['normal', 'sensitive', 'secret']).default('normal'),
 });
 
 function chunkMarkdown(content: string): string[] {
@@ -93,6 +94,7 @@ export async function memoryStoreDocument(
   if (allowed.length === 0) {
     throw new Error(`Access denied to namespace '${ns}'`);
   }
+  ensureAccessLevelAllowed(params.access_level, auth.maxAccessLevel);
 
   const docRes = await query(
     `INSERT INTO documents (title, source, namespace, tags)
@@ -118,7 +120,7 @@ export async function memoryStoreDocument(
         ns,
         params.tags,
         '{}',
-        'normal',
+        params.access_level,
         auth.keyId,
         documentId,
         i,

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { query } from '../db.js';
 import type { AuthContext } from '../types.js';
-import { checkPermission } from '../auth.js';
+import { accessLevelSql, checkPermission } from '../auth.js';
 
 export const listNamespacesSchema = z.object({});
 
@@ -12,8 +12,10 @@ export async function memoryListNamespaces(
   checkPermission(auth, 'read');
 
   const res = await query(
-    `SELECT namespace, COUNT(*)::int as count FROM memories WHERE namespace = ANY($1) GROUP BY namespace`,
-    [auth.namespaces]
+    `SELECT namespace, COUNT(*)::int as count FROM memories
+     WHERE namespace = ANY($1) AND ${accessLevelSql('access_level', '$2')}
+     GROUP BY namespace`,
+    [auth.namespaces, auth.maxAccessLevel]
   );
   return res.rows;
 }

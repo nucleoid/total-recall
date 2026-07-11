@@ -5,6 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "test:access-level": "tsx test/access-level.integration.test.ts",
+    "test:access-level:db": "tsx test/access-level.db.test.ts",
     "start": "node dist/index.js",
     "migrate": "tsx scripts/migrate.ts",
     "create-key": "tsx scripts/create-key.ts",

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { query } from '../db.js';
 import type { AuthContext } from '../types.js';
-import { checkPermission } from '../auth.js';
+import { accessLevelSql, checkPermission } from '../auth.js';
 
 const ALL_NAMESPACES = ['personal', 'work', 'projects', 'financial', 'shared'];
 
@@ -19,28 +19,30 @@ export async function memoryStats(
   }
 
   const ns = auth.namespaces;
+  const accessWhere = accessLevelSql('access_level', '$2');
+  const values = [ns, auth.maxAccessLevel];
 
   const [totalRes, byNsRes, bySrcRes, docsRes, oldestRes, newestRes] = await Promise.all([
-    query('SELECT COUNT(*) as total FROM memories WHERE namespace = ANY($1)', [ns]),
+    query(`SELECT COUNT(*) as total FROM memories WHERE namespace = ANY($1) AND ${accessWhere}`, values),
     query(
-      'SELECT namespace, COUNT(*) as count FROM memories WHERE namespace = ANY($1) GROUP BY namespace ORDER BY count DESC',
-      [ns]
+      `SELECT namespace, COUNT(*) as count FROM memories WHERE namespace = ANY($1) AND ${accessWhere} GROUP BY namespace ORDER BY count DESC`,
+      values
     ),
     query(
-      'SELECT source, COUNT(*) as count FROM memories WHERE namespace = ANY($1) GROUP BY source ORDER BY count DESC',
-      [ns]
+      `SELECT source, COUNT(*) as count FROM memories WHERE namespace = ANY($1) AND ${accessWhere} GROUP BY source ORDER BY count DESC`,
+      values
     ),
     query(
-      'SELECT COUNT(DISTINCT document_id) as total FROM memories WHERE namespace = ANY($1) AND document_id IS NOT NULL',
-      [ns]
+      `SELECT COUNT(DISTINCT document_id) as total FROM memories WHERE namespace = ANY($1) AND ${accessWhere} AND document_id IS NOT NULL`,
+      values
     ),
     query(
-      'SELECT MIN(created_at) as oldest FROM memories WHERE namespace = ANY($1)',
-      [ns]
+      `SELECT MIN(created_at) as oldest FROM memories WHERE namespace = ANY($1) AND ${accessWhere}`,
+      values
     ),
     query(
-      'SELECT MAX(created_at) as newest FROM memories WHERE namespace = ANY($1)',
-      [ns]
+      `SELECT MAX(created_at) as newest FROM memories WHERE namespace = ANY($1) AND ${accessWhere}`,
+      values
     ),
   ]);
 
