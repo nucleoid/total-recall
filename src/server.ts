@@ -23,26 +23,165 @@ dotenv.config();
 const PORT = parseInt(process.env.PORT || '3002', 10);
 
 // Store transports by session ID
-const transports: Record<string, StreamableHTTPServerTransport> = {};
+interface SessionRecord {
+  transport: StreamableHTTPServerTransport;
+  keyId: string;
+  auth: AuthContext;
+  closing: boolean;
+}
+
+const sessions = new Map<string, SessionRecord>();
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+type ValidateKey = typeof validateKey;
+type RegisterTools = typeof registerTools;
+
+let keyValidator: ValidateKey = validateKey;
+let toolRegistrar: RegisterTools = registerTools;
+
+export function setServerTestOverrides(overrides: {
+  validateKey?: ValidateKey;
+  registerTools?: RegisterTools;
+}): void {
+  keyValidator = overrides.validateKey ?? validateKey;
+  toolRegistrar = overrides.registerTools ?? registerTools;
+}
+
+export async function resetServerTestState(): Promise<void> {
+  const records = [...sessions.values()];
+  sessions.clear();
+  await Promise.allSettled(records.map((record) => record.transport.close()));
+}
 
 function createServer(getAuth: () => Promise<AuthContext>): Server {
   const server = new Server(
     { name: 'total-recall', version: '1.0.0' },
     { capabilities: { tools: {} } }
   );
-  registerTools(server, getAuth);
+  toolRegistrar(server, getAuth);
   return server;
 }
 
 function extractApiKey(req: express.Request): string | null {
   const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer ')) return null;
+  if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) return null;
   const key = auth.slice(7);
   if (!key.startsWith('tr_')) return null;
   return key;
 }
 
-const app = express();
+function extractSessionId(req: express.Request): string | undefined | null {
+  const header = req.headers['mcp-session-id'];
+  if (header === undefined) return undefined;
+  if (Array.isArray(header)) return null;
+
+  const sessionId = header.trim();
+  if (!SESSION_ID_PATTERN.test(sessionId)) return null;
+  return sessionId;
+}
+
+function sendPostUnauthorized(res: express.Response): void {
+  res.status(401).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Unauthorized: missing or invalid API key' },
+    id: null,
+  });
+}
+
+function sendPostForbidden(res: express.Response): void {
+  res.status(403).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Forbidden: invalid API key' },
+    id: null,
+  });
+}
+
+function sendPostNoValidSession(res: express.Response): void {
+  res.status(400).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Bad Request: no valid session ID' },
+    id: null,
+  });
+}
+
+function sendPostInternalError(res: express.Response): void {
+  res.status(500).json({
+    jsonrpc: '2.0',
+    error: { code: -32603, message: 'Internal server error' },
+    id: null,
+  });
+}
+
+function safelyEndResponse(res: express.Response): void {
+  if (res.headersSent && !res.writableEnded) {
+    res.end();
+  }
+}
+
+async function closeSessionRecord(record: SessionRecord): Promise<void> {
+  record.closing = true;
+  const sid = record.transport.sessionId;
+  if (sid && sessions.get(sid) === record) {
+    sessions.delete(sid);
+  }
+  try {
+    await record.transport.close();
+  } catch (error) {
+    console.error('[total-recall] MCP session close error:', error);
+  }
+}
+
+async function authenticateMcpRequest(
+  req: express.Request,
+  res: express.Response,
+  responseType: 'json' | 'text'
+): Promise<AuthContext | null> {
+  const apiKey = extractApiKey(req);
+  if (!apiKey) {
+    if (responseType === 'json') {
+      sendPostUnauthorized(res);
+    } else {
+      res.status(401).send('Unauthorized');
+    }
+    return null;
+  }
+
+  const authContext = await keyValidator(apiKey);
+  if (!authContext) {
+    if (responseType === 'json') {
+      sendPostForbidden(res);
+    } else {
+      res.status(403).send('Forbidden');
+    }
+    return null;
+  }
+
+  return authContext;
+}
+
+function resolveOwnedSession(
+  req: express.Request,
+  res: express.Response,
+  auth: AuthContext,
+  responseType: 'json' | 'text'
+): SessionRecord | null {
+  const sessionId = extractSessionId(req);
+  const record = sessionId ? sessions.get(sessionId) : undefined;
+
+  if (!sessionId || !record || record.keyId !== auth.keyId || record.closing) {
+    if (responseType === 'json') {
+      sendPostNoValidSession(res);
+    } else {
+      res.status(400).send('Invalid or missing session ID');
+    }
+    return null;
+  }
+
+  record.auth = auth;
+  return record;
+}
+
+export const app = express();
 app.use(express.json());
 
 // Health check
@@ -52,114 +191,104 @@ app.get('/health', (_req, res) => {
 
 // MCP endpoint - POST
 app.post('/mcp', async (req, res) => {
-  // Authenticate
-  const apiKey = extractApiKey(req);
-  if (!apiKey) {
-    res.status(401).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Unauthorized: missing or invalid API key' },
-      id: null,
-    });
-    return;
-  }
-
-  const authContext = await validateKey(apiKey);
-  if (!authContext) {
-    res.status(403).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Forbidden: invalid API key' },
-      id: null,
-    });
-    return;
-  }
-
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-
   try {
-    let transport: StreamableHTTPServerTransport;
+    const authContext = await authenticateMcpRequest(req, res, 'json');
+    if (!authContext) return;
 
-    if (sessionId && transports[sessionId]) {
-      transport = transports[sessionId];
-    } else if (!sessionId && isInitializeRequest(req.body)) {
+    const sessionId = extractSessionId(req);
+
+    if (sessionId !== undefined) {
+      const record = resolveOwnedSession(req, res, authContext, 'json');
+      if (!record) return;
+      await record.transport.handleRequest(req, res, req.body);
+    } else if (isInitializeRequest(req.body)) {
       // New session
-      transport = new StreamableHTTPServerTransport({
+      let record: SessionRecord | null = null;
+      const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid: string) => {
-          transports[sid] = transport;
+          record = {
+            transport,
+            keyId: authContext.keyId,
+            auth: authContext,
+            closing: false,
+          };
+          sessions.set(sid, record);
         },
       });
 
       transport.onclose = () => {
         const sid = transport.sessionId;
-        if (sid && transports[sid]) {
-          delete transports[sid];
+        if (sid && record && sessions.get(sid) === record) {
+          record.closing = true;
+          sessions.delete(sid);
         }
       };
 
-      // Revalidate the session key for each tool call instead of retaining authority indefinitely.
-      const sessionApiKey = apiKey;
       const server = createServer(async () => {
-        const fresh = await validateKey(sessionApiKey);
-        if (!fresh) throw new Error('Invalid API key');
-        return fresh;
+        if (!record) {
+          throw new Error('MCP session is not initialized');
+        }
+        return record.auth;
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
-      return;
     } else {
-      res.status(400).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'Bad Request: no valid session ID' },
-        id: null,
-      });
-      return;
+      sendPostNoValidSession(res);
     }
-
-    await transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.error('[total-recall] HTTP error:', error);
     if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: 'Internal server error' },
-        id: null,
-      });
+      sendPostInternalError(res);
+    } else {
+      safelyEndResponse(res);
     }
   }
 });
 
 // MCP endpoint - GET (SSE stream)
 app.get('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).send('Invalid or missing session ID');
-    return;
-  }
+  try {
+    const authContext = await authenticateMcpRequest(req, res, 'text');
+    if (!authContext) return;
 
-  // Authenticate SSE connections too
-  const apiKey = extractApiKey(req);
-  if (!apiKey) {
-    res.status(401).send('Unauthorized');
-    return;
-  }
-  const authContext = await validateKey(apiKey);
-  if (!authContext) {
-    res.status(403).send('Forbidden');
-    return;
-  }
+    const record = resolveOwnedSession(req, res, authContext, 'text');
+    if (!record) return;
 
-  await transports[sessionId].handleRequest(req, res);
+    await record.transport.handleRequest(req, res);
+  } catch (error) {
+    console.error('[total-recall] HTTP SSE error:', error);
+    if (!res.headersSent) {
+      res.status(500).send('Internal server error');
+    } else {
+      safelyEndResponse(res);
+    }
+  }
 });
 
 // MCP endpoint - DELETE (session termination)
 app.delete('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).send('Invalid or missing session ID');
-    return;
-  }
+  try {
+    const authContext = await authenticateMcpRequest(req, res, 'text');
+    if (!authContext) return;
 
-  await transports[sessionId].handleRequest(req, res);
+    const record = resolveOwnedSession(req, res, authContext, 'text');
+    if (!record) return;
+
+    try {
+      record.closing = true;
+      await record.transport.handleRequest(req, res);
+    } finally {
+      await closeSessionRecord(record);
+    }
+  } catch (error) {
+    console.error('[total-recall] HTTP DELETE error:', error);
+    if (!res.headersSent) {
+      res.status(500).send('Internal server error');
+    } else {
+      safelyEndResponse(res);
+    }
+  }
 });
 
 
@@ -171,7 +300,7 @@ async function authenticateRequest(req: express.Request, res: express.Response):
     res.status(401).json({ error: 'Unauthorized: missing or invalid API key' });
     return null;
   }
-  const auth = await validateKey(apiKey);
+  const auth = await keyValidator(apiKey);
   if (!auth) {
     res.status(403).json({ error: 'Forbidden: invalid API key' });
     return null;
@@ -400,24 +529,28 @@ app.post('/api/media/rollup', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.error(`[total-recall] HTTP server listening on port ${PORT}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.error(`[total-recall] HTTP server listening on port ${PORT}`);
+  });
+}
 
 process.on('SIGINT', async () => {
   console.error('[total-recall] Shutting down HTTP server...');
-  for (const sid in transports) {
-    await transports[sid].close();
-    delete transports[sid];
+  for (const [sid, record] of sessions) {
+    record.closing = true;
+    await record.transport.close();
+    sessions.delete(sid);
   }
   await shutdown();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  for (const sid in transports) {
-    await transports[sid].close();
-    delete transports[sid];
+  for (const [sid, record] of sessions) {
+    record.closing = true;
+    await record.transport.close();
+    sessions.delete(sid);
   }
   await shutdown();
   process.exit(0);
