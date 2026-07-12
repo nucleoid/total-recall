@@ -52,6 +52,14 @@ export interface SearchParams {
   source?: string;
   after?: string;
   before?: string;
+  mediaFilters?: MediaSearchFilters;
+}
+
+export interface MediaSearchFilters {
+  services?: string[];
+  eventTypes?: string[];
+  playedAfter?: string;
+  playedBefore?: string;
 }
 
 export interface ListParams {
