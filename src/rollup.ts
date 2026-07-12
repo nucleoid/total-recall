@@ -56,8 +56,8 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
 
         const insert = await queryScoped<{ id: string }>(
           scope,
-          `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, client_id, agent_id)
-           VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8)
+          `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, event_at, client_id, agent_id)
+           VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9)
            RETURNING id`,
           [
             summary,
@@ -66,6 +66,7 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
             MEDIA_NAMESPACE,
             tags,
             JSON.stringify(metadata),
+            event.played_at,
             event.client_id,
             event.agent_id,
           ]
