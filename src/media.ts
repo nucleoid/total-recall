@@ -1,5 +1,6 @@
-import { queryScoped, queryUnscoped, type DbScope } from './db.js';
+import { queryScoped, queryUnscoped, type DbScope, type ScopedClient } from './db.js';
 import type { AuthContext } from './types.js';
+import type { QueryResultRow } from 'pg';
 
 export interface MediaEvent {
   id: string;
@@ -61,11 +62,11 @@ export interface UpsertResult {
   ids: string[];
 }
 
-/**
- * Idempotent batch upsert of media events. Conflict key is
- * (service, service_id, played_at). Events without a service_id always insert.
- */
-export async function upsertMediaEvents(events: MediaEventInput[], scope: DbScope): Promise<UpsertResult> {
+async function upsertMediaEventsWithQuery(
+  events: MediaEventInput[],
+  scope: DbScope,
+  query: <T extends QueryResultRow>(text: string, params?: unknown[]) => Promise<{ rows: T[] }>
+): Promise<UpsertResult> {
   if (events.length === 0) return { inserted: 0, skipped: 0, ids: [] };
 
   const ids: string[] = [];
@@ -73,8 +74,7 @@ export async function upsertMediaEvents(events: MediaEventInput[], scope: DbScop
   let skipped = 0;
 
   for (const e of events) {
-    const res = await queryScoped<{ id: string; inserted: boolean }>(
-      scope,
+    const res = await query<{ id: string; inserted: boolean }>(
       `INSERT INTO media_events
          (service, service_id, event_type, title, artist, album, show, season, episode, year,
           genres, duration_ms, played_ms, completed, played_at, metadata, client_id, agent_id)
@@ -112,6 +112,26 @@ export async function upsertMediaEvents(events: MediaEventInput[], scope: DbScop
   }
 
   return { inserted, skipped, ids };
+}
+
+/**
+ * Idempotent batch upsert of media events. Conflict key is
+ * (service, service_id, played_at). Events without a service_id always insert.
+ */
+export async function upsertMediaEvents(events: MediaEventInput[], scope: DbScope): Promise<UpsertResult> {
+  return upsertMediaEventsWithQuery(events, scope, (text, params) =>
+    queryScoped(scope, text, params)
+  );
+}
+
+export async function upsertMediaEventsWithClient(
+  client: ScopedClient,
+  events: MediaEventInput[],
+  scope: DbScope
+): Promise<UpsertResult> {
+  return upsertMediaEventsWithQuery(events, scope, (text, params) =>
+    client.query(text, params)
+  );
 }
 
 export async function listMediaEvents(auth: AuthContext, scope: DbScope, filters: MediaListFilters = {}): Promise<MediaEvent[]> {
@@ -197,12 +217,68 @@ export interface ConnectorSyncState {
   updated_at: Date;
 }
 
+export interface ConnectorSyncStatePatch {
+  last_sync_at?: Date | null;
+  last_event_at?: Date | null;
+  cursor?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
 export async function getSyncState(service: string): Promise<ConnectorSyncState | null> {
   const res = await queryUnscoped<ConnectorSyncState>(
     `SELECT * FROM connector_sync_state WHERE service = $1`,
     [service]
   );
   return res.rows[0] ?? null;
+}
+
+export async function mutateConnectorSyncStateWithClient(
+  client: ScopedClient,
+  service: string,
+  mutate: (current: ConnectorSyncState) => ConnectorSyncStatePatch
+): Promise<ConnectorSyncState> {
+  await client.query(
+    `INSERT INTO connector_sync_state (service, metadata, updated_at)
+     VALUES ($1, '{}'::jsonb, NOW())
+     ON CONFLICT (service) DO NOTHING`,
+    [service]
+  );
+
+  const currentRes = await client.query<ConnectorSyncState>(
+    `SELECT * FROM connector_sync_state WHERE service = $1 FOR UPDATE`,
+    [service]
+  );
+  const current = currentRes.rows[0];
+  if (!current) {
+    throw new Error(`Failed to lock connector sync state for ${service}`);
+  }
+
+  const patch = mutate(current);
+  const next = {
+    last_sync_at: patch.last_sync_at !== undefined ? patch.last_sync_at : current.last_sync_at,
+    last_event_at: patch.last_event_at !== undefined ? patch.last_event_at : current.last_event_at,
+    cursor: patch.cursor !== undefined ? patch.cursor : current.cursor,
+    metadata: patch.metadata !== undefined ? patch.metadata : current.metadata,
+  };
+
+  const updated = await client.query<ConnectorSyncState>(
+    `UPDATE connector_sync_state
+     SET last_sync_at = $2,
+         last_event_at = $3,
+         cursor = $4,
+         metadata = $5,
+         updated_at = NOW()
+     WHERE service = $1
+     RETURNING *`,
+    [
+      service,
+      next.last_sync_at,
+      next.last_event_at,
+      next.cursor,
+      JSON.stringify(next.metadata ?? {}),
+    ]
+  );
+  return updated.rows[0];
 }
 
 export async function setSyncState(

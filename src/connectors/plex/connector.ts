@@ -1,5 +1,17 @@
-import { BaseConnector, type ConnectorContext } from '../base.js';
-import type { MediaEventInput } from '../../media.js';
+import {
+  BaseConnector,
+  filterValidMediaEventDates,
+  type ConnectorContext,
+  type SyncResult,
+} from '../base.js';
+import {
+  getSyncState,
+  mutateConnectorSyncStateWithClient,
+  upsertMediaEventsWithClient,
+  type ConnectorSyncState,
+  type MediaEventInput,
+} from '../../media.js';
+import { withScopedClient } from '../../db.js';
 import { loadCreds, plexHeaders } from './auth.js';
 import { getAccount, listServers, pickReachableUri, type PlexResource } from './discovery.js';
 import { toMediaEvent, type PlexHistoryItem } from './transform.js';
@@ -14,6 +26,89 @@ export interface PlexHistoryFetchDeps {
 
 const DEFAULT_HISTORY_PAGE_SIZE = 100;
 const DEFAULT_MAX_HISTORY_PAGES = 1000;
+const PLEX_CURSOR_VERSION = 1;
+
+export interface PlexCursorMetadata {
+  cursor_version: 1;
+  server_cursors: Record<string, string>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function parseCursorDate(value: unknown, now = Date.now()): Date | null {
+  if (
+    typeof value !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+  ) return null;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  if (date.getTime() > now) return null;
+  return date;
+}
+
+export function parsePlexCursorMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+  warn: (message: string) => void = () => undefined
+): Record<string, Date> {
+  const plex = metadata?.plex;
+  if (plex === undefined) return {};
+  if (!isRecord(plex)) {
+    warn('[plex] ignoring malformed cursor metadata: metadata.plex is not an object');
+    return {};
+  }
+  if (plex.cursor_version !== PLEX_CURSOR_VERSION) {
+    warn(`[plex] ignoring unsupported cursor metadata version: ${String(plex.cursor_version)}`);
+    return {};
+  }
+  if (!isRecord(plex.server_cursors)) {
+    warn('[plex] ignoring malformed cursor metadata: server_cursors is not an object');
+    return {};
+  }
+
+  const parsed: Record<string, Date> = {};
+  for (const [serverId, value] of Object.entries(plex.server_cursors)) {
+    if (serverId.trim() === '') {
+      warn('[plex] ignoring cursor metadata entry with empty server id');
+      continue;
+    }
+    const date = parseCursorDate(value);
+    if (!date) {
+      warn(`[plex] ignoring malformed cursor metadata entry for server "${serverId}"`);
+      continue;
+    }
+    parsed[serverId] = date;
+  }
+  return parsed;
+}
+
+export function mergePlexCursorMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+  candidates: Record<string, string>
+): Record<string, unknown> {
+  const existing = parsePlexCursorMetadata(metadata);
+  for (const [serverId, iso] of Object.entries(candidates)) {
+    const candidate = parseCursorDate(iso, Number.POSITIVE_INFINITY);
+    if (!candidate) continue;
+    const previous = existing[serverId];
+    if (!previous || candidate > previous) {
+      existing[serverId] = candidate;
+    }
+  }
+
+  const server_cursors = Object.fromEntries(
+    Object.entries(existing).map(([serverId, date]) => [serverId, date.toISOString()])
+  );
+
+  return {
+    ...(metadata ?? {}),
+    plex: {
+      cursor_version: PLEX_CURSOR_VERSION,
+      server_cursors,
+    } satisfies PlexCursorMetadata,
+  };
+}
 
 export function historyAccountId(
   server: Pick<PlexResource, 'owned'>,
@@ -33,19 +128,23 @@ export function normalizePlexAccountId(value: unknown): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
+export interface PlexServerHistoryResult {
+  events: MediaEventInput[];
+  scannedThrough: Date | null;
+}
+
 export async function fetchHistoryForServer(args: {
   server: PlexResource;
   creds: Awaited<ReturnType<typeof loadCreds>>;
   account: { id: number };
   since: Date | null;
   deps?: PlexHistoryFetchDeps;
-}): Promise<MediaEventInput[]> {
+}): Promise<PlexServerHistoryResult> {
   const { server, creds, account, since, deps = {} } = args;
   const warn = deps.warn ?? console.warn;
   const reachable = await (deps.pickReachableUri ?? pickReachableUri)(server, creds);
   if (!reachable) {
-    warn(`[plex] no reachable connection for server "${server.name}", skipping`);
-    return [];
+    throw new Error(`Plex no reachable connection for server "${server.name}"`);
   }
 
   const expectedAccountId = historyAccountId(server, account);
@@ -65,6 +164,7 @@ export async function fetchHistoryForServer(args: {
   const pageSize = deps.historyPageSize ?? DEFAULT_HISTORY_PAGE_SIZE;
   const maxPages = deps.maxHistoryPages ?? DEFAULT_MAX_HISTORY_PAGES;
   const events: MediaEventInput[] = [];
+  let scannedThrough: Date | null = null;
   let start = 0;
   let pages = 0;
   let seenHistoryRows = 0;
@@ -95,16 +195,45 @@ export async function fetchHistoryForServer(args: {
       throw new Error(`Plex no history endpoint accepted on server "${server.name}"`);
     }
 
-    const body = await res.json() as {
+    let body: {
       MediaContainer?: {
         Metadata?: PlexHistoryItem[];
         totalSize?: unknown;
       };
     };
+    try {
+      body = await res.json() as typeof body;
+    } catch {
+      throw new Error(`Plex history fetch failed on server "${server.name}": invalid JSON`);
+    }
     const container = body.MediaContainer;
-    const items = container?.Metadata ?? [];
+    if (!isRecord(container)) {
+      throw new Error(`Plex history fetch failed on server "${server.name}": invalid MediaContainer`);
+    }
+    if (container.Metadata !== undefined && !Array.isArray(container.Metadata)) {
+      throw new Error(`Plex history fetch failed on server "${server.name}": invalid Metadata page`);
+    }
+    const items = (container.Metadata ?? []) as PlexHistoryItem[];
     seenHistoryRows += items.length;
     for (const item of items) {
+      if (
+        typeof item.viewedAt !== 'number' ||
+        !Number.isSafeInteger(item.viewedAt) ||
+        item.viewedAt <= 0
+      ) {
+        throw new Error(`Plex history fetch failed on server "${server.name}": invalid viewedAt`);
+      }
+      const viewedAt = new Date(item.viewedAt * 1000);
+      if (!Number.isFinite(viewedAt.getTime())) {
+        throw new Error(`Plex history fetch failed on server "${server.name}": invalid viewedAt`);
+      }
+      if (viewedAt.getTime() > Date.now()) {
+        throw new Error(`Plex history fetch failed on server "${server.name}": future viewedAt`);
+      }
+      if (!scannedThrough || viewedAt > scannedThrough) {
+        scannedThrough = viewedAt;
+      }
+
       const itemAccountId = normalizePlexAccountId(item.accountID);
       if (itemAccountId === null) {
         warn(`[plex] skipping history item with malformed accountID on server "${server.name}"`);
@@ -119,11 +248,23 @@ export async function fetchHistoryForServer(args: {
       if (event) events.push(event);
     }
 
-    const totalSize = typeof container?.totalSize === 'number' && Number.isSafeInteger(container.totalSize)
-      ? container.totalSize
-      : null;
+    let totalSize: number | null = null;
+    if (container.totalSize !== undefined) {
+      if (
+        typeof container.totalSize !== 'number' ||
+        !Number.isSafeInteger(container.totalSize) ||
+        container.totalSize < 0
+      ) {
+        throw new Error(`Plex history fetch failed on server "${server.name}": invalid totalSize`);
+      }
+      totalSize = container.totalSize;
+    }
     start += items.length;
     pages++;
+
+    if (items.length === 0 && totalSize !== null && start < totalSize) {
+      throw new Error(`Plex history pagination did not advance on server "${server.name}"`);
+    }
 
     const done = items.length === 0 ||
       (totalSize !== null ? start >= totalSize : items.length < pageSize);
@@ -131,8 +272,7 @@ export async function fetchHistoryForServer(args: {
       break;
     }
     if (pages >= maxPages) {
-      warn(`[plex] history pagination hit ${maxPages} page cap on server "${server.name}"`);
-      break;
+      throw new Error(`Plex history pagination hit ${maxPages} page cap on server "${server.name}"`);
     }
   }
 
@@ -142,7 +282,7 @@ export async function fetchHistoryForServer(args: {
     );
   }
 
-  return events;
+  return { events, scannedThrough };
 }
 
 export async function fetchHistoryForServers(args: {
@@ -150,15 +290,32 @@ export async function fetchHistoryForServers(args: {
   creds: Awaited<ReturnType<typeof loadCreds>>;
   account: { id: number };
   since: Date | null;
+  sinceByServer?: Record<string, Date | null | undefined>;
   throwOnServerErrors?: boolean;
   deps?: PlexHistoryFetchDeps;
-}): Promise<{ events: MediaEventInput[]; errors: string[] }> {
+}): Promise<{
+  events: MediaEventInput[];
+  errors: string[];
+  cursorCandidates: Record<string, string>;
+  successfulServers: string[];
+}> {
   const events: MediaEventInput[] = [];
   const errors: string[] = [];
+  const cursorCandidates: Record<string, string> = {};
+  const successfulServers: string[] = [];
 
   for (const server of args.servers) {
     try {
-      events.push(...await fetchHistoryForServer({ ...args, server }));
+      const serverHistory = await fetchHistoryForServer({
+        ...args,
+        server,
+        since: args.sinceByServer?.[server.clientIdentifier] ?? args.since,
+      });
+      successfulServers.push(server.clientIdentifier);
+      events.push(...serverHistory.events);
+      if (serverHistory.scannedThrough) {
+        cursorCandidates[server.clientIdentifier] = serverHistory.scannedThrough.toISOString();
+      }
     } catch (err: any) {
       errors.push(err?.message ?? String(err));
     }
@@ -168,7 +325,7 @@ export async function fetchHistoryForServers(args: {
     throw new Error(`Plex history fetch failed for ${errors.length} server(s): ${errors.join('; ')}`);
   }
 
-  return { events, errors };
+  return { events, errors, cursorCandidates, successfulServers };
 }
 
 export class PlexConnector extends BaseConnector {
@@ -198,5 +355,79 @@ export class PlexConnector extends BaseConnector {
     }
 
     return { events };
+  }
+
+  async sync(ctx: ConnectorContext): Promise<SyncResult> {
+    const start = Date.now();
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    let ingested = 0;
+    let skipped = 0;
+
+    try {
+      const state = await getSyncState(this.service);
+      const sinceByServer = parsePlexCursorMetadata(state?.metadata, (message) => warnings.push(message));
+
+      const creds = await loadCreds();
+      const account = await getAccount(creds);
+      const servers = await listServers(creds);
+
+      if (servers.length === 0) {
+        throw new Error('No accessible Plex servers found for this account.');
+      }
+
+      const fetchResult = await fetchHistoryForServers({
+        servers,
+        creds,
+        account,
+        since: null,
+        sinceByServer,
+        throwOnServerErrors: false,
+      });
+      errors.push(...fetchResult.errors);
+
+      if (fetchResult.successfulServers.length === 0 && fetchResult.errors.length > 0) {
+        return {
+          service: this.service,
+          events_ingested: 0,
+          events_skipped: 0,
+          warnings,
+          errors,
+          duration_ms: Date.now() - start,
+        };
+      }
+
+      const valid = filterValidMediaEventDates(fetchResult.events);
+      errors.push(...valid.errors);
+      skipped += valid.skipped;
+
+      const enriched = valid.events.map((event) => ({
+        ...event,
+        client_id: event.client_id ?? ctx.apiKeyId,
+        agent_id: event.agent_id ?? ctx.agentId,
+      }));
+
+      await withScopedClient(ctx.scope, async (client) => {
+        const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
+        ingested = result.inserted;
+        skipped += result.skipped;
+
+        await mutateConnectorSyncStateWithClient(client, this.service, (current: ConnectorSyncState) => ({
+          last_sync_at: new Date(),
+          metadata: mergePlexCursorMetadata(current.metadata, fetchResult.cursorCandidates),
+        }));
+      });
+    } catch (err: any) {
+      errors.push(err?.message ?? String(err));
+    }
+
+    return {
+      service: this.service,
+      events_ingested: ingested,
+      events_skipped: skipped,
+      warnings,
+      errors,
+      duration_ms: Date.now() - start,
+    };
   }
 }
