@@ -22,6 +22,7 @@
     "start:http": "node dist/server.js",
     "start:stdio": "node dist/index.js",
     "preseed:gemini": "tsx scripts/preseed-gemini.ts",
+    "repair:gemini-source-keys": "tsx scripts/repair-gemini-source-keys.ts",
     "watcher": "tsx src/watcher.ts",
     "start:watcher": "node dist/watcher.js",
     "preseed:chatgpt": "tsx scripts/preseed-chatgpt.ts",
