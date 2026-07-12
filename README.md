@@ -285,6 +285,20 @@ Key files are monitored for changes, diffed by content hash, chunked, and upsert
 - Symlinks are followed. Containment is lexical rather than a security boundary: a symlink below the workspace may point outside it.
 - No duplicates, no stale entries
 
+#### Linux watcher ownership and scheduled diagnostics
+
+Use **systemd as the sole watcher owner** where available. Configure the service with the deployment's absolute Node binary and project directory, run `npm run build`, and start `node dist/watcher.js` from that directory. Do not also install a cron watcher starter. `scripts/daily-sync.sh` is a Linux-only (`bash`, `flock`, and `/proc`) **cron fallback** for deployments without a service manager; it is not the Windows watcher procedure from #31 and does not support macOS.
+
+For the cron fallback, copy `scripts/daily-sync.env.example` to an owner-only deployment file and replace its example paths. `NODE_BIN` must be an absolute executable. `PROJECT_DIR` defaults to the real directory containing this checkout but may be set explicitly. Optional statistics run only when absolute executable `MCPORTER_BIN` and `PYTHON3_BIN` values are supplied. The script intentionally does not source the application's `.env`; source only the dedicated, shell-safe scheduler file from the cron command. **When upgrading from the old script, replace the old bare cron invocation in the same deployment window:** it has no `NODE_BIN`, so the corrected script intentionally rejects it rather than trusting cron's `PATH`.
+
+```cron
+*/5 * * * * . /etc/total-recall/daily-sync.env && /srv/total-recall/scripts/daily-sync.sh
+```
+
+The fallback serializes startup with a bounded lock wait (`LOCK_TIMEOUT_SECONDS`, default 10) and records its validated watcher under the current user's private `XDG_RUNTIME_DIR/total-recall`, or `/tmp/total-recall-$UID` when no runtime directory is configured. Logs stay there as `watcher.log`; upgrade any tailing or rotation rules that still read the legacy `/tmp/total-recall-watcher.log`. It adopts exactly one same-user watcher launched as either the absolute entrypoint or the legacy `node dist/watcher.js` from this project. If diagnostics report multiple matching watchers, inspect `ps -o pid,user,lstart,args -p <pid,...>`, choose which deployment-owned process to retain, and stop surplus processes manually; the script never guesses or kills a PID. Then rerun it to adopt the survivor. Never run systemd and cron as competing owners.
+
+For upgrades, stop the selected owner, build `dist/watcher.js`, update deployment-specific absolute paths (including NVM's versioned Node path), and restart that same owner. A healthy watcher using an older Node executable can be adopted with a warning, but binary upgrades should use a coordinated restart so the pidfile reflects the intended process. Rollback may remove the private runtime pid/lock files after stopping the fallback watcher; the old script ignores these files and can resume spawning duplicates, so restoring it is not a safe ownership strategy. No schema migration, reindex, API-key/session change, or application downtime is otherwise required.
+
 ### Pre-Seed (one-time bulk import)
 Bootstrap from existing AI conversation history across platforms.
 
