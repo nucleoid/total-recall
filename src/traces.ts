@@ -1,5 +1,4 @@
 import { queryScoped, type DbScope } from './db.js';
-import { checkAdminPermission } from './auth.js';
 import type { AuthContext, RecallTrace } from './types.js';
 
 export async function logTrace(params: {
@@ -37,11 +36,10 @@ export async function listTraces(
   agentId?: string,
   sessionId?: string
 ): Promise<RecallTrace[]> {
-  checkAdminPermission(auth);
-
-  const conditions: string[] = [];
-  const values: unknown[] = [];
-  let idx = 0;
+  const isAdmin = auth.permissions.includes('admin');
+  const conditions: string[] = ['($2::boolean OR rt.client_id = $1)'];
+  const values: unknown[] = [auth.keyId, isAdmin];
+  let idx = 2;
   const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
 
   if (agentId) conditions.push(`rt.agent_id = ${p(agentId)}`);
@@ -50,10 +48,10 @@ export async function listTraces(
   const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
   const res = await queryScoped<RecallTrace>(
-    scope,
+    { ...scope, isAdmin },
     `SELECT rt.*, a.name AS agent_name
      FROM recall_traces rt
-     LEFT JOIN agents a ON a.id = rt.agent_id
+     LEFT JOIN agents a ON a.id = rt.agent_id AND a.api_key_id::text = rt.client_id
      ${where}
      ORDER BY rt.created_at DESC
      LIMIT ${p(limit)} OFFSET ${p(offset)}`,
@@ -63,15 +61,15 @@ export async function listTraces(
 }
 
 export async function getTrace(auth: AuthContext, id: string, scope: DbScope): Promise<RecallTrace | null> {
-  checkAdminPermission(auth);
-
+  const isAdmin = auth.permissions.includes('admin');
   const res = await queryScoped<RecallTrace>(
-    scope,
+    { ...scope, isAdmin },
     `SELECT rt.*, a.name AS agent_name
      FROM recall_traces rt
-     LEFT JOIN agents a ON a.id = rt.agent_id
-     WHERE rt.id = $1`,
-    [id]
+     LEFT JOIN agents a ON a.id = rt.agent_id AND a.api_key_id::text = rt.client_id
+     WHERE rt.id = $1 AND ($3::boolean OR rt.client_id = $2)`,
+    [id, auth.keyId, isAdmin]
   );
   return res.rows[0] ?? null;
 }
+

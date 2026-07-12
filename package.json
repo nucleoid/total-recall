@@ -30,6 +30,7 @@
     "ytmusic:sync": "tsx scripts/ytmusic-sync.ts",
     "plex:auth": "tsx scripts/plex-auth.ts",
     "plex:sync": "tsx scripts/plex-sync.ts",
+    "preflight:media-keys": "tsx scripts/preflight-media-keys.ts",
     "test:plex": "node --test --import tsx test/connectors/plex-connector.test.ts"
   },
   "dependencies": {

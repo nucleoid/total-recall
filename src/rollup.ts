@@ -1,6 +1,8 @@
 import { queryScoped, type DbScope } from './db.js';
 import { embed } from './embedding.js';
 import { getRollupPendingEvents, linkEventToMemory, type MediaEvent } from './media.js';
+import { checkPermission } from './auth.js';
+import type { AuthContext } from './types.js';
 
 const MEDIA_NAMESPACE = 'media';
 
@@ -16,12 +18,13 @@ export interface RollupResult {
  * downstream filtering. The event is linked back via memory_id so we don't
  * roll it up twice.
  */
-export async function rollupPendingEvents(scope: DbScope, batchSize = 50): Promise<RollupResult> {
+export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, batchSize = 50): Promise<RollupResult> {
+  checkPermission(auth, 'write');
   if (!scope.namespaces.includes(MEDIA_NAMESPACE)) {
     throw new Error(`Permission denied: requires '${MEDIA_NAMESPACE}' namespace`);
   }
 
-  const events = await getRollupPendingEvents(scope, batchSize);
+  const events = await getRollupPendingEvents(auth, scope, batchSize);
     let rolled = 0;
     let failed = 0;
     const errors: string[] = [];
@@ -68,7 +71,7 @@ export async function rollupPendingEvents(scope: DbScope, batchSize = 50): Promi
           ]
         );
 
-        await linkEventToMemory(scope, event.id, insert.rows[0].id);
+        await linkEventToMemory(auth, scope, event.id, insert.rows[0].id);
         rolled++;
       } catch (err: any) {
         failed++;

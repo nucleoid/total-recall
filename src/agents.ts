@@ -1,8 +1,8 @@
-import { queryScoped, queryUnscoped, type DbScope } from './db.js';
-import { accessLevelSql, checkAdminPermission } from './auth.js';
+import { queryScoped, type DbScope } from './db.js';
+import { accessLevelSql } from './auth.js';
 import type { Agent, AgentParams, AuthContext } from './types.js';
 
-export async function upsertAgent(params: AgentParams, scope?: DbScope): Promise<Agent> {
+export async function upsertAgent(params: AgentParams, scope: DbScope): Promise<Agent> {
   let parentAgentId: string | null = null;
   if (params.parent_agent_name) {
     const parent = await getAgentByName(params.parent_agent_name, scope);
@@ -11,12 +11,11 @@ export async function upsertAgent(params: AgentParams, scope?: DbScope): Promise
 
   const sql = `INSERT INTO agents (name, type, model, runtime, parent_agent_id, api_key_id, metadata)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (name) DO UPDATE SET
+     ON CONFLICT (api_key_id, name) DO UPDATE SET
        type = COALESCE(EXCLUDED.type, agents.type),
        model = COALESCE(EXCLUDED.model, agents.model),
        runtime = COALESCE(EXCLUDED.runtime, agents.runtime),
        parent_agent_id = COALESCE(EXCLUDED.parent_agent_id, agents.parent_agent_id),
-       api_key_id = COALESCE(EXCLUDED.api_key_id, agents.api_key_id),
        metadata = agents.metadata || EXCLUDED.metadata,
        last_seen_at = NOW()
      RETURNING *`;
@@ -26,44 +25,47 @@ export async function upsertAgent(params: AgentParams, scope?: DbScope): Promise
     params.model ?? null,
     params.runtime ?? null,
     parentAgentId,
-    params.api_key_id ?? null,
+    scope.keyId,
     JSON.stringify(params.metadata ?? {}),
   ];
-  const res = scope
-    ? await queryScoped<Agent>(scope, sql, values)
-    : await queryUnscoped<Agent>(sql, values);
+  const res = await queryScoped<Agent>(scope, sql, values);
   return res.rows[0];
 }
 
-export async function getAgent(id: string, scope?: DbScope): Promise<Agent | null> {
-  const res = scope
-    ? await queryScoped<Agent>(scope, 'SELECT * FROM agents WHERE id = $1', [id])
-    : await queryUnscoped<Agent>('SELECT * FROM agents WHERE id = $1', [id]);
+export async function getAgent(id: string, scope: DbScope): Promise<Agent | null> {
+  const res = await queryScoped<Agent>(
+    scope,
+    'SELECT * FROM agents WHERE id = $1 AND api_key_id::text = $2',
+    [id, scope.keyId]
+  );
   return res.rows[0] ?? null;
 }
 
-export async function getAgentByName(name: string, scope?: DbScope): Promise<Agent | null> {
-  const res = scope
-    ? await queryScoped<Agent>(scope, 'SELECT * FROM agents WHERE name = $1', [name])
-    : await queryUnscoped<Agent>('SELECT * FROM agents WHERE name = $1', [name]);
+export async function getAgentByName(name: string, scope: DbScope): Promise<Agent | null> {
+  const res = await queryScoped<Agent>(
+    scope,
+    'SELECT * FROM agents WHERE name = $1 AND api_key_id::text = $2',
+    [name, scope.keyId]
+  );
   return res.rows[0] ?? null;
 }
 
 export async function listAgents(auth: AuthContext, scope: DbScope): Promise<any[]> {
-  checkAdminPermission(auth);
-
+  const isAdmin = auth.permissions.includes('admin');
   const res = await queryScoped(
-    scope,
+    { ...scope, isAdmin },
     `SELECT a.*,
        COUNT(m.id)::int AS memory_count,
        MAX(m.created_at) AS last_memory_at
      FROM agents a
      LEFT JOIN memories m ON m.agent_id = a.id
-       AND m.namespace = ANY($1)
-       AND ${accessLevelSql('m.access_level', '$2')}
+       AND (($4::boolean AND m.client_id = a.api_key_id::text) OR (NOT $4::boolean AND m.client_id = $1))
+       AND m.namespace = ANY($2)
+       AND ${accessLevelSql('m.access_level', '$3')}
+     WHERE ($4::boolean OR a.api_key_id::text = $1)
      GROUP BY a.id
      ORDER BY a.last_seen_at DESC`,
-    [auth.namespaces, auth.maxAccessLevel]
+    [scope.keyId, auth.namespaces, auth.maxAccessLevel, isAdmin]
   );
   return res.rows;
 }
@@ -77,6 +79,9 @@ export async function resolveAgent(
   apiKeyId?: string,
   scope?: DbScope
 ): Promise<string> {
+  if (!scope) {
+    throw new Error('Agent resolution requires an authenticated database scope');
+  }
   const agent = await upsertAgent({
     name: agentName,
     type: agentType,

@@ -49,7 +49,7 @@ test('queryScoped wraps protected SQL in a transaction-local namespace/key scope
   const client = new FakeClient();
   setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
 
-  const scope: DbScope = { namespaces: ['financial,quarterly', 'shared'], keyId: 'key-1' };
+  const scope: DbScope = { namespaces: ['financial,quarterly', 'shared'], keyId: 'key-1', isAdmin: true };
   await queryScoped(scope, 'SELECT * FROM memories WHERE namespace = ANY($1)', [['shared']]);
 
   assert.deepEqual(
@@ -57,13 +57,15 @@ test('queryScoped wraps protected SQL in a transaction-local namespace/key scope
     [
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
-      "SELECT set_config('app.api_key_id', $1, true)",
+      "SELECT set_config('app.current_key_id', $1, true)",
+      "SELECT set_config('app.current_key_is_admin', $1, true)",
       'SELECT * FROM memories WHERE namespace = ANY($1)',
       'COMMIT',
     ]
   );
   assert.equal(client.calls[1].params?.[0], JSON.stringify(scope.namespaces));
   assert.equal(client.calls[2].params?.[0], scope.keyId);
+  assert.equal(client.calls[3].params?.[0], 'true');
   assert.deepEqual(client.releaseArgs, []);
 });
 
@@ -84,7 +86,8 @@ test('withScopedClient rolls back and reuses the connection after callback failu
     [
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
-      "SELECT set_config('app.api_key_id', $1, true)",
+      "SELECT set_config('app.current_key_id', $1, true)",
+      "SELECT set_config('app.current_key_is_admin', $1, true)",
       'ROLLBACK',
     ]
   );
@@ -107,7 +110,8 @@ test('withScopedClient rolls back and discards connections on commit failure', a
     [
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
-      "SELECT set_config('app.api_key_id', $1, true)",
+      "SELECT set_config('app.current_key_id', $1, true)",
+      "SELECT set_config('app.current_key_is_admin', $1, true)",
       'COMMIT',
       'ROLLBACK',
     ]

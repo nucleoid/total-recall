@@ -1,4 +1,4 @@
-import { BaseConnector } from '../base.js';
+import { BaseConnector, type ConnectorContext } from '../base.js';
 import type { MediaEventInput } from '../../media.js';
 import { getValidAccessToken } from './auth.js';
 import { toMediaEvent, type PlayHistoryObject } from './transform.js';
@@ -8,7 +8,7 @@ const RECENTLY_PLAYED_URL = 'https://api.spotify.com/v1/me/player/recently-playe
 export class SpotifyConnector extends BaseConnector {
   readonly service = 'spotify';
 
-  protected async fetchSince(since: Date | null): Promise<{
+  protected async fetchSince(since: Date | null, _ctx: ConnectorContext): Promise<{
     events: MediaEventInput[];
     cursor?: string;
   }> {

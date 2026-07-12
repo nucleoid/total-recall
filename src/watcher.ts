@@ -4,7 +4,6 @@ import path from 'path';
 import crypto from 'crypto';
 import { queryScoped, queryUnscoped, shutdown, type DbScope } from './db.js';
 import { embed } from './embedding.js';
-import { resolveAgent } from './agents.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -202,16 +201,6 @@ function debouncedProcess(filePath: string): void {
 }
 
 async function main() {
-  watcherAgentId = await resolveAgent(
-    'file-watcher',
-    'system',
-    undefined,
-    'total-recall-watcher',
-    undefined,
-    undefined,
-    WATCHER_SCOPE
-  );
-
   const watchPaths = WATCH_SPECS.flatMap(s => s.paths);
   console.log(`[watcher] Starting file sync watcher...`);
   console.log(`[watcher] Watching ${watchPaths.length} paths`);

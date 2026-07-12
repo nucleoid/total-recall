@@ -1,4 +1,4 @@
-import { BaseConnector } from '../base.js';
+import { BaseConnector, type ConnectorContext } from '../base.js';
 import type { MediaEventInput } from '../../media.js';
 import { loadCreds, plexHeaders } from './auth.js';
 import { getAccount, listServers, pickReachableUri, type PlexResource } from './discovery.js';
@@ -174,7 +174,7 @@ export async function fetchHistoryForServers(args: {
 export class PlexConnector extends BaseConnector {
   readonly service = 'plex';
 
-  protected async fetchSince(since: Date | null): Promise<{
+  protected async fetchSince(since: Date | null, _ctx: ConnectorContext): Promise<{
     events: MediaEventInput[];
     cursor?: string;
   }> {
