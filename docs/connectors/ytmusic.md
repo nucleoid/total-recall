@@ -74,7 +74,7 @@ Expected output:
 
 ### 6. Schedule
 
-Recommended: hourly. YouTube only retains a finite history window, but you only need to pull whatever's new since last_event_at.
+Recommended: hourly. YouTube only retains a finite history window, so each sync refetches the full `get_history()` window and lets database conflicts skip rows already stored.
 
 ```cron
 0 * * * * cd /home/fuego/projects/total-recall && /usr/bin/node dist/scripts/ytmusic-sync.js >> /tmp/ytmusic-sync.log 2>&1
@@ -108,6 +108,17 @@ YouTube Music often returns history positions as labels rather than exact
 instants. The connector accepts exact offset-aware ISO timestamps and these
 English bucket labels:
 
+- `Today` and `just now` -> 12:00 UTC on the current UTC date.
+- `Yesterday` -> 12:00 UTC on the previous UTC date.
+- `N minutes ago` and `N hours ago` -> the minute or hour boundary after
+  subtracting the offset from the sync time.
+- `N days ago` -> 12:00 UTC on the target UTC date.
+- `N weeks ago`, `last week`, and `a week ago` -> Wednesday 12:00 UTC of the
+  target Monday-based week.
+- `N months ago`, `last month`, and `a month ago` -> day 15 12:00 UTC of the
+  target calendar month.
+- `N years ago`, `last year`, and `a year ago` -> July 2 12:00 UTC of the
+  target calendar year.
 - `This week` -> Wednesday 12:00 UTC of the current Monday-based week.
 - `This month` -> day 15 12:00 UTC of the current month.
 - Full English month names and standard three-letter abbreviations -> day 15
@@ -120,10 +131,19 @@ The helper preserves the original label as `played_raw` and records
 metadata so downstream users can audit the approximation and the sync cursor
 does not advance from future-dated representatives.
 
-Incremental sync uses an overlapping cursor for coarse buckets. A new item in
-an already-seen bucket such as `This week` is still eligible for ingestion even
-when the bucket representative timestamp is equal to the previous cursor.
-Offset-aware exact timestamps continue to be filtered by `--since`.
+Sync intentionally does not pass `--since` to the Python helper and does not
+advance the generic `last_event_at` high-water mark. A new item in an
+already-seen bucket such as `Today` or `This week` remains eligible for
+ingestion even when its representative timestamp is equal to rows from a
+previous sync. This favors completeness over using coarse timestamps as an
+exclusive cursor.
+
+Label aging can still create approximate duplicates. For example, a play first
+seen as `Today` maps to that day at noon and maps to the same instant if it is
+seen as `Yesterday` the next day, but a later transition to `This week` or
+`This month` may map to a different bucket representative. The connector keeps
+the raw label and precision metadata so downstream dedupe policy can make that
+tradeoff explicitly.
 
 Unsupported localized or malformed labels are not guessed. The helper emits a
 structured `unparsable played bucket` diagnostic for the item and skips only
@@ -148,3 +168,5 @@ Each event rolls up to a summary memory like:
 **Headers stop working after a while** — YouTube Music sessions roll over occasionally (every few weeks typically). Re-capture and re-run `npm run ytmusic:auth-browser`.
 
 **Cron has no PATH for python3** — keep `YTMUSIC_PYTHON` set to the absolute venv path in `.env`.
+
+**Recovering from prior cursor misses** — run another normal sync. The connector now refetches the retained history window, so tracks that are still present in YouTube Music history can be picked up without resetting credentials or editing sync state.

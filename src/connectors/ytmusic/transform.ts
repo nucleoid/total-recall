@@ -53,6 +53,8 @@ function joinArtists(artists?: YtArtist[] | null): string | undefined {
 
 export function toMediaEvent(item: YtHistoryItem): MediaEventInput | null {
   if (!item.title || !item.played) return null;
+  const playedAt = new Date(item.played);
+  if (!Number.isFinite(playedAt.getTime())) return null;
 
   const durationSec = parseDurationSeconds(item);
   const durationMs = durationSec ? durationSec * 1000 : undefined;

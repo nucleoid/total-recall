@@ -23,6 +23,10 @@ function helperPath(): string {
   return join(here, '..', '..', '..', 'scripts', 'ytmusic_helper.py');
 }
 
+export function buildYtmusicFetchArgs(tokenPath: string): string[] {
+  return ['fetch', '--token-file', tokenPath];
+}
+
 interface ChildResult {
   stdout: string;
   stderr: string;
@@ -88,9 +92,10 @@ export class YtmusicConnector extends BaseConnector {
     await setConnectorCredentials(this.service, config);
   }
 
-  protected async fetchSince(since: Date | null, ctx: ConnectorContext): Promise<{
+  protected async fetchSince(_since: Date | null, ctx: ConnectorContext): Promise<{
     events: MediaEventInput[];
     cursor?: string;
+    advanceLastEventAt?: boolean;
   }> {
     const stored = await getConnectorCredentials(this.service);
     if (!stored) {
@@ -103,8 +108,7 @@ export class YtmusicConnector extends BaseConnector {
     try {
       await writeFile(tokenPath, JSON.stringify(stored));
 
-      const args = ['fetch', '--token-file', tokenPath];
-      if (since) args.push('--since', since.toISOString());
+      const args = buildYtmusicFetchArgs(tokenPath);
 
       const result = await runPython(args);
       if (result.code !== 0) {
@@ -131,7 +135,7 @@ export class YtmusicConnector extends BaseConnector {
       // syncs ("Today" → "Yesterday" the next day). Without extra dedup
       // we'd insert a fresh row every time a bucket rolls. Suppress any
       // event whose videoId already exists in media_events for this service.
-      if (events.length === 0) return { events };
+      if (events.length === 0) return { events, advanceLastEventAt: false };
 
       const videoIds = [...new Set(events.map((e) => e.service_id).filter(Boolean))] as string[];
       const existingRows = await queryScoped<{ service_id: string }>(
@@ -143,7 +147,7 @@ export class YtmusicConnector extends BaseConnector {
       const seen = new Set(existingRows.rows.map((r) => r.service_id));
       const fresh = events.filter((e) => e.service_id && !seen.has(e.service_id));
 
-      return { events: fresh };
+      return { events: fresh, advanceLastEventAt: false };
     } finally {
       // We also read the file back so the Python helper's refreshed token
       // is captured even if it didn't emit the stderr notice (some
