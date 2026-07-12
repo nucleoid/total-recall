@@ -4,7 +4,9 @@ import path from 'path';
 import crypto from 'crypto';
 import { queryUnscoped, shutdown } from './db.js';
 import { embed } from './embedding.js';
-import { commitPreparedFile, prepareChunks } from './watcher/sync.js';
+import { commitIfCurrent, commitPreparedFile, prepareChunks } from './watcher/sync.js';
+import { PathWorkQueue, type PathWork } from './watcher/queue.js';
+import { shutdownWatcher } from './watcher/lifecycle.js';
 import { upsertSystemAgent } from './agents.js';
 import dotenv from 'dotenv';
 
@@ -129,7 +131,16 @@ async function getStoredHash(filePath: string): Promise<string | null> {
   return res.rows[0]?.content_hash ?? null;
 }
 
-async function processFile(filePath: string): Promise<void> {
+function fingerprintFile(filePath: string): Promise<string | null> {
+  return fs.promises.readFile(filePath, 'utf8')
+    .then((content) => crypto.createHash('sha256').update(content).digest('hex'))
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+}
+
+async function processFile(filePath: string, work: PathWork): Promise<void> {
   if (shouldExclude(filePath)) return;
 
   const spec = resolveSpec(filePath);
@@ -147,30 +158,24 @@ async function processFile(filePath: string): Promise<void> {
   const chunks = chunkMarkdown(content, spec.source, relPath);
   const preparedChunks = await prepareChunks(chunks, embed);
 
-  await commitPreparedFile({
-    relPath,
-    hash,
-    namespace: spec.namespace,
-    source: spec.source,
-    agentId: watcherAgentId,
-    chunks: preparedChunks,
+  const committed = await commitIfCurrent({
+    filePath,
+    preparedFingerprint: hash,
+    readFingerprint: fingerprintFile,
+    work,
+    commit: async () => {
+      await commitPreparedFile({
+        relPath,
+        hash,
+        namespace: spec.namespace,
+        source: spec.source,
+        agentId: watcherAgentId,
+        chunks: preparedChunks,
+      });
+      return true;
+    },
   });
-  console.log(`Synced ${relPath}: ${preparedChunks.length} chunks`);
-}
-
-const pending = new Map<string, NodeJS.Timeout>();
-
-function debouncedProcess(filePath: string): void {
-  const existing = pending.get(filePath);
-  if (existing) clearTimeout(existing);
-  pending.set(filePath, setTimeout(async () => {
-    pending.delete(filePath);
-    try {
-      await processFile(filePath);
-    } catch (err) {
-      console.error(`Error processing ${filePath}:`, err);
-    }
-  }, 500));
+  if (committed) console.log(`Synced ${relPath}: ${preparedChunks.length} chunks`);
 }
 
 async function main() {
@@ -185,6 +190,7 @@ async function main() {
   console.log(`[watcher] Starting file sync watcher...`);
   console.log(`[watcher] Watching ${watchPaths.length} paths`);
 
+  const queue = new PathWorkQueue(processFile);
   const watcher = chokidar.watch(watchPaths, {
     persistent: true,
     ignoreInitial: false,
@@ -193,16 +199,27 @@ async function main() {
   });
 
   watcher
-    .on('add', (fp) => debouncedProcess(fp))
-    .on('change', (fp) => debouncedProcess(fp))
+    .on('add', (fp) => queue.enqueue(fp))
+    .on('change', (fp) => queue.enqueue(fp))
+    // #27 will reconcile deletion; queueing now makes unlink/add storms converge on final state.
+    .on('unlink', (fp) => queue.enqueue(fp))
     .on('ready', () => console.log('[watcher] Initial scan complete. Watching for changes...'))
     .on('error', (err) => console.error('[watcher] Error:', err));
 
   const graceful = async () => {
     console.log('[watcher] Shutting down...');
-    await watcher.close();
-    await shutdown();
-    process.exit(0);
+    try {
+      await shutdownWatcher({
+        closeWatcher: () => watcher.close(),
+        queue,
+        shutdownDatabase: shutdown,
+        timeoutMs: 30_000,
+      });
+      process.exit(0);
+    } catch (error) {
+      console.error('[watcher] Graceful shutdown failed:', error);
+      process.exit(1);
+    }
   };
   process.on('SIGINT', graceful);
   process.on('SIGTERM', graceful);
