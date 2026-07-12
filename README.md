@@ -273,9 +273,16 @@ Key files are monitored for changes, diffed by content hash, chunked, and upsert
 - `memory/*.md` (daily logs) → `personal` + `projects`
 - Cortex content: `journals/`, `concepts/`, `projects/`, `documents/` → mixed namespaces
 
+**Workspace setup:**
+- Set `OPENCLAW_WORKSPACE` to an existing workspace directory (for example, `C:\Users\me\.openclaw\workspace` on Windows). Relative values resolve from the watcher process's working directory.
+- If the variable is absent, the watcher retains the Linux compatibility default `/home/fuego/.openclaw/workspace`; a blank value or missing/non-directory root fails startup. Optional files and child directories may be absent.
+- Restart the watcher after changing the root. Existing `file-sync` rows are not rewritten or removed, so audit/back up rows before changing an established root and stop duplicate watcher instances first.
+
 **Sync mechanics:**
-- `sync_state` table tracks `file_path → content_hash`
+- `sync_state` table tracks `file_path → content_hash` using `/`-separated, workspace-relative identities on every OS. The same portable identity is used for metadata and source keys.
+- Native absolute paths are used only for filesystem access and Chokidar.
 - On change: re-chunk, re-embed, **upsert** (deterministic ID from `source_file + heading_path`)
+- Symlinks are followed. Containment is lexical rather than a security boundary: a symlink below the workspace may point outside it.
 - No duplicates, no stale entries
 
 ### Pre-Seed (one-time bulk import)

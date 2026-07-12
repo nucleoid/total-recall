@@ -2,6 +2,13 @@ import chokidar from 'chokidar';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import {
+  buildWatchSpecs,
+  exclusionReason,
+  matchWatchSpec,
+  resolveWorkspaceFile,
+  resolveWorkspaceRoot,
+} from './watcher/paths.js';
 import { queryUnscoped, shutdown } from './db.js';
 import { embed } from './embedding.js';
 import { commitIfCurrent, commitPreparedFile, prepareChunks } from './watcher/sync.js';
@@ -12,44 +19,11 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const WORKSPACE = '/home/fuego/.openclaw/workspace';
-const CORTEX_CONTENT = path.join(WORKSPACE, 'projects/cortex/content');
-interface WatchSpec {
-  paths: string[];
-  namespace: string;
-  source: string;
-}
+const WORKSPACE = resolveWorkspaceRoot(process.env.OPENCLAW_WORKSPACE, fs.statSync);
+const WATCH_SPECS = buildWatchSpecs(WORKSPACE);
 
-const WATCH_SPECS: WatchSpec[] = [
-  { paths: [path.join(WORKSPACE, 'MEMORY.md')], namespace: 'personal', source: 'openclaw-memory' },
-  { paths: [path.join(WORKSPACE, 'USER.md')], namespace: 'personal', source: 'openclaw-user' },
-  { paths: [path.join(WORKSPACE, 'IDENTITY.md')], namespace: 'personal', source: 'openclaw-identity' },
-  { paths: [path.join(WORKSPACE, 'TOOLS.md')], namespace: 'projects', source: 'openclaw-tools' },
-  { paths: [path.join(WORKSPACE, 'HEARTBEAT.md')], namespace: 'projects', source: 'openclaw-heartbeat' },
-  { paths: [path.join(WORKSPACE, 'AGENTS.md')], namespace: 'projects', source: 'openclaw-agents' },
-  { paths: [path.join(WORKSPACE, 'memory')], namespace: 'personal', source: 'openclaw-daily' },
-  { paths: [path.join(CORTEX_CONTENT, 'journals')], namespace: 'personal', source: 'cortex-journal' },
-  { paths: [path.join(CORTEX_CONTENT, 'concepts')], namespace: 'projects', source: 'cortex-concept' },
-  { paths: [path.join(CORTEX_CONTENT, 'projects')], namespace: 'projects', source: 'cortex-project' },
-  { paths: [path.join(CORTEX_CONTENT, 'documents')], namespace: 'shared', source: 'cortex-document' },
-];
-
-function resolveSpec(filePath: string): { namespace: string; source: string } | null {
-  const abs = path.resolve(filePath);
-  for (const spec of WATCH_SPECS) {
-    for (const p of spec.paths) {
-      if (abs === p || abs.startsWith(p + '/')) {
-        return { namespace: spec.namespace, source: spec.source };
-      }
-    }
-  }
-  return null;
-}
-
-function shouldExclude(filePath: string): boolean {
-  if (!filePath.endsWith('.md')) return true;
-  if (path.basename(filePath).startsWith('.env')) return true;
-  if (filePath.includes('/deliverables/') || filePath.includes('/DELIVERABLE')) return true;
+function shouldExclude(filePath: string, relPath: string): boolean {
+  if (exclusionReason(relPath.split('/').join(path.sep))) return true;
   try {
     const stat = fs.statSync(filePath);
     if (stat.size > 1_000_000) return true;
@@ -141,16 +115,16 @@ function fingerprintFile(filePath: string): Promise<string | null> {
 }
 
 async function processFile(filePath: string, work: PathWork): Promise<void> {
-  if (shouldExclude(filePath)) return;
-
-  const spec = resolveSpec(filePath);
+  const spec = matchWatchSpec(filePath, WATCH_SPECS);
   if (!spec) return;
 
-  const content = fs.readFileSync(filePath, 'utf-8');
-  if (content.includes('DELIVERABLE')) return;
+  const identity = resolveWorkspaceFile(WORKSPACE, filePath);
+  const { absolutePath, relativePath: relPath } = identity;
+  if (shouldExclude(absolutePath, relPath)) return;
 
+  const content = fs.readFileSync(absolutePath, 'utf-8');
+  if (content.includes('DELIVERABLE')) return;
   const hash = crypto.createHash('sha256').update(content).digest('hex');
-  const relPath = path.relative(WORKSPACE, filePath);
 
   const storedHash = await getStoredHash(relPath);
   if (storedHash === hash) return;
@@ -159,7 +133,7 @@ async function processFile(filePath: string, work: PathWork): Promise<void> {
   const preparedChunks = await prepareChunks(chunks, embed);
 
   const committed = await commitIfCurrent({
-    filePath,
+    filePath: absolutePath,
     preparedFingerprint: hash,
     readFingerprint: fingerprintFile,
     work,
@@ -186,7 +160,7 @@ async function main() {
   });
   watcherAgentId = watcherAgent.id;
 
-  const watchPaths = WATCH_SPECS.flatMap(s => s.paths);
+  const watchPaths = WATCH_SPECS.map(spec => spec.path);
   console.log(`[watcher] Starting file sync watcher...`);
   console.log(`[watcher] Watching ${watchPaths.length} paths`);
 
@@ -198,11 +172,12 @@ async function main() {
     awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
   });
 
+  const enqueue = (filePath: string) => queue.enqueue(resolveWorkspaceFile(WORKSPACE, filePath).absolutePath);
   watcher
-    .on('add', (fp) => queue.enqueue(fp))
-    .on('change', (fp) => queue.enqueue(fp))
+    .on('add', enqueue)
+    .on('change', enqueue)
     // #27 will reconcile deletion; queueing now makes unlink/add storms converge on final state.
-    .on('unlink', (fp) => queue.enqueue(fp))
+    .on('unlink', enqueue)
     .on('ready', () => console.log('[watcher] Initial scan complete. Watching for changes...'))
     .on('error', (err) => console.error('[watcher] Error:', err));
 
