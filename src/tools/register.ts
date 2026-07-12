@@ -64,12 +64,12 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_store_document',
-    description: 'Store a document by chunking it and embedding each chunk. Supports markdown (splits on ## headings) and plain text (splits on paragraphs).',
+    description: 'Store up to 1 MiB of decoded UTF-8 document content. Markdown headings and paragraph boundaries are preferred; every lossless embedding chunk is at most 2,000 UTF-8 bytes.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         title: { type: 'string', description: 'Document title' },
-        content: { type: 'string', description: 'Full document content' },
+        content: { type: 'string', description: 'Nonblank document content (maximum 1 MiB decoded UTF-8; embedded losslessly in chunks of at most 2,000 UTF-8 bytes)' },
         namespace: { type: 'string', description: 'Namespace (default: shared)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags for categorization' },
         source: { type: 'string', description: 'Source identifier (default: manual)' },

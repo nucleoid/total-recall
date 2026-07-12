@@ -76,6 +76,15 @@ Store a memory with automatic embedding.
 
 The API key's `max_access_level` must be greater than or equal to the requested `access_level`. Reads compare ranks as `normal < sensitive < secret`; rows above the key ceiling are excluded from search, recall, list, namespace counts, stats, and agent memory counts before pagination or aggregation. Null legacy memory values are treated as `normal`; unknown legacy labels fail closed and are not visible to any key.
 
+### memory_store_document
+Store a nonblank document of at most **1 MiB decoded UTF-8**. Chunking prefers markdown heading and paragraph boundaries, then hard-splits on Unicode code-point boundaries. It is lossless and every embedding chunk is at most **2,000 UTF-8 bytes**. MCP and REST use the same decoded-content schema; an HTTP transport may independently reject an oversized JSON envelope before schema validation.
+- title: string (required)
+- content: string (required)
+- namespace?: string (default `shared`)
+- source?: string (default `manual`)
+- tags?: string[]
+- idempotency_key?: string
+
 ### memory_search
 Hybrid vector + full-text search.
 - query: string (required)

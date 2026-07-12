@@ -6,12 +6,24 @@ import { embed } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 
-const MAX_DOCUMENT_CONTENT_LENGTH = 1_000_000;
-const MAX_DOCUMENT_CHUNKS = 500;
+export const MAX_DOCUMENT_CONTENT_BYTES = 1024 * 1024;
+export const MAX_DOCUMENT_CHUNK_BYTES = 2_000;
+// Greedy packing can create at most two chunks per chunk-sized span, plus one.
+const MAX_DOCUMENT_CHUNKS = Math.ceil((MAX_DOCUMENT_CONTENT_BYTES * 2) / MAX_DOCUMENT_CHUNK_BYTES) + 1;
 
 export const storeDocumentSchema = z.object({
   title: z.string().min(1),
-  content: z.string().min(1).max(MAX_DOCUMENT_CONTENT_LENGTH),
+  content: z.string().superRefine((value, ctx) => {
+    if (value.trim().length === 0) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Document content must contain non-whitespace text' });
+    }
+    if (Buffer.byteLength(value, 'utf8') > MAX_DOCUMENT_CONTENT_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Document content must not exceed 1 MiB of decoded UTF-8',
+      });
+    }
+  }),
   namespace: z.string().default('shared'),
   tags: z.array(z.string()).default([]),
   source: z.string().default('manual'),
@@ -42,74 +54,84 @@ export function isStoreDocumentConflictError(err: unknown): err is StoreDocument
     (typeof err === 'object' && err !== null && (err as { statusCode?: unknown }).statusCode === 409);
 }
 
-function chunkMarkdown(content: string): string[] {
-  const lines = content.split('\n');
+function preferredBoundaryOffsets(content: string): number[] {
+  const offsets = new Set<number>([0, content.length]);
+
+  // Keep paragraph separators with the paragraph before them.
+  for (const match of content.matchAll(/(?:\r?\n[\t ]*){2,}/g)) {
+    offsets.add(match.index + match[0].length);
+  }
+
+  // A heading starts a preferred segment; its preceding newline stays untouched.
+  for (const match of content.matchAll(/(?:^|\r?\n)(?=#{1,6}[\t ])/gm)) {
+    offsets.add(match.index + match[0].length);
+  }
+
+  return [...offsets].sort((a, b) => a - b);
+}
+
+function hardSplitByUtf8Bytes(value: string, maxBytes: number): string[] {
+  const pieces: string[] = [];
+  let current = '';
+  let currentBytes = 0;
+
+  for (const codePoint of value) {
+    const codePointBytes = Buffer.byteLength(codePoint, 'utf8');
+    if (current && currentBytes + codePointBytes > maxBytes) {
+      pieces.push(current);
+      current = '';
+      currentBytes = 0;
+    }
+    current += codePoint;
+    currentBytes += codePointBytes;
+  }
+  if (current) pieces.push(current);
+  return pieces;
+}
+
+/** Losslessly chunks content, preferring markdown/paragraph boundaries. */
+export function chunkDocumentContent(content: string): string[] {
+  if (content.length === 0) return [];
+
+  const offsets = preferredBoundaryOffsets(content);
   const chunks: string[] = [];
-  let current: string[] = [];
+  let current = '';
+  let currentBytes = 0;
 
   const flush = () => {
-    const text = current.join('\n').trim();
-    if (text) chunks.push(text);
-    current = [];
+    if (current) chunks.push(current);
+    current = '';
+    currentBytes = 0;
   };
 
-  for (const line of lines) {
-    if (/^## /.test(line) && current.length > 0) {
-      flush();
-    }
-    current.push(line);
+  for (let i = 1; i < offsets.length; i++) {
+    const segment = content.slice(offsets[i - 1], offsets[i]);
+    const segmentBytes = Buffer.byteLength(segment, 'utf8');
 
-    // If chunk getting too large, split on ### too
-    const currentText = current.join('\n');
-    if (currentText.length > 2000 && /^### /.test(line) && current.length > 1) {
-      current.pop();
-      flush();
-      current.push(line);
+    if (currentBytes + segmentBytes <= MAX_DOCUMENT_CHUNK_BYTES) {
+      current += segment;
+      currentBytes += segmentBytes;
+      continue;
+    }
+
+    flush();
+    const pieces = hardSplitByUtf8Bytes(segment, MAX_DOCUMENT_CHUNK_BYTES);
+    for (let j = 0; j < pieces.length; j++) {
+      const piece = pieces[j];
+      if (j < pieces.length - 1) {
+        chunks.push(piece);
+      } else {
+        current = piece;
+        currentBytes = Buffer.byteLength(piece, 'utf8');
+      }
     }
   }
   flush();
 
-  // Split any remaining oversized chunks
-  const result: string[] = [];
-  for (const chunk of chunks) {
-    if (chunk.length <= 2000) {
-      result.push(chunk);
-    } else {
-      const paras = chunk.split(/\n\n+/);
-      let buf = '';
-      for (const p of paras) {
-        if (buf && (buf.length + p.length) > 2000) {
-          result.push(buf.trim());
-          buf = '';
-        }
-        buf += (buf ? '\n\n' : '') + p;
-      }
-      if (buf.trim()) result.push(buf.trim());
-    }
+  if (chunks.some((chunk) => chunk.length === 0 || Buffer.byteLength(chunk, 'utf8') > MAX_DOCUMENT_CHUNK_BYTES)) {
+    throw new Error('Document chunking produced an invalid embedding chunk');
   }
-  return result;
-}
-
-function chunkPlainText(content: string): string[] {
-  const paras = content.split(/\n\n+/);
-  const chunks: string[] = [];
-  let buf = '';
-
-  for (const p of paras) {
-    if (buf && (buf.length + p.length) > 2000) {
-      chunks.push(buf.trim());
-      buf = '';
-    }
-    buf += (buf ? '\n\n' : '') + p;
-  }
-  if (buf.trim()) chunks.push(buf.trim());
   return chunks;
-}
-
-function chunkContent(content: string): string[] {
-  const isMarkdown = /^#{1,3} /m.test(content);
-  const chunks = isMarkdown ? chunkMarkdown(content) : chunkPlainText(content);
-  return chunks.length > 0 ? chunks : [content];
 }
 
 function normalizeTags(tags: string[]): string[] {
@@ -181,6 +203,8 @@ export async function memoryStoreDocument(
   params: StoreDocumentParams,
   auth: AuthContext
 ): Promise<StoredDocumentResult> {
+  // Keep direct callers on the same decoded-content contract as MCP and REST.
+  params = storeDocumentSchema.parse(params);
   checkPermission(auth, 'write');
 
   const ns = params.namespace;
@@ -189,7 +213,7 @@ export async function memoryStoreDocument(
     throw new Error(`Access denied to namespace '${ns}'`);
   }
 
-  const chunks = chunkContent(params.content);
+  const chunks = chunkDocumentContent(params.content);
   if (chunks.length > MAX_DOCUMENT_CHUNKS) {
     throw new Error(`Document has too many chunks (${chunks.length}); maximum is ${MAX_DOCUMENT_CHUNKS}`);
   }

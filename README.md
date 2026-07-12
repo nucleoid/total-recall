@@ -153,7 +153,7 @@ Store a single memory/fact with metadata. Optionally track which agent stored it
 `access_level` defaults to `normal` and may be `normal`, `sensitive`, or `secret`. The caller's API key must have a `max_access_level` at least as high as the memory being stored.
 
 ### `memory_store_document`
-Chunk and store a full document. Auto-splits by headings (markdown) or paragraphs (plain text), embeds each chunk, links them with a shared `document_id` for full-doc retrieval.
+Chunk and store a full document. Content must contain non-whitespace text and is limited to **1 MiB of decoded UTF-8**. Chunking prefers markdown headings and paragraph boundaries, then splits on Unicode code-point boundaries so every embedding chunk is at most **2,000 UTF-8 bytes** without dropping or changing source text. Chunks share a `document_id` for full-document retrieval.
 ```json
 {
   "title": "NZ Tax Residency Rules",
@@ -163,7 +163,7 @@ Chunk and store a full document. Auto-splits by headings (markdown) or paragraph
   "source": "manual"
 }
 ```
-Document chunks are stored with `normal` access unless document classification is added in a later schema/API change.
+Document chunks are stored with `normal` access unless document classification is added in a later schema/API change. The decoded limit is enforced consistently by the MCP and REST schemas (400 for invalid decoded content). HTTP JSON envelope limits are independent and can reject a request earlier with 413; this change does not raise the server's transport parser limit.
 
 ### `memory_search`
 Hybrid semantic + keyword search with filters. Every search is logged as a recall trace with timing data.
