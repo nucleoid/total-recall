@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type pg from 'pg';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { setPoolForTesting } from '../../src/db.js';
 import { resolveWorkspaceFile } from '../../src/watcher/paths.js';
 import {
@@ -9,6 +10,7 @@ import {
   prepareChunks,
   type FileSyncInput,
 } from '../../src/watcher/sync.js';
+import { chunkMarkdown } from '../../src/watcher/chunking.js';
 
 type Call = { text: string; params?: unknown[] };
 
@@ -194,6 +196,62 @@ test('concurrent files receive independent transaction-local namespace scopes', 
   );
   assert.deepEqual(configured, [JSON.stringify(['personal']), JSON.stringify(['projects'])]);
   assert.notEqual(personal.pid, projects.pid);
+});
+
+test('a never-synced CRLF file embeds and stores only body content with parsed tags', async () => {
+  const content = '---\r\ntags: [alpha, beta]\r\n---\r\nBody content long enough to sync.\r\n';
+  const embedded: string[] = [];
+  const chunks = await prepareChunks(
+    chunkMarkdown(content, 'test-source', 'notes/crlf.md'),
+    async (value) => { embedded.push(value); return [0.1]; }
+  );
+  const client = new TransactionClient(501);
+  client.committedHash = null;
+  setPoolForTesting(new SequencedPool([client]) as unknown as pg.Pool);
+
+  await commitPreparedFile({
+    relPath: 'notes/crlf.md',
+    hash: crypto.createHash('sha256').update(content).digest('hex'),
+    namespace: 'projects',
+    source: 'test-source',
+    agentId: 'agent-1',
+    chunks,
+  });
+
+  assert.deepEqual(embedded, ['Body content long enough to sync.']);
+  assert.deepEqual([...client.committed.values()], embedded);
+  const memoryCall = client.calls.find(({ text }) => text.includes('INSERT INTO memories'));
+  assert.deepEqual(memoryCall?.params?.[4], ['alpha', 'beta']);
+  assert.doesNotMatch(embedded[0], /---|tags:/);
+});
+
+test('corrected parsing deterministically replaces a previously stored raw-frontmatter root chunk', async () => {
+  const lf = '---\ntags: [corrected]\n---\nBody content long enough to sync.\n';
+  const crlf = lf.replaceAll('\n', '\r\n');
+  const hash = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+  assert.notEqual(hash(lf), hash(crlf));
+  assert.equal(hash(crlf), hash(crlf));
+
+  const client = new TransactionClient(502);
+  client.committed.set('file-sync:notes/corrected.md:(root)', crlf.trim());
+  setPoolForTesting(new SequencedPool([client, client]) as unknown as pg.Pool);
+
+  for (const content of [lf, crlf]) {
+    const chunks = await prepareChunks(
+      chunkMarkdown(content, 'test-source', 'notes/corrected.md'),
+      async () => [0.2]
+    );
+    await commitPreparedFile({
+      relPath: 'notes/corrected.md',
+      hash: hash(content),
+      namespace: 'projects',
+      source: 'test-source',
+      agentId: 'agent-1',
+      chunks,
+    });
+    assert.equal(client.committedHash, hash(content));
+    assert.equal(client.committed.get('file-sync:notes/corrected.md:(root)'), 'Body content long enough to sync.');
+  }
 });
 
 test('zero-chunk files advance sync state without requiring DELETE authority', async () => {
