@@ -525,6 +525,10 @@ Deploy server support for `memory_store.idempotency_key` before deploying the ne
 
 `memory_store.idempotency_key` identity is scoped only by the authenticated API key, not by namespace. Reusing a key updates the original row and preserves `created_at`; when the API key is authorized for both the old and new namespaces, this may intentionally move the memory and update its access level. If the existing row is outside the caller's namespace grants, the operation returns the same access-denied error without revealing whether the key already exists.
 
+## Contributor note: stdio output
+
+`src/index.ts` is the stdio MCP entry point. Standard output is reserved exclusively for MCP JSON-RPC transport messages; startup and runtime diagnostics from the entry point and every module it imports must use standard error.
+
 ## Development Status
 
 - [x] PostgreSQL + pgvector setup, schema, basic CRUD

@@ -44,6 +44,12 @@ const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'nomic-embed-text';
 const useGemini = !!GEMINI_API_KEY;
 
+if (useGemini) {
+  console.error(`[embedding] Using Gemini API (${EMBEDDING_MODEL}, ${EMBEDDING_DIMENSIONS}d)`);
+} else {
+  console.error(`[embedding] No GEMINI_API_KEY found, falling back to Ollama (${OLLAMA_MODEL})`);
+}
+
 async function embedGemini(text: string): Promise<number[]> {
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${GEMINI_API_KEY}`, {
     method: 'POST',
