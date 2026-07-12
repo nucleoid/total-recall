@@ -409,6 +409,18 @@ This command uses `CREATE UNIQUE INDEX CONCURRENTLY` on `(client_id, namespace, 
 | `shared` | General knowledge, non-sensitive | All agents |
 | `media` | Viewing/listening history rollups from connectors | Home agents |
 
+Media rollups have exactly one kind tag: `music`, `tv`, `movie`, or `unknown`. Classification uses trusted Plex type metadata first, canonical artist/show/episode fields next, and Spotify/YouTube Music play semantics after that; generic events are `unknown` rather than assumed movies. Existing linked rollups can be inspected and optionally repaired without re-embedding content:
+
+```bash
+npm run media:repair-tags -- --dry-run --max-rows 10000
+# Back up/review first, then apply in bounded batches:
+npm run media:repair-tags -- --apply --confirm-backup --batch-size 500 --max-rows 10000
+# If limitReached is true, continue from the returned opaque nextCursor:
+npm run media:repair-tags -- --apply --confirm-backup --batch-size 500 --max-rows 10000 --cursor '<nextCursor>'
+```
+
+Apply refuses to start without `--confirm-backup`: the repair replaces the complete generated tag array from each linked source event, permanently removing custom tags unless they are restored from that backup. It leaves unlinked and non-media-source memories untouched. Continue promptly with each returned `nextCursor` until `limitReached` is false and `nextCursor` is null; until then, repaired and legacy classification tags coexist. The operation is idempotent, and restarting without a cursor safely rescans from the beginning.
+
 ## Security Model
 
 Access levels are enforced in addition to namespace ACLs. Each key has `max_access_level` (`normal < sensitive < secret`); search, recall, list, namespace counts, stats, and agent memory counts hide rows above that ceiling before pagination or aggregation.

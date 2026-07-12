@@ -153,6 +153,8 @@ Each event rolls up to a summary memory like:
 
 > Listened to "Punisher" by Phoebe Bridgers from "Punisher" on 2026-05-22 via ytmusic.
 
+Every rollup has one exclusive media-kind tag. YouTube Music `play` events are tagged `music` even if artist metadata is missing; events without trusted service or canonical field evidence use `unknown` rather than defaulting to `movie`.
+
 ## Troubleshooting
 
 **`ytmusicapi not installed`** — install into the venv and set `YTMUSIC_PYTHON` to its python3 binary.
