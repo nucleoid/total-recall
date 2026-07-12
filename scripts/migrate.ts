@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
 import dotenv from 'dotenv';
 
@@ -14,6 +15,68 @@ const OWNER_REQUIRED_MIGRATIONS: Record<string, Record<string, string[]>> = {
     recall_traces: ['SELECT', 'INSERT'],
   },
 };
+
+export type MigrationFile = {
+  file: string;
+  version: string;
+  number: number;
+  bytes: Buffer;
+  checksum: string;
+  sql: string;
+};
+
+const MIGRATION_FILENAME = /^(\d{3})_([a-z0-9]+(?:_[a-z0-9]+)*)\.sql$/;
+const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
+const MAX_LOCK_TIMEOUT_MS = 600_000;
+
+export function loadMigrationInventory(migrationsDir: string): MigrationFile[] {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const migrations: MigrationFile[] = [];
+  const numbers = new Map<string, string>();
+
+  for (const file of readdirSync(migrationsDir).filter(name => name.endsWith('.sql'))) {
+    const match = MIGRATION_FILENAME.exec(file);
+    if (!match) {
+      throw new Error(`Invalid migration filename "${file}"; expected NNN_lowercase_name.sql`);
+    }
+    const [, numericPrefix] = match;
+    const existing = numbers.get(numericPrefix);
+    if (existing) {
+      throw new Error(`Duplicate migration number ${numericPrefix}: ${existing} and ${file}`);
+    }
+    numbers.set(numericPrefix, file);
+
+    const bytes = readFileSync(join(migrationsDir, file));
+    let sql: string;
+    try {
+      sql = decoder.decode(bytes);
+    } catch {
+      throw new Error(`Migration ${file} is not valid UTF-8`);
+    }
+    migrations.push({
+      file,
+      version: file.slice(0, -'.sql'.length),
+      number: Number(numericPrefix),
+      bytes,
+      checksum: createHash('sha256').update(bytes).digest('hex'),
+      sql,
+    });
+  }
+
+  return migrations.sort((left, right) => left.number - right.number);
+}
+
+export function parseMigrationLockTimeout(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_LOCK_TIMEOUT_MS;
+  if (!/^\d+$/.test(value)) {
+    throw new Error('MIGRATION_LOCK_TIMEOUT_MS must be an integer from 1 to 600000');
+  }
+  const timeout = Number(value);
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > MAX_LOCK_TIMEOUT_MS) {
+    throw new Error('MIGRATION_LOCK_TIMEOUT_MS must be an integer from 1 to 600000');
+  }
+  return timeout;
+}
 
 type CurrentRole = {
   currentUser: string;
@@ -40,18 +103,23 @@ async function rejectRuntimeMigrationRole(client: pg.Client): Promise<void> {
   );
 }
 
-async function ensureSchemaMigrationsTable(client: pg.Client): Promise<void> {
+async function schemaMigrationsTableExists(client: pg.Client): Promise<boolean> {
   const existing = await client.query<{ regclass: string | null }>(
-    "SELECT to_regclass('public.schema_migrations')::text AS regclass"
+    "SELECT to_regclass('public.schema_migrations')::text AS regclass",
   );
-  if (existing.rows[0]?.regclass) return;
+  return existing.rows[0]?.regclass !== null;
+}
 
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version TEXT PRIMARY KEY,
-      applied_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
+async function ensureSchemaMigrationsTable(client: pg.Client): Promise<void> {
+  if (!(await schemaMigrationsTableExists(client))) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version TEXT PRIMARY KEY,
+        applied_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+  }
+  await client.query('ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT');
 }
 
 async function hasGrantOption(client: pg.Client, relation: string, privilege: string): Promise<boolean> {
@@ -111,34 +179,136 @@ async function assertCanGrantForMigration(
   );
 }
 
-async function migrate() {
-  const connectionString = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL;
-  if (!connectionString) {
-    throw new Error('MIGRATION_DATABASE_URL or DATABASE_URL must be set');
-  }
+const MIGRATION_LOCK_KEY_1 = 1_414_676_812;
+const MIGRATION_LOCK_KEY_2 = 1_296_650_834;
+const CHECKSUM_PATTERN = /^[0-9a-f]{64}$/;
 
-  const client = new pg.Client({ connectionString });
-  await client.connect();
+export type MigrationRunOptions = {
+  lockTimeoutMs: number;
+  signal?: AbortSignal;
+  log?: (message: string) => void;
+  warn?: (message: string) => void;
+};
+
+function interrupted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new Error('Migration interrupted by signal');
+}
+
+async function acquireMigrationLock(client: pg.Client, options: MigrationRunOptions): Promise<void> {
+  const started = Date.now();
+  options.log?.(`Waiting up to ${options.lockTimeoutMs}ms for migration advisory lock...`);
+  while (true) {
+    interrupted(options.signal);
+    const result = await client.query<{ acquired: boolean }>(
+      'SELECT pg_try_advisory_lock($1, $2) AS acquired',
+      [MIGRATION_LOCK_KEY_1, MIGRATION_LOCK_KEY_2],
+    );
+    if (result.rows[0]?.acquired) {
+      options.log?.('Migration advisory lock acquired.');
+      return;
+    }
+    const remaining = options.lockTimeoutMs - (Date.now() - started);
+    if (remaining <= 0) {
+      throw new Error(`Timed out waiting for migration advisory lock after ${options.lockTimeoutMs}ms`);
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining)));
+  }
+}
+
+type LedgerRow = { version: string; checksum: string | null };
+
+export async function runMigrations(
+  client: pg.Client,
+  migrations: MigrationFile[],
+  options: MigrationRunOptions,
+): Promise<void> {
+  const byVersion = new Map(migrations.map(migration => [migration.version, migration]));
+  let lockAcquired = false;
+  let failed = false;
 
   try {
+    await acquireMigrationLock(client, options);
+    lockAcquired = true;
+    interrupted(options.signal);
     await rejectRuntimeMigrationRole(client);
+    if (await schemaMigrationsTableExists(client)) {
+      const existingVersions = await client.query<{ version: string }>(
+        'SELECT version FROM schema_migrations ORDER BY version',
+      );
+      const appliedVersions = new Set(existingVersions.rows.map(row => row.version));
+      for (const migration of migrations) {
+        const ownerRequired = OWNER_REQUIRED_MIGRATIONS[migration.version];
+        if (ownerRequired && !appliedVersions.has(migration.version)) {
+          await assertCanGrantForMigration(client, migration.version, migration.file, ownerRequired);
+        }
+      }
+    }
     await ensureSchemaMigrationsTable(client);
 
-    const applied = await client.query('SELECT version FROM schema_migrations ORDER BY version');
-    const appliedSet = new Set(applied.rows.map((r: any) => r.version));
+    const applied = await client.query<LedgerRow>(
+      'SELECT version, checksum FROM schema_migrations ORDER BY version',
+    );
+    for (const row of applied.rows) {
+      const migration = byVersion.get(row.version);
+      if (!migration) {
+        throw new Error(`Unknown applied migration ${row.version}: no exact migration file exists`);
+      }
+      if (row.checksum !== null && !CHECKSUM_PATTERN.test(row.checksum)) {
+        throw new Error(`Malformed checksum for applied migration ${row.version}`);
+      }
+      if (row.checksum !== null && row.checksum !== migration.checksum) {
+        throw new Error(`Checksum mismatch for applied migration ${row.version}`);
+      }
+    }
 
-    const migrationsDir = join(__dirname, '..', 'migrations');
-    const files = readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+    const appliedSet = new Set(applied.rows.map(row => row.version));
+    const maxAppliedNumber = applied.rows.reduce(
+      (maximum, row) => Math.max(maximum, byVersion.get(row.version)!.number),
+      -1,
+    );
+    const outOfOrder = migrations.find(
+      migration => !appliedSet.has(migration.version) && migration.number < maxAppliedNumber,
+    );
+    if (outOfOrder) {
+      throw new Error(
+        `Out-of-order migration ${outOfOrder.version} cannot back-fill below applied migration number ${maxAppliedNumber}`,
+      );
+    }
 
-    for (const file of files) {
-      const version = file.replace('.sql', '');
+    const unbaselined = applied.rows.filter(row => row.checksum === null);
+    if (unbaselined.length > 0) {
+      options.warn?.(
+        'WARNING: baselining legacy migration checksums from this reviewed checkout; ' +
+          'PostgreSQL cannot detect edits made before this baseline. Verify this immutable release first.',
+      );
+      await client.query('BEGIN');
+      try {
+        for (const row of unbaselined) {
+          const migration = byVersion.get(row.version)!;
+          const update = await client.query(
+            'UPDATE schema_migrations SET checksum = $1 WHERE version = $2 AND checksum IS NULL',
+            [migration.checksum, row.version],
+          );
+          if (update.rowCount !== 1) {
+            throw new Error(`Migration ledger changed while baselining ${row.version}`);
+          }
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      }
+    }
+
+    for (const migration of migrations) {
+      interrupted(options.signal);
+      const { file, version, sql, checksum } = migration;
       if (appliedSet.has(version)) {
-        console.log(`✓ ${file} (already applied)`);
+        options.log?.(`✓ ${file} (already applied)`);
         continue;
       }
 
-      console.log(`→ Applying ${file}...`);
-      const sql = readFileSync(join(migrationsDir, file), 'utf-8');
+      options.log?.(`→ Applying ${file}...`);
       const ownerRequired = OWNER_REQUIRED_MIGRATIONS[version];
       if (ownerRequired) {
         await assertCanGrantForMigration(client, version, file, ownerRequired);
@@ -146,22 +316,80 @@ async function migrate() {
       await client.query('BEGIN');
       try {
         await client.query(sql);
-        await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [version]);
+        await client.query(
+          'INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)',
+          [version, checksum],
+        );
         await client.query('COMMIT');
-        console.log(`✓ ${file} applied`);
-      } catch (err) {
+        options.log?.(`✓ ${file} applied`);
+      } catch (error) {
         await client.query('ROLLBACK');
-        throw err;
+        throw error;
       }
     }
 
-    console.log('All migrations complete.');
+    options.log?.('All migrations complete.');
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    await client.end();
+    if (lockAcquired) {
+      try {
+        const result = await client.query<{ unlocked: boolean }>(
+          'SELECT pg_advisory_unlock($1, $2) AS unlocked',
+          [MIGRATION_LOCK_KEY_1, MIGRATION_LOCK_KEY_2],
+        );
+        if (!result.rows[0]?.unlocked) {
+          const message = 'Migration advisory lock was not held during release';
+          if (!failed) throw new Error(message);
+          options.warn?.(`WARNING: ${message}; preserving the original migration failure.`);
+        }
+      } catch (unlockError) {
+        if (!failed) throw unlockError;
+        options.warn?.(`WARNING: migration lock release failed after migration error: ${String(unlockError)}`);
+      }
+    }
   }
 }
 
-migrate().catch((err) => {
-  console.error('Migration failed:', err);
-  process.exit(1);
-});
+async function migrate() {
+  const connectionString = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error('MIGRATION_DATABASE_URL or DATABASE_URL must be set');
+  }
+
+  const migrations = loadMigrationInventory(join(__dirname, '..', 'migrations'));
+  const lockTimeoutMs = parseMigrationLockTimeout(process.env.MIGRATION_LOCK_TIMEOUT_MS);
+  const client = new pg.Client({ connectionString });
+  const abortController = new AbortController();
+  let forcedClose: Promise<void> | undefined;
+  const onSignal = (signal: NodeJS.Signals) => {
+    console.error(`Migration interrupted by ${signal}; closing the database session.`);
+    abortController.abort();
+    forcedClose ??= client.end();
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+
+  try {
+    await client.connect();
+    await runMigrations(client, migrations, {
+      lockTimeoutMs,
+      signal: abortController.signal,
+      log: console.log,
+      warn: console.warn,
+    });
+  } finally {
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+    if (forcedClose) await forcedClose;
+    else await client.end();
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  migrate().catch((err) => {
+    console.error('Migration failed:', err);
+    process.exitCode = 1;
+  });
+}

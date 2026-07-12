@@ -352,6 +352,12 @@ DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run migrate
 
 The migration connection must use a database owner or migration role that can create roles, grant privileges, alter tables, create functions, and manage indexes. The runtime application URL for `total_recall_app` is intentionally narrower and should not be used for DDL.
 
+Migration files are immutable after distribution. The runner records the SHA-256 of each file's exact bytes and stops before pending migrations if applied history is changed, missing, renamed, malformed, or ambiguous. On the first checksum-aware run, legacy ledger rows are baselined atomically from the reviewed checkout. This trust boundary cannot detect edits made before that baseline, so run it only from a reconciled, immutable release.
+
+Migration runners serialize on a database-local advisory lock before reading or upgrading the ledger and hold it through the last migration. `MIGRATION_LOCK_TIMEOUT_MS` controls the bounded wait (default `30000`, accepted range `1`–`600000` milliseconds). A timeout makes no ledger or schema changes; increase it only when the expected migration duration justifies a longer deployment wait.
+
+A checksum mismatch is an operational stop, not a prompt to overwrite the ledger. Restore the exact migration file from the reviewed release, inspect the ledger and actual schema, then make any required change through an audited forward repair migration. Connection loss can make commit acknowledgement ambiguous, so inspect both schema and ledger before retrying. Rolling back to the old runner ignores checksums and removes drift and concurrency protection; leave the additive `checksum` column in place and restore the checksum-aware runner instead.
+
 Before deploying migration 007 to an existing database, check who owns the legacy decay function. Function signature: `public.calculate_relevance(double precision, double precision, timestamp with time zone, integer)`.
 
 ```sql
