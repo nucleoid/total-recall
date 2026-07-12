@@ -26,6 +26,7 @@
     "repair:last-boosted-at": "tsx scripts/repair-last-boosted-at.ts",
     "repair:media-event-at": "tsx scripts/repair-media-event-at.ts",
     "index:media-event-at": "tsx scripts/create-media-event-at-index.ts",
+    "index:document-idempotency": "tsx scripts/create-document-idempotency-index.ts",
     "reembed": "tsx scripts/reembed-all.ts",
     "spotify:auth": "tsx scripts/spotify-auth.ts",
     "spotify:sync": "tsx scripts/spotify-sync.ts",

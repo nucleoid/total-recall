@@ -385,6 +385,19 @@ DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run index:me
 
 This command runs `CREATE INDEX CONCURRENTLY IF NOT EXISTS memories_media_event_at_idx ON public.memories (namespace, event_at DESC) WHERE event_at IS NOT NULL`, which must stay outside `npm run migrate` because PostgreSQL disallows concurrent index creation inside a transaction block.
 
+### Document idempotency rollout
+
+Migration 017 adds nullable document ownership/idempotency columns and the request-hash CHECK without building the unique index in the transaction-wrapped migration. The additive `ALTER TABLE` still takes a brief table lock, so schedule the normal migration window; the potentially longer index build is kept online. Roll it out in this order:
+
+1. Run `npm run migrate` with the owner migration connection.
+2. Build the required namespace-scoped unique index with the separate online operation:
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run index:document-idempotency
+```
+
+This command uses `CREATE UNIQUE INDEX CONCURRENTLY` on `(client_id, namespace, idempotency_key)`, repairs an invalid leftover index on retry, and must complete successfully before the new runtime is deployed. The runtime's `ON CONFLICT` clause depends on this index. Stop old document writers during the final cutover, deploy the new runtime only after the command reports `indexValid: true`, then resume writers. Existing rows remain nullable and are not backfilled; retaining the columns/index during rollback is safe.
+
 ## Namespace Design
 
 | Namespace | Contents | Access |

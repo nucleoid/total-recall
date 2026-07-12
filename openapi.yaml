@@ -110,6 +110,11 @@ paths:
                   type: array
                   items:
                     type: string
+                source:
+                  type: string
+                idempotency_key:
+                  type: string
+                  description: Optional retry key scoped to the authenticated API key. Reusing it with a different document returns 409.
       responses:
         "200":
           description: Document stored
@@ -126,6 +131,8 @@ paths:
           description: Unauthorized
         "403":
           description: Forbidden
+        "409":
+          description: Idempotency conflict or incomplete prior document write
 components:
   schemas:
     Memory:
