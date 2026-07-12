@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "typecheck:scripts": "tsc --project tsconfig.scripts.json",
     "test": "node --test --test-concurrency=1 --import tsx \"test/**/*.test.ts\" && npm run test:daily-sync && npm run test:access-level:db",
     "test:daily-sync": "node scripts/run-daily-sync-tests.mjs",
     "test:integration": "node --import tsx --test test/*.integration.test.ts",
@@ -53,6 +54,7 @@
     "express": "^5.2.1",
     "glob": "^13.0.6",
     "pg": "^8.13.1",
+    "stream-json": "^3.5.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
