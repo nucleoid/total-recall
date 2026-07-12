@@ -509,3 +509,54 @@ Deploy server support for `memory_store.idempotency_key` before deploying the ne
 ## Links
 - **Discord:** Total Recall category (general, dev, security, research)
 - **Cortex Board:** `total-recall` (violet)
+
+## Stable relevance scores and historical repair
+
+`relevance_base_score` is the stable importance assigned to a memory. `relevance_score`
+is only a materialized effective value: base importance decayed by elapsed time plus a
+bounded access bonus. Search recalculates that effective value from the stable base at
+statement time; the daily decay job materializes the same formula for inspection. An
+access increment affects subsequent searches, not the search that selected the row.
+
+Migration 018 deliberately leaves historical base scores unclassified. It changes the
+forward formula without resetting or otherwise mutating historical score rows. Decay
+will abort without updating anything while any relevance base remains unclassified, so
+a missed scheduler pause cannot destroy the facts required by repair. Historical repair
+is an owner-operated, approval-gated maintenance procedure and is never run at boot or
+by a schedule:
+
+1. Pause decay jobs and deploy migration 018 with the search and decay code together.
+2. Begin a maintenance window: freeze search and recall writes. Keep recalls frozen
+   through preview, apply, and post-apply verification: access timestamps and counters are
+   deliberately part of the strict fingerprint and any recall correctly causes drift.
+3. With recalls frozen, run a **fresh preview**:
+   `npm run repair:relevance-scores -- --preview relevance-preview.json`. Preview is
+   read-only and exports each candidate's exact row ID, current facts, and fingerprint.
+4. Separately inventory intentional custom weights and classify every exported row. Do
+   not infer ownership from a namespace, count, score, or absence from another export.
+5. Take and verify a **verified restorable backup**. Build a manifest with `backupVerified: true`
+   and one approval for every candidate using exact IDs and fingerprints. Use
+   `reset-managed` (base 1.0), or `preserve-custom` with an independently verified finite
+   nonnegative `baseScore`. If the fresh preview proves there are zero candidates, an
+   empty approvals array is the exact manifest; apply rechecks the database before safely
+   finalizing `NOT NULL`.
+6. Run `npm run repair:relevance-scores -- --apply approved-manifest.json`. Verify the
+   apply result, constraint, and score distribution before resuming recalls or decay.
+   Missing approvals, broad IDs, changed fingerprints, invalid bases, or an unverified
+   backup abort the transaction.
+
+Uncertain rows must remain unchanged; they block final `NOT NULL` enforcement rather
+than being guessed. Applying an approved manifest recomputes only its exact rows and can
+lock rows, generate WAL, and change ranking immediately. Size the maintenance window
+from the preview and database lock/WAL budget. No embedding/vector reindex or API-key
+reauthentication is required.
+
+All-row maintenance uses the explicitly configured owner/BYPASSRLS
+`MAINTENANCE_DATABASE_URL`. For backward compatibility only, `MIGRATION_DATABASE_URL`
+is the owner-capable fallback. `DATABASE_URL` and the RLS-scoped runtime role are never
+used or elevated for repair or decay. Provision the maintenance scheduler environment
+before rollout; the command verifies table ownership/BYPASSRLS before touching rows.
+
+Rollback cannot reconstruct compounded scores or infer prior custom bases. Keep the
+added column and corrected function on application rollback and roll forward. Old code is unsafe
+after any repair because it will resume compounding the effective score.

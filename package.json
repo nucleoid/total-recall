@@ -23,6 +23,7 @@
     "start:watcher": "node dist/watcher.js",
     "preseed:chatgpt": "tsx scripts/preseed-chatgpt.ts",
     "decay:update": "tsx scripts/decay-update.ts",
+    "repair:relevance-scores": "tsx scripts/repair-relevance-scores.ts",
     "repair:last-boosted-at": "tsx scripts/repair-last-boosted-at.ts",
     "repair:media-event-at": "tsx scripts/repair-media-event-at.ts",
     "media:repair-tags": "tsx scripts/repair-media-rollup-tags.ts",
