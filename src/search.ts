@@ -1,11 +1,12 @@
 import { withScopedClient, type DbScope } from './db.js';
 import { embed } from './embedding.js';
 import { accessLevelSql } from './auth.js';
+import { hnswEfSearchFromEnv } from './config.js';
 import type { AccessLevel, SearchParams, SearchResult } from './types.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
-const EF_SEARCH = parseInt(process.env.HNSW_EF_SEARCH || '200', 10);
+const EF_SEARCH = hnswEfSearchFromEnv();
 
 export async function hybridSearch(
   params: SearchParams,

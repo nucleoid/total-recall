@@ -17,6 +17,8 @@ DATABASE_URL=postgresql://total_recall_app:total_recall_app_dev@localhost:5432/t
 
 `npm run migrate` uses `MIGRATION_DATABASE_URL` when it is set. The fallback only works when DATABASE_URL is an owner-capable migration connection; the runtime `total_recall_app` role is rejected before migrations run. The MCP server and REST API use `DATABASE_URL`.
 
+Recall queries set pgvector's transaction-local HNSW search breadth from `HNSW_EF_SEARCH`. The value must be a decimal integer from `1` to `1000`; when unset, empty, or whitespace-only, Total Recall uses `200`. Invalid non-blank values fail during startup before the MCP server or REST API starts accepting traffic.
+
 ## Architecture
 
 ```
