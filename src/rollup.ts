@@ -1,10 +1,12 @@
-import { queryScoped, type DbScope } from './db.js';
+import { withScopedClient, type DbScope } from './db.js';
 import { embed } from './embedding.js';
-import { getRollupPendingEvents, linkEventToMemory, type MediaEvent } from './media.js';
+import { getRollupPendingEvents, linkEventToMemoryWithClient, type MediaEvent } from './media.js';
 import { checkPermission } from './auth.js';
 import type { AuthContext } from './types.js';
 
 const MEDIA_NAMESPACE = 'media';
+
+class ConcurrentRollupNoOp extends Error {}
 
 export interface RollupResult {
   rolled: number;
@@ -25,62 +27,69 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
   }
 
   const events = await getRollupPendingEvents(auth, scope, batchSize);
-    let rolled = 0;
-    let failed = 0;
-    const errors: string[] = [];
+  let rolled = 0;
+  let failed = 0;
+  const errors: string[] = [];
 
-    for (const event of events) {
-      try {
-        const summary = buildSummary(event);
-        const tags = buildTags(event);
-        const metadata = {
-          service: event.service,
-          service_id: event.service_id,
-          event_type: event.event_type,
-          played_at: event.played_at,
-          title: event.title,
-          ...(event.artist && { artist: event.artist }),
-          ...(event.album && { album: event.album }),
-          ...(event.show && { show: event.show }),
-          ...(event.season !== null && { season: event.season }),
-          ...(event.episode !== null && { episode: event.episode }),
-          ...(event.year !== null && { year: event.year }),
-          ...(event.duration_ms !== null && { duration_ms: event.duration_ms }),
-          ...(event.played_ms !== null && { played_ms: event.played_ms }),
-          ...(event.completed !== null && { completed: event.completed }),
-          ...event.metadata,
-        };
+  for (const event of events) {
+    try {
+      const summary = buildSummary(event);
+      const tags = buildTags(event);
+      const metadata = {
+        service: event.service,
+        service_id: event.service_id,
+        event_type: event.event_type,
+        played_at: event.played_at,
+        title: event.title,
+        ...(event.artist && { artist: event.artist }),
+        ...(event.album && { album: event.album }),
+        ...(event.show && { show: event.show }),
+        ...(event.season !== null && { season: event.season }),
+        ...(event.episode !== null && { episode: event.episode }),
+        ...(event.year !== null && { year: event.year }),
+        ...(event.duration_ms !== null && { duration_ms: event.duration_ms }),
+        ...(event.played_ms !== null && { played_ms: event.played_ms }),
+        ...(event.completed !== null && { completed: event.completed }),
+        ...event.metadata,
+      };
 
-        const vec = await embed(summary);
-        const vecStr = `[${vec.join(',')}]`;
+      const vec = await embed(summary);
+      const vecStr = `[${vec.join(',')}]`;
 
-        const insert = await queryScoped<{ id: string }>(
-          scope,
-          `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, event_at, client_id, agent_id)
-           VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9)
-           RETURNING id`,
-          [
-            summary,
-            vecStr,
-            `media:${event.service}`,
-            MEDIA_NAMESPACE,
-            tags,
-            JSON.stringify(metadata),
-            event.played_at,
-            event.client_id,
-            event.agent_id,
-          ]
-        );
+      await withScopedClient(
+        { namespaces: [MEDIA_NAMESPACE], keyId: auth.keyId },
+        async (client) => {
+          const insert = await client.query<{ id: string }>(
+            `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, event_at, client_id, agent_id)
+             VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING id`,
+            [
+              summary,
+              vecStr,
+              `media:${event.service}`,
+              MEDIA_NAMESPACE,
+              tags,
+              JSON.stringify(metadata),
+              event.played_at,
+              event.client_id,
+              event.agent_id,
+            ]
+          );
 
-        await linkEventToMemory(auth, scope, event.id, insert.rows[0].id);
-        rolled++;
-      } catch (err: any) {
-        failed++;
-        errors.push(`event ${event.id}: ${err?.message ?? String(err)}`);
-      }
+          const linked = await linkEventToMemoryWithClient(client, event.id, insert.rows[0].id, auth.keyId);
+          if (!linked) throw new ConcurrentRollupNoOp();
+        }
+      );
+      rolled++;
+    } catch (err: unknown) {
+      if (err instanceof ConcurrentRollupNoOp) continue;
+      failed++;
+      const message = err instanceof Error ? err.message : String(err);
+      errors.push(`event ${event.id}: ${message}`);
     }
+  }
 
-    return { rolled, failed, errors };
+  return { rolled, failed, errors };
 }
 
 function buildSummary(e: MediaEvent): string {

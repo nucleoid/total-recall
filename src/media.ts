@@ -172,15 +172,20 @@ export async function getRollupPendingEvents(auth: AuthContext, scope: DbScope, 
   return res.rows;
 }
 
-export async function linkEventToMemory(auth: AuthContext, scope: DbScope, eventId: string, memoryId: string): Promise<void> {
-  const res = await queryScoped(
-    scope,
-    `UPDATE media_events SET memory_id = $1 WHERE id = $2 AND client_id = $3`,
-    [memoryId, eventId, auth.keyId]
+export async function linkEventToMemoryWithClient(
+  client: ScopedClient,
+  eventId: string,
+  memoryId: string,
+  keyId: string
+): Promise<boolean> {
+  const res = await client.query(
+    `UPDATE media_events
+     SET memory_id = $1
+     WHERE id = $2 AND client_id = $3 AND memory_id IS NULL
+     RETURNING id`,
+    [memoryId, eventId, keyId]
   );
-  if (res.rowCount !== 1) {
-    throw new Error('Media event link failed: event not found for authenticated key');
-  }
+  return res.rowCount !== 1 ? false : true;
 }
 
 // === Connector credentials ===
