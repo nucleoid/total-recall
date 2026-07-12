@@ -551,11 +551,34 @@ lock rows, generate WAL, and change ranking immediately. Size the maintenance wi
 from the preview and database lock/WAL budget. No embedding/vector reindex or API-key
 reauthentication is required.
 
-All-row maintenance uses the explicitly configured owner/BYPASSRLS
-`MAINTENANCE_DATABASE_URL`. For backward compatibility only, `MIGRATION_DATABASE_URL`
-is the owner-capable fallback. `DATABASE_URL` and the RLS-scoped runtime role are never
-used or elevated for repair or decay. Provision the maintenance scheduler environment
-before rollout; the command verifies table ownership/BYPASSRLS before touching rows.
+All-row decay and re-embedding prefer an operator-only owner/BYPASSRLS
+`MAINTENANCE_DATABASE_URL`, then an owner-capable `MIGRATION_DATABASE_URL`. The deprecated
+`OWNER_DATABASE_URL` remains a final compatibility fallback and emits a warning; update
+older re-embedding runbooks without requiring an immediate secret rename. `DATABASE_URL`
+is never used because it belongs to the RLS-scoped runtime app role. The commands run
+`SET row_security = off` and read `public.memories` before doing any work, so insufficient
+authority errors instead of silently maintaining only visible namespaces. They print only
+safe database identity and dynamic per-namespace counts, never the connection URL. Do not
+grant `BYPASSRLS` to the service role or place maintenance credentials in long-running
+service environments. The separately approval-gated relevance repair retains its #34
+migration-owner fallback.
+
+Live store/search/rollup embedding dotenv precedence is unchanged. Re-embedding loads `.env`
+without overriding an already configured maintenance environment, then requires the canonical
+Gemini profile: a nonblank `GEMINI_API_KEY`, `EMBEDDING_MODEL=gemini-embedding-2-preview`, and
+`EMBEDDING_DIMENSIONS=768`. It fails before database access on an Ollama fallback, model
+mismatch, or dimension mismatch rather than writing incompatible vectors.
+
+Before either command, take and verify a restorable backup and confirm provider capacity.
+Pause scheduled decay while the #34 relevance migration/repair is in progress. Run
+`npm run decay:update` only after every historical relevance base is classified; it updates
+and reports every namespace, including `media` and future names. Invoke `npm run reembed`
+deliberately: each invocation re-embeds the full store idempotently, emits batch progress,
+reports selected and successful totals by namespace, and reports inventory drift from
+concurrent inserts. A retry starts the full store again and consumes provider quota again;
+successful per-row updates from a partial run remain committed. Verify the `media` count
+and error totals before resuming schedules. Re-embedding newly included rows consumes
+provider quota and changes vectors.
 
 Rollback cannot reconstruct compounded scores or infer prior custom bases. Keep the
 added column and corrected function on application rollback and roll forward. Old code is unsafe
