@@ -362,6 +362,24 @@ DROP FUNCTION IF EXISTS public.calculate_relevance(FLOAT, FLOAT, TIMESTAMPTZ, IN
 
 Run the remediation as a database owner or equivalent DBA role. Do not grant `total_recall_app` general DDL privileges, and do not elevate the runtime app role for this migration.
 
+Before deploying migration 019, repeat the ownership check for its exact canonical signature. Migration 019 changes only function volatility metadata, so the role running `npm run migrate` must own the function even when that role is otherwise DDL-capable:
+
+```sql
+SELECT pg_get_userbyid(p.proowner) AS function_owner
+FROM pg_proc p
+WHERE p.oid = to_regprocedure(
+  'public.calculate_relevance(double precision,double precision,timestamp with time zone,integer)'
+);
+```
+
+If the returned owner differs from the migration role, have the function owner or a superuser transfer ownership before running migration 019:
+
+```sql
+ALTER FUNCTION public.calculate_relevance(FLOAT, FLOAT, TIMESTAMPTZ, INTEGER) OWNER TO <migration-owner>;
+```
+
+Alternatively, the function owner or a superuser may drop and recreate the canonical function from migration 018 with `<migration-owner>` as owner before retrying. Do not merely drop it: migration 019 intentionally does not recreate or replace the function body. The migration fails before changing volatility with SQLSTATE `42501` and this remediation when ownership has drifted. Do not grant `total_recall_app` general DDL privileges or otherwise elevate the runtime role.
+
 Migration 007 intentionally does not backfill existing `last_boosted_at` values inside the schema transaction. To repair legacy rows after the migration is applied, run the bounded operational repair with the same owner or migration connection:
 
 ```bash

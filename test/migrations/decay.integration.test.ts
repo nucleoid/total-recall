@@ -10,6 +10,7 @@ import { repairLastBoostedAt } from '../../scripts/repair-last-boosted-at.js';
 const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const migrationsDir = join(repoRoot, 'migrations');
 const decayMigration = join(migrationsDir, '007_decay.sql');
+const volatilityRepairMigration = join(migrationsDir, '019_repair_relevance_volatility.sql');
 const hasDecayMigration = existsSync(decayMigration);
 
 let containerId: string | undefined;
@@ -37,17 +38,39 @@ test('decay schema is represented by numbered migration 007', () => {
   assert.match(sql, /LANGUAGE plpgsql\s+STABLE/i);
 });
 
+test('forward repair targets only the canonical calculate_relevance signature and restores runtime execution', () => {
+  assert.equal(
+    existsSync(volatilityRepairMigration),
+    true,
+    'expected the next migration to repair databases whose bad volatility was already ledgered'
+  );
+
+  const sql = readFileSync(volatilityRepairMigration, 'utf8');
+  assert.match(
+    sql,
+    /ALTER FUNCTION public\.calculate_relevance\(DOUBLE PRECISION, DOUBLE PRECISION, TIMESTAMPTZ, INTEGER\) STABLE/i
+  );
+  assert.match(
+    sql,
+    /GRANT EXECUTE ON FUNCTION public\.calculate_relevance\(DOUBLE PRECISION, DOUBLE PRECISION, TIMESTAMPTZ, INTEGER\) TO total_recall_app/i
+  );
+  assert.doesNotMatch(sql, /CREATE(?:\s+OR\s+REPLACE)?\s+FUNCTION/i);
+});
+
 test('migration rollout docs require calculate_relevance ownership preflight', () => {
   const readme = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   const decaySql = readFileSync(decayMigration, 'utf8');
+  const repairSql = readFileSync(volatilityRepairMigration, 'utf8');
 
   assert.match(readme, /Before deploying migration 007/i);
+  assert.match(readme, /Before deploying migration 019/i);
   assert.match(readme, /pg_get_userbyid\(p\.proowner\)/i);
   assert.match(readme, /public\.calculate_relevance\s*\(\s*double precision,\s*double precision,\s*timestamp with time zone,\s*integer\s*\)/i);
   assert.match(readme, /ALTER FUNCTION public\.calculate_relevance\(FLOAT, FLOAT, TIMESTAMPTZ, INTEGER\) OWNER TO <migration-owner>/i);
   assert.match(readme, /DROP FUNCTION IF EXISTS public\.calculate_relevance\(FLOAT, FLOAT, TIMESTAMPTZ, INTEGER\)/i);
   assert.match(readme, /Do not grant `total_recall_app` general DDL/i);
   assert.doesNotMatch(decaySql, /GRANT\s+(CREATE|ALL PRIVILEGES|ALTER|DROP)\b[^;]*\bTO\s+total_recall_app/i);
+  assert.doesNotMatch(repairSql, /GRANT\s+(CREATE|ALL PRIVILEGES|ALTER|DROP)\b[^;]*\bTO\s+total_recall_app/i);
 });
 
 test('clean install and upgrade paths converge on decay schema', { skip: !hasDecayMigration && 'missing 007_decay.sql' }, async () => {
@@ -126,6 +149,160 @@ test('clean install and upgrade paths converge on decay schema', { skip: !hasDec
     await assertDecaySchema();
     await assertFunctionVolatility();
     await assertLastBoostedAt('legacy row with standalone decay objects', '2025-05-06T07:08:09.000Z');
+  });
+});
+
+test('ledgered bad volatility is repaired exactly once and remains transaction-stable for the app role', async () => {
+  await withFreshDatabase(async () => {
+    await resetDatabase();
+    await applyMigrationsThrough('018_stable_relevance_base');
+
+    const owner = await ownerClient();
+    try {
+      await owner.query(`
+        ALTER FUNCTION public.calculate_relevance(DOUBLE PRECISION, DOUBLE PRECISION, TIMESTAMPTZ, INTEGER)
+          IMMUTABLE
+      `);
+      await owner.query(`
+        REVOKE ALL ON FUNCTION public.calculate_relevance(DOUBLE PRECISION, DOUBLE PRECISION, TIMESTAMPTZ, INTEGER)
+          FROM PUBLIC, total_recall_app
+      `);
+      await owner.query(`
+        CREATE FUNCTION public.calculate_relevance(p_value INTEGER)
+        RETURNS INTEGER LANGUAGE sql IMMUTABLE AS 'SELECT p_value'
+      `);
+    } finally {
+      await owner.end();
+    }
+
+    await assert.rejects(
+      () => applyMigration('019_repair_relevance_volatility.sql'),
+      /calculate_relevance[\s\S]+overload/i
+    );
+
+    const cleanup = await ownerClient();
+    try {
+      await cleanup.query('DROP FUNCTION public.calculate_relevance(INTEGER)');
+    } finally {
+      await cleanup.end();
+    }
+    await applyMigration('019_repair_relevance_volatility.sql');
+
+    const catalog = await ownerClient();
+    try {
+      const { rows } = await catalog.query<{ provolatile: string; args: string }>(`
+        SELECT p.provolatile,
+               pg_get_function_identity_arguments(p.oid) AS args
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND p.proname = 'calculate_relevance'
+      `);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].provolatile, 's');
+      assert.equal(
+        rows[0].args,
+        'p_relevance_base_score double precision, p_decay_rate double precision, p_accessed_at timestamp with time zone, p_access_count integer'
+      );
+    } finally {
+      await catalog.end();
+    }
+
+    const app = new pg.Client({ connectionString: appUrl });
+    await app.connect();
+    try {
+      await app.query('BEGIN');
+      const anchor = await app.query<{ accessed_at: Date }>(
+        "SELECT date_trunc('milliseconds', NOW() - INTERVAL '1 day') AS accessed_at"
+      );
+      const first = await app.query<{ score: number }>(
+        'SELECT public.calculate_relevance(1.0, 1.0, $1::timestamptz, 0) AS score',
+        [anchor.rows[0].accessed_at]
+      );
+      await app.query("SELECT pg_sleep(0.1)");
+      const repeated = await app.query<{ score: number }>(
+        'SELECT public.calculate_relevance(1.0, 1.0, $1::timestamptz, 0) AS score',
+        [anchor.rows[0].accessed_at]
+      );
+      assert.equal(repeated.rows[0].score, first.rows[0].score);
+      await app.query('COMMIT');
+
+      await app.query("SELECT pg_sleep(0.1)");
+      const nextTransaction = await app.query<{ score: number }>(
+        'SELECT public.calculate_relevance(1.0, 1.0, $1::timestamptz, 0) AS score',
+        [anchor.rows[0].accessed_at]
+      );
+      assert.ok(nextTransaction.rows[0].score < first.rows[0].score);
+
+      await app.query("SELECT set_config('app.allowed_namespaces', 'shared', false)");
+      await app.query(
+        `INSERT INTO memories (
+           content, embedding, source, namespace, client_id, relevance_base_score, decay_rate, accessed_at
+         ) VALUES ($1, $2::vector, 'test', 'shared', 'test-client', 1.0, 0.01, NOW() - INTERVAL '1 day')`,
+        ['runtime hybrid relevance', zeroVector()]
+      );
+      const hybrid = await app.query<{ final_score: number }>(`
+        WITH vector_results AS (
+          SELECT relevance_base_score, decay_rate, accessed_at, access_count, 1.0 AS vec_score
+          FROM memories
+          WHERE namespace = 'shared'
+        ), scored AS MATERIALIZED (
+          SELECT vec_score,
+                 public.calculate_relevance(
+                   relevance_base_score, decay_rate, accessed_at, access_count
+                 ) AS relevance
+          FROM vector_results
+        )
+        SELECT vec_score * LEAST(relevance, 2.0) AS final_score
+        FROM scored
+      `);
+      assert.equal(hybrid.rows.length, 1);
+      assert.equal(typeof hybrid.rows[0].final_score, 'number');
+    } finally {
+      await app.end();
+    }
+  });
+});
+
+test('migration 019 fails before DDL with clear remediation when calculate_relevance has a different owner', async () => {
+  await withFreshDatabase(async () => {
+    await resetDatabase();
+    await applyMigrationsThrough('018_stable_relevance_base');
+
+    const owner = await ownerClient();
+    try {
+      await owner.query(`
+        ALTER FUNCTION public.calculate_relevance(DOUBLE PRECISION, DOUBLE PRECISION, TIMESTAMPTZ, INTEGER)
+          IMMUTABLE
+      `);
+      await owner.query(`
+        ALTER FUNCTION public.calculate_relevance(DOUBLE PRECISION, DOUBLE PRECISION, TIMESTAMPTZ, INTEGER)
+          OWNER TO total_recall_app
+      `);
+    } finally {
+      await owner.end();
+    }
+
+    await assert.rejects(
+      () => applyMigration('019_repair_relevance_volatility.sql'),
+      /calculate_relevance[\s\S]+owned by total_recall_app[\s\S]+ALTER FUNCTION[\s\S]+OWNER TO/i
+    );
+
+    const catalog = await ownerClient();
+    try {
+      const { rows } = await catalog.query<{ provolatile: string; owner: string }>(`
+        SELECT p.provolatile, pg_get_userbyid(p.proowner) AS owner
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND p.oid = to_regprocedure(
+            'public.calculate_relevance(double precision,double precision,timestamp with time zone,integer)'
+          )
+      `);
+      assert.deepEqual(rows, [{ provolatile: 'i', owner: 'total_recall_app' }]);
+    } finally {
+      await catalog.end();
+    }
   });
 });
 
