@@ -68,8 +68,6 @@ export function toMediaEvent(item: PlayHistoryObject): MediaEventInput {
     year: parseYear(track.album?.release_date),
     genres: [],                                // not in this endpoint; could enrich later
     duration_ms: track.duration_ms,
-    played_ms: track.duration_ms,              // recently-played items are completed plays
-    completed: true,
     played_at: item.played_at,
     metadata: {
       track_id: track.id,

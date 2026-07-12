@@ -5,7 +5,7 @@ Pulls your recently-played tracks from Spotify into `media_events`, rolls them u
 ## Limitations
 
 - Spotify only exposes the **last 50 played tracks** via the Web API. There's no deeper history endpoint.
-- Skipped tracks are not reported as a distinct event type — Spotify only logs completed plays in `recently-played`.
+- Spotify's `recently-played` endpoint confirms that a play event occurred, but does not report playback progress or completion. `played_ms` and `completed` are therefore stored as unknown (`NULL`), while `duration_ms` retains the track duration.
 - Podcast episodes are returned by the same endpoint but are not yet specially handled.
 
 For a one-time backfill of years of history, request a "Stream history" from Spotify under Account → Privacy (delivered in ~30 days). A separate importer for that JSON dump is a future option.
@@ -74,7 +74,28 @@ Each play becomes one row in `media_events` with:
 - `service_id = 'spotify:track:...'` (the track URI, ensuring deduplication)
 - `event_type = 'play'`
 - `title`, `artist`, `album`, `year`, `duration_ms`, `played_at`
+- nullable `played_ms` and `completed`, both left `NULL` because progress is unknown
 - `metadata` with track ID, ISRC, popularity, album art URL, context (playlist/album/etc.)
+
+## Historical progress repair
+
+Older connector versions fabricated a full listen for every recently-played item. Historical rows cannot be repaired automatically: the database has no ingestion provenance, and an identical row could have been supplied through the REST API with measured progress.
+
+The repair command is preview-only by default:
+
+```bash
+npm run spotify:repair-progress -- --max-rows 500
+```
+
+Stop Spotify sync before previewing. Preview prints bounded candidate IDs, the complete candidate count, and current-state fingerprints without writing. Time filters (`--played-after` and `--played-before`) may narrow preview only; they never authorize updates.
+
+Applying is a separate, explicitly authorized operation. First take and verify a restorable backup, independently prove each event ID came from the affected Spotify connector, and copy only those exact preview records (`id`, `clientId`, and `fingerprint`) into a JSON approval manifest. Then run:
+
+```bash
+npm run spotify:repair-progress -- --apply --confirm-backup --approval-manifest ./approved-spotify-events.json
+```
+
+A predicate, count, date range, or general approval of the repair is not authorization. Missing, duplicate, nonmatching, or drifted IDs are rejected. Ambiguous or unverified candidates remain unchanged. Apply nulls only the approved event's progress fields and, when the still-linked rollup is `source='media:spotify'`, removes its `played_ms`/`completed` metadata keys and exact `completed` tag. It preserves content, embedding, duration, unrelated metadata/tags, IDs, and links; no re-embedding occurs. Consequently, a rare legacy artist-less Spotify rollup that fell back to completion wording in its summary may retain that historical text even after its structured progress is nulled. A non-zero partial failure reports a resumable checkpoint. Inspect outcomes before resuming Spotify sync.
 
 The rollup writes a summary memory like:
 

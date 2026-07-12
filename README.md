@@ -421,6 +421,10 @@ npm run media:repair-tags -- --apply --confirm-backup --batch-size 500 --max-row
 
 Apply refuses to start without `--confirm-backup`: the repair replaces the complete generated tag array from each linked source event, permanently removing custom tags unless they are restored from that backup. It leaves unlinked and non-media-source memories untouched. Continue promptly with each returned `nextCursor` until `limitReached` is false and `nextCursor` is null; until then, repaired and legacy classification tags coexist. The operation is idempotent, and restarting without a cursor safely rescans from the beginning.
 
+Media progress is nullable by design: `duration_ms` describes the item's duration, while absent `played_ms` or `completed` means the provider did not report progress. In particular, Spotify recently-played events retain duration but leave both progress fields `NULL`.
+
+Historical Spotify rows that asserted `played_ms=duration_ms` and `completed=true` are not automatically rewritten because their ingestion provenance is ambiguous. `npm run spotify:repair-progress` is preview-only by default and writes nothing. For an authorized repair, pause Spotify sync, take and verify a restorable backup, independently prove connector provenance per candidate, and create an approval manifest containing only exact previewed event IDs, client IDs, and fingerprints. Apply requires both `--apply --confirm-backup --approval-manifest <file>`; broad predicates, counts, date ranges, and approval of the command itself are rejected. Unverified rows stay unchanged. See [the Spotify connector guide](docs/connectors/spotify.md#historical-progress-repair) for the full workflow.
+
 ## Security Model
 
 Access levels are enforced in addition to namespace ACLs. Each key has `max_access_level` (`normal < sensitive < secret`); search, recall, list, namespace counts, stats, and agent memory counts hide rows above that ceiling before pagination or aggregation.
