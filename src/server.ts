@@ -10,7 +10,11 @@ import type { AuthContext } from './types.js';
 import { registerTools } from './tools/register.js';
 import { memorySearch, searchSchema } from './tools/search.js';
 import { memoryStore, storeSchema } from './tools/store.js';
-import { memoryStoreDocument, storeDocumentSchema } from './tools/store-document.js';
+import {
+  isStoreDocumentConflictError,
+  memoryStoreDocument,
+  storeDocumentSchema,
+} from './tools/store-document.js';
 import { memoryStats } from './tools/stats.js';
 import { mediaSearch, mediaSearchSchema } from './tools/media-search.js';
 import { upsertAgent, listAgents } from './agents.js';
@@ -324,6 +328,8 @@ function sendApiError(res: express.Response, label: string, err: any): void {
     res.status(400).json({ error: 'Invalid request', details: err.errors });
   } else if (typeof err.message === 'string' && err.message.startsWith('Invalid ')) {
     res.status(400).json({ error: err.message });
+  } else if (isStoreDocumentConflictError(err)) {
+    res.status(409).json({ error: err.message });
   } else if (permissionDenied(err)) {
     res.status(403).json({ error: err.message });
   } else {

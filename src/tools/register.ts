@@ -69,6 +69,10 @@ const TOOL_DEFINITIONS = [
         namespace: { type: 'string', description: 'Namespace (default: shared)' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags for categorization' },
         source: { type: 'string', description: 'Source identifier (default: manual)' },
+        idempotency_key: {
+          type: 'string',
+          description: 'Optional retry key. Reusing the same key with the same document returns the committed document; a different document returns an error.',
+        },
       },
       required: ['title', 'content'],
     },
