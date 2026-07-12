@@ -37,6 +37,41 @@ def resolve(raw, now=None):
 
 
 class PlayedAtParserTests(unittest.TestCase):
+    def test_today_and_just_now_use_day_noon_not_sync_wall_clock(self):
+        morning = datetime(2026, 3, 1, 8, 30, 1, tzinfo=timezone.utc)
+        evening = datetime(2026, 3, 1, 23, 59, 59, tzinfo=timezone.utc)
+
+        self.assertEqual(resolve("Today", morning), "2026-03-01T12:00:00+00:00")
+        self.assertEqual(resolve("just now", morning), "2026-03-01T12:00:00+00:00")
+        self.assertEqual(resolve("Today", evening), "2026-03-01T12:00:00+00:00")
+
+    def test_relative_calendar_buckets_use_real_month_and_year_midpoints(self):
+        leap_day = datetime(2024, 3, 31, 8, 30, tzinfo=timezone.utc)
+        after_new_year = datetime(2026, 1, 1, 8, 30, tzinfo=timezone.utc)
+
+        self.assertEqual(resolve("1 month ago", leap_day), "2024-02-15T12:00:00+00:00")
+        self.assertEqual(resolve("last month", leap_day), "2024-02-15T12:00:00+00:00")
+        self.assertEqual(resolve("1 year ago", after_new_year), "2025-07-02T12:00:00+00:00")
+        self.assertEqual(resolve("last year", after_new_year), "2025-07-02T12:00:00+00:00")
+
+    def test_relative_minute_and_hour_labels_truncate_to_bucket_boundaries(self):
+        now = datetime(2026, 3, 1, 8, 30, 45, 987654, tzinfo=timezone.utc)
+
+        self.assertEqual(resolve("5 minutes ago", now), "2026-03-01T08:25:00+00:00")
+        self.assertEqual(resolve("2 hours ago", now), "2026-03-01T06:00:00+00:00")
+
+    def test_now_must_be_timezone_aware(self):
+        with self.assertRaisesRegex(ValueError, "now must be timezone-aware"):
+            resolve("Today", datetime(2026, 3, 1, 8, 30))
+
+    def test_label_aging_stability_and_broader_bucket_ambiguity_are_explicit(self):
+        first_seen = datetime(2026, 3, 1, 8, 30, tzinfo=timezone.utc)
+        next_day = datetime(2026, 3, 2, 8, 30, tzinfo=timezone.utc)
+
+        self.assertEqual(resolve("Today", first_seen), "2026-03-01T12:00:00+00:00")
+        self.assertEqual(resolve("Yesterday", next_day), "2026-03-01T12:00:00+00:00")
+        self.assertNotEqual(resolve("Today", first_seen), resolve("This week", next_day))
+
     def test_new_bucket_labels_use_deterministic_utc_representatives(self):
         now = datetime(2026, 3, 1, 8, 30, tzinfo=timezone.utc)
 
@@ -166,6 +201,21 @@ class FetchCommandTests(unittest.TestCase):
 
         self.assertEqual(diagnostics, [])
         self.assertEqual([item["videoId"] for item in output["items"]], ["new-week"])
+
+    def test_out_of_range_relative_bucket_is_reported_and_skipped(self):
+        output, diagnostics = self.run_fetch([
+            {"videoId": "ok", "title": "OK", "played": "Today"},
+            {"videoId": "ancient", "title": "Ancient", "played": "9000 years ago"},
+        ])
+
+        self.assertEqual([item["videoId"] for item in output["items"]], ["ok"])
+        self.assertEqual(diagnostics, [{
+            "skipped": {
+                "reason": "unparsable played bucket",
+                "played": "9000 years ago",
+                "videoId": "ancient",
+            }
+        }])
 
 
 if __name__ == "__main__":

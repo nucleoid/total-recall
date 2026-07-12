@@ -96,12 +96,26 @@ def _week_midpoint(now: datetime) -> datetime:
     return datetime(monday.year, monday.month, monday.day, 12, tzinfo=timezone.utc) + timedelta(days=2)
 
 
+def _day_midpoint(dt: datetime) -> datetime:
+    target = dt.date()
+    return datetime(target.year, target.month, target.day, 12, tzinfo=timezone.utc)
+
+
 def _month_midpoint(year: int, month: int) -> datetime:
     return datetime(year, month, 15, 12, tzinfo=timezone.utc)
 
 
 def _year_midpoint(year: int) -> datetime:
     return datetime(year, 7, 2, 12, tzinfo=timezone.utc)
+
+
+def _subtract_months(dt: datetime, months: int) -> tuple[int, int]:
+    month_index = (dt.year * 12 + (dt.month - 1)) - months
+    return month_index // 12, (month_index % 12) + 1
+
+
+def _subtract_years(dt: datetime, years: int) -> int:
+    return dt.year - years
 
 
 def _resolve_played_at_details(raw: str | None, now: datetime) -> PlayedAtResolution | None:
@@ -133,19 +147,16 @@ def _resolve_played_at_details(raw: str | None, now: datetime) -> PlayedAtResolu
             return None
 
     if s in ("today", "just now"):
-        return PlayedAtResolution(_iso_utc(now), "relative", s)
+        return PlayedAtResolution(_day_midpoint(now).isoformat(), "day", s)
     if s in ("yesterday",):
-        dt = (now - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
-        return PlayedAtResolution(dt.isoformat(), "day", s)
+        return PlayedAtResolution(_day_midpoint(now - timedelta(days=1)).isoformat(), "day", s)
     if s in ("last week", "a week ago"):
-        dt = (now - timedelta(weeks=1)).replace(hour=12, minute=0, second=0, microsecond=0)
-        return PlayedAtResolution(dt.isoformat(), "week", s)
+        return PlayedAtResolution(_week_midpoint(now - timedelta(weeks=1)).isoformat(), "week", s)
     if s in ("last month", "a month ago"):
-        dt = (now - timedelta(days=30)).replace(hour=12, minute=0, second=0, microsecond=0)
-        return PlayedAtResolution(dt.isoformat(), "month", s)
+        year, month = _subtract_months(now, 1)
+        return PlayedAtResolution(_month_midpoint(year, month).isoformat(), "month", s)
     if s in ("last year", "a year ago"):
-        dt = (now - timedelta(days=365)).replace(hour=12, minute=0, second=0, microsecond=0)
-        return PlayedAtResolution(dt.isoformat(), "year", s)
+        return PlayedAtResolution(_year_midpoint(_subtract_years(now, 1)).isoformat(), "year", s)
 
     m = _RELATIVE_TIME_RE.match(s)
     if m:
@@ -156,12 +167,27 @@ def _resolve_played_at_details(raw: str | None, now: datetime) -> PlayedAtResolu
             "hour": timedelta(hours=n),
             "day": timedelta(days=n),
             "week": timedelta(weeks=n),
-            "month": timedelta(days=30 * n),
-            "year": timedelta(days=365 * n),
-        }[unit]
-        ts = now - delta
-        if unit in ("day", "week", "month", "year"):
-            ts = ts.replace(hour=12, minute=0, second=0, microsecond=0)
+        }.get(unit)
+        if unit == "month":
+            year, month = _subtract_months(now, n)
+            if year < 1:
+                return None
+            ts = _month_midpoint(year, month)
+        elif unit == "year":
+            year = _subtract_years(now, n)
+            if year < 1:
+                return None
+            ts = _year_midpoint(year)
+        else:
+            ts = now - delta
+            if unit == "minute":
+                ts = ts.replace(second=0, microsecond=0)
+            elif unit == "hour":
+                ts = ts.replace(minute=0, second=0, microsecond=0)
+            elif unit == "day":
+                ts = _day_midpoint(ts)
+            elif unit == "week":
+                ts = _week_midpoint(ts)
         return PlayedAtResolution(ts.isoformat(), unit, s, unit in ("minute", "hour"))
 
     return None
