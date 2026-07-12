@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type pg from 'pg';
+import path from 'node:path';
 import { setPoolForTesting } from '../../src/db.js';
+import { resolveWorkspaceFile } from '../../src/watcher/paths.js';
 import {
   commitPreparedFile,
   prepareChunks,
@@ -70,6 +72,44 @@ function input(namespace = 'projects'): FileSyncInput {
 }
 
 test.afterEach(() => setPoolForTesting(null));
+
+test('separator and dot-segment aliases share queue, source, metadata, and sync-state identities', async () => {
+  const workspace = 'C:\\Users\\me\\.openclaw\\workspace';
+  const aliases = [
+    'C:\\Users\\me\\.openclaw\\workspace\\memory\\day.md',
+    'C:/Users/me/.openclaw/workspace/memory/./day.md',
+  ];
+  const identities = aliases.map(candidate => resolveWorkspaceFile(workspace, candidate, path.win32));
+  assert.deepEqual(identities, [
+    { absolutePath: aliases[0], relativePath: 'memory/day.md' },
+    { absolutePath: aliases[0], relativePath: 'memory/day.md' },
+  ]);
+
+  const client = new TransactionClient(99);
+  setPoolForTesting(new SequencedPool([client, client]) as unknown as pg.Pool);
+  for (const identity of identities) {
+    await commitPreparedFile({
+      relPath: identity.relativePath,
+      hash: 'same-hash',
+      namespace: 'personal',
+      source: 'openclaw-daily',
+      agentId: 'agent-1',
+      chunks: [{
+        content: 'same content',
+        vectorStr: '[0.1]',
+        sourceKey: `file-sync:${identity.relativePath}:(root)`,
+        tags: [],
+        metadata: { file: identity.relativePath },
+      }],
+    });
+  }
+
+  const memoryCalls = client.calls.filter(({ text }) => text.includes('INSERT INTO memories'));
+  const stateCalls = client.calls.filter(({ text }) => text.includes('INSERT INTO sync_state'));
+  assert.deepEqual(new Set(memoryCalls.map(call => call.params?.[6])), new Set(['file-sync:memory/day.md:(root)']));
+  assert.deepEqual(new Set(memoryCalls.map(call => JSON.parse(call.params?.[5] as string).file)), new Set(['memory/day.md']));
+  assert.deepEqual(new Set(stateCalls.map(call => call.params?.[0])), new Set(['memory/day.md']));
+});
 
 test('embedding completes before a client is acquired and all mutations use that one client', async () => {
   const client = new TransactionClient(101);
