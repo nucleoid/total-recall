@@ -62,13 +62,19 @@ export async function withScopedClient<T>(
   scope: DbScope,
   fn: (client: ScopedClient) => Promise<T>
 ): Promise<T> {
+  validateScope(scope);
+
   const client = await getPool().connect();
   let releaseError: Error | undefined;
-  let committed = false;
+  let transactionStarted = false;
   let phase: 'setup' | 'callback' | 'commit' = 'setup';
 
   try {
+    // SET LOCAL restores the preceding session value. Deny by default first so a
+    // client inherited from older session-scoped callers cannot regain authority.
+    await client.query("SELECT set_config('app.allowed_namespaces', '', false)");
     await client.query('BEGIN');
+    transactionStarted = true;
     await client.query(
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       [JSON.stringify(scope.namespaces)]
@@ -86,21 +92,36 @@ export async function withScopedClient<T>(
     const result = await fn(client);
     phase = 'commit';
     await client.query('COMMIT');
-    committed = true;
+    transactionStarted = false;
     return result;
   } catch (err) {
-    const caught = err instanceof Error ? err : new Error(String(err));
-    releaseError = phase === 'callback' ? undefined : caught;
-    if (!committed) {
+    const primary = err instanceof Error ? err : new Error(String(err));
+    releaseError = phase === 'callback' ? undefined : primary;
+
+    if (transactionStarted) {
       try {
         await client.query('ROLLBACK');
-      } catch {
-        releaseError = caught;
+        transactionStarted = false;
+      } catch (rollbackError) {
+        releaseError = primary;
+        Object.defineProperty(primary, 'rollbackError', {
+          value: rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)),
+          enumerable: false,
+          configurable: true,
+        });
       }
     }
-    throw err;
+    throw primary;
   } finally {
     client.release(releaseError);
+  }
+}
+
+function validateScope(scope: DbScope): void {
+  for (const namespace of scope.namespaces) {
+    if (namespace.trim().length === 0 || namespace.includes(',')) {
+      throw new Error('DbScope namespace entries must be nonempty and cannot contain commas');
+    }
   }
 }
 

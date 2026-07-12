@@ -10,9 +10,12 @@ const files = globSync('{src,scripts}/**/*.ts', { cwd: root, nodir: true });
 test('runtime code does not use process-wide or session-scoped namespace context', () => {
   const offenders = files.flatMap((file) => {
     const text = readFileSync(join(root, file), 'utf8');
+    const sessionScoped = [
+      ...text.matchAll(/set_config\('app\.allowed_namespaces'[^)]*,\s*false\)/g),
+    ].filter((match) => match[0] !== "set_config('app.allowed_namespaces', '', false)");
     const matches = [
       ...text.matchAll(/setNamespaceContext|getCurrentNamespaces|_currentNamespaces/g),
-      ...text.matchAll(/set_config\('app\.allowed_namespaces'[^)]*,\s*false\)/g),
+      ...sessionScoped,
       ...text.matchAll(/SET\s+app\.allowed_namespaces/gi),
     ];
     return matches.map((match) => `${file}: ${match[0]}`);

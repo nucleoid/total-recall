@@ -93,6 +93,7 @@ test('hybridSearch sets local HNSW inside the scoped transaction before search a
   assert.deepEqual(
     client.calls.map((call) => summarize(call.text)),
     [
+      "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",
@@ -103,8 +104,8 @@ test('hybridSearch sets local HNSW inside the scoped transaction before search a
       'COMMIT',
     ]
   );
-  assert.deepEqual(client.calls[4].params, ['321']);
-  assert.deepEqual(client.calls[6].params, [['memory-1']]);
+  assert.deepEqual(client.calls[5].params, ['321']);
+  assert.deepEqual(client.calls[7].params, [['memory-1']]);
   assert.deepEqual(client.releaseArgs, []);
 });
 
@@ -119,6 +120,7 @@ test('hybridSearch commits empty result searches without an access-count update'
   assert.deepEqual(
     client.calls.map((call) => summarize(call.text)),
     [
+      "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",
@@ -150,6 +152,7 @@ test('hybridSearch rolls back and releases when search or update fails', async (
   assert.deepEqual(
     updateFailure.calls.map((call) => summarize(call.text)),
     [
+      "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",

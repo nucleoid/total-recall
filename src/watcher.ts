@@ -2,8 +2,9 @@ import chokidar from 'chokidar';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { queryScoped, queryUnscoped, shutdown, type DbScope } from './db.js';
+import { queryUnscoped, shutdown } from './db.js';
 import { embed } from './embedding.js';
+import { commitPreparedFile, prepareChunks } from './watcher/sync.js';
 import { upsertSystemAgent } from './agents.js';
 import dotenv from 'dotenv';
 
@@ -11,11 +12,6 @@ dotenv.config();
 
 const WORKSPACE = '/home/fuego/.openclaw/workspace';
 const CORTEX_CONTENT = path.join(WORKSPACE, 'projects/cortex/content');
-const WATCHER_SCOPE: DbScope = {
-  keyId: 'file-sync',
-  namespaces: ['personal', 'work', 'projects', 'financial', 'shared'],
-};
-
 interface WatchSpec {
   paths: string[];
   namespace: string;
@@ -126,33 +122,11 @@ function chunkMarkdown(content: string, source: string, relPath: string): Chunk[
   return chunks;
 }
 
-const UPSERT_SQL = `
-INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, agent_id)
-VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'file-sync', $7, $8)
-ON CONFLICT (source_key) DO UPDATE SET
-  content = EXCLUDED.content,
-  embedding = EXCLUDED.embedding,
-  source = EXCLUDED.source,
-  namespace = EXCLUDED.namespace,
-  tags = EXCLUDED.tags,
-  metadata = EXCLUDED.metadata,
-  agent_id = EXCLUDED.agent_id,
-  updated_at = NOW()
-`;
-
 let watcherAgentId: string | null = null;
 
 async function getStoredHash(filePath: string): Promise<string | null> {
   const res = await queryUnscoped('SELECT content_hash FROM sync_state WHERE file_path = $1', [filePath]);
   return res.rows[0]?.content_hash ?? null;
-}
-
-async function updateHash(filePath: string, hash: string): Promise<void> {
-  await queryUnscoped(
-    `INSERT INTO sync_state (file_path, content_hash, last_synced) VALUES ($1, $2, NOW())
-     ON CONFLICT (file_path) DO UPDATE SET content_hash = $2, last_synced = NOW()`,
-    [filePath, hash]
-  );
 }
 
 async function processFile(filePath: string): Promise<void> {
@@ -171,19 +145,17 @@ async function processFile(filePath: string): Promise<void> {
   if (storedHash === hash) return;
 
   const chunks = chunkMarkdown(content, spec.source, relPath);
-  if (chunks.length === 0) return;
+  const preparedChunks = await prepareChunks(chunks, embed);
 
-  for (const chunk of chunks) {
-    const embedding = await embed(chunk.content.slice(0, 8000));
-    const vectorStr = `[${embedding.join(',')}]`;
-    await queryScoped(WATCHER_SCOPE, UPSERT_SQL, [
-      chunk.content, vectorStr, spec.source, spec.namespace,
-      chunk.tags, JSON.stringify(chunk.metadata), chunk.sourceKey, watcherAgentId,
-    ]);
-  }
-
-  await updateHash(relPath, hash);
-  console.log(`Synced ${relPath}: ${chunks.length} chunks`);
+  await commitPreparedFile({
+    relPath,
+    hash,
+    namespace: spec.namespace,
+    source: spec.source,
+    agentId: watcherAgentId,
+    chunks: preparedChunks,
+  });
+  console.log(`Synced ${relPath}: ${preparedChunks.length} chunks`);
 }
 
 const pending = new Map<string, NodeJS.Timeout>();
