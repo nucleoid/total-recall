@@ -7,7 +7,7 @@ import {
   resolveMaintenanceDatabaseUrl,
 } from '../scripts/lib/maintenance-db.js';
 
-test('maintenance URL uses maintenance, migration, then deprecated owner fallback and never the runtime role', () => {
+test('maintenance URL preserves maintenance aliases before the runtime fallback', () => {
   const warnings: string[] = [];
   assert.equal(resolveMaintenanceDatabaseUrl({
     MAINTENANCE_DATABASE_URL: 'postgres://maintenance/custom-db',
@@ -27,9 +27,9 @@ test('maintenance URL uses maintenance, migration, then deprecated owner fallbac
   }, warning => warnings.push(warning)), 'postgres://legacy/custom-db');
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /OWNER_DATABASE_URL.*deprecated.*MIGRATION_DATABASE_URL/i);
-  assert.throws(
-    () => resolveMaintenanceDatabaseUrl({ DATABASE_URL: 'postgres://app/runtime' }),
-    /MAINTENANCE_DATABASE_URL.*MIGRATION_DATABASE_URL.*OWNER_DATABASE_URL/i,
+  assert.equal(
+    resolveMaintenanceDatabaseUrl({ DATABASE_URL: 'postgres://app/runtime' }),
+    'postgres://app/runtime',
   );
 });
 

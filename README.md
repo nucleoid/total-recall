@@ -570,33 +570,47 @@ from the preview and database lock/WAL budget. No embedding/vector reindex or AP
 reauthentication is required.
 
 All-row decay and re-embedding prefer an operator-only owner/BYPASSRLS
-`MAINTENANCE_DATABASE_URL`, then an owner-capable `MIGRATION_DATABASE_URL`. The deprecated
-`OWNER_DATABASE_URL` remains a final compatibility fallback and emits a warning; update
-older re-embedding runbooks without requiring an immediate secret rename. `DATABASE_URL`
-is never used because it belongs to the RLS-scoped runtime app role. The commands run
-`SET row_security = off` and read `public.memories` before doing any work, so insufficient
-authority errors instead of silently maintaining only visible namespaces. They print only
-safe database identity and dynamic per-namespace counts, never the connection URL. Do not
-grant `BYPASSRLS` to the service role or place maintenance credentials in long-running
+`MAINTENANCE_DATABASE_URL`, then preserve the owner-capable `MIGRATION_DATABASE_URL` and
+deprecated `OWNER_DATABASE_URL` compatibility fallbacks. When none is set, they use
+`DATABASE_URL`; an RLS-scoped runtime app role fails the same all-row preflight rather than
+partially updating visible namespaces. The commands run `SET row_security = off` and read
+`public.memories` before doing any work. They print only safe identity from
+`current_database()` and `current_user` (plus server address), never the connection URL. Do
+not grant `BYPASSRLS` to the service role or place maintenance credentials in long-running
 service environments. The separately approval-gated relevance repair retains its #34
 migration-owner fallback.
 
-Live store/search/rollup embedding dotenv precedence is unchanged. Re-embedding loads `.env`
-without overriding an already configured maintenance environment, then requires the canonical
-Gemini profile: a nonblank `GEMINI_API_KEY`, `EMBEDDING_MODEL=gemini-embedding-2-preview`, and
-`EMBEDDING_DIMENSIONS=768`. It fails before database access on an Ollama fallback, model
-mismatch, or dimension mismatch rather than writing incompatible vectors.
+Live store/search/rollup embedding now loads dotenv without overriding shell or service
+environment values. Shell/service configuration is authoritative. Before rollout, audit
+`GEMINI_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `OLLAMA_URL`, `OLLAMA_MODEL`, and
+every database URL variable in each HoT service and operator shell for conflicts with dotenv files.
+Confirm that the authoritative values select the intended provider, model, dimensions, and
+database; record that audit with the deployment. Re-embedding uses the same non-overriding
+bootstrap, then requires the canonical Gemini profile: a nonblank `GEMINI_API_KEY`,
+`EMBEDDING_MODEL=gemini-embedding-2-preview`, and `EMBEDDING_DIMENSIONS=768`. It fails before
+database access on an Ollama fallback, model mismatch, or dimension mismatch rather than writing
+incompatible vectors.
 
-Before either command, take and verify a restorable backup and confirm provider capacity.
+Before either command, take and confirm a **verified restorable backup**, verify provider
+capacity, and independently verify the intended database target. `DATABASE_URL` is only a final
+compatibility fallback: the connection must prove table-owner, superuser, or `BYPASSRLS` all-row
+capability through the preflight on that same session; the normal RLS-limited runtime role fails
+before embedding/API work. `DATABASE_URL` is used only when no maintenance alias is set; confirm
+the printed `source` matches your intent. For example, set the URL explicitly and invoke
+`DATABASE_URL=postgresql://<owner-role>@<host>/<database> npm run reembed`; the command prints
+`current_database()` and `current_user` after the capability preflight. The invocation is
+noninteractive and begins re-embedding immediately after that output; cancel it if the safe
+identity is not the intended target. There is no confirmation prompt.
+
 Pause scheduled decay while the #34 relevance migration/repair is in progress. Run
 `npm run decay:update` only after every historical relevance base is classified; it updates
 and reports every namespace, including `media` and future names. Invoke `npm run reembed`
 deliberately: each invocation re-embeds the full store idempotently, emits batch progress,
 reports selected and successful totals by namespace, and reports inventory drift from
-concurrent inserts. A retry starts the full store again and consumes provider quota again;
-successful per-row updates from a partial run remain committed. Verify the `media` count
-and error totals before resuming schedules. Re-embedding newly included rows consumes
-provider quota and changes vectors.
+concurrent inserts. Re-embedding must never run as an automatic deploy-time task. A retry starts
+the full store again and consumes provider quota again; successful per-row updates from a
+partial run remain committed. Verify the `media` count and error totals before resuming
+schedules. Re-embedding newly included rows consumes provider quota and changes vectors.
 
 Rollback cannot reconstruct compounded scores or infer prior custom bases. Keep the
 added column and corrected function on application rollback and roll forward. Old code is unsafe

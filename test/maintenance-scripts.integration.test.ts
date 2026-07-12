@@ -96,9 +96,10 @@ test('provider mismatch falls back safely, counts each selected row once, and sa
   assert.ok(result.errors.every(error => !JSON.stringify(error).includes('TOP SECRET')));
 });
 
-test('live embedding import preserves legacy dotenv override precedence', async () => {
+test('live embedding import preserves process environment precedence over dotenv', async () => {
   const source = await readFile(new URL('../src/embedding.ts', import.meta.url), 'utf8');
-  assert.match(source, /dotenv\.config\(\s*\{\s*override:\s*true\s*\}\s*\)/);
+  assert.doesNotMatch(source, /dotenv\.config\(\s*\{\s*override:\s*true\s*\}\s*\)/);
+  assert.match(source, /dotenv\.config\(\s*\)/);
 });
 
 test('maintenance validates the canonical Gemini 768 profile without mutating environment', () => {

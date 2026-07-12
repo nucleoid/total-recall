@@ -22,18 +22,33 @@ export interface NamespaceCount {
   count: number;
 }
 
+export type MaintenanceDatabaseSource = keyof MaintenanceEnvironment;
+
+export interface MaintenanceDatabaseConfig {
+  connectionString: string;
+  source: MaintenanceDatabaseSource;
+}
+
 /** Resolve owner-capable operator configuration without normalizing or exposing it. */
+export function resolveMaintenanceDatabaseConfig(
+  env: MaintenanceEnvironment,
+  warn: (message: string) => void = console.warn,
+): MaintenanceDatabaseConfig {
+  if (env.MAINTENANCE_DATABASE_URL?.trim()) return { connectionString: env.MAINTENANCE_DATABASE_URL, source: 'MAINTENANCE_DATABASE_URL' };
+  if (env.MIGRATION_DATABASE_URL?.trim()) return { connectionString: env.MIGRATION_DATABASE_URL, source: 'MIGRATION_DATABASE_URL' };
+  if (env.OWNER_DATABASE_URL?.trim()) {
+    warn('OWNER_DATABASE_URL is deprecated for maintenance; use MAINTENANCE_DATABASE_URL or MIGRATION_DATABASE_URL');
+    return { connectionString: env.OWNER_DATABASE_URL, source: 'OWNER_DATABASE_URL' };
+  }
+  if (env.DATABASE_URL?.trim()) return { connectionString: env.DATABASE_URL, source: 'DATABASE_URL' };
+  throw new Error('MAINTENANCE_DATABASE_URL, MIGRATION_DATABASE_URL, OWNER_DATABASE_URL, or DATABASE_URL is required');
+}
+
 export function resolveMaintenanceDatabaseUrl(
   env: MaintenanceEnvironment,
   warn: (message: string) => void = console.warn,
 ): string {
-  if (env.MAINTENANCE_DATABASE_URL?.trim()) return env.MAINTENANCE_DATABASE_URL;
-  if (env.MIGRATION_DATABASE_URL?.trim()) return env.MIGRATION_DATABASE_URL;
-  if (env.OWNER_DATABASE_URL?.trim()) {
-    warn('OWNER_DATABASE_URL is deprecated for maintenance; use MAINTENANCE_DATABASE_URL or MIGRATION_DATABASE_URL');
-    return env.OWNER_DATABASE_URL;
-  }
-  throw new Error('MAINTENANCE_DATABASE_URL or MIGRATION_DATABASE_URL is required (deprecated OWNER_DATABASE_URL is also accepted)');
+  return resolveMaintenanceDatabaseConfig(env, warn).connectionString;
 }
 
 /**
@@ -68,18 +83,33 @@ export async function inventoryNamespaces(client: QueryClient): Promise<Namespac
   return result.rows.map(row => ({ namespace: row.namespace, count: Number(row.count) }));
 }
 
+export type MaintenanceClientFactory = (connectionString: string) => pg.Client;
+
 export async function connectMaintenanceClient(
   env: MaintenanceEnvironment = process.env,
-  createClient: (connectionString: string) => pg.Client = connectionString => new pg.Client({ connectionString }),
-): Promise<{ client: pg.Client; identity: MaintenanceIdentity }> {
-  const connectionString = resolveMaintenanceDatabaseUrl(env);
+  createClient: MaintenanceClientFactory = connectionString => new pg.Client({ connectionString }),
+): Promise<{ client: pg.Client; identity: MaintenanceIdentity; source: MaintenanceDatabaseSource }> {
+  const { connectionString, source } = resolveMaintenanceDatabaseConfig(env);
   const client = createClient(connectionString);
   try {
     await client.connect();
     const identity = await prepareAllRowMaintenance(client);
-    return { client, identity };
+    return { client, identity, source };
   } catch (error) {
     await client.end().catch(() => undefined);
     throw error;
+  }
+}
+
+export async function withMaintenanceClient<T>(
+  env: MaintenanceEnvironment,
+  operation: (client: pg.Client, identity: MaintenanceIdentity, source: MaintenanceDatabaseSource) => Promise<T>,
+  createClient?: MaintenanceClientFactory,
+): Promise<T> {
+  const { client, identity, source } = await connectMaintenanceClient(env, createClient);
+  try {
+    return await operation(client, identity, source);
+  } finally {
+    await client.end();
   }
 }
