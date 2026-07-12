@@ -113,12 +113,41 @@ function buildSummary(e: MediaEvent): string {
   return `Watched "${e.title}"${year} on ${date} via ${e.service}.${completion}${genres}`;
 }
 
-function buildTags(e: MediaEvent): string[] {
-  const tags = new Set<string>(['media', e.service, e.event_type]);
-  if (e.artist) tags.add('music');
-  else if (e.show || e.season != null) tags.add('tv');
-  else tags.add('movie');
+export type MediaKind = 'music' | 'tv' | 'movie' | 'unknown';
+
+const MEDIA_KINDS = new Set<MediaKind>(['music', 'tv', 'movie', 'unknown']);
+
+export function classifyMediaKind(e: MediaEvent): MediaKind {
+  const service = e.service.trim().toLowerCase();
+  const eventType = e.event_type.trim().toLowerCase();
+  const metadata = e.metadata && typeof e.metadata === 'object' && !Array.isArray(e.metadata)
+    ? e.metadata
+    : {};
+  const rawPlexType = metadata.plex_type;
+  const plexType = typeof rawPlexType === 'string' ? rawPlexType.trim().toLowerCase() : '';
+
+  if (service === 'plex') {
+    if (plexType === 'track') return 'music';
+    if (plexType === 'episode') return 'tv';
+    if (plexType === 'movie') return 'movie';
+  }
+  if (e.artist) return 'music';
+  if (e.show || e.season != null || e.episode != null) return 'tv';
+  if ((service === 'spotify' || service === 'ytmusic') && eventType === 'play') return 'music';
+  return 'unknown';
+}
+
+export function buildTags(e: MediaEvent): string[] {
+  const kind = classifyMediaKind(e);
+  const tags = new Set<string>(['media', e.service, e.event_type, kind]);
   if (e.completed === true) tags.add('completed');
-  for (const g of e.genres ?? []) tags.add(g.toLowerCase());
+  if (Array.isArray(e.genres)) {
+    for (const genre of e.genres) {
+      if (typeof genre !== 'string') continue;
+      const normalized = genre.trim().toLowerCase();
+      if (!normalized || (MEDIA_KINDS.has(normalized as MediaKind) && normalized !== kind)) continue;
+      tags.add(normalized);
+    }
+  }
   return [...tags];
 }

@@ -25,6 +25,7 @@
     "decay:update": "tsx scripts/decay-update.ts",
     "repair:last-boosted-at": "tsx scripts/repair-last-boosted-at.ts",
     "repair:media-event-at": "tsx scripts/repair-media-event-at.ts",
+    "media:repair-tags": "tsx scripts/repair-media-rollup-tags.ts",
     "repair:document-chunk-counts": "tsx scripts/repair-document-chunk-counts.ts",
     "index:media-event-at": "tsx scripts/create-media-event-at-index.ts",
     "index:document-idempotency": "tsx scripts/create-document-idempotency-index.ts",

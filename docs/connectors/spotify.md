@@ -80,7 +80,7 @@ The rollup writes a summary memory like:
 
 > Listened to "Motion Sickness" by Phoebe Bridgers from "Stranger in the Alps" on 2026-05-20 via spotify.
 
-These are embedded and searchable via `media_search` or any other consumer of the `media` namespace.
+These are embedded and searchable via `media_search` or any other consumer of the `media` namespace. Every rollup has one exclusive media-kind tag. Spotify `play` events are tagged `music` even if artist metadata is missing; events without trusted service or canonical field evidence use `unknown` rather than defaulting to `movie`.
 
 ## Troubleshooting
 
