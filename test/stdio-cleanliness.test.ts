@@ -150,8 +150,8 @@ test('missing API key errors remain JSON-RPC-only on stdout', async () => {
       'missing-key error response',
     );
     const error = parseProtocolOutput(server.stdout()).find((message) => message.id === 2);
-    assert.ok(error?.error, 'missing key should produce a JSON-RPC error');
-    assert.match(error.error.message, /TOTAL_RECALL_API_KEY not set/);
+    assert.equal(error?.result?.isError, true, 'missing key should produce an MCP tool error');
+    assert.match(error.result.content[0].text, /TOTAL_RECALL_API_KEY not set/);
   } finally {
     await server.cleanup();
   }
@@ -177,7 +177,8 @@ test('invalid API key failures remain JSON-RPC-only on stdout', async () => {
       8_000,
     );
     const error = parseProtocolOutput(server.stdout()).find((message) => message.id === 2);
-    assert.ok(error?.error, 'invalid key failure should produce a JSON-RPC error');
+    assert.equal(error?.result?.isError, true, 'invalid key should produce an MCP tool error');
+    assert.doesNotMatch(JSON.stringify(error), /tr_invalid/);
   } finally {
     await server.cleanup();
   }

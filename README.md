@@ -506,7 +506,7 @@ npm run create-key -- --name "trusted-agent" --namespaces "personal,shared" --ma
 
 Null legacy memory access levels are normalized to `normal`. Unknown legacy labels are hidden from every key until operators remediate them; the migration adds a `NOT VALID` constraint so new writes must use one of the supported values.
 
-1. **API keys** — unique per client (`tr_` prefix), revocable, SHA256 hashed at rest
+1. **API keys** — unique per client (`tr_` prefix), revocable, SHA256 hashed at rest. MCP tool calls revalidate the key against PostgreSQL, so disabling/deleting a key or changing its namespaces, permissions, or access ceiling takes effect on the next call. A stdio client captures `TOTAL_RECALL_API_KEY` at process startup; replacing that environment secret requires restarting that client, but does not require issuing new credentials when the existing key remains valid. HTTP MCP sessions are bound to the API key that initialized them; another valid key cannot use a captured session ID.
 2. **Namespace ACLs** — each key bound to specific namespaces
 3. **Row-Level Security** — PostgreSQL RLS policies enforce namespace isolation at the database level
 4. **Audit log** — every read/write logged with client ID, agent ID, and timestamp

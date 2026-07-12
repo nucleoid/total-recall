@@ -208,10 +208,11 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    const auth = await getAuth();
-    const scope = dbScopeFromAuth(auth);
 
     try {
+      const auth = await getAuth();
+      const scope = dbScopeFromAuth(auth);
+
       switch (name) {
         case 'memory_store': {
           const params = storeSchema.parse(args);
