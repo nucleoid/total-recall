@@ -313,6 +313,26 @@ Preseed commands currently fail closed before reading exports, connecting to Pos
 
 Once that gate is implemented, ChatGPT import requires `CHATGPT_IMPORTS_DIR` or a directory as the first CLI argument. The directory scanner accepts only `conversations.json` and `conversations-<digits>.json` (unsuffixed first, then numeric suffix order); backups and unrelated files are ignored. Each root array is streamed one conversation at a time, output chunks are committed in batches of at most ten, and reruns converge through stable source keys. A failed later file or batch leaves earlier batches committed. The default single-conversation limit is 16 MiB; `--max-conversation-bytes <bytes>` permits an explicit positive override up to 64 MiB, with correspondingly higher Node heap risk.
 
+#### Gemini Takeout identity and historical repair
+
+After the same #9/#61 gate is implemented, set `GEMINI_TAKEOUT_HTML_PATH` (or pass one HTML path) and run `npm run preseed:gemini`. The importer preserves the existing `Q: …\n\nA: …` format and 4,000-character cap, then assigns `gemini-conv:v2:<sha256>` from the exact persisted content and normalized UTC instant. Export reorder or prepend therefore cannot renumber existing conversations. Prompt/response differences beyond 4,000 characters are indistinguishable and cannot be recovered from historical rows.
+
+Timestamp parsing is deliberately explicit and host-timezone independent. Supported named forms are NZST and NZDT, followed by UTC/GMT/Z and numeric offsets such as `+05:30`, `-0330`, `UTC+12:45`, or `GMT-03:30`. English abbreviated month names and 12-hour clocks are required. Unknown/ambiguous abbreviations and localized month names are reported as omissions and make a non-empty partial import exit nonzero; they are never passed to host-local `Date` parsing.
+
+The repair command is **preview-only by default** and requires owner-only `MIGRATION_DATABASE_URL`; it never falls back to the app-role `DATABASE_URL`:
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>/total_recall npm run repair:gemini-source-keys
+```
+
+Preview scans only positional keys belonging to `client_id='preseed-gemini'` and `source='gemini-conversation'`. It prints bounded IDs, current-state fingerprints, proposed targets, and collision equivalence—not memory content or credentials—and writes nothing. There is no automatic historical cleanup. Before apply: stop Gemini import, take and verify a restorable backup, independently verify every candidate and collision against the original export, and prepare an approval manifest with `version: 1`, `backupVerified: true`, plus an `approvals` entry for every exact affected row. Each entry names `id`, `expectedFingerprint`, `targetKey`, and `action` (`rekey`; byte-equivalent-collision `retain`/`delete` with the exact `retainId`; or `leave` for every row in a non-equivalent collision). Counts, predicates, generated targets, and policy-wide approval are not row approval.
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>/total_recall npm run repair:gemini-source-keys -- --apply ./approved-gemini-rows.json
+```
+
+Apply takes an advisory lock and rechecks every row in one transaction. Drift, missing or broad approval, unrelated rows, uniqueness conflicts, non-oldest retention, or deletion of non-byte-equivalent rows rolls the entire operation back. For an approved byte-equivalent collision, retain exactly the oldest ID identified by preview, delete only explicitly named duplicates, and merge no mutable metadata. Deleting a duplicate can leave historical, non-FK audit/trace references pointing at that deleted duplicate ID; independent verification must include those references, and the retained byte-equivalent memory does not rewrite them. Non-equivalent or uncertain collision groups require exact `leave` approvals and remain wholly unchanged. Ordinary approved rows are rekeyed in place, preserving IDs, content, embeddings, metadata, and references; no re-embedding, schema migration, or reindex is performed.
+
 ### Ingestion Pipeline (shared by all sources)
 
 ```
