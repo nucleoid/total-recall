@@ -32,6 +32,8 @@ let admin: pg.Client;
 let adminUrl = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? '';
 let containerId: string | null = null;
 let mediaSearch: (params: any, auth: AuthContext) => Promise<SearchResult[]>;
+let rollupPendingEvents: (auth: AuthContext, scope: any, batchSize?: number) => Promise<{ rolled: number; failed: number; errors: string[] }>;
+let dbScopeFromAuth: (auth: AuthContext) => any;
 let shutdown: () => Promise<void>;
 
 before(async () => {
@@ -72,15 +74,24 @@ before(async () => {
 
   process.env.DATABASE_URL = process.env.TEST_APP_DATABASE_URL ?? appRoleUrl(adminUrl);
   ({ mediaSearch } = await import('../src/tools/media-search.js'));
-  ({ shutdown } = await import('../src/db.js'));
+  ({ rollupPendingEvents } = await import('../src/rollup.js'));
+  ({ dbScopeFromAuth, shutdown } = await import('../src/db.js'));
 });
 
 beforeEach(async () => {
-  await admin.query(`DELETE FROM memories WHERE source LIKE $1`, [`${TEST_SOURCE_PREFIX}%`]);
+  await admin.query(`DELETE FROM media_events WHERE service LIKE $1`, [`${TEST_SOURCE_PREFIX}%`]);
+  await admin.query(`DELETE FROM memories WHERE source LIKE $1 OR source LIKE $2`, [
+    `${TEST_SOURCE_PREFIX}%`,
+    `media:${TEST_SOURCE_PREFIX}%`,
+  ]);
 });
 
 after(async () => {
-  await admin?.query(`DELETE FROM memories WHERE source LIKE $1`, [`${TEST_SOURCE_PREFIX}%`]);
+  await admin?.query(`DELETE FROM media_events WHERE service LIKE $1`, [`${TEST_SOURCE_PREFIX}%`]);
+  await admin?.query(`DELETE FROM memories WHERE source LIKE $1 OR source LIKE $2`, [
+    `${TEST_SOURCE_PREFIX}%`,
+    `media:${TEST_SOURCE_PREFIX}%`,
+  ]);
   await shutdown?.();
   await admin?.end();
   if (containerId) {
@@ -238,7 +249,7 @@ test('media event type filters OR within their group and AND with services', asy
   ]);
 });
 
-test('media played date filters use metadata played_at and ignore malformed values', async () => {
+test('media played date filters use event_at and exclude null event times', async () => {
   await seedMemory({
     content: 'filter target anthem old spotify play',
     source: `${TEST_SOURCE_PREFIX}:old-played-new-rollup`,
@@ -248,6 +259,7 @@ test('media played date filters use metadata played_at and ignore malformed valu
       event_type: 'play',
       played_at: '2020-01-01T10:00:00.000Z',
     },
+    eventAt: '2020-01-01T10:00:00.000Z',
     createdAt: '2026-01-01T10:00:00.000Z',
   });
   await seedMemory({
@@ -259,6 +271,7 @@ test('media played date filters use metadata played_at and ignore malformed valu
       event_type: 'play',
       played_at: '2026-01-01T10:00:00.000Z',
     },
+    eventAt: '2026-01-01T10:00:00.000Z',
     createdAt: '2020-01-01T10:00:00.000Z',
   });
   await seedMemory({
@@ -300,6 +313,119 @@ test('media played date filters use metadata played_at and ignore malformed valu
   assert.deepEqual(sources(afterResults), [`${TEST_SOURCE_PREFIX}:new-played-old-rollup`]);
 });
 
+test('media event_at migration exposes a nullable column without building the operational index', async () => {
+  const column = await admin.query<{ is_nullable: string }>(
+    `SELECT is_nullable
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'memories'
+       AND column_name = 'event_at'`
+  );
+  const index = await admin.query<{ indexdef: string }>(
+    `SELECT indexdef
+     FROM pg_indexes
+     WHERE schemaname = 'public'
+       AND indexname = 'memories_media_event_at_idx'`
+  );
+
+  assert.equal(column.rowCount, 1);
+  assert.equal(column.rows[0].is_nullable, 'YES');
+  assert.equal(index.rowCount, 0);
+});
+
+test('media played date filters use event_at instead of created_at or metadata played_at', async () => {
+  await seedMemory({
+    content: 'filter target anthem old event new rollup',
+    source: `${TEST_SOURCE_PREFIX}:old-event-new-rollup`,
+    tags: ['media', 'spotify', 'play'],
+    metadata: {
+      service: 'spotify',
+      event_type: 'play',
+      played_at: '2026-01-01T10:00:00.000Z',
+    },
+    eventAt: '2020-01-01T10:00:00.000Z',
+    createdAt: '2026-01-01T10:00:00.000Z',
+  });
+  await seedMemory({
+    content: 'filter target anthem new event old rollup',
+    source: `${TEST_SOURCE_PREFIX}:new-event-old-rollup`,
+    tags: ['media', 'spotify', 'play'],
+    metadata: {
+      service: 'spotify',
+      event_type: 'play',
+      played_at: '2020-01-01T10:00:00.000Z',
+    },
+    eventAt: '2026-01-01T10:00:00.000Z',
+    createdAt: '2020-01-01T10:00:00.000Z',
+  });
+
+  const historicalResults = await mediaSearch(
+    {
+      query: 'filter target anthem',
+      played_before: '2020-12-31T23:59:59.999Z',
+      limit: 10,
+      threshold: 0,
+      agent_name: TEST_AGENT_NAME,
+    },
+    authContext()
+  );
+
+  assert.deepEqual(sources(historicalResults), [`${TEST_SOURCE_PREFIX}:old-event-new-rollup`]);
+
+  const currentResults = await mediaSearch(
+    {
+      query: 'filter target anthem',
+      played_after: '2025-01-01T00:00:00.000Z',
+      limit: 10,
+      threshold: 0,
+      agent_name: TEST_AGENT_NAME,
+    },
+    authContext()
+  );
+
+  assert.deepEqual(sources(currentResults), [`${TEST_SOURCE_PREFIX}:new-event-old-rollup`]);
+});
+
+test('media played date-only bounds normalize to full UTC days', async () => {
+  await seedMemory({
+    content: 'filter target anthem late utc day',
+    source: `${TEST_SOURCE_PREFIX}:late-utc-day`,
+    tags: ['media', 'plex', 'watch'],
+    metadata: {
+      service: 'plex',
+      event_type: 'watch',
+      played_at: '2024-06-05T23:59:59.999Z',
+    },
+    eventAt: '2024-06-05T23:59:59.999Z',
+    createdAt: '2026-01-01T10:00:00.000Z',
+  });
+  await seedMemory({
+    content: 'filter target anthem next utc day',
+    source: `${TEST_SOURCE_PREFIX}:next-utc-day`,
+    tags: ['media', 'plex', 'watch'],
+    metadata: {
+      service: 'plex',
+      event_type: 'watch',
+      played_at: '2024-06-06T00:00:00.000Z',
+    },
+    eventAt: '2024-06-06T00:00:00.000Z',
+    createdAt: '2026-01-01T10:00:00.000Z',
+  });
+
+  const beforeResults = await mediaSearch(
+    {
+      query: 'filter target anthem',
+      played_before: '2024-06-05',
+      limit: 10,
+      threshold: 0,
+      agent_name: TEST_AGENT_NAME,
+    },
+    authContext()
+  );
+
+  assert.deepEqual(sources(beforeResults), [`${TEST_SOURCE_PREFIX}:late-utc-day`]);
+});
+
 test('media played date inputs are validated before searching', async () => {
   await assert.rejects(
     () =>
@@ -313,7 +439,7 @@ test('media played date inputs are validated before searching', async () => {
         },
         authContext()
       ),
-    /played_after must be an ISO date-time/
+    /played_after must be an offset-aware ISO date-time or YYYY-MM-DD/
   );
 
   await assert.rejects(
@@ -329,8 +455,36 @@ test('media played date inputs are validated before searching', async () => {
         },
         authContext()
       ),
-    /played_after must be before or equal to played_before/
+    /played_before must be after or equal to played_after/
   );
+});
+
+test('media rollup writes event_at from the structured event played_at', async () => {
+  const service = `${TEST_SOURCE_PREFIX}-rollup`;
+  const playedAt = '2019-07-08T09:10:11.000Z';
+  await admin.query(
+    `INSERT INTO media_events
+       (service, service_id, event_type, title, artist, album, genres, played_at, client_id)
+     VALUES ($1, 'track-1', 'play', 'Rollup Event Time', 'Test Artist', 'Test Album', $2, $3::timestamptz, $4)`,
+    [service, ['integration'], playedAt, API_KEY_ID]
+  );
+
+  const auth = authContext(['read', 'write']);
+  const result = await rollupPendingEvents(auth, dbScopeFromAuth(auth), 10);
+
+  assert.equal(result.rolled, 1);
+  assert.equal(result.failed, 0);
+
+  const memory = await admin.query<{ event_at: Date; played_at: string }>(
+    `SELECT event_at, metadata->>'played_at' AS played_at
+     FROM memories
+     WHERE source = $1`,
+    [`media:${service}`]
+  );
+
+  assert.equal(memory.rowCount, 1);
+  assert.equal(memory.rows[0].event_at.toISOString(), playedAt);
+  assert.equal(new Date(memory.rows[0].played_at).toISOString(), playedAt);
 });
 
 test('structured service filters do not match arbitrary tag collisions', async () => {
@@ -480,13 +634,14 @@ async function seedMemory(input: {
   source: string;
   tags: string[];
   metadata: Record<string, unknown>;
+  eventAt?: string;
   createdAt?: string;
   vector?: string;
 }): Promise<void> {
   await admin.query(
     `INSERT INTO memories
-       (content, embedding, source, namespace, tags, metadata, client_id, created_at)
-     VALUES ($1, $2::vector, $3, 'media', $4, $5, $6, COALESCE($7::timestamptz, NOW()))`,
+       (content, embedding, source, namespace, tags, metadata, client_id, event_at, created_at)
+     VALUES ($1, $2::vector, $3, 'media', $4, $5, $6, $7::timestamptz, COALESCE($8::timestamptz, NOW()))`,
     [
       input.content,
       input.vector ?? VECTOR,
@@ -494,17 +649,18 @@ async function seedMemory(input: {
       input.tags,
       JSON.stringify(input.metadata),
       API_KEY_ID,
+      input.eventAt ?? null,
       input.createdAt ?? null,
     ]
   );
 }
 
-function authContext(): AuthContext {
+function authContext(permissions: string[] = ['read']): AuthContext {
   return {
     keyId: API_KEY_ID,
     name: 'media-search-filter-test',
     namespaces: ['media'],
-    permissions: ['read'],
+    permissions,
     maxAccessLevel: 'secret',
   };
 }

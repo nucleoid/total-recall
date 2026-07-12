@@ -362,6 +362,27 @@ DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run repair:l
 
 The repair is resumable: re-run it until `remainingRows` is `0`. It updates only rows where `last_boosted_at IS NULL`, setting the value to `COALESCE(accessed_at, created_at, NOW())`, and preserves existing non-null values by default. Do not overwrite non-null `last_boosted_at` values without a separate reviewed dry run and repair plan.
 
+Migration 015 adds nullable `memories.event_at` for media played-time filtering. It intentionally does not backfill historical rows or build the search index inside the normal transaction-wrapped migration runner. The historical repair accepts offset-aware ISO timestamps and uses PostgreSQL 16 `pg_input_is_valid` to report malformed timestamp strings without aborting the batch. Roll it out in this order:
+
+1. Run `npm run migrate` to add the nullable column.
+2. Stop old media rollup workers, deploy the new writer, then restart rollups. Do not run old and new rollup writers concurrently during cutover; old writers leave `event_at` null.
+3. Repair historical media rows in bounded batches:
+
+```bash
+DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run repair:media-event-at -- --dry-run
+DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run repair:media-event-at -- --batch-size 1000 --max-rows 10000
+```
+
+The media repair is resumable: re-run it until `remainingRows` is `0`. It updates only `namespace = 'media'` rows where `event_at IS NULL` and `metadata.played_at` is a valid offset-aware ISO timestamp. Malformed historical values, including PostgreSQL special timestamp literals such as `now`, are reported as `malformedRows` plus bounded `malformedSamples`; they remain null and are not guessed. During this rollout window, `media_search` queries with `played_after` or `played_before` exclude historical rows whose `event_at` is still null; expect complete bounded played-time results only after `remainingRows` is `0`.
+
+4. Build the event-time search index with the explicit non-transactional operation:
+
+```bash
+DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run index:media-event-at
+```
+
+This command runs `CREATE INDEX CONCURRENTLY IF NOT EXISTS memories_media_event_at_idx ON public.memories (namespace, event_at DESC) WHERE event_at IS NOT NULL`, which must stay outside `npm run migrate` because PostgreSQL disallows concurrent index creation inside a transaction block.
+
 ## Namespace Design
 
 | Namespace | Contents | Access |

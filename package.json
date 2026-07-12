@@ -24,6 +24,8 @@
     "preseed:chatgpt": "tsx scripts/preseed-chatgpt.ts",
     "decay:update": "tsx scripts/decay-update.ts",
     "repair:last-boosted-at": "tsx scripts/repair-last-boosted-at.ts",
+    "repair:media-event-at": "tsx scripts/repair-media-event-at.ts",
+    "index:media-event-at": "tsx scripts/create-media-event-at-index.ts",
     "reembed": "tsx scripts/reembed-all.ts",
     "spotify:auth": "tsx scripts/spotify-auth.ts",
     "spotify:sync": "tsx scripts/spotify-sync.ts",

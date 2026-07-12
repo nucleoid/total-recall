@@ -8,6 +8,12 @@ import { logTrace } from '../traces.js';
 
 const MEDIA_NAMESPACE = 'media';
 const ISO_DATE_TIME_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const ISO_DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+type NormalizedPlayedBound = {
+  value: string;
+  exclusive: boolean;
+};
 
 export const mediaSearchSchema = z.object({
   query: z.string().min(1),
@@ -36,18 +42,24 @@ export async function mediaSearch(
   const tags = normalizeGroup(params.tags);
   const services = normalizeGroup(params.services);
   const eventTypes = normalizeGroup(params.event_types);
-  const playedAfter = validatePlayedDate('played_after', params.played_after);
-  const playedBefore = validatePlayedDate('played_before', params.played_before);
-  if (playedAfter && playedBefore && Date.parse(playedAfter) > Date.parse(playedBefore)) {
-    throw new Error('played_after must be before or equal to played_before');
+  const playedAfter = normalizePlayedBound('played_after', params.played_after);
+  const playedBefore = normalizePlayedBound('played_before', params.played_before);
+  if (playedAfter && playedBefore) {
+    const afterMs = Date.parse(playedAfter.value);
+    const beforeMs = Date.parse(playedBefore.value);
+    const reversed = playedBefore.exclusive ? afterMs >= beforeMs : afterMs > beforeMs;
+    if (reversed) {
+      throwPlayedDateError('played_before', 'played_before must be after or equal to played_after');
+    }
   }
   const mediaFilters =
     services || eventTypes || playedAfter || playedBefore
       ? {
           services,
           eventTypes,
-          playedAfter,
-          playedBefore,
+          eventAfter: playedAfter?.value,
+          eventBefore: playedBefore?.value,
+          eventBeforeExclusive: playedBefore?.exclusive,
         }
       : undefined;
 
@@ -96,10 +108,46 @@ function normalizeGroup(values: string[] | undefined): string[] | undefined {
   return normalized.length > 0 ? normalized : undefined;
 }
 
-function validatePlayedDate(name: 'played_after' | 'played_before', value: string | undefined): string | undefined {
+function normalizePlayedBound(
+  name: 'played_after' | 'played_before',
+  value: string | undefined
+): NormalizedPlayedBound | undefined {
   if (!value) return undefined;
-  if (!ISO_DATE_TIME_WITH_ZONE.test(value) || Number.isNaN(Date.parse(value))) {
-    throw new Error(`${name} must be an ISO date-time with timezone`);
+
+  if (ISO_DATE_ONLY.test(value)) {
+    const date = parseUtcDateOnly(name, value);
+    if (name === 'played_before') {
+      date.setUTCDate(date.getUTCDate() + 1);
+      return { value: date.toISOString(), exclusive: true };
+    }
+    return { value: date.toISOString(), exclusive: false };
   }
-  return value;
+
+  if (!ISO_DATE_TIME_WITH_ZONE.test(value) || Number.isNaN(Date.parse(value))) {
+    throwPlayedDateError(name, `${name} must be an offset-aware ISO date-time or YYYY-MM-DD`);
+  }
+  return { value, exclusive: false };
+}
+
+function parseUtcDateOnly(name: 'played_after' | 'played_before', value: string): Date {
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    throwPlayedDateError(name, `${name} must be a valid YYYY-MM-DD date`);
+  }
+  return date;
+}
+
+function throwPlayedDateError(name: 'played_after' | 'played_before', message: string): never {
+  throw new z.ZodError([
+    {
+      code: z.ZodIssueCode.custom,
+      path: [name],
+      message,
+    },
+  ]);
 }

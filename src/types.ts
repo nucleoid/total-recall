@@ -11,6 +11,7 @@ export interface Memory {
   access_level: AccessLevel;
   client_id: string;
   created_at: Date;
+  event_at?: Date | null;
   updated_at: Date;
   accessed_at: Date;
   access_count: number;
@@ -58,8 +59,9 @@ export interface SearchParams {
 export interface MediaSearchFilters {
   services?: string[];
   eventTypes?: string[];
-  playedAfter?: string;
-  playedBefore?: string;
+  eventAfter?: string;
+  eventBefore?: string;
+  eventBeforeExclusive?: boolean;
 }
 
 export interface ListParams {

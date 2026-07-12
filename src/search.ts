@@ -6,7 +6,6 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const EF_SEARCH = parseInt(process.env.HNSW_EF_SEARCH || '200', 10);
-const ISO_TIMESTAMPTZ_PATTERN = '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$';
 
 export async function hybridSearch(
   params: SearchParams,
@@ -44,11 +43,12 @@ export async function hybridSearch(
     if (params.mediaFilters?.eventTypes && params.mediaFilters.eventTypes.length > 0) {
       conditions.push(`m.metadata->>'event_type' = ANY(${p(params.mediaFilters.eventTypes)}::text[])`);
     }
-    if (params.mediaFilters?.playedAfter) {
-      conditions.push(`${playedAtExpression('m')} >= ${p(params.mediaFilters.playedAfter)}::timestamptz`);
+    if (params.mediaFilters?.eventAfter) {
+      conditions.push(`m.event_at >= ${p(params.mediaFilters.eventAfter)}::timestamptz`);
     }
-    if (params.mediaFilters?.playedBefore) {
-      conditions.push(`${playedAtExpression('m')} <= ${p(params.mediaFilters.playedBefore)}::timestamptz`);
+    if (params.mediaFilters?.eventBefore) {
+      const operator = params.mediaFilters.eventBeforeExclusive ? '<' : '<=';
+      conditions.push(`m.event_at ${operator} ${p(params.mediaFilters.eventBefore)}::timestamptz`);
     }
     if (params.source) {
       conditions.push(`m.source = ${p(params.source)}`);
@@ -64,7 +64,7 @@ export async function hybridSearch(
 
     const sql = `
       WITH vector_results AS (
-        SELECT id, content, metadata, tags, source, namespace, created_at, relevance_score, decay_rate,
+        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, decay_rate,
           updated_at, accessed_at, access_count, access_level, client_id,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
@@ -73,7 +73,7 @@ export async function hybridSearch(
         LIMIT 50
       ),
       text_only_results AS (
-        SELECT id, content, metadata, tags, source, namespace, created_at, relevance_score, decay_rate,
+        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, decay_rate,
           updated_at, accessed_at, access_count, access_level, client_id,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
@@ -119,9 +119,4 @@ export async function hybridSearch(
 
     return res.rows as SearchResult[];
   });
-}
-
-function playedAtExpression(alias: string): string {
-  return `(CASE WHEN ${alias}.metadata->>'played_at' ~ '${ISO_TIMESTAMPTZ_PATTERN}' ` +
-    `THEN (${alias}.metadata->>'played_at')::timestamptz END)`;
 }
