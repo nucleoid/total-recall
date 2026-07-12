@@ -223,6 +223,25 @@ async function loadStoreDocument() {
   return import('../src/tools/store-document.js');
 }
 
+test('direct document stores validate blank and decoded oversize content before embedding or SQL', async () => {
+  const pool = new FakePool();
+  setPoolForTesting(pool as unknown as pg.Pool);
+  const embeddings = installEmbeddingMock();
+  const { MAX_DOCUMENT_CONTENT_BYTES, memoryStoreDocument } = await loadStoreDocument();
+
+  for (const content of [' \t\r\n', 'x'.repeat(MAX_DOCUMENT_CONTENT_BYTES + 1)]) {
+    await assert.rejects(
+      () => memoryStoreDocument({
+        title: 'invalid', content, namespace: 'shared', tags: [], source: 'manual',
+      }, AUTH_A),
+      /(?:non-whitespace|1 MiB)/i
+    );
+  }
+
+  assert.equal(embeddings.calls(), 0);
+  assert.equal(pool.clients.length, 0);
+});
+
 test('embed failure at chunk 7 opens no database transaction', async () => {
   const pool = new FakePool();
   setPoolForTesting(pool as unknown as pg.Pool);
@@ -282,10 +301,10 @@ test('same namespace idempotency key converges and changed request conflicts; na
   const retry = await memoryStoreDocument(params, AUTH_A);
 
   assert.equal(retry.document_id, first.document_id);
-  assert.equal(retry.chunks_stored, 2);
+  assert.equal(retry.chunks_stored, 4);
   assert.equal(pool.db.docs.filter((row) => row.client_id === AUTH_A.keyId).length, 1);
-  assert.equal(pool.db.memories.filter((row) => row.client_id === AUTH_A.keyId).length, 2);
-  assert.equal(embeddings.calls(), 2, 'completed idempotent retries should return before embedding');
+  assert.equal(pool.db.memories.filter((row) => row.client_id === AUTH_A.keyId).length, 4);
+  assert.equal(embeddings.calls(), 4, 'completed idempotent retries should return before embedding');
 
   await assert.rejects(
     () => memoryStoreDocument({ ...params, content: 'changed' }, AUTH_A),
