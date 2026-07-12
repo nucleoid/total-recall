@@ -180,7 +180,13 @@ total-recall/
 The canonical variables below are for the currently gated preseed/repair commands. Live readers and writers still select Ollama when no Gemini key is present until #9 identity storage and #61 mixed-aware readers permit a coordinated cutover.
 
 ```
-DATABASE_URL=postgresql://total_recall:total_recall_dev@localhost:5432/total_recall
+# Runtime and preseed app role; migration/maintenance credentials are separate.
+DATABASE_URL=postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall
+MIGRATION_DATABASE_URL=postgresql://total_recall:total_recall_dev@localhost:5432/total_recall
+CLAUDE_IMPORTS_DIR=/absolute/path/to/claude-export
+OPENCLAW_WORKSPACE=/absolute/path/to/.openclaw/workspace
+OPENCLAW_CORTEX_CONTENT=/absolute/path/to/cortex/content
+OPENCLAW_SECOND_BRAIN=/absolute/path/to/second-brain
 EMBEDDING_PROVIDER=gemini
 GEMINI_API_KEY=your-gemini-api-key-here
 EMBEDDING_MODEL=gemini-embedding-2-preview
@@ -198,6 +204,20 @@ node dist/index.js
 ```
 
 Migration `009_api_key_access_ceiling.sql` backfills existing `api_keys.max_access_level` values to `secret` to preserve upgraded installations, then sets the default for newly created keys to `normal`. Use `--max-access-level sensitive` or `--max-access-level secret` only for clients that should read and write higher-classification memories.
+
+## Preseed Import Safety
+After the #9/#61 gate opens, preseed commands use `DATABASE_URL` and reject any superuser,
+`BYPASSRLS` identity, or owner of `memories` before reading exports. They embed bounded groups
+before beginning a transaction, set only that group's `app.allowed_namespaces` transaction-locally,
+and roll back the complete group on failure. Owner credentials remain exclusive to migrations and
+explicit all-row maintenance.
+
+Empty Claude exports are successful zero-write imports: empty conversation/memory arrays, absent
+or empty `chat_messages`, and absent or blank `conversations_memory` report zero. Missing files and
+malformed shapes remain errors. A memory-only export uses the captured `memories.json` mtime or
+requires explicit `--memory-timestamp`; run time is never substituted. Claude uses
+`CLAUDE_IMPORTS_DIR`. OpenClaw uses `OPENCLAW_WORKSPACE`, with optional
+`OPENCLAW_CORTEX_CONTENT` and `OPENCLAW_SECOND_BRAIN` overrides; canonical paths are deduplicated.
 
 ## Key Requirements
 1. All embedding happens server-side (client sends plain text)
