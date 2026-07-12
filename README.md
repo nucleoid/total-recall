@@ -446,15 +446,19 @@ Getting agents to *reliably* use memory is harder than building the memory syste
 - **Store before moving on** — save decisions, preferences, and facts incrementally
 - **Self-check before session ends** — review whether key takeaways were stored
 
-**[Discord Sweep](scripts/discord-sweep.py)** — Automated safety net that periodically re-reads Discord channel logs, extracts noteworthy items via LLM, and stores them. Run as a cron job to catch anything that in-session storage missed.
+**[Discord Sweep](scripts/discord-sweep.py)** — Automated safety net that processes adjacent, per-channel checkpoint windows, extracts noteworthy items via an LLM, and stores them with retry-safe idempotency keys. `--hours` controls only a channel's first lookback; later runs resume from its successful watermark.
 
 ```bash
-# Dry run to see what would be stored
+# Dry run to see what would be stored (never changes state or calls storage)
 python3 scripts/discord-sweep.py --hours 12 --dry-run
 
-# Production cron (every 6 hours, 1h overlap buffer)
-0 */6 * * * python3 /path/to/discord-sweep.py --hours 7 >> /tmp/discord-sweep.log 2>&1
+# Production cron (every 6 hours; no overlap buffer is needed)
+0 */6 * * * python3 /path/to/discord-sweep.py --hours 6 >> /tmp/discord-sweep.log 2>&1
 ```
+
+Deploy server support for `memory_store.idempotency_key` before deploying the new cron, then verify through the same `mcporter call total-recall.memory_store` MCP path used by the cron that a keyed response includes `idempotency_key_honored: true`. The cron accepts both mcporter's unwrapped JSON and standard MCP text-content envelope and requires that acknowledgement, so a new cron against an old server retains its pending store and exits nonzero instead of silently checkpointing an unkeyed write. The cron writes state v2 under `~/.cache/discord-sweep/` using a single-process lock and owner-only atomic files. During an interrupted store, that state temporarily contains the normalized extracted memory payload so the retry does not rerun the LLM; it is removed immediately after the window checkpoints. Back up the old state before deployment (migration also creates `state.json.v1.bak`). Rollback requires restoring that legacy backup. Failed channels retain pending state and make the command exit nonzero while independent channels continue. This prevents new duplicates but does not remove historical ones.
+
+`memory_store.idempotency_key` identity is scoped only by the authenticated API key, not by namespace. Reusing a key updates the original row and preserves `created_at`; when the API key is authorized for both the old and new namespaces, this may intentionally move the memory and update its access level. If the existing row is outside the caller's namespace grants, the operation returns the same access-denied error without revealing whether the key already exists.
 
 ## Development Status
 

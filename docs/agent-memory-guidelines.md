@@ -117,12 +117,15 @@ than losing context.
 In-session discipline will never be 100%. For chat platforms where message history persists (Discord, Slack, etc.), you can run a periodic sweep that re-reads recent conversations and extracts anything worth storing.
 
 See [`scripts/discord-sweep.py`](../scripts/discord-sweep.py) for a reference implementation that:
-- Reads recent messages from Discord channel logs
+- Reads half-open, adjacent windows from Discord channel logs, checkpointed by stable channel ID
 - Uses an LLM to extract decisions, preferences, facts, and lessons
-- Stores extracted memories via the `memory_store` MCP tool
-- Runs as a cron job (recommended: every 4-8 hours)
+- Persists a temporary owner-only extraction snapshot and uses keyed `memory_store` retries
+- Advances a channel only after extraction and all stores succeed; other channels continue on failure
+- Runs as a cron job (recommended: every 4-8 hours; `--hours` is first-run lookback only)
 
-This catches context that slipped through in-session storage. It's a safety net, not a replacement for the discipline rules above.
+Deploy keyed server support before the cron and verify the acknowledgement through the same `mcporter call total-recall.memory_store` MCP path the cron uses. Every keyed response must include `idempotency_key_honored: true`; the sweep unwraps either direct JSON or the standard MCP text-content envelope and refuses to checkpoint without the acknowledgement, which makes a misordered new-cron/old-server rollout fail closed. State v2 is atomically stored in the owner-only `~/.cache/discord-sweep/` directory and the local pending payload is deleted immediately after a successful checkpoint. A dry run neither changes state nor calls storage. The first real run backs up valid legacy state; retain that backup for rollback. This catches context that slipped through in-session storage. It's a safety net, not a replacement for the discipline rules above.
+
+For general callers, an idempotency key is scoped to the authenticated API key rather than a namespace. Reuse updates the same memory and preserves its original `created_at`; a caller granted both namespaces may intentionally move that row and update its access level. Reuse cannot reveal or mutate a row whose current namespace is outside the caller's grants: it returns the normalized access-denied response.
 
 ## Architecture of Memory Reliability
 

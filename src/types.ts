@@ -42,6 +42,7 @@ export interface StoreParams {
   tags?: string[];
   metadata?: Record<string, unknown>;
   access_level?: AccessLevel;
+  idempotency_key?: string;
 }
 
 export interface SearchParams {

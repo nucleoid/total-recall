@@ -392,7 +392,11 @@ app.post('/api/store', async (req, res) => {
     if (!auth) return;
     const params = storeSchema.parse(req.body);
     const result = await memoryStore(params, auth);
-    res.json({ id: result.id, created: true });
+    res.json({
+      id: result.id,
+      created: true,
+      ...(result.idempotency_key_honored && { idempotency_key_honored: true }),
+    });
   } catch (err: any) {
     sendApiError(res, '/api/store', err);
   }
