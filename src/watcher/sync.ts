@@ -1,5 +1,6 @@
 import type { ScopedClient } from '../db.js';
 import { withScopedClient } from '../db.js';
+import type { PathWork } from './queue.js';
 
 export interface SyncChunk {
   content: string;
@@ -52,6 +53,25 @@ export async function prepareChunks(
     prepared.push({ ...chunk, vectorStr: `[${embedding.join(',')}]` });
   }
   return prepared;
+}
+
+export interface CurrentCommit<T> {
+  filePath: string;
+  preparedFingerprint: string | null;
+  readFingerprint: (filePath: string) => Promise<string | null>;
+  work: PathWork;
+  commit: () => Promise<T>;
+}
+
+/** Guard expensive preparation immediately before opening its mutation scope. */
+export async function commitIfCurrent<T>(input: CurrentCommit<T>): Promise<T | undefined> {
+  if (!input.work.isCurrent()) return undefined;
+  const currentFingerprint = await input.readFingerprint(input.filePath);
+  if (!input.work.isCurrent() || currentFingerprint !== input.preparedFingerprint) {
+    input.work.retryIfCurrent();
+    return undefined;
+  }
+  return input.commit();
 }
 
 export async function commitPreparedFile(input: FileSyncInput): Promise<void> {
