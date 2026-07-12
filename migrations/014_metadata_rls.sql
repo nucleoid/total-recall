@@ -24,7 +24,7 @@ GRANT EXECUTE ON FUNCTION app_current_key_id() TO total_recall_app;
 GRANT EXECUTE ON FUNCTION app_current_key_is_admin() TO total_recall_app;
 
 ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_name_key;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_api_key_name_unique ON agents (api_key_id, name);
+DROP INDEX IF EXISTS idx_agents_api_key_name_unique;
 
 GRANT SELECT, INSERT, UPDATE ON agents TO total_recall_app;
 GRANT SELECT, INSERT ON recall_traces TO total_recall_app;

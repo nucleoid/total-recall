@@ -1,8 +1,16 @@
-import { queryScoped, type DbScope } from './db.js';
+import { queryScoped, queryUnscoped, type DbScope } from './db.js';
 import { accessLevelSql } from './auth.js';
-import type { Agent, AgentParams, AuthContext } from './types.js';
+import type { Agent, AgentParams, AuthContext, SystemAgentParams } from './types.js';
+
+function assertAgentScope(params: AgentParams, scope: DbScope): void {
+  if (params.api_key_id !== scope.keyId) {
+    throw new Error('Agent api_key_id must match the authenticated database scope');
+  }
+}
 
 export async function upsertAgent(params: AgentParams, scope: DbScope): Promise<Agent> {
+  assertAgentScope(params, scope);
+
   let parentAgentId: string | null = null;
   if (params.parent_agent_name) {
     const parent = await getAgentByName(params.parent_agent_name, scope);
@@ -11,7 +19,7 @@ export async function upsertAgent(params: AgentParams, scope: DbScope): Promise<
 
   const sql = `INSERT INTO agents (name, type, model, runtime, parent_agent_id, api_key_id, metadata)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (api_key_id, name) DO UPDATE SET
+     ON CONFLICT (api_key_id, name) WHERE api_key_id IS NOT NULL DO UPDATE SET
        type = COALESCE(EXCLUDED.type, agents.type),
        model = COALESCE(EXCLUDED.model, agents.model),
        runtime = COALESCE(EXCLUDED.runtime, agents.runtime),
@@ -25,10 +33,24 @@ export async function upsertAgent(params: AgentParams, scope: DbScope): Promise<
     params.model ?? null,
     params.runtime ?? null,
     parentAgentId,
-    scope.keyId,
+    params.api_key_id,
     JSON.stringify(params.metadata ?? {}),
   ];
   const res = await queryScoped<Agent>(scope, sql, values);
+  return res.rows[0];
+}
+
+export async function upsertSystemAgent(params: SystemAgentParams): Promise<Agent> {
+  const res = await queryUnscoped<Agent>(
+    'SELECT * FROM upsert_system_agent($1, $2, $3, $4, $5::jsonb)',
+    [
+      params.name,
+      params.type ?? 'system',
+      params.model ?? null,
+      params.runtime ?? null,
+      JSON.stringify(params.metadata ?? {}),
+    ]
+  );
   return res.rows[0];
 }
 
@@ -79,9 +101,16 @@ export async function resolveAgent(
   apiKeyId?: string,
   scope?: DbScope
 ): Promise<string> {
+  if (!apiKeyId) {
+    throw new Error('apiKeyId is required to resolve authenticated agents');
+  }
   if (!scope) {
     throw new Error('Agent resolution requires an authenticated database scope');
   }
+  if (apiKeyId !== scope.keyId) {
+    throw new Error('apiKeyId must match the authenticated database scope');
+  }
+
   const agent = await upsertAgent({
     name: agentName,
     type: agentType,
