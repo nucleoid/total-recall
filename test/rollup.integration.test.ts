@@ -214,7 +214,9 @@ test('successful rollup commits one exact memory and link on one media-scoped cl
   assert.ok(writer);
   assert.match(writer.calls.find((call) => /UPDATE media_events/i.test(call.text))!.text, /memory_id IS NULL[\s\S]+RETURNING id/i);
   assert.deepEqual(new Set(writer.calls.map((call) => call.pid)), new Set([writer.pid]));
-  const namespaceCall = writer.calls.find((call) => call.text.includes("set_config('app.allowed_namespaces'"));
+  const namespaceCall = writer.calls.find((call) =>
+    call.text.includes("set_config('app.allowed_namespaces'") && (call.params?.length ?? 0) > 0
+  );
   assert.equal(namespaceCall?.params?.[0], JSON.stringify(['media']));
 });
 

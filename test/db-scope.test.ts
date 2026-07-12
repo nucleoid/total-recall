@@ -49,12 +49,13 @@ test('queryScoped wraps protected SQL in a transaction-local namespace/key scope
   const client = new FakeClient();
   setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
 
-  const scope: DbScope = { namespaces: ['financial,quarterly', 'shared'], keyId: 'key-1', isAdmin: true };
+  const scope: DbScope = { namespaces: ['financial-quarterly', 'shared'], keyId: 'key-1', isAdmin: true };
   await queryScoped(scope, 'SELECT * FROM memories WHERE namespace = ANY($1)', [['shared']]);
 
   assert.deepEqual(
     client.calls.map((call) => call.text),
     [
+      "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",
@@ -63,9 +64,9 @@ test('queryScoped wraps protected SQL in a transaction-local namespace/key scope
       'COMMIT',
     ]
   );
-  assert.equal(client.calls[1].params?.[0], JSON.stringify(scope.namespaces));
-  assert.equal(client.calls[2].params?.[0], scope.keyId);
-  assert.equal(client.calls[3].params?.[0], 'true');
+  assert.equal(client.calls[2].params?.[0], JSON.stringify(scope.namespaces));
+  assert.equal(client.calls[3].params?.[0], scope.keyId);
+  assert.equal(client.calls[4].params?.[0], 'true');
   assert.deepEqual(client.releaseArgs, []);
 });
 
@@ -84,6 +85,7 @@ test('withScopedClient rolls back and reuses the connection after callback failu
   assert.deepEqual(
     client.calls.map((call) => call.text),
     [
+      "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",
@@ -91,7 +93,7 @@ test('withScopedClient rolls back and reuses the connection after callback failu
       'ROLLBACK',
     ]
   );
-  assert.equal(client.calls[1].params?.[0], '[]');
+  assert.equal(client.calls[2].params?.[0], '[]');
   assert.deepEqual(client.releaseArgs, []);
 });
 
@@ -108,6 +110,7 @@ test('withScopedClient rolls back and discards connections on commit failure', a
   assert.deepEqual(
     client.calls.map((call) => call.text),
     [
+      "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",
