@@ -62,6 +62,11 @@ export interface ReembedSummary {
 
 type Embedder = (texts: string[]) => Promise<number[][]>;
 
+/** #41 cannot safely write mixed vectors before #9 identity storage and #61 mixed-aware readers. */
+export function requireMixedEmbeddingMigrationSupport(): void {
+  throw new Error('Re-embedding is disabled until #9 provides embedding identity storage and #61 mixed-aware readers are deployed');
+}
+
 function increment(counts: Record<string, number>, namespace: string): void {
   counts[namespace] = (counts[namespace] ?? 0) + 1;
 }
@@ -205,6 +210,7 @@ export async function runReembedAgainstEnvironment(
 }
 
 async function main(): Promise<void> {
+  requireMixedEmbeddingMigrationSupport();
   const profile = validateMaintenanceEmbeddingProfile(process.env);
   const embedder = createMaintenanceEmbedder(profile);
   console.log('[reembed] Validated embedding profile', {

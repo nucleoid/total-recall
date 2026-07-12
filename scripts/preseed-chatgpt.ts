@@ -1,15 +1,16 @@
+import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import fs from 'fs';
 import path from 'path';
+import { embed } from '../src/embedding.js';
+import { requireEmbeddingIdentityWriter } from './lib/preseed-embedding.js';
 
 const DATABASE_URL = process.env.OWNER_DATABASE_URL || 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall';
-const OLLAMA_URL = 'http://localhost:11434/api/embed';
 const IMPORTS_DIR = '/home/fuego/projects/total-recall/imports/chatgpt';
 const MAX_CONTENT = 4000;
 const TURNS_PER_CHUNK = 5;
 
 const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 5 });
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 interface MappingNode {
   message?: {
@@ -37,17 +38,6 @@ interface Turn {
   create_time: number | null;
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
-  const resp = await fetch(OLLAMA_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'nomic-embed-text', input: text.slice(0, 8000) }),
-  });
-  if (!resp.ok) throw new Error(`Ollama error: ${resp.status} ${await resp.text()}`);
-  const data = await resp.json() as { embeddings: number[][] };
-  return data.embeddings[0];
-}
-
 function walkConversation(mapping: Record<string, MappingNode>): Turn[] {
   // Find root node (no parent)
   let rootId: string | null = null;
@@ -63,7 +53,7 @@ function walkConversation(mapping: Record<string, MappingNode>): Turn[] {
   const turns: Turn[] = [];
   let current: string | null = rootId;
   while (current) {
-    const node = mapping[current];
+    const node: MappingNode | undefined = mapping[current];
     if (!node) break;
 
     const msg = node.message;
@@ -142,6 +132,7 @@ ON CONFLICT (source_key) DO UPDATE SET
 `;
 
 async function main() {
+  requireEmbeddingIdentityWriter();
   const allConversations: Conversation[] = [];
   for (let i = 0; i <= 8; i++) {
     const fname = `conversations-${String(i).padStart(3, '0')}.json`;
@@ -180,7 +171,7 @@ async function main() {
     });
 
     for (const chunk of chunks) {
-      const embedding = await getEmbedding(chunk.content);
+      const embedding = await embed(chunk.content);
       const vectorStr = `[${embedding.join(',')}]`;
 
       await client.query(UPSERT_SQL, [
@@ -195,7 +186,6 @@ async function main() {
       ]);
 
       totalMemories++;
-      await sleep(100);
 
       const ts = new Date(chunk.createdAt).getTime();
       if (ts < minDate) minDate = ts;
@@ -216,7 +206,9 @@ async function main() {
   console.log(`📅 Date range: ${from} → ${to}`);
 }
 
-main().catch(err => {
-  console.error('Fatal:', err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(err => {
+    console.error('Fatal:', err);
+    process.exitCode = 1;
+  });
+}

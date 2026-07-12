@@ -139,8 +139,9 @@ test('reembed uses the validated maintenance embedding client rather than the li
   assert.match(source, /validateMaintenanceEmbeddingProfile/);
 });
 
-test('runbook describes full-store retries rather than claiming resumability', async () => {
+test('runbook supersedes unsafe full-store retries with the mixed-vector prerequisite gate', async () => {
   const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
-  assert.doesNotMatch(readme, /reembed[^.]{0,120}resumable|resumable[^.]{0,120}reembed/i);
-  assert.match(readme, /re-embeds the full store|full-store re-embedding/i);
+  assert.match(readme, /reembed[^.]*gated|gated[^.]*reembed/i);
+  assert.match(readme, /#9[^.]*#61/i);
+  assert.doesNotMatch(readme, /re-embeds the full store|full-store re-embedding/i);
 });
