@@ -1,12 +1,13 @@
 import { z } from 'zod';
 import { hybridSearch } from '../search.js';
 import { dbScopeFromAuth } from '../db.js';
-import type { AuthContext, SearchResult } from '../types.js';
+import type { AuthContext, SearchParams, SearchResult } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
 import { logTrace } from '../traces.js';
 
 const MEDIA_NAMESPACE = 'media';
+const ISO_DATE_TIME_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export const mediaSearchSchema = z.object({
   query: z.string().min(1),
@@ -32,15 +33,28 @@ export async function mediaSearch(
   const namespaces = filterNamespaces([MEDIA_NAMESPACE], auth.namespaces);
   if (namespaces.length === 0) return [];
 
-  const combinedTags = new Set<string>(params.tags ?? []);
-  for (const svc of params.services ?? []) combinedTags.add(svc);
-  for (const et of params.event_types ?? []) combinedTags.add(et);
+  const tags = normalizeGroup(params.tags);
+  const services = normalizeGroup(params.services);
+  const eventTypes = normalizeGroup(params.event_types);
+  const playedAfter = validatePlayedDate('played_after', params.played_after);
+  const playedBefore = validatePlayedDate('played_before', params.played_before);
+  if (playedAfter && playedBefore && Date.parse(playedAfter) > Date.parse(playedBefore)) {
+    throw new Error('played_after must be before or equal to played_before');
+  }
+  const mediaFilters =
+    services || eventTypes || playedAfter || playedBefore
+      ? {
+          services,
+          eventTypes,
+          playedAfter,
+          playedBefore,
+        }
+      : undefined;
 
-  const searchParams = {
+  const searchParams: SearchParams = {
     query: params.query,
-    tags: combinedTags.size ? [...combinedTags] : undefined,
-    after: params.played_after,
-    before: params.played_before,
+    tags,
+    mediaFilters,
     limit: params.limit,
     threshold: params.threshold,
   };
@@ -74,4 +88,18 @@ export async function mediaSearch(
   }, scope).catch((err) => console.error('[total-recall] trace log error:', err.message));
 
   return results;
+}
+
+function normalizeGroup(values: string[] | undefined): string[] | undefined {
+  if (!values) return undefined;
+  const normalized = [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function validatePlayedDate(name: 'played_after' | 'played_before', value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (!ISO_DATE_TIME_WITH_ZONE.test(value) || Number.isNaN(Date.parse(value))) {
+    throw new Error(`${name} must be an ISO date-time with timezone`);
+  }
+  return value;
 }
