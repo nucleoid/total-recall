@@ -65,7 +65,7 @@ export async function hybridSearch(
 
     const sql = `
       WITH vector_results AS (
-        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, decay_rate,
+        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
           updated_at, accessed_at, access_count, access_level, client_id,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
@@ -74,7 +74,7 @@ export async function hybridSearch(
         LIMIT 50
       ),
       text_only_results AS (
-        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, decay_rate,
+        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
           updated_at, accessed_at, access_count, access_level, client_id,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
@@ -94,16 +94,20 @@ export async function hybridSearch(
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
+      ),
+      scored AS MATERIALIZED (
+        SELECT c.*,
+          COALESCE(t.text_score, 0) AS text_score,
+          (c.vec_score * 0.3 + COALESCE(t.text_score, 0) * 0.7 + CASE WHEN COALESCE(t.text_score, 0) > 0 THEN 0.5 ELSE 0 END) AS base_score,
+          calculate_relevance(c.relevance_base_score, c.decay_rate, c.accessed_at, c.access_count) AS relevance
+        FROM combined c
+        LEFT JOIN text_scores t ON c.id = t.id
+        WHERE c.vec_score >= ${pThreshold} OR t.text_score > 0
       )
-      SELECT c.*,
-        COALESCE(t.text_score, 0) AS text_score,
-        (c.vec_score * 0.3 + COALESCE(t.text_score, 0) * 0.7 + CASE WHEN COALESCE(t.text_score, 0) > 0 THEN 0.5 ELSE 0 END) AS base_score,
-        calculate_relevance(c.relevance_score, c.decay_rate, c.accessed_at, c.access_count) AS relevance,
-        (c.vec_score * 0.3 + COALESCE(t.text_score, 0) * 0.7 + CASE WHEN COALESCE(t.text_score, 0) > 0 THEN 2.0 ELSE 0 END)
-          * LEAST(calculate_relevance(c.relevance_score, c.decay_rate, c.accessed_at, c.access_count), 2.0) AS final_score
-      FROM combined c
-      LEFT JOIN text_scores t ON c.id = t.id
-      WHERE c.vec_score >= ${pThreshold} OR t.text_score > 0
+      SELECT s.*,
+        (s.vec_score * 0.3 + s.text_score * 0.7 + CASE WHEN s.text_score > 0 THEN 2.0 ELSE 0 END)
+          * LEAST(s.relevance, 2.0) AS final_score
+      FROM scored s
       ORDER BY final_score DESC
       LIMIT ${pLimit};
     `;
