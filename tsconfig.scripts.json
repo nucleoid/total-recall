@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": [
+    "scripts/preseed-chatgpt.ts",
+    "scripts/lib/preseed-embedding.ts",
+    "test/preseed-chatgpt.test.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

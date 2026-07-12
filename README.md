@@ -311,6 +311,8 @@ Bootstrap from existing AI conversation history across platforms.
 
 Preseed commands currently fail closed before reading exports, connecting to PostgreSQL, or calling an embedding provider. Issue #9 must first supply the approved embedding-identity schema and atomic vector+descriptor writer; issue #61 mixed-aware readers must then be deployed everywhere before preseed can create mixed-vintage writes. #41 deliberately does not guess column names or stamp provenance onto vectors whose identity is unknown.
 
+Once that gate is implemented, ChatGPT import requires `CHATGPT_IMPORTS_DIR` or a directory as the first CLI argument. The directory scanner accepts only `conversations.json` and `conversations-<digits>.json` (unsuffixed first, then numeric suffix order); backups and unrelated files are ignored. Each root array is streamed one conversation at a time, output chunks are committed in batches of at most ten, and reruns converge through stable source keys. A failed later file or batch leaves earlier batches committed. The default single-conversation limit is 16 MiB; `--max-conversation-bytes <bytes>` permits an explicit positive override up to 64 MiB, with correspondingly higher Node heap risk.
+
 ### Ingestion Pipeline (shared by all sources)
 
 ```
