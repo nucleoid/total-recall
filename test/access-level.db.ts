@@ -88,7 +88,7 @@ async function setup(): Promise<Record<string, string>> {
   await client.query(`
     CREATE TABLE agents (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      name TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
       type TEXT NOT NULL DEFAULT 'llm',
       model TEXT,
       runtime TEXT,
@@ -99,6 +99,7 @@ async function setup(): Promise<Record<string, string>> {
       last_seen_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  await client.query(`CREATE UNIQUE INDEX agents_api_key_name_idx ON agents (api_key_id, name)`);
   await client.query(`
     CREATE TABLE memories (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -120,7 +121,9 @@ async function setup(): Promise<Record<string, string>> {
   `);
 
   const agentRes = await client.query(
-    `INSERT INTO agents (name, type) VALUES ('agent-a', 'llm'), ('agent-b', 'llm') RETURNING id, name`
+    `INSERT INTO agents (name, type, api_key_id)
+     VALUES ('agent-a', 'llm', 'key-normal'), ('agent-b', 'llm', 'key-normal')
+     RETURNING id, name`
   );
   const agentA = agentRes.rows.find((r) => r.name === 'agent-a').id;
   const agentB = agentRes.rows.find((r) => r.name === 'agent-b').id;
@@ -129,11 +132,11 @@ async function setup(): Promise<Record<string, string>> {
   const inserted = await client.query(`
     INSERT INTO memories (content, source, namespace, tags, metadata, access_level, client_id, agent_id, document_id, chunk_index)
     VALUES
-      ('normal memory', 'test', 'shared', '{}', '{}', 'normal', 'seed', $1, $3, 0),
-      ('sensitive memory', 'test', 'shared', '{}', '{}', 'sensitive', 'seed', $1, NULL, NULL),
-      ('secret memory', 'test', 'shared', '{}', '{}', 'secret', 'seed', $2, $3, 1),
-      ('unknown memory', 'test', 'shared', '{}', '{}', 'classified', 'seed', $2, NULL, NULL),
-      ('null memory', 'test', 'shared', '{}', '{}', NULL, 'seed', $2, NULL, NULL)
+      ('normal memory', 'test', 'shared', '{}', '{}', 'normal', 'key-normal', $1, $3, 0),
+      ('sensitive memory', 'test', 'shared', '{}', '{}', 'sensitive', 'key-normal', $1, NULL, NULL),
+      ('secret memory', 'test', 'shared', '{}', '{}', 'secret', 'key-normal', $2, $3, 1),
+      ('unknown memory', 'test', 'shared', '{}', '{}', 'classified', 'key-normal', $2, NULL, NULL),
+      ('null memory', 'test', 'shared', '{}', '{}', NULL, 'key-normal', $2, NULL, NULL)
     RETURNING id, content
   `, [agentA, agentB, documentId]);
 

@@ -201,7 +201,7 @@ Register or update an AI agent in the provenance system.
 ```
 
 ### `agent_list`
-List all registered agents with memory counts and last activity. Requires an API key with the `admin` permission because this is a global observability view.
+List registered agents owned by the authenticated API key, with memory counts and last activity. Requires `read` permission.
 
 ## Agent Provenance Model
 
@@ -217,7 +217,7 @@ Every memory can be linked to the agent that created it. Agents are identified b
 **How it works:**
 1. When `memory_store` or `memory_search` is called with `agent_name`, the agent is resolved (created if new, updated if existing)
 2. The `agent_id` is stored on the memory record for provenance
-3. Use `agent_list` with an `admin` API key to see all registered agents and their memory counts
+3. Use `agent_list` with a `read` API key to see that key's registered agents and memory counts
 
 ## Recall Trace Auditing
 
@@ -236,7 +236,7 @@ Every search operation is automatically logged as a recall trace, enabling full 
 GET /api/traces?limit=20&offset=0&agent_id=<uuid>&session_id=<string>
 ```
 
-Agent and trace listing endpoints are admin-only global observability surfaces. Ordinary application keys can still write provenance through memory store/search paths, but cannot invoke global agent or trace listings.
+Agent and trace listing endpoints are scoped to the authenticated API key. Shared namespaces do not expose another key's provenance rows.
 
 ## REST API
 
@@ -249,9 +249,9 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | POST | `/api/store` | Store a single memory |
 | POST | `/api/store-document` | Store a chunked document |
 | GET | `/api/stats` | Memory statistics (admin) |
-| GET | `/api/agents` | List registered agents (admin) |
+| GET | `/api/agents` | List registered agents for the key |
 | POST | `/api/agents` | Register/update an agent |
-| GET | `/api/traces` | Paginated recall traces (admin) |
+| GET | `/api/traces` | Paginated recall traces for the key |
 | GET | `/api/audit` | Paginated audit log |
 | POST | `/api/media/search` | Vector search over media (viewing/listening) history |
 | POST | `/api/media/events` | Upsert media events (used by connectors) |

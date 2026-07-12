@@ -137,8 +137,8 @@ export class YtmusicConnector extends BaseConnector {
       const existingRows = await queryScoped<{ service_id: string }>(
         ctx.scope,
         `SELECT DISTINCT service_id FROM media_events
-         WHERE service = 'ytmusic' AND service_id = ANY($1)`,
-        [videoIds]
+         WHERE client_id = $1 AND service = 'ytmusic' AND service_id = ANY($2)`,
+        [ctx.scope.keyId, videoIds]
       );
       const seen = new Set(existingRows.rows.map((r) => r.service_id));
       const fresh = events.filter((e) => e.service_id && !seen.has(e.service_id));

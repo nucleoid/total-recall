@@ -254,6 +254,7 @@ const ordinaryAuth: AuthContext = {
   name: 'ordinary',
   namespaces: ['shared'],
   permissions: ['read', 'write'],
+  maxAccessLevel: 'secret',
 };
 
 const adminAuth: AuthContext = {
@@ -261,6 +262,7 @@ const adminAuth: AuthContext = {
   name: 'admin',
   namespaces: ['shared'],
   permissions: ['read', 'write', 'admin'],
+  maxAccessLevel: 'secret',
 };
 
 async function seedRuntimeApiKeys(): Promise<void> {
@@ -305,14 +307,14 @@ async function exerciseRuntimePaths(label: string): Promise<void> {
   await queryScoped(
     ordinaryScope,
     `INSERT INTO memories (content, source, namespace, client_id, agent_id)
-     VALUES ($1, 'integration-test', 'shared', 'issue-3-client', $2)`,
-    [visibleContent, agentId]
+     VALUES ($1, 'integration-test', 'shared', $2, $3)`,
+    [visibleContent, ordinaryAuth.keyId, agentId]
   );
   await withOwnerClient(async (client) => {
     await client.query(
       `INSERT INTO memories (content, source, namespace, client_id, agent_id)
-       VALUES ($1, 'integration-test', 'private', 'issue-3-client', $2)`,
-      [hiddenContent, agentId]
+       VALUES ($1, 'integration-test', 'private', $2, $3)`,
+      [hiddenContent, ordinaryAuth.keyId, agentId]
     );
   });
 
@@ -325,21 +327,25 @@ async function exerciseRuntimePaths(label: string): Promise<void> {
   await logTrace({
     sessionId: `session-${label}`,
     agentId,
-    clientId: 'issue-3-client',
+    clientId: ordinaryAuth.keyId,
     queryText: `find ${label}`,
     memoryIds: visible.rows.map((row: any) => row.id),
     resultCount: visible.rows.length,
   }, ordinaryScope);
 
-  await assert.rejects(() => listAgents(ordinaryAuth, ordinaryScope), /requires 'admin'/);
-  await assert.rejects(() => listTraces(ordinaryAuth, ordinaryScope, 10, 0, agentId, `session-${label}`), /requires 'admin'/);
+  const ordinaryAgents = await listAgents(ordinaryAuth, ordinaryScope);
+  assert.equal(ordinaryAgents.some((agent) => agent.id === agentId), true);
 
-  const agents = await listAgents(adminAuth, adminScope);
-  assert.equal(agents.some((agent) => agent.id === agentId), true);
+  const ordinaryTraces = await listTraces(ordinaryAuth, ordinaryScope, 10, 0, agentId, `session-${label}`);
+  assert.equal(ordinaryTraces.length, 1);
+  assert.equal(ordinaryTraces[0].query_text, `find ${label}`);
 
-  const traces = await listTraces(adminAuth, adminScope, 10, 0, agentId, `session-${label}`);
-  assert.equal(traces.length, 1);
-  assert.equal(traces[0].query_text, `find ${label}`);
+  const adminAgents = await listAgents(adminAuth, adminScope);
+  assert.equal(adminAgents.some((agent) => agent.id === agentId), true);
+
+  const adminTraces = await listTraces(adminAuth, adminScope, 10, 0, agentId, `session-${label}`);
+  assert.equal(adminTraces.length, 1);
+  assert.equal(adminTraces[0].query_text, `find ${label}`);
 
   await shutdown();
 }
@@ -426,5 +432,5 @@ test('documented environment separates owner migrations from runtime app role', 
   assert.match(readme, /MIGRATION_DATABASE_URL/);
   assert.match(readme, /fallback only works when DATABASE_URL is an owner-capable/);
   assert.match(readme, /DATABASE_URL=postgresql:\/\/total_recall_app:/);
-  assert.match(readme, /Agent and trace listing endpoints are admin-only/);
+  assert.match(readme, /Agent and trace listing endpoints are scoped to the authenticated API key/);
 });

@@ -11,6 +11,7 @@ let pool: pg.Pool | null = null;
 export interface DbScope {
   namespaces: string[];
   keyId: string;
+  isAdmin?: boolean;
 }
 
 export type ScopedClient = pg.PoolClient;
@@ -31,7 +32,11 @@ export function getPool(): pg.Pool {
 }
 
 export function dbScopeFromAuth(auth: AuthContext): DbScope {
-  return { namespaces: auth.namespaces, keyId: auth.keyId };
+  return {
+    namespaces: auth.namespaces,
+    keyId: auth.keyId,
+    isAdmin: auth.permissions.includes('admin'),
+  };
 }
 
 export function setPoolForTesting(testPool: pg.Pool | null): void {
@@ -69,8 +74,12 @@ export async function withScopedClient<T>(
       [JSON.stringify(scope.namespaces)]
     );
     await client.query(
-      "SELECT set_config('app.api_key_id', $1, true)",
+      "SELECT set_config('app.current_key_id', $1, true)",
       [scope.keyId]
+    );
+    await client.query(
+      "SELECT set_config('app.current_key_is_admin', $1, true)",
+      [scope.isAdmin === true ? 'true' : 'false']
     );
 
     phase = 'callback';
