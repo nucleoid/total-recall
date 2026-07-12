@@ -5,8 +5,12 @@ import {
   validateMaintenanceEmbeddingProfile,
 } from './lib/maintenance-embedding.js';
 import {
-  connectMaintenanceClient,
   inventoryNamespaces,
+  withMaintenanceClient,
+  type MaintenanceClientFactory,
+  type MaintenanceDatabaseSource,
+  type MaintenanceEnvironment,
+  type MaintenanceIdentity,
   type NamespaceCount,
   type QueryClient,
 } from './lib/maintenance-db.js';
@@ -31,6 +35,10 @@ export interface ReembedOptions {
   delayMs?: number;
   dimensions?: number;
   onProgress?: (progress: ReembedProgress) => void;
+}
+
+export interface RunReembedOptions extends ReembedOptions {
+  onIdentity?: (identity: MaintenanceIdentity, source: MaintenanceDatabaseSource) => void;
 }
 
 export interface ReembedError {
@@ -183,36 +191,47 @@ export async function reembedWithClient(
   };
 }
 
+export async function runReembedAgainstEnvironment(
+  env: MaintenanceEnvironment,
+  embedder: Embedder,
+  options: RunReembedOptions = {},
+  createClient?: MaintenanceClientFactory,
+): Promise<{ identity: MaintenanceIdentity; source: MaintenanceDatabaseSource; summary: ReembedSummary }> {
+  return withMaintenanceClient(env, async (client, identity, source) => {
+    options.onIdentity?.(identity, source);
+    const summary = await reembedWithClient(client, embedder, options);
+    return { identity, source, summary };
+  }, createClient);
+}
+
 async function main(): Promise<void> {
   const profile = validateMaintenanceEmbeddingProfile(process.env);
   const embedder = createMaintenanceEmbedder(profile);
-  const { client, identity } = await connectMaintenanceClient();
-  try {
-    console.log('[reembed] Maintenance database', identity);
-    console.log('[reembed] Validated embedding profile', {
-      provider: profile.provider,
-      model: profile.model,
-      dimensions: profile.dimensions,
-    });
-    const summary = await reembedWithClient(client, embedder, {
-      dimensions: profile.dimensions,
-      onProgress: progress => console.log('[reembed] Progress checkpoint', progress),
-    });
-    console.log('[reembed] Selected totals', {
-      total: summary.selected,
-      byNamespace: summary.selectedByNamespace,
-    });
-    console.log('[reembed] Actual result totals', {
-      succeeded: summary.succeeded,
-      failed: summary.failed,
-      succeededByNamespace: summary.succeededByNamespace,
-      failedByNamespace: summary.failedByNamespace,
-      concurrentInventoryDelta: summary.concurrentInventoryDelta,
-    });
-    if (summary.errors.length > 0) console.log('[reembed] Sanitized errors', summary.errors);
-  } finally {
-    await client.end();
-  }
+  console.log('[reembed] Validated embedding profile', {
+    provider: profile.provider,
+    model: profile.model,
+    dimensions: profile.dimensions,
+  });
+  const { summary } = await runReembedAgainstEnvironment(process.env, embedder, {
+    dimensions: profile.dimensions,
+    onIdentity: (identity, source) => {
+      console.log('[reembed] Maintenance database', { ...identity, source });
+      console.log('[reembed] All-row capability preflight passed; re-embedding starts immediately and is noninteractive.');
+    },
+    onProgress: progress => console.log('[reembed] Progress checkpoint', progress),
+  });
+  console.log('[reembed] Selected totals', {
+    total: summary.selected,
+    byNamespace: summary.selectedByNamespace,
+  });
+  console.log('[reembed] Actual result totals', {
+    succeeded: summary.succeeded,
+    failed: summary.failed,
+    succeededByNamespace: summary.succeededByNamespace,
+    failedByNamespace: summary.failedByNamespace,
+    concurrentInventoryDelta: summary.concurrentInventoryDelta,
+  });
+  if (summary.errors.length > 0) console.log('[reembed] Sanitized errors', summary.errors);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
