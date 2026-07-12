@@ -1,24 +1,14 @@
+import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import fs from 'fs';
 import * as cheerio from 'cheerio';
+import { embed } from '../src/embedding.js';
+import { requireEmbeddingIdentityWriter } from './lib/preseed-embedding.js';
 
 const DATABASE_URL = process.env.OWNER_DATABASE_URL || 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall';
-const OLLAMA_URL = 'http://localhost:11434/api/embed';
 const HTML_PATH = '/home/fuego/projects/total-recall/imports/gemini-new/Takeout/My Activity/Gemini Apps/MyActivity.html';
 
 const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 5 });
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-async function getEmbedding(text: string): Promise<number[]> {
-  const resp = await fetch(OLLAMA_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'nomic-embed-text', input: text.slice(0, 8000) }),
-  });
-  if (!resp.ok) throw new Error(`Ollama error: ${resp.status} ${await resp.text()}`);
-  const data = await resp.json() as { embeddings: number[][] };
-  return data.embeddings[0];
-}
 
 function htmlToText(html: string): string {
   return html
@@ -129,6 +119,7 @@ ON CONFLICT (source_key) DO UPDATE SET
 `;
 
 async function main() {
+  requireEmbeddingIdentityWriter();
   console.log('Reading HTML file...');
   const html = fs.readFileSync(HTML_PATH, 'utf-8');
 
@@ -148,7 +139,7 @@ async function main() {
       const sourceKey = `gemini-conv:${conv.index}:${conv.timestamp}`;
 
       try {
-        const embedding = await getEmbedding(content);
+        const embedding = await embed(content);
         const embeddingStr = `[${embedding.join(',')}]`;
 
         await client.query(UPSERT_SQL, [
@@ -160,7 +151,6 @@ async function main() {
         imported++;
         dates.push(conv.timestamp);
         if (imported % 50 === 0) console.log(`  Imported ${imported}/${conversations.length}...`);
-        await sleep(100);
       } catch (err: any) {
         errors++;
         if (errors <= 3) console.error(`  Error on conv ${conv.index}: ${err.message}`);
@@ -176,4 +166,9 @@ async function main() {
   }
 }
 
-main().catch(console.error);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(err => {
+    console.error('Fatal:', err);
+    process.exitCode = 1;
+  });
+}

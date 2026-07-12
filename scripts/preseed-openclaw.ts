@@ -1,10 +1,12 @@
+import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import fs from 'fs';
 import path from 'path';
 import { glob } from 'glob';
+import { embed } from '../src/embedding.js';
+import { requireEmbeddingIdentityWriter } from './lib/preseed-embedding.js';
 
 const DATABASE_URL = 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall';
-const OLLAMA_URL = 'http://localhost:11434/api/embed';
 const WORKSPACE = '/home/fuego/.openclaw/workspace';
 const CORTEX_CONTENT = path.join(WORKSPACE, 'projects/cortex/content');
 
@@ -132,19 +134,6 @@ function chunkMarkdown(content: string, source: string, relPath: string): Chunk[
   return chunks;
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
-  const resp = await fetch(OLLAMA_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: "nomic-embed-text", input: text.slice(0, 8000) }),
-  });
-  if (!resp.ok) throw new Error(`Ollama error: ${resp.status} ${await resp.text()}`);
-  const data = await resp.json() as { embeddings: number[][] };
-  return data.embeddings[0];
-}
-
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
 const UPSERT_SQL = `
 INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key)
 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'preseed', $7)
@@ -155,6 +144,7 @@ ON CONFLICT (source_key) DO UPDATE SET
 `;
 
 async function main() {
+  requireEmbeddingIdentityWriter();
   let totalChunks = 0;
   let totalFiles = 0;
 
@@ -190,7 +180,7 @@ async function main() {
       totalFiles++;
 
       for (const chunk of chunks) {
-        const embedding = await getEmbedding(chunk.content);
+        const embedding = await embed(chunk.content);
         const vectorStr = `[${embedding.join(',')}]`;
 
         await client.query(UPSERT_SQL, [
@@ -204,7 +194,6 @@ async function main() {
         ]);
 
         totalChunks++;
-        await sleep(100);
       }
     }
   }
@@ -214,7 +203,9 @@ async function main() {
   console.log(`\nPre-seed complete: ${totalChunks} chunks from ${totalFiles} files`);
 }
 
-main().catch(err => {
-  console.error('Fatal:', err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(err => {
+    console.error('Fatal:', err);
+    process.exitCode = 1;
+  });
+}

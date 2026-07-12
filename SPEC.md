@@ -154,7 +154,7 @@ total-recall/
 ├── src/
 │   ├── index.ts          # MCP server entry point
 │   ├── db.ts             # Database connection + queries
-│   ├── embedding.ts      # Ollama embedding client
+│   ├── embedding.ts      # Canonical Gemini embedding client
 │   ├── search.ts         # Hybrid search logic
 │   ├── auth.ts           # API key validation + namespace ACL
 │   ├── tools/
@@ -177,10 +177,14 @@ total-recall/
 ```
 
 ## Environment Variables
+The canonical variables below are for the currently gated preseed/repair commands. Live readers and writers still select Ollama when no Gemini key is present until #9 identity storage and #61 mixed-aware readers permit a coordinated cutover.
+
 ```
 DATABASE_URL=postgresql://total_recall:total_recall_dev@localhost:5432/total_recall
-OLLAMA_URL=http://localhost:11434
-EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_PROVIDER=gemini
+GEMINI_API_KEY=your-gemini-api-key-here
+EMBEDDING_MODEL=gemini-embedding-2-preview
+EMBEDDING_DIMENSIONS=768
 HNSW_EF_SEARCH=200
 ```
 
@@ -201,4 +205,6 @@ Migration `009_api_key_access_ceiling.sql` backfills existing `api_keys.max_acce
 3. Hybrid search combines vector similarity (70%) + full-text ranking (30%)
 4. HNSW index with high ef_search for best real-time recall
 5. Access tracking (accessed_at, access_count) updated on search hits
-6. Graceful handling of Ollama being down (queue/retry)
+6. Embedding is explicitly Gemini `gemini-embedding-2-preview` at 768 dimensions; failures never fall back across vector spaces
+7. Preseed and repair remain fail-closed until #9 identity storage and #61 mixed-aware readers exist; unknown rows are text-only
+8. Migration completion requires zero active legacy/unknown rows before operators disable legacy querying

@@ -304,10 +304,12 @@ Bootstrap from existing AI conversation history across platforms.
 
 | Source | Script | Format | Status |
 |--------|--------|--------|--------|
-| OpenClaw | `preseed-openclaw.ts` | Markdown files | Done |
-| ChatGPT | `preseed-chatgpt.ts` | JSON export | Done |
-| Claude | `preseed-claude.ts` | JSON export | Done |
-| Gemini | `preseed-gemini.ts` | HTML export | Done |
+| OpenClaw | `preseed-openclaw.ts` | Markdown files | Gated on #9 |
+| ChatGPT | `preseed-chatgpt.ts` | JSON export | Gated on #9 |
+| Claude | `preseed-claude.ts` | JSON export | Gated on #9 |
+| Gemini | `preseed-gemini.ts` | HTML export | Gated on #9 |
+
+Preseed commands currently fail closed before reading exports, connecting to PostgreSQL, or calling an embedding provider. Issue #9 must first supply the approved embedding-identity schema and atomic vector+descriptor writer; issue #61 mixed-aware readers must then be deployed everywhere before preseed can create mixed-vintage writes. #41 deliberately does not guess column names or stamp provenance onto vectors whose identity is unknown.
 
 ### Ingestion Pipeline (shared by all sources)
 
@@ -324,7 +326,7 @@ Deduplicator (skip if >0.92 cosine similarity to existing)
     ↓
 Namespace Tagger (auto-classify or rule-based)
     ↓
-Embedder (Gemini Embedding 2 via API, fallback to Ollama nomic-embed-text)
+Gated preseed embedder (explicit Gemini gemini-embedding-2-preview, 768d)
     ↓
 PostgreSQL + pgvector (upsert)
 ```
@@ -334,7 +336,7 @@ PostgreSQL + pgvector (upsert)
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
 | Database | PostgreSQL 16 + pgvector | Battle-tested, vector search built-in, HNSW indexes |
-| Embedding | Gemini Embedding 2 (768d) | High quality, free tier. Fallback: Ollama nomic-embed-text |
+| Embedding target | Gemini `gemini-embedding-2-preview` (768d) | Canonical target for gated preseed/repair; live fallback remains until #9/#61 |
 | Protocol | MCP (Model Context Protocol) | Standard for LLM tool integration |
 | REST API | Express 5 | For non-MCP consumers (Cortex dashboard, Custom GPTs) |
 | Auth | API keys + namespace ACLs + RLS | Per-client scoping with row-level security |
@@ -600,37 +602,29 @@ not grant `BYPASSRLS` to the service role or place maintenance credentials in lo
 service environments. The separately approval-gated relevance repair retains its #34
 migration-owner fallback.
 
-Live store/search/rollup embedding now loads dotenv without overriding shell or service
-environment values. Shell/service configuration is authoritative. Before rollout, audit
-`GEMINI_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `OLLAMA_URL`, `OLLAMA_MODEL`, and
-every database URL variable in each HoT service and operator shell for conflicts with dotenv files.
-Confirm that the authoritative values select the intended provider, model, dimensions, and
-database; record that audit with the deployment. Re-embedding uses the same non-overriding
-bootstrap, then requires the canonical Gemini profile: a nonblank `GEMINI_API_KEY`,
-`EMBEDDING_MODEL=gemini-embedding-2-preview`, and `EMBEDDING_DIMENSIONS=768`. It fails before
-database access on an Ollama fallback, model mismatch, or dimension mismatch rather than writing
-incompatible vectors.
+Live store/search/rollup embedding loads dotenv without overriding shell or service
+environment values. To avoid mixed writes before #9 and #61, those existing paths retain their
+current import-time provider selection until the coordinated cutover. Do not switch their provider
+piecemeal. Canonical preseed and repair require `EMBEDDING_PROVIDER=gemini`, a nonblank
+`GEMINI_API_KEY`, `EMBEDDING_MODEL=gemini-embedding-2-preview`, and
+`EMBEDDING_DIMENSIONS=768`; their gates currently stop before use. Once mixed-aware rollout is
+possible, a failed Gemini request must never fall back to another vector space. Audit configuration
+in every HoT service and operator shell before rollout and record the audit.
 
-Before either command, take and confirm a **verified restorable backup**, verify provider
-capacity, and independently verify the intended database target. `DATABASE_URL` is only a final
-compatibility fallback: the connection must prove table-owner, superuser, or `BYPASSRLS` all-row
-capability through the preflight on that same session; the normal RLS-limited runtime role fails
-before embedding/API work. `DATABASE_URL` is used only when no maintenance alias is set; confirm
-the printed `source` matches your intent. For example, set the URL explicitly and invoke
-`DATABASE_URL=postgresql://<owner-role>@<host>/<database> npm run reembed`; the command prints
-`current_database()` and `current_user` after the capability preflight. The invocation is
-noninteractive and begins re-embedding immediately after that output; cancel it if the safe
-identity is not the intended target. There is no confirmation prompt.
+`npm run reembed` is currently gated and exits nonzero before provider or database access. Do not
+remove that gate until #9 identity storage exists and #61 mixed-aware readers are deployed on every
+instance. Then take a verified restorable backup, inventory vector vintages, and prove the intended
+maintenance database and provider capacity. Unknown rows are text-only until actually re-embedded;
+never assign them a guessed legacy or target identity.
 
 Pause scheduled decay while the #34 relevance migration/repair is in progress. Run
 `npm run decay:update` only after every historical relevance base is classified; it updates
-and reports every namespace, including `media` and future names. Invoke `npm run reembed`
-deliberately: each invocation re-embeds the full store idempotently, emits batch progress,
-reports selected and successful totals by namespace, and reports inventory drift from
-concurrent inserts. Re-embedding must never run as an automatic deploy-time task. A retry starts
-the full store again and consumes provider quota again; successful per-row updates from a
-partial run remain committed. Verify the `media` count and error totals before resuming
-schedules. Re-embedding newly included rows consumes provider quota and changes vectors.
+and reports every namespace, including `media` and future names. After #9 and #61 are delivered,
+repair must claim bounded batches, generate canonical vectors outside the transaction, and commit
+each vector with its complete descriptor atomically. Retry failures without metadata-only stamps.
+Do not declare rollout complete until verification reports **zero active legacy/unknown** rows.
+Only then disable and remove legacy query profiles and credentials. PostgreSQL maintains HNSW on
+updates, so no manual index rebuild is required, but plan for substantial WAL/index/IO load.
 
 Rollback cannot reconstruct compounded scores or infer prior custom bases. Keep the
 added column and corrected function on application rollback and roll forward. Old code is unsafe

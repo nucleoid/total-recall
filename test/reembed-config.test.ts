@@ -134,7 +134,7 @@ test('DATABASE_URL fallback completes the all-row capability gate before invokin
   assert.equal(ended, 1);
 });
 
-test('operator configuration and runbook document audited, immediate safe reembedding', async () => {
+test('operator configuration and runbook document audited, gated mixed-aware reembedding', async () => {
   const envExample = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
   assert.match(envExample, /DATABASE_URL=/);
   assert.match(envExample, /# MAINTENANCE_DATABASE_URL=/);
@@ -144,11 +144,10 @@ test('operator configuration and runbook document audited, immediate safe reembe
   const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
   assert.match(readme, /verified restorable backup/i);
   assert.match(readme, /current_database\(\).*current_user/is);
-  assert.match(readme, /DATABASE_URL=.*npm run reembed/);
-  assert.match(readme, /DATABASE_URL[^.]*only when no maintenance alias[^.]*printed `source`/is);
-  assert.match(readme, /DATABASE_URL[^.]*owner|owner[^.]*DATABASE_URL/is);
+  assert.match(readme, /MAINTENANCE_DATABASE_URL/);
   assert.match(readme, /BYPASSRLS/);
-  assert.match(readme, /noninteractive[^.]*immediate|immediate[^.]*noninteractive/i);
-  assert.match(readme, /audit[^.]*GEMINI_API_KEY[^.]*EMBEDDING_MODEL[^.]*EMBEDDING_DIMENSIONS[^.]*OLLAMA_/is);
-  assert.match(readme, /must not|never[^.]*deploy-time|deploy-time[^.]*never/i);
+  assert.match(readme, /reembed[^.]*gated|gated[^.]*reembed/i);
+  assert.match(readme, /GEMINI_API_KEY[^.]*EMBEDDING_MODEL[^.]*EMBEDDING_DIMENSIONS/is);
+  assert.match(readme, /audit configuration/i);
+  assert.match(readme, /#9[^.]*#61/i);
 });

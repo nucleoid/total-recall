@@ -1,13 +1,14 @@
+import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import fs from 'fs';
 import path from 'path';
+import { embed } from '../src/embedding.js';
+import { requireEmbeddingIdentityWriter } from './lib/preseed-embedding.js';
 
 const DATABASE_URL = 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall';
-const OLLAMA_URL = 'http://localhost:11434/api/embed';
 const IMPORTS_DIR = '/home/fuego/projects/total-recall/imports/claude';
 
 const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 5 });
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 const TRIVIAL_MESSAGES = new Set(['yes', 'no', 'ok', 'okay', 'thanks', 'thank you', 'yep', 'nope', 'sure', 'got it', 'cool', 'nice', 'great', 'right', 'correct', 'exactly', 'agreed', 'perfect']);
 
@@ -32,17 +33,6 @@ interface Conversation {
 interface MemoryExport {
   conversations_memory: string;
   account_uuid: string;
-}
-
-async function getEmbedding(text: string): Promise<number[]> {
-  const resp = await fetch(OLLAMA_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'nomic-embed-text', input: text.slice(0, 8000) }),
-  });
-  if (!resp.ok) throw new Error(`Ollama error: ${resp.status} ${await resp.text()}`);
-  const data = await resp.json() as { embeddings: number[][] };
-  return data.embeddings[0];
 }
 
 function extractTags(conversationName: string): string[] {
@@ -112,7 +102,7 @@ async function importConversations(client: pg.PoolClient): Promise<number> {
         message_uuid: human.uuid,
       };
 
-      const embedding = await getEmbedding(content);
+      const embedding = await embed(content);
       const vectorStr = `[${embedding.join(',')}]`;
 
       await client.query(UPSERT_SQL, [
@@ -122,7 +112,6 @@ async function importConversations(client: pg.PoolClient): Promise<number> {
 
       pairCount++;
       count++;
-      await sleep(100);
     }
 
     console.log(`  "${conv.name}" → ${pairCount} pairs`);
@@ -155,7 +144,7 @@ async function importMemories(client: pg.PoolClient, latestDate: string): Promis
 
   for (let i = 0; i < chunks.length; i++) {
     const sourceKey = `claude-memory:${i}`;
-    const embedding = await getEmbedding(chunks[i]);
+    const embedding = await embed(chunks[i]);
     const vectorStr = `[${embedding.join(',')}]`;
 
     await client.query(UPSERT_SQL, [
@@ -166,7 +155,6 @@ async function importMemories(client: pg.PoolClient, latestDate: string): Promis
     ]);
 
     count++;
-    await sleep(100);
   }
 
   console.log(`  Memory document → ${count} chunks`);
@@ -174,6 +162,7 @@ async function importMemories(client: pg.PoolClient, latestDate: string): Promis
 }
 
 async function main() {
+  requireEmbeddingIdentityWriter();
   const client = await pool.connect();
 
   console.log('=== Importing Claude conversations ===');
@@ -193,7 +182,9 @@ async function main() {
   console.log(`\n✅ Done: ${convCount} conversation pairs + ${memCount} memory chunks = ${convCount + memCount} total`);
 }
 
-main().catch(err => {
-  console.error('Fatal:', err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(err => {
+    console.error('Fatal:', err);
+    process.exitCode = 1;
+  });
+}
