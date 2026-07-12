@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DECAY_SCOPE, updateDecayWithClient } from '../scripts/decay-update.js';
+import { updateDecayWithClient } from '../scripts/decay-update.js';
 import {
   resolveMaintenanceDatabaseUrl,
   verifyAllRowMaintenanceRole,
@@ -9,8 +9,8 @@ import {
 test('decay update materializes from stable base and is idempotent with unchanged facts', async () => {
   const queries: string[] = [];
   const rows = [
-    { maintenance_ready: true, relevance_score: 1.1 },
-    { maintenance_ready: true, relevance_score: 1.1 },
+    { maintenance_ready: true, namespace: 'personal', relevance_score: 1.1 },
+    { maintenance_ready: true, namespace: 'media', relevance_score: 1.1 },
   ];
   const client = {
     async query(sql: string) {
@@ -69,7 +69,16 @@ test('maintenance role verification accepts superusers and inherited table owner
   assert.match(verificationSql, /rolbypassrls/i);
 });
 
-test('decay maintenance includes every currently supported namespace', () => {
-  assert.deepEqual(DECAY_SCOPE.namespaces, ['personal', 'work', 'projects', 'financial', 'shared', 'media']);
-  assert.equal(DECAY_SCOPE.isAdmin, true);
+test('decay maintenance updates the table without a namespace allowlist', async () => {
+  let updateSql = '';
+  const client = {
+    async query(sql: string) {
+      updateSql = sql;
+      return { rows: [{ maintenance_ready: true, namespace: null, relevance_score: null }] };
+    },
+  };
+
+  await updateDecayWithClient(client as never);
+  assert.doesNotMatch(updateSql, /allowed_namespaces|namespace\s*=\s*ANY/i);
+  assert.match(updateSql, /RETURNING namespace, relevance_score/i);
 });

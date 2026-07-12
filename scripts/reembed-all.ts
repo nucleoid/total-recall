@@ -1,97 +1,223 @@
+import { pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+import {
+  createMaintenanceEmbedder,
+  validateMaintenanceEmbeddingProfile,
+} from './lib/maintenance-embedding.js';
+import {
+  connectMaintenanceClient,
+  inventoryNamespaces,
+  type NamespaceCount,
+  type QueryClient,
+} from './lib/maintenance-db.js';
 
-import pg from 'pg';
-import { embedBatch } from '../src/embedding.js';
+dotenv.config();
 
-const BATCH_SIZE = 10;
-const DELAY_MS = 50;
+interface MemoryRow {
+  id: string;
+  content: string;
+  namespace: string;
+}
 
-async function main() {
-  const pool = new pg.Pool({
-    connectionString: process.env.OWNER_DATABASE_URL || 'postgresql://total_recall:total_recall_dev@localhost:5432/total_recall',
-  });
+export interface ReembedProgress {
+  processed: number;
+  selected: number;
+  succeeded: number;
+  failed: number;
+}
 
-  const client = await pool.connect();
-  console.log('[reembed] Connected to PostgreSQL');
+export interface ReembedOptions {
+  batchSize?: number;
+  delayMs?: number;
+  dimensions?: number;
+  onProgress?: (progress: ReembedProgress) => void;
+}
 
-  // Owner connection intentionally bypasses RLS for full-store re-embedding.
-  const { rows } = await client.query<{ id: string; content: string }>(
-    `SELECT id, content FROM memories ORDER BY id`
+export interface ReembedError {
+  id: string;
+  namespace: string;
+  category: 'provider_error' | 'response_count_mismatch' | 'dimension_mismatch' | 'database_error';
+}
+
+export interface ReembedSummary {
+  selected: number;
+  succeeded: number;
+  failed: number;
+  selectedByNamespace: Record<string, number>;
+  succeededByNamespace: Record<string, number>;
+  failedByNamespace: Record<string, number>;
+  initialInventory: NamespaceCount[];
+  finalInventory: NamespaceCount[];
+  concurrentInventoryDelta: number;
+  errors: ReembedError[];
+}
+
+type Embedder = (texts: string[]) => Promise<number[][]>;
+
+function increment(counts: Record<string, number>, namespace: string): void {
+  counts[namespace] = (counts[namespace] ?? 0) + 1;
+}
+
+function sortedCounts(counts: Record<string, number>): Record<string, number> {
+  return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function inventoryTotal(inventory: NamespaceCount[]): number {
+  return inventory.reduce((total, row) => total + row.count, 0);
+}
+
+function embeddingCategory(embeddings: number[][], expectedCount: number, dimensions: number): ReembedError['category'] | undefined {
+  if (embeddings.length !== expectedCount) return 'response_count_mismatch';
+  if (embeddings.some(vector => vector.length !== dimensions || vector.some(value => !Number.isFinite(value)))) {
+    return 'dimension_mismatch';
+  }
+  return undefined;
+}
+
+async function updateEmbedding(client: QueryClient, row: MemoryRow, embedding: number[]): Promise<void> {
+  const result = await client.query(
+    'UPDATE public.memories SET embedding = $1 WHERE id = $2',
+    [`[${embedding.join(',')}]`, row.id],
   );
-  console.log(`[reembed] Found ${rows.length} memories to re-embed`);
+  if (result.rowCount !== undefined && result.rowCount !== null && result.rowCount !== 1) {
+    throw new Error('memory row was not updated');
+  }
+}
 
-  const startTime = Date.now();
-  let processed = 0;
-  let errors = 0;
-  const errorDetails: Array<{ id: string; error: string }> = [];
+export async function reembedWithClient(
+  client: QueryClient,
+  embedder: Embedder,
+  options: ReembedOptions = {},
+): Promise<ReembedSummary> {
+  const batchSize = options.batchSize ?? 10;
+  const delayMs = options.delayMs ?? 50;
+  const dimensions = options.dimensions ?? 768;
+  if (!Number.isInteger(batchSize) || batchSize < 1) throw new Error('batchSize must be a positive integer');
+  if (!Number.isInteger(dimensions) || dimensions < 1) throw new Error('dimensions must be a positive integer');
+  if (!Number.isFinite(delayMs) || delayMs < 0) throw new Error('delayMs must be nonnegative');
 
-  // Process in batches
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE);
-    const texts = batch.map((r) => r.content);
+  const initialInventory = await inventoryNamespaces(client);
+  const selected = await client.query<MemoryRow>(
+    'SELECT id, content, namespace FROM public.memories ORDER BY id',
+  );
+  const selectedByNamespace: Record<string, number> = {};
+  for (const row of selected.rows) increment(selectedByNamespace, row.namespace);
 
+  const succeededByNamespace: Record<string, number> = {};
+  const failedByNamespace: Record<string, number> = {};
+  const errors: ReembedError[] = [];
+
+  const recordSuccess = (row: MemoryRow) => increment(succeededByNamespace, row.namespace);
+  const recordFailure = (row: MemoryRow, category: ReembedError['category']) => {
+    increment(failedByNamespace, row.namespace);
+    errors.push({ id: row.id, namespace: row.namespace, category });
+  };
+
+  for (let offset = 0; offset < selected.rows.length; offset += batchSize) {
+    const batch = selected.rows.slice(offset, offset + batchSize);
+    let embeddings: number[][] | undefined;
+    let batchFailure: ReembedError['category'] | undefined;
     try {
-      const embeddings = await embedBatch(texts);
+      embeddings = await embedder(batch.map(row => row.content));
+      batchFailure = embeddingCategory(embeddings, batch.length, dimensions);
+    } catch {
+      batchFailure = 'provider_error';
+    }
 
-      // Update each memory with its new embedding
-      for (let j = 0; j < batch.length; j++) {
-        const vectorStr = `[${embeddings[j].join(',')}]`;
-        await client.query(`UPDATE memories SET embedding = $1 WHERE id = $2`, [
-          vectorStr,
-          batch[j].id,
-        ]);
+    if (batchFailure === undefined && embeddings) {
+      for (let index = 0; index < batch.length; index++) {
+        try {
+          await updateEmbedding(client, batch[index], embeddings[index]);
+          recordSuccess(batch[index]);
+        } catch {
+          recordFailure(batch[index], 'database_error');
+        }
       }
-
-      processed += batch.length;
-    } catch (err: any) {
-      // Fallback: try individually
+    } else {
       for (const row of batch) {
         try {
-          const [embedding] = await embedBatch([row.content]);
-          const vectorStr = `[${embedding.join(',')}]`;
-          await client.query(`UPDATE memories SET embedding = $1 WHERE id = $2`, [
-            vectorStr,
-            row.id,
-          ]);
-          processed++;
-        } catch (innerErr: any) {
-          errors++;
-          errorDetails.push({ id: row.id, error: innerErr.message });
+          const individual = await embedder([row.content]);
+          const category = embeddingCategory(individual, 1, dimensions);
+          if (category) {
+            recordFailure(row, category);
+            continue;
+          }
+          try {
+            await updateEmbedding(client, row, individual[0]);
+            recordSuccess(row);
+          } catch {
+            recordFailure(row, 'database_error');
+          }
+        } catch {
+          recordFailure(row, 'provider_error');
         }
       }
     }
 
-    // Progress logging
-    if (processed % 100 < BATCH_SIZE || i + BATCH_SIZE >= rows.length) {
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`[reembed] Progress: ${processed}/${rows.length} (${elapsed}s elapsed, ${errors} errors)`);
-    }
+    options.onProgress?.({
+      processed: Math.min(offset + batch.length, selected.rows.length),
+      selected: selected.rows.length,
+      succeeded: Object.values(succeededByNamespace).reduce((total, count) => total + count, 0),
+      failed: Object.values(failedByNamespace).reduce((total, count) => total + count, 0),
+    });
 
-    // Rate limit
-    if (i + BATCH_SIZE < rows.length) {
-      await new Promise((r) => setTimeout(r, DELAY_MS));
-    }
-  }
-
-  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`\n[reembed] ✅ Complete!`);
-  console.log(`[reembed]   Total: ${processed} re-embedded`);
-  console.log(`[reembed]   Errors: ${errors}`);
-  console.log(`[reembed]   Time: ${totalTime}s`);
-
-  if (errorDetails.length > 0) {
-    console.log(`[reembed]   Error details:`);
-    for (const e of errorDetails) {
-      console.log(`    - ${e.id}: ${e.error}`);
+    if (delayMs > 0 && offset + batchSize < selected.rows.length) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }
 
-  client.release();
-  await pool.end();
+  const finalInventory = await inventoryNamespaces(client);
+  const succeeded = Object.values(succeededByNamespace).reduce((total, count) => total + count, 0);
+  const failed = Object.values(failedByNamespace).reduce((total, count) => total + count, 0);
+  return {
+    selected: selected.rows.length,
+    succeeded,
+    failed,
+    selectedByNamespace: sortedCounts(selectedByNamespace),
+    succeededByNamespace: sortedCounts(succeededByNamespace),
+    failedByNamespace: sortedCounts(failedByNamespace),
+    initialInventory,
+    finalInventory,
+    concurrentInventoryDelta: inventoryTotal(finalInventory) - inventoryTotal(initialInventory),
+    errors,
+  };
 }
 
-main().catch((err) => {
-  console.error('[reembed] Fatal error:', err);
-  process.exit(1);
-});
+async function main(): Promise<void> {
+  const profile = validateMaintenanceEmbeddingProfile(process.env);
+  const embedder = createMaintenanceEmbedder(profile);
+  const { client, identity } = await connectMaintenanceClient();
+  try {
+    console.log('[reembed] Maintenance database', identity);
+    console.log('[reembed] Validated embedding profile', {
+      provider: profile.provider,
+      model: profile.model,
+      dimensions: profile.dimensions,
+    });
+    const summary = await reembedWithClient(client, embedder, {
+      dimensions: profile.dimensions,
+      onProgress: progress => console.log('[reembed] Progress checkpoint', progress),
+    });
+    console.log('[reembed] Selected totals', {
+      total: summary.selected,
+      byNamespace: summary.selectedByNamespace,
+    });
+    console.log('[reembed] Actual result totals', {
+      succeeded: summary.succeeded,
+      failed: summary.failed,
+      succeededByNamespace: summary.succeededByNamespace,
+      failedByNamespace: summary.failedByNamespace,
+      concurrentInventoryDelta: summary.concurrentInventoryDelta,
+    });
+    if (summary.errors.length > 0) console.log('[reembed] Sanitized errors', summary.errors);
+  } finally {
+    await client.end();
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(error => {
+    console.error('[reembed] Failed:', error instanceof Error ? error.message : 'unknown error');
+    process.exitCode = 1;
+  });
+}

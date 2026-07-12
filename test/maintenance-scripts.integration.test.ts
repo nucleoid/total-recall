@@ -1,0 +1,145 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+import { updateDecayWithClient } from '../scripts/decay-update.js';
+import { validateMaintenanceEmbeddingProfile } from '../scripts/lib/maintenance-embedding.js';
+import { reembedWithClient } from '../scripts/reembed-all.js';
+
+test('decay reports actual returned totals for personal, media, and future namespaces', async () => {
+  const client = { async query(sql: string) {
+    assert.doesNotMatch(sql, /allowed_namespaces|namespace\s*=\s*ANY/i);
+    return { rows: [
+      { maintenance_ready: true, namespace: 'personal', relevance_score: 1 },
+      { maintenance_ready: true, namespace: 'media', relevance_score: 0.9 },
+      { maintenance_ready: true, namespace: 'future', relevance_score: 0.8 },
+    ] };
+  } };
+  const summary = await updateDecayWithClient(client as never);
+  assert.deepEqual(summary.byNamespace, { future: 1, media: 1, personal: 1 });
+  assert.equal(summary.count, 3);
+});
+
+test('reembed processes every selected namespace and reports concurrent insert drift', async () => {
+  const updates: string[] = [];
+  let inventoryCalls = 0;
+  const client = { async query(sql: string, values?: unknown[]) {
+    if (/SELECT id, content, namespace/i.test(sql)) return { rows: [
+      { id: 'p', content: 'personal secret', namespace: 'personal' },
+      { id: 'm', content: 'media secret', namespace: 'media' },
+      { id: 'f', content: 'future secret', namespace: 'future' },
+    ] };
+    if (/UPDATE public\.memories/i.test(sql)) { updates.push(String(values?.[1])); return { rows: [], rowCount: 1 }; }
+    if (/GROUP BY namespace/i.test(sql)) {
+      inventoryCalls++;
+      return { rows: inventoryCalls === 1
+        ? [{ namespace: 'personal', count: '1' }, { namespace: 'media', count: '1' }, { namespace: 'future', count: '1' }]
+        : [{ namespace: 'personal', count: '2' }, { namespace: 'media', count: '1' }, { namespace: 'future', count: '1' }] };
+    }
+    throw new Error(`unexpected SQL category`);
+  } };
+  const result = await reembedWithClient(client as never, async texts => texts.map(() => [0.1, 0.2]), { batchSize: 10, delayMs: 0, dimensions: 2 });
+  assert.deepEqual(updates, ['p', 'm', 'f']);
+  assert.deepEqual(result.succeededByNamespace, { future: 1, media: 1, personal: 1 });
+  assert.equal(result.concurrentInventoryDelta, 1);
+});
+
+test('reembed emits durable batch progress for long-running full-store operations', async () => {
+  const progress: Array<{ processed: number; selected: number; succeeded: number; failed: number }> = [];
+  const client = { async query(sql: string) {
+    if (/SELECT id, content, namespace/i.test(sql)) return { rows: [
+      { id: 'a', content: 'first', namespace: 'personal' },
+      { id: 'b', content: 'second', namespace: 'media' },
+      { id: 'c', content: 'third', namespace: 'future' },
+    ] };
+    if (/UPDATE public\.memories/i.test(sql)) return { rows: [], rowCount: 1 };
+    if (/GROUP BY namespace/i.test(sql)) return { rows: [
+      { namespace: 'future', count: '1' },
+      { namespace: 'media', count: '1' },
+      { namespace: 'personal', count: '1' },
+    ] };
+    throw new Error('unexpected SQL');
+  } };
+
+  await reembedWithClient(client as never, async texts => texts.map(() => [0.1, 0.2]), {
+    batchSize: 2,
+    delayMs: 0,
+    dimensions: 2,
+    onProgress: checkpoint => progress.push(checkpoint),
+  });
+
+  assert.deepEqual(progress, [
+    { processed: 2, selected: 3, succeeded: 2, failed: 0 },
+    { processed: 3, selected: 3, succeeded: 3, failed: 0 },
+  ]);
+});
+
+test('provider mismatch falls back safely, counts each selected row once, and sanitizes errors', async () => {
+  const updates: string[] = [];
+  const client = { async query(sql: string, values?: unknown[]) {
+    if (/SELECT id, content, namespace/i.test(sql)) return { rows: [
+      { id: 'a', content: 'TOP SECRET A', namespace: 'media' },
+      { id: 'b', content: 'TOP SECRET B', namespace: 'future' },
+    ] };
+    if (/UPDATE public\.memories/i.test(sql)) { updates.push(String(values?.[1])); return { rows: [], rowCount: 1 }; }
+    if (/GROUP BY namespace/i.test(sql)) return { rows: [{ namespace: 'media', count: '1' }, { namespace: 'future', count: '1' }] };
+    throw new Error('unexpected SQL');
+  } };
+  const embed = async (texts: string[]) => {
+    if (texts.length > 1) return [[0.1, 0.2]];
+    if (texts[0].includes('B')) throw new Error(`provider echoed ${texts[0]}`);
+    return [[0.1, 0.2]];
+  };
+  const result = await reembedWithClient(client as never, embed, { batchSize: 10, delayMs: 0, dimensions: 2 });
+  assert.deepEqual(updates, ['a']);
+  assert.equal(result.succeeded + result.failed, 2);
+  assert.equal(result.failed, 1);
+  assert.ok(result.errors.every(error => !JSON.stringify(error).includes('TOP SECRET')));
+});
+
+test('live embedding import preserves legacy dotenv override precedence', async () => {
+  const source = await readFile(new URL('../src/embedding.ts', import.meta.url), 'utf8');
+  assert.match(source, /dotenv\.config\(\s*\{\s*override:\s*true\s*\}\s*\)/);
+});
+
+test('maintenance validates the canonical Gemini 768 profile without mutating environment', () => {
+  const valid = {
+    GEMINI_API_KEY: 'configured-key',
+    EMBEDDING_MODEL: 'gemini-embedding-2-preview',
+    EMBEDDING_DIMENSIONS: '768',
+  };
+  assert.deepEqual(validateMaintenanceEmbeddingProfile(valid), {
+    provider: 'gemini',
+    apiKey: 'configured-key',
+    model: 'gemini-embedding-2-preview',
+    dimensions: 768,
+  });
+  assert.deepEqual(valid, {
+    GEMINI_API_KEY: 'configured-key',
+    EMBEDDING_MODEL: 'gemini-embedding-2-preview',
+    EMBEDDING_DIMENSIONS: '768',
+  });
+  assert.throws(() => validateMaintenanceEmbeddingProfile({
+    EMBEDDING_MODEL: 'gemini-embedding-2-preview',
+    EMBEDDING_DIMENSIONS: '768',
+  }), /Gemini.*GEMINI_API_KEY/i);
+  assert.throws(() => validateMaintenanceEmbeddingProfile({
+    ...valid,
+    EMBEDDING_MODEL: 'text-embedding-004',
+  }), /gemini-embedding-2-preview/i);
+  assert.throws(() => validateMaintenanceEmbeddingProfile({
+    ...valid,
+    EMBEDDING_DIMENSIONS: '1536',
+  }), /768/i);
+});
+
+test('reembed uses the validated maintenance embedding client rather than the live dotenv bootstrap', async () => {
+  const source = await readFile(new URL('../scripts/reembed-all.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /from ['"]\.\.\/src\/embedding\.js['"]/);
+  assert.match(source, /validateMaintenanceEmbeddingProfile/);
+});
+
+test('runbook describes full-store retries rather than claiming resumability', async () => {
+  const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+  assert.doesNotMatch(readme, /reembed[^.]{0,120}resumable|resumable[^.]{0,120}reembed/i);
+  assert.match(readme, /re-embeds the full store|full-store re-embedding/i);
+});
