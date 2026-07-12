@@ -3,7 +3,7 @@ import { getConnectorCredentials, setConnectorCredentials } from '../../media.js
 
 const PLEX_TV = 'https://plex.tv';
 const PIN_POLL_INTERVAL_MS = 2000;
-const PIN_POLL_TIMEOUT_MS = 25 * 60 * 1000;     // PINs expire after 30 min
+const PIN_EXPIRED_ERROR = 'Plex PIN expired without being claimed.';
 
 export interface PlexCreds {
   client_identifier: string;
@@ -35,12 +35,24 @@ export function plexHeaders(creds: PlexCreds): Record<string, string> {
   };
 }
 
-interface PinResponse {
+export interface PinResponse {
   id: number;
   code: string;
   authToken: string | null;
   expiresAt: string;
 }
+
+export interface PollPinDeps {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  fetch: typeof fetch;
+}
+
+const defaultPollPinDeps: PollPinDeps = {
+  now: Date.now,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  fetch: (input, init) => globalThis.fetch(input, init),
+};
 
 async function createPin(clientIdentifier: string): Promise<PinResponse> {
   // strong=false returns the short 4-character code that plex.tv/link expects.
@@ -55,19 +67,62 @@ async function createPin(clientIdentifier: string): Promise<PinResponse> {
   return res.json() as Promise<PinResponse>;
 }
 
-async function pollPin(pinId: number, clientIdentifier: string): Promise<string> {
-  const deadline = Date.now() + PIN_POLL_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const res = await fetch(`${PLEX_TV}/api/v2/pins/${pinId}`, {
-      headers: clientHeaders(clientIdentifier),
-    });
+export async function pollPin(
+  pin: PinResponse,
+  clientIdentifier: string,
+  deps: PollPinDeps = defaultPollPinDeps,
+): Promise<string> {
+  const deadline = Date.parse(pin.expiresAt);
+  if (!Number.isFinite(deadline) || deadline <= deps.now()) {
+    throw new Error(PIN_EXPIRED_ERROR);
+  }
+
+  while (deps.now() < deadline) {
+    let res: Response;
+    try {
+      res = await deps.fetch(`${PLEX_TV}/api/v2/pins/${pin.id}`, {
+        headers: clientHeaders(clientIdentifier),
+      });
+    } catch {
+      const remainingMs = deadline - deps.now();
+      if (remainingMs <= 0) break;
+      await deps.sleep(Math.min(PIN_POLL_INTERVAL_MS, remainingMs));
+      continue;
+    }
+
     if (res.ok) {
       const body = await res.json() as PinResponse;
-      if (body.authToken) return body.authToken;
+      if (typeof body.authToken === 'string' && body.authToken.length > 0) {
+        return body.authToken;
+      }
+    } else if (res.status === 404) {
+      throw new Error('Plex PIN expired or was deleted.');
+    } else if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+      throw new Error(`Plex PIN poll failed with status ${res.status}.`);
     }
-    await new Promise((r) => setTimeout(r, PIN_POLL_INTERVAL_MS));
+
+    const remainingMs = deadline - deps.now();
+    if (remainingMs <= 0) break;
+    const requestedDelayMs = res.status === 429
+      ? retryAfterMs(res.headers.get('Retry-After'), deps.now()) ?? PIN_POLL_INTERVAL_MS
+      : PIN_POLL_INTERVAL_MS;
+    const effectiveDelayMs = requestedDelayMs > 0 ? requestedDelayMs : PIN_POLL_INTERVAL_MS;
+    const boundedDelayMs = Math.min(effectiveDelayMs, remainingMs);
+    await deps.sleep(boundedDelayMs);
   }
-  throw new Error('Plex PIN expired without being claimed.');
+  throw new Error(PIN_EXPIRED_ERROR);
+}
+
+function retryAfterMs(value: string | null, nowMs: number): number | null {
+  if (value === null) return null;
+
+  const deltaSeconds = Number(value);
+  if (Number.isFinite(deltaSeconds) && deltaSeconds >= 0) {
+    return deltaSeconds * 1000;
+  }
+
+  const dateMs = Date.parse(value);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - nowMs) : null;
 }
 
 /**
@@ -85,7 +140,7 @@ export async function pinFlow(prompt: (link: string, code: string) => void): Pro
   const link = 'https://plex.tv/link';
   prompt(link, pin.code);
 
-  const authToken = await pollPin(pin.id, clientIdentifier);
+  const authToken = await pollPin(pin, clientIdentifier);
   const creds: PlexCreds = { client_identifier: clientIdentifier, auth_token: authToken };
   await setConnectorCredentials('plex', creds as unknown as Record<string, unknown>);
   return creds;
