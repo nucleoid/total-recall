@@ -99,7 +99,7 @@ async function setup(): Promise<Record<string, string>> {
       last_seen_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-  await client.query(`CREATE UNIQUE INDEX agents_api_key_name_idx ON agents (api_key_id, name)`);
+  await client.query(`CREATE UNIQUE INDEX agents_api_key_name_idx ON agents (api_key_id, name) WHERE api_key_id IS NOT NULL`);
   await client.query(`
     CREATE TABLE memories (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
