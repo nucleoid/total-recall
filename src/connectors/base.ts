@@ -1,11 +1,13 @@
 import type { MediaEventInput } from '../media.js';
-import type { DbScope } from '../db.js';
+import { withScopedClient, type DbScope } from '../db.js';
 import {
-  upsertMediaEvents,
   getSyncState,
-  setSyncState,
+  mutateConnectorSyncStateWithClient,
   getConnectorCredentials,
   setConnectorCredentials,
+  upsertMediaEventsWithClient,
+  type ConnectorSyncState,
+  type ConnectorSyncStatePatch,
 } from '../media.js';
 
 export interface ConnectorContext {
@@ -21,6 +23,7 @@ export interface SyncResult {
   service: string;
   events_ingested: number;
   events_skipped: number;
+  warnings?: string[];
   errors: string[];
   duration_ms: number;
   cursor?: string;
@@ -29,11 +32,13 @@ export interface SyncResult {
 export interface ConnectorFetchResult {
   events: MediaEventInput[];
   cursor?: string;
+  errors?: string[];
   /**
    * Whether BaseConnector should advance connector_sync_state.last_event_at
    * from the returned events. Defaults to true for existing connectors.
    */
   advanceLastEventAt?: boolean;
+  syncState?: (current: ConnectorSyncState) => ConnectorSyncStatePatch;
 }
 
 function validEventDate(event: MediaEventInput): Date {
@@ -133,8 +138,15 @@ export abstract class BaseConnector {
       const state = await getSyncState(this.service);
       const since = state?.last_event_at ?? null;
 
-      const { events, cursor: nextCursor, advanceLastEventAt = true } = await this.fetchSince(since, ctx);
+      const {
+        events,
+        cursor: nextCursor,
+        errors: fetchErrors = [],
+        advanceLastEventAt = true,
+        syncState,
+      } = await this.fetchSince(since, ctx);
       cursor = nextCursor;
+      errors.push(...fetchErrors);
       const valid = filterValidMediaEventDates(events);
       errors.push(...valid.errors);
       skipped += valid.skipped;
@@ -145,16 +157,19 @@ export abstract class BaseConnector {
         agent_id: e.agent_id ?? ctx.agentId,
       }));
 
-      const result = await upsertMediaEvents(enriched, ctx.scope);
-      ingested = result.inserted;
-      skipped += result.skipped;
+      await withScopedClient(ctx.scope, async (client) => {
+        const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
+        ingested = result.inserted;
+        skipped += result.skipped;
 
-      const lastEventAt = resolveLastEventAt(valid.events, since, advanceLastEventAt);
+        const lastEventAt = resolveLastEventAt(valid.events, since, advanceLastEventAt);
 
-      await setSyncState(this.service, {
-        last_sync_at: new Date(),
-        last_event_at: lastEventAt,
-        cursor: nextCursor ?? state?.cursor ?? null,
+        await mutateConnectorSyncStateWithClient(client, this.service, (current) => ({
+          last_sync_at: new Date(),
+          last_event_at: lastEventAt,
+          cursor: nextCursor ?? current.cursor ?? state?.cursor ?? null,
+          ...(syncState ? syncState(current) : {}),
+        }));
       });
     } catch (err: any) {
       errors.push(err?.message ?? String(err));
@@ -191,9 +206,11 @@ export abstract class BaseConnector {
         client_id: e.client_id ?? ctx.apiKeyId,
         agent_id: e.agent_id ?? ctx.agentId,
       }));
-      const result = await upsertMediaEvents(enriched, ctx.scope);
-      ingested = result.inserted;
-      skipped += result.skipped;
+      await withScopedClient(ctx.scope, async (client) => {
+        const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
+        ingested = result.inserted;
+        skipped += result.skipped;
+      });
     } catch (err: any) {
       errors.push(err?.message ?? String(err));
     }

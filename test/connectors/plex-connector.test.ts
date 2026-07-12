@@ -5,7 +5,9 @@ import {
   fetchHistoryForServers,
   fetchHistoryForServer,
   historyAccountId,
+  mergePlexCursorMetadata,
   normalizePlexAccountId,
+  parsePlexCursorMetadata,
   type PlexHistoryFetchDeps,
 } from '../../src/connectors/plex/connector.js';
 import type { PlexCreds } from '../../src/connectors/plex/auth.js';
@@ -84,7 +86,7 @@ test('owned server history uses local owner accountID=1 and filters out plex.tv 
   assert.equal(calls[0].url.pathname, '/status/sessions/history');
   assert.equal(calls[0].url.searchParams.get('accountID'), '1');
   assert.equal(calls[0].token, 'account-token');
-  assert.deepEqual(events.map((event) => event.service_id), ['owned-client:owned-row']);
+  assert.deepEqual(events.events.map((event) => event.service_id), ['owned-client:owned-row']);
 });
 
 test('shared server history uses plex.tv accountID, resource token, fallback, and string row IDs', async () => {
@@ -155,7 +157,7 @@ test('shared server history uses plex.tv accountID, resource token, fallback, an
   ]);
   assert.deepEqual(calls.map((call) => call.url.searchParams.get('accountID')), ['98765', '98765']);
   assert.deepEqual(calls.map((call) => call.token), ['shared-resource-token', 'shared-resource-token']);
-  assert.deepEqual(events.map((event) => event.service_id), ['shared-client:shared-row']);
+  assert.deepEqual(events.events.map((event) => event.service_id), ['shared-client:shared-row']);
 });
 
 test('mixed owned/shared pagination keeps accountID and token isolated on every page', async () => {
@@ -218,12 +220,12 @@ test('mixed owned/shared pagination keeps accountID and token isolated on every 
     deps,
   });
 
-  assert.deepEqual(ownedEvents.map((event) => event.service_id), [
+  assert.deepEqual(ownedEvents.events.map((event) => event.service_id), [
     'owned-paged:owned-page-1',
     'owned-paged:owned-page-2',
     'owned-paged:owned-page-3',
   ]);
-  assert.deepEqual(sharedEvents.map((event) => event.service_id), ['shared-paged:shared-page-1']);
+  assert.deepEqual(sharedEvents.events.map((event) => event.service_id), ['shared-paged:shared-page-1']);
   assert.deepEqual(calls, [
     { server: 'owned', start: '0', accountID: '1', token: 'account-token' },
     { server: 'owned', start: '2', accountID: '1', token: 'account-token' },
@@ -373,7 +375,68 @@ test('normalizes account IDs and rejects malformed account, discovery, and histo
       }), { status: 200 }),
     },
   });
-  assert.deepEqual(events.map((event) => event.service_id), ['owned-client:valid-row']);
+  assert.deepEqual(events.events.map((event) => event.service_id), ['owned-client:valid-row']);
+});
+
+test('cursor metadata is canonical, versioned, monotonic, and preserves unrelated metadata', () => {
+  const warnings: string[] = [];
+  const parsed = parsePlexCursorMetadata({
+    unrelated: { keep: true },
+    plex: {
+      cursor_version: 1,
+      server_cursors: {
+        valid: '2026-01-01T00:00:00.000Z',
+        'date-only': '2026-01-01',
+        future: '9999-01-01T00:00:00.000Z',
+      },
+    },
+  }, (message) => warnings.push(message));
+
+  assert.deepEqual(Object.keys(parsed), ['valid']);
+  assert.equal(warnings.length, 2);
+
+  assert.deepEqual(
+    mergePlexCursorMetadata({
+      unrelated: { keep: true },
+      plex: {
+        cursor_version: 1,
+        server_cursors: {
+          same: '2026-02-01T00:00:00.000Z',
+          other: '2026-03-01T00:00:00.000Z',
+        },
+      },
+    }, {
+      same: '2026-01-01T00:00:00.000Z',
+      added: '2026-04-01T00:00:00.000Z',
+    }),
+    {
+      unrelated: { keep: true },
+      plex: {
+        cursor_version: 1,
+        server_cursors: {
+          same: '2026-02-01T00:00:00.000Z',
+          other: '2026-03-01T00:00:00.000Z',
+          added: '2026-04-01T00:00:00.000Z',
+        },
+      },
+    }
+  );
+});
+
+test('history JSON failures include server context', async () => {
+  await assert.rejects(
+    () => fetchHistoryForServer({
+      server: server({ name: 'Broken JSON Server' }),
+      creds,
+      account: { id: 98765 },
+      since: null,
+      deps: {
+        pickReachableUri: async () => ({ uri: 'https://owned.example', token: 'account-token' }),
+        fetch: async () => new Response('{broken', { status: 200 }),
+      },
+    }),
+    /Broken JSON Server.*invalid JSON/
+  );
 });
 
 test('history endpoint errors include server context without leaking resource tokens', async () => {
@@ -403,6 +466,26 @@ test('history endpoint errors include server context without leaking resource to
       return true;
     }
   );
+});
+
+test('an unreachable server is a contextual failure and does not count as successful', async () => {
+  const result = await fetchHistoryForServers({
+    servers: [server({ name: 'Offline Server', clientIdentifier: 'offline-server' })],
+    creds,
+    account: { id: 98765 },
+    since: null,
+    deps: {
+      pickReachableUri: async () => null,
+      warn: () => undefined,
+    },
+  });
+
+  assert.deepEqual(result.events, []);
+  assert.deepEqual(result.successfulServers, []);
+  assert.deepEqual(result.cursorCandidates, {});
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /Offline Server/);
+  assert.match(result.errors[0], /no reachable connection/);
 });
 
 test('server errors are isolated so other servers can still return events', async () => {
@@ -502,6 +585,171 @@ test('server errors can be escalated so callers do not advance a shared cursor',
   );
 });
 
+test('per-server cursors isolate failures and recovery bounds', async () => {
+  const bad = server({ name: 'Bad Server', clientIdentifier: 'bad-server', owned: true });
+  const good = server({ name: 'Good Server', clientIdentifier: 'good-server', owned: true });
+  const calls: { host: string; viewedAt: string | null }[] = [];
+
+  const first = await fetchHistoryForServers({
+    servers: [bad, good],
+    creds,
+    account: { id: 98765 },
+    since: new Date('2025-01-01T00:00:00.000Z'),
+    sinceByServer: {
+      'good-server': new Date('2024-01-01T00:00:00.000Z'),
+      'bad-server': new Date('2023-01-01T00:00:00.000Z'),
+    },
+    deps: {
+      pickReachableUri: async (resource) => ({
+        uri: resource.clientIdentifier === 'bad-server'
+          ? 'https://bad.example'
+          : 'https://good.example',
+        token: 'account-token',
+      }),
+      fetch: async (input) => {
+        const url = new URL(String(input));
+        calls.push({
+          host: url.hostname,
+          viewedAt: url.searchParams.get('viewedAt>='),
+        });
+        if (url.hostname === 'bad.example') {
+          return new Response('offline', { status: 503 });
+        }
+        return new Response(JSON.stringify({
+          MediaContainer: {
+            Metadata: [
+              {
+                ratingKey: 'good-row',
+                type: 'movie',
+                title: 'Good Row',
+                viewedAt: 1_704_067_200,
+                accountID: 1,
+              },
+            ],
+          },
+        }), { status: 200 });
+      },
+    },
+  });
+
+  assert.deepEqual(first.events.map((event) => event.service_id), ['good-server:good-row']);
+  assert.equal(first.errors.length, 1);
+  assert.match(first.errors[0], /Bad Server/);
+  assert.deepEqual(first.cursorCandidates, {
+    'good-server': '2024-01-01T00:00:00.000Z',
+  });
+  assert.deepEqual(calls, [
+    { host: 'bad.example', viewedAt: '1672531200' },
+    { host: 'good.example', viewedAt: '1704067200' },
+  ]);
+
+  calls.length = 0;
+  const recovered = await fetchHistoryForServers({
+    servers: [bad],
+    creds,
+    account: { id: 98765 },
+    since: new Date('2025-01-01T00:00:00.000Z'),
+    sinceByServer: {
+      'good-server': new Date('2024-01-01T12:00:00.000Z'),
+      'bad-server': new Date('2023-01-01T00:00:00.000Z'),
+    },
+    deps: {
+      pickReachableUri: async () => ({ uri: 'https://bad.example', token: 'account-token' }),
+      fetch: async (input) => {
+        const url = new URL(String(input));
+        calls.push({
+          host: url.hostname,
+          viewedAt: url.searchParams.get('viewedAt>='),
+        });
+        return new Response(JSON.stringify({
+          MediaContainer: {
+            Metadata: [
+              {
+                ratingKey: 'bad-row',
+                type: 'movie',
+                title: 'Recovered Row',
+                viewedAt: 1_672_574_400,
+                accountID: 1,
+              },
+            ],
+          },
+        }), { status: 200 });
+      },
+    },
+  });
+
+  assert.deepEqual(recovered.events.map((event) => event.service_id), ['bad-server:bad-row']);
+  assert.deepEqual(recovered.cursorCandidates, {
+    'bad-server': '2023-01-01T12:00:00.000Z',
+  });
+  assert.deepEqual(calls, [
+    { host: 'bad.example', viewedAt: '1672531200' },
+  ]);
+});
+
+test('a fully scanned account-mismatched server advances to the scanned high-water', async () => {
+  const result = await fetchHistoryForServers({
+    servers: [server({ name: 'Shared Mismatch', clientIdentifier: 'shared-mismatch', owned: false })],
+    creds,
+    account: { id: 98765 },
+    since: null,
+    deps: {
+      pickReachableUri: async () => ({ uri: 'https://shared-mismatch.example', token: 'shared-token' }),
+      warn: () => undefined,
+      fetch: async () => new Response(JSON.stringify({
+        MediaContainer: {
+          Metadata: [
+            {
+              ratingKey: 'other-user-row',
+              type: 'movie',
+              title: 'Other User Row',
+              viewedAt: 1_700_000_080,
+              accountID: 1,
+            },
+          ],
+        },
+      }), { status: 200 }),
+    },
+  });
+
+  assert.deepEqual(result.events, []);
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.cursorCandidates, {
+    'shared-mismatch': '2023-11-14T22:14:40.000Z',
+  });
+});
+
+test('future-dated server history fails without events or cursor advancement', async () => {
+  const result = await fetchHistoryForServers({
+    servers: [server({ name: 'Clock Skew Server', clientIdentifier: 'clock-skew' })],
+    creds,
+    account: { id: 98765 },
+    since: null,
+    deps: {
+      pickReachableUri: async () => ({ uri: 'https://clock-skew.example', token: 'account-token' }),
+      fetch: async () => new Response(JSON.stringify({
+        MediaContainer: {
+          Metadata: [
+            {
+              ratingKey: 'future-row',
+              type: 'movie',
+              title: 'Future Row',
+              viewedAt: 253_370_764_800,
+              accountID: 1,
+            },
+          ],
+        },
+      }), { status: 200 }),
+    },
+  });
+
+  assert.deepEqual(result.events, []);
+  assert.deepEqual(result.cursorCandidates, {});
+  assert.deepEqual(result.successfulServers, []);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /Clock Skew Server.*future viewedAt/);
+});
+
 test('shared servers warn when returned rows are all filtered by accountID', async () => {
   const warnings: string[] = [];
   const events = await fetchHistoryForServer({
@@ -528,7 +776,7 @@ test('shared servers warn when returned rows are all filtered by accountID', asy
     } as PlexHistoryFetchDeps,
   });
 
-  assert.deepEqual(events, []);
+  assert.deepEqual(events.events, []);
   assert.ok(warnings.some((warning) =>
     warning.includes('Shared Mismatch') && warning.includes('accountID')
   ));
@@ -564,48 +812,45 @@ test('pagination continues through short pages when totalSize says more rows rem
   });
 
   assert.deepEqual(calls, ['0', '1', '2']);
-  assert.deepEqual(events.map((event) => event.service_id), [
+  assert.deepEqual(events.events.map((event) => event.service_id), [
     'owned-client:short-1',
     'owned-client:short-2',
     'owned-client:short-3',
   ]);
 });
 
-test('pagination stops at the configured page cap when totalSize is unavailable', async () => {
+test('pagination page cap fails the server instead of committing a partial page sequence', async () => {
   const calls: string[] = [];
-  const events = await fetchHistoryForServer({
-    server: server(),
-    creds,
-    account: { id: 98765 },
-    since: null,
-    deps: {
-      pickReachableUri: async () => ({ uri: 'https://owned.example', token: 'account-token' }),
-      fetch: async (input) => {
-        const url = new URL(String(input));
-        const start = Number(url.searchParams.get('X-Plex-Container-Start') ?? '0');
-        calls.push(String(start));
-        if (calls.length > 2) {
-          throw new Error('pagination cap was not respected');
-        }
-        return new Response(JSON.stringify({
-          MediaContainer: {
-            Metadata: [
-              { ratingKey: `cap-${start}`, type: 'movie', title: `Cap ${start}`, viewedAt: 1_700_000_050 + start, accountID: 1 },
-              { ratingKey: `cap-${start + 1}`, type: 'movie', title: `Cap ${start + 1}`, viewedAt: 1_700_000_051 + start, accountID: 1 },
-            ],
-          },
-        }), { status: 200 });
+  await assert.rejects(
+    () => fetchHistoryForServer({
+      server: server(),
+      creds,
+      account: { id: 98765 },
+      since: null,
+      deps: {
+        pickReachableUri: async () => ({ uri: 'https://owned.example', token: 'account-token' }),
+        fetch: async (input) => {
+          const url = new URL(String(input));
+          const start = Number(url.searchParams.get('X-Plex-Container-Start') ?? '0');
+          calls.push(String(start));
+          if (calls.length > 2) {
+            throw new Error('pagination cap was not respected');
+          }
+          return new Response(JSON.stringify({
+            MediaContainer: {
+              Metadata: [
+                { ratingKey: `cap-${start}`, type: 'movie', title: `Cap ${start}`, viewedAt: 1_700_000_050 + start, accountID: 1 },
+                { ratingKey: `cap-${start + 1}`, type: 'movie', title: `Cap ${start + 1}`, viewedAt: 1_700_000_051 + start, accountID: 1 },
+              ],
+            },
+          }), { status: 200 });
+        },
+        historyPageSize: 2,
+        maxHistoryPages: 2,
       },
-      historyPageSize: 2,
-      maxHistoryPages: 2,
-    } as PlexHistoryFetchDeps,
-  });
+    } as PlexHistoryFetchDeps),
+    /pagination hit 2 page cap/
+  );
 
   assert.deepEqual(calls, ['0', '2']);
-  assert.deepEqual(events.map((event) => event.service_id), [
-    'owned-client:cap-0',
-    'owned-client:cap-1',
-    'owned-client:cap-2',
-    'owned-client:cap-3',
-  ]);
 });
