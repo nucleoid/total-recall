@@ -26,7 +26,7 @@ async function main(): Promise<void> {
   const creds = await pinFlow((link, code) => {
     console.log(`  Link:  ${link}`);
     console.log(`  Code:  ${code}\n`);
-    console.log('Waiting for authorization (PIN expires in 25 minutes)...\n');
+    console.log('Waiting for authorization...\n');
   });
 
   console.log('\n✓ Authorized. Storing account + server discovery...\n');

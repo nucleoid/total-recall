@@ -87,10 +87,10 @@ npm run plex:auth
 The script prints something like:
 
 ```
-Link:  https://plex.tv/link?code=ABCD
+Link:  https://plex.tv/link
 Code:  ABCD
 
-Waiting for authorization (PIN expires in 25 minutes)...
+Waiting for authorization...
 ```
 
 Open the link **on any device** (laptop, phone), sign in if needed, enter the code, approve. The script polls and unblocks when you have authorized, then prints the list of servers discovered.
@@ -136,7 +136,9 @@ Rolled-up memories read like:
 
 **`No Plex credentials. Run scripts/plex-auth.ts first.`** - exactly what it says. Run `npm run plex:auth`.
 
-**`Plex PIN expired without being claimed.`** - you took longer than 25 min. Just re-run `npm run plex:auth`.
+**`Plex PIN expired without being claimed.`** - PIN expiry is controlled by Plex. The PIN may have reached its server-provided deadline before it was approved; just re-run `npm run plex:auth`.
+
+**`Plex PIN expired or was deleted.`** - Plex no longer recognizes the PIN. Re-run `npm run plex:auth`; the connector stops polling deleted PINs immediately.
 
 **`No accessible Plex servers found for this account.`** - check that your plex.tv account is actually linked to at least one server (yours or a friend's). Try logging into app.plex.tv to confirm.
 
