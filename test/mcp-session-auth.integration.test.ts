@@ -14,6 +14,8 @@ import type { AuthContext } from '../src/types.js';
 type AuthResolver = () => Promise<AuthContext>;
 
 const authByToken = new Map<string, AuthContext | null>();
+const queuedAuthByToken = new Map<string, Array<AuthContext | null>>();
+const validationCalls: string[] = [];
 const toolAuthCalls: AuthContext[] = [];
 let app: express.Express;
 let resetServerTestState: () => Promise<void>;
@@ -30,15 +32,26 @@ function registerTestTools(server: Server, getAuth: AuthResolver): void {
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async () => {
-    const auth = await getAuth();
-    toolAuthCalls.push(auth);
-    return {
-      content: [{ type: 'text', text: JSON.stringify(auth) }],
-    };
+    try {
+      const auth = await getAuth();
+      toolAuthCalls.push(auth);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(auth) }],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
   });
 }
 
 async function validateKey(apiKey: string): Promise<AuthContext | null> {
+  validationCalls.push(apiKey);
+  const queued = queuedAuthByToken.get(apiKey);
+  if (queued && queued.length > 0) return queued.shift() ?? null;
   return authByToken.get(apiKey) ?? null;
 }
 
@@ -93,6 +106,8 @@ before(async () => {
 beforeEach(async () => {
   await resetServerTestState();
   authByToken.clear();
+  queuedAuthByToken.clear();
+  validationCalls.length = 0;
   toolAuthCalls.length = 0;
 });
 
@@ -133,11 +148,14 @@ async function createInitializedSession(): Promise<string> {
   return sessionId;
 }
 
-function parseToolAuth(response: request.Response): AuthContext {
-  const body = response.body.result
+function parseMcpBody(response: request.Response): any {
+  return response.body.result
     ? response.body
     : JSON.parse(response.text.split('\n').find((line) => line.startsWith('data: '))!.slice(6));
-  const text = body.result.content[0].text;
+}
+
+function parseToolAuth(response: request.Response): AuthContext {
+  const text = parseMcpBody(response).result.content[0].text;
   return JSON.parse(text) as AuthContext;
 }
 
@@ -228,16 +246,25 @@ test('MCP initialize rejects malformed and duplicate session headers', async () 
   assert.equal(duplicate.headers['mcp-session-id'], undefined);
 });
 
-test('MCP session owner can POST and receives refreshed auth on each request', async () => {
+test('MCP session owner gets fresh auth for both the request and tool operation', async () => {
   seedKeys();
   const sessionId = await createInitializedSession();
-
-  authByToken.set('tr_key_a', {
+  const requestAuth = {
     keyId: 'key-a',
-    name: 'key A refreshed',
+    name: 'key A request auth',
+    namespaces: ['alpha'],
+    permissions: ['read'],
+    maxAccessLevel: 'normal' as const,
+  };
+  const toolAuth = {
+    keyId: 'key-a',
+    name: 'key A tool auth',
     namespaces: ['gamma'],
     permissions: ['read', 'admin'],
-  });
+    maxAccessLevel: 'secret' as const,
+  };
+  queuedAuthByToken.set('tr_key_a', [requestAuth, toolAuth]);
+  const callsBefore = validationCalls.length;
 
   const response = await request(app)
     .post('/mcp')
@@ -247,12 +274,28 @@ test('MCP session owner can POST and receives refreshed auth on each request', a
     .send(callWhoamiRequest())
     .expect(200);
 
-  assert.deepEqual(parseToolAuth(response), {
-    keyId: 'key-a',
-    name: 'key A refreshed',
-    namespaces: ['gamma'],
-    permissions: ['read', 'admin'],
-  });
+  assert.deepEqual(parseToolAuth(response), toolAuth);
+  assert.deepEqual(validationCalls.slice(callsBefore), ['tr_key_a', 'tr_key_a']);
+});
+
+test('MCP session key disabled between request and tool resolution returns no stale result', async () => {
+  seedKeys();
+  const sessionId = await createInitializedSession();
+  queuedAuthByToken.set('tr_key_a', [authByToken.get('tr_key_a')!, null]);
+
+  const response = await request(app)
+    .post('/mcp')
+    .set('Authorization', bearer('tr_key_a'))
+    .set('mcp-session-id', sessionId)
+    .set('Accept', 'application/json, text/event-stream')
+    .send(callWhoamiRequest())
+    .expect(200);
+
+  const body = parseMcpBody(response);
+  assert.equal(body.result.isError, true);
+  assert.match(body.result.content[0].text, /Invalid API key/);
+  assert.doesNotMatch(JSON.stringify(body), /tr_key_a/);
+  assert.equal(toolAuthCalls.length, 0);
 });
 
 test('MCP session creator disablement rejects the next request before tools run', async () => {

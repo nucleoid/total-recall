@@ -30,8 +30,8 @@ const PORT = parseInt(process.env.PORT || '3002', 10);
 // Store transports by session ID
 interface SessionRecord {
   transport: StreamableHTTPServerTransport;
-  keyId: string;
-  auth: AuthContext;
+  boundKeyId: string;
+  boundApiKey: string;
   closing: boolean;
 }
 
@@ -173,7 +173,7 @@ function resolveOwnedSession(
   const sessionId = extractSessionId(req);
   const record = sessionId ? sessions.get(sessionId) : undefined;
 
-  if (!sessionId || !record || record.keyId !== auth.keyId || record.closing) {
+  if (!sessionId || !record || record.boundKeyId !== auth.keyId || record.closing) {
     if (responseType === 'json') {
       sendPostNoValidSession(res);
     } else {
@@ -182,7 +182,6 @@ function resolveOwnedSession(
     return null;
   }
 
-  record.auth = auth;
   return record;
 }
 
@@ -208,14 +207,19 @@ app.post('/mcp', async (req, res) => {
       await record.transport.handleRequest(req, res, req.body);
     } else if (isInitializeRequest(req.body)) {
       // New session
+      const boundApiKey = extractApiKey(req);
+      if (!boundApiKey) {
+        sendPostUnauthorized(res);
+        return;
+      }
       let record: SessionRecord | null = null;
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid: string) => {
           record = {
             transport,
-            keyId: authContext.keyId,
-            auth: authContext,
+            boundKeyId: authContext.keyId,
+            boundApiKey,
             closing: false,
           };
           sessions.set(sid, record);
@@ -231,10 +235,14 @@ app.post('/mcp', async (req, res) => {
       };
 
       const server = createServer(async () => {
-        if (!record) {
+        if (!record || record.closing) {
           throw new Error('MCP session is not initialized');
         }
-        return record.auth;
+        const freshAuth = await keyValidator(record.boundApiKey);
+        if (!freshAuth || freshAuth.keyId !== record.boundKeyId) {
+          throw new Error('Invalid API key');
+        }
+        return freshAuth;
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);

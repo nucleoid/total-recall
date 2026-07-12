@@ -19,6 +19,8 @@ cd ~/projects/total-recall
 npx tsx scripts/create-key.ts --name "client-name" --namespaces "ns1,ns2"
 ```
 
+Total Recall revalidates authentication and ACLs for every MCP tool call. Disabling or deleting a key, or changing its namespaces, permissions, or access ceiling, therefore applies on the next call. Local stdio clients keep the `TOTAL_RECALL_API_KEY` value with which their process started, so replacing that environment secret requires restarting the client process. Remote HTTP MCP sessions are bound to the key that initialized them; after a server restart clients must initialize a new in-memory session, but they can keep using the same valid API key.
+
 ---
 
 ## 1. OpenClaw (Cass)
