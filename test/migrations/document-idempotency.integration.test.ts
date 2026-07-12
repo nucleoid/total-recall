@@ -80,6 +80,43 @@ test('real PostgreSQL enforces document idempotency migration, RLS, concurrency,
   const appPool = new pg.Pool({ connectionString: appUrl, max: 8 });
   setPoolForTesting(appPool);
   const { memoryStoreDocument, StoreDocumentConflictError } = await import('../../src/tools/store-document.js');
+  const { memoryStore, storeSchema } = await import('../../src/tools/store.js');
+
+  await t.test('memory keyed reuse moves authorized namespaces and normalizes hidden RLS conflicts', async () => {
+    const elevatedAuth = { ...auth(KEY_A), maxAccessLevel: 'secret' as const };
+    const first = await memoryStore(storeSchema.parse({
+      content: 'before move', namespace: 'alpha', access_level: 'normal', idempotency_key: 'memory-move',
+    }), elevatedAuth);
+    const moved = await memoryStore(storeSchema.parse({
+      content: 'after move', namespace: 'beta', access_level: 'sensitive', idempotency_key: 'memory-move',
+    }), elevatedAuth);
+    assert.equal(moved.id, first.id);
+    assert.equal(moved.idempotency_key_honored, true);
+
+    const owner = await ownerClient();
+    try {
+      const row = await owner.query<{ namespace: string; access_level: string; created_at: Date }>(
+        'SELECT namespace, access_level, created_at FROM memories WHERE id = $1',
+        [first.id]
+      );
+      assert.deepEqual(
+        { namespace: row.rows[0].namespace, access_level: row.rows[0].access_level },
+        { namespace: 'beta', access_level: 'sensitive' }
+      );
+
+      await memoryStore(storeSchema.parse({
+        content: 'hidden original', namespace: 'beta', idempotency_key: 'memory-hidden',
+      }), elevatedAuth);
+      await assert.rejects(
+        () => memoryStore(storeSchema.parse({
+          content: 'probe', namespace: 'alpha', idempotency_key: 'memory-hidden',
+        }), { ...elevatedAuth, namespaces: ['alpha'] }),
+        (error: unknown) => error instanceof Error && error.message === 'Access denied to existing idempotent memory'
+      );
+    } finally {
+      await owner.end();
+    }
+  });
 
   await t.test('same key is isolated by namespace and owner while RLS denies ungranted namespaces', async () => {
     const base = {

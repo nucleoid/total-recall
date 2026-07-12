@@ -72,6 +72,11 @@ paths:
                 source:
                   type: string
                   description: Source identifier (defaults to key name)
+                idempotency_key:
+                  type: string
+                  minLength: 1
+                  maxLength: 512
+                  description: Optional retry key scoped only to the authenticated API key. Reusing it updates the same memory while preserving created_at; callers authorized for both namespaces may move it and may update its access level.
       responses:
         "200":
           description: Memory stored
@@ -84,6 +89,9 @@ paths:
                     type: string
                   created:
                     type: boolean
+                  idempotency_key_honored:
+                    type: boolean
+                    description: Present and true only when an idempotency_key was supplied and honored. Keyed callers should require this acknowledgement before checkpointing.
         "401":
           description: Unauthorized
         "403":

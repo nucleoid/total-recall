@@ -54,6 +54,10 @@ const TOOL_DEFINITIONS = [
         agent_model: { type: 'string', description: 'LLM model identifier (e.g. "claude-opus-4-7")' },
         agent_runtime: { type: 'string', description: 'Runtime environment (e.g. "claude-code", "openclaw")' },
         session_id: { type: 'string', description: 'Optional session/conversation ID for grouping related operations' },
+        idempotency_key: {
+          type: 'string',
+          description: 'Optional retry key (1-512 characters), scoped only to the authenticated API key. Reusing it updates the same memory, including authorized namespace and access-level moves; keyed responses acknowledge that the key was honored.',
+        },
       },
       required: ['content'],
     },
