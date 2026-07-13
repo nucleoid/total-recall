@@ -17,6 +17,8 @@ Usage:
 Requires:  pip install ytmusicapi
 """
 
+from __future__ import annotations
+
 import argparse
 import contextlib
 import json
@@ -66,6 +68,8 @@ class PlayedAtResolution:
     precision: str
     bucket: str | None = None
     since_comparable: bool = False
+    bucket_start: str | None = None
+    bucket_end: str | None = None
 
 
 def _require_utc_now(now: datetime) -> datetime:
@@ -109,6 +113,55 @@ def _year_midpoint(year: int) -> datetime:
     return datetime(year, 7, 2, 12, tzinfo=timezone.utc)
 
 
+def _fuzzy_resolution(
+    representative: datetime,
+    precision: str,
+    since_comparable: bool = False,
+) -> PlayedAtResolution:
+    representative = representative.astimezone(timezone.utc)
+    if precision == "minute":
+        start = representative.replace(second=0, microsecond=0)
+        end = start + timedelta(minutes=1)
+        bucket = f"minute:{start.strftime('%Y-%m-%dT%H:%M')}"
+    elif precision == "hour":
+        start = representative.replace(minute=0, second=0, microsecond=0)
+        end = start + timedelta(hours=1)
+        bucket = f"hour:{start.strftime('%Y-%m-%dT%H')}"
+    elif precision == "day":
+        start = representative.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        bucket = f"day:{start.date().isoformat()}"
+    elif precision == "week":
+        start = (representative - timedelta(days=representative.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end = start + timedelta(days=7)
+        year, week, _weekday = start.date().isocalendar()
+        bucket = f"week:{year}-W{week:02d}"
+    elif precision == "month":
+        start = representative.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_year, end_month = (
+            (start.year + 1, 1) if start.month == 12 else (start.year, start.month + 1)
+        )
+        end = datetime(end_year, end_month, 1, tzinfo=timezone.utc)
+        bucket = f"month:{start.year:04d}-{start.month:02d}"
+    elif precision == "year":
+        start = datetime(representative.year, 1, 1, tzinfo=timezone.utc)
+        end = datetime(representative.year + 1, 1, 1, tzinfo=timezone.utc)
+        bucket = f"year:{representative.year:04d}"
+    else:
+        raise ValueError(f"unsupported fuzzy precision: {precision}")
+
+    return PlayedAtResolution(
+        representative.isoformat(),
+        precision,
+        bucket,
+        since_comparable,
+        start.isoformat(),
+        end.isoformat(),
+    )
+
+
 def _subtract_months(dt: datetime, months: int) -> tuple[int, int]:
     month_index = (dt.year * 12 + (dt.month - 1)) - months
     return month_index // 12, (month_index % 12) + 1
@@ -130,33 +183,33 @@ def _resolve_played_at_details(raw: str | None, now: datetime) -> PlayedAtResolu
     s = raw.strip().lower()
 
     if s == "this week":
-        return PlayedAtResolution(_week_midpoint(now).isoformat(), "week", s)
+        return _fuzzy_resolution(_week_midpoint(now), "week")
     if s == "this month":
-        return PlayedAtResolution(_month_midpoint(now.year, now.month).isoformat(), "month", s)
+        return _fuzzy_resolution(_month_midpoint(now.year, now.month), "month")
     if s in _MONTHS:
         month = _MONTHS[s]
         year = now.year if month <= now.month else now.year - 1
-        return PlayedAtResolution(_month_midpoint(year, month).isoformat(), "month", s)
+        return _fuzzy_resolution(_month_midpoint(year, month), "month")
     if _YEAR_RE.match(s):
         year = int(s)
         if year == 0:
             return None
         try:
-            return PlayedAtResolution(_year_midpoint(year).isoformat(), "year", s)
+            return _fuzzy_resolution(_year_midpoint(year), "year")
         except ValueError:
             return None
 
     if s in ("today", "just now"):
-        return PlayedAtResolution(_day_midpoint(now).isoformat(), "day", s)
+        return _fuzzy_resolution(_day_midpoint(now), "day")
     if s in ("yesterday",):
-        return PlayedAtResolution(_day_midpoint(now - timedelta(days=1)).isoformat(), "day", s)
+        return _fuzzy_resolution(_day_midpoint(now - timedelta(days=1)), "day")
     if s in ("last week", "a week ago"):
-        return PlayedAtResolution(_week_midpoint(now - timedelta(weeks=1)).isoformat(), "week", s)
+        return _fuzzy_resolution(_week_midpoint(now - timedelta(weeks=1)), "week")
     if s in ("last month", "a month ago"):
         year, month = _subtract_months(now, 1)
-        return PlayedAtResolution(_month_midpoint(year, month).isoformat(), "month", s)
+        return _fuzzy_resolution(_month_midpoint(year, month), "month")
     if s in ("last year", "a year ago"):
-        return PlayedAtResolution(_year_midpoint(_subtract_years(now, 1)).isoformat(), "year", s)
+        return _fuzzy_resolution(_year_midpoint(_subtract_years(now, 1)), "year")
 
     m = _RELATIVE_TIME_RE.match(s)
     if m:
@@ -188,7 +241,7 @@ def _resolve_played_at_details(raw: str | None, now: datetime) -> PlayedAtResolu
                 ts = _day_midpoint(ts)
             elif unit == "week":
                 ts = _week_midpoint(ts)
-        return PlayedAtResolution(ts.isoformat(), unit, s, unit in ("minute", "hour"))
+        return _fuzzy_resolution(ts, unit, unit in ("minute", "hour"))
 
     return None
 
@@ -377,6 +430,10 @@ def cmd_fetch(args):
                 item["played_cursor_eligible"] = played.since_comparable
                 if played.bucket is not None:
                     item["played_bucket"] = played.bucket
+                if played.bucket_start is not None:
+                    item["played_bucket_start"] = played.bucket_start
+                if played.bucket_end is not None:
+                    item["played_bucket_end"] = played.bucket_end
             else:
                 # Couldn't parse — drop so we don't poison the DB with a
                 # malformed timestamptz. Logged for visibility.

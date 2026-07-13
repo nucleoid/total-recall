@@ -18,6 +18,7 @@ HELPER_PATH = ROOT / "scripts" / "ytmusic_helper.py"
 
 spec = importlib.util.spec_from_file_location("ytmusic_helper", HELPER_PATH)
 ytmusic_helper = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = ytmusic_helper
 assert spec.loader is not None
 spec.loader.exec_module(ytmusic_helper)
 
@@ -177,10 +178,14 @@ class FetchCommandTests(unittest.TestCase):
         self.assertEqual(output["items"][0]["played"], "2026-02-25T12:00:00+00:00")
         self.assertEqual(output["items"][0]["played_raw"], "This week")
         self.assertEqual(output["items"][0]["played_precision"], "week")
-        self.assertEqual(output["items"][0]["played_bucket"], "this week")
+        self.assertEqual(output["items"][0]["played_bucket"], "week:2026-W09")
+        self.assertEqual(output["items"][0]["played_bucket_start"], "2026-02-23T00:00:00+00:00")
+        self.assertEqual(output["items"][0]["played_bucket_end"], "2026-03-02T00:00:00+00:00")
         self.assertFalse(output["items"][0]["played_cursor_eligible"])
         self.assertEqual(output["items"][1]["played_precision"], "month")
-        self.assertEqual(output["items"][1]["played_bucket"], "march")
+        self.assertEqual(output["items"][1]["played_bucket"], "month:2026-03")
+        self.assertEqual(output["items"][1]["played_bucket_start"], "2026-03-01T00:00:00+00:00")
+        self.assertEqual(output["items"][1]["played_bucket_end"], "2026-04-01T00:00:00+00:00")
         self.assertFalse(output["items"][1]["played_cursor_eligible"])
         self.assertEqual(diagnostics, [{
             "skipped": {
@@ -189,6 +194,24 @@ class FetchCommandTests(unittest.TestCase):
                 "videoId": "bad",
             }
         }])
+
+    def test_moving_today_label_has_absolute_bucket_identity_without_changing_midpoint(self):
+        first_day = datetime(2026, 3, 1, 8, 30, tzinfo=timezone.utc)
+        second_day = datetime(2026, 3, 2, 8, 30, tzinfo=timezone.utc)
+
+        first = ytmusic_helper._resolve_played_at_details("Today", first_day)
+        second = ytmusic_helper._resolve_played_at_details("Today", second_day)
+
+        self.assertEqual(first.iso, "2026-03-01T12:00:00+00:00")
+        self.assertEqual(first.bucket, "day:2026-03-01")
+        self.assertEqual(first.bucket_start, "2026-03-01T00:00:00+00:00")
+        self.assertEqual(first.bucket_end, "2026-03-02T00:00:00+00:00")
+        self.assertEqual(second.bucket, "day:2026-03-02")
+        self.assertNotEqual(first.bucket, second.bucket)
+
+    def test_helper_postpones_annotations_for_python_39_import_compatibility(self):
+        source = HELPER_PATH.read_text(encoding="utf-8")
+        self.assertIn("from __future__ import annotations", source)
 
     def test_since_keeps_later_items_from_same_coarse_bucket(self):
         output, diagnostics = self.run_fetch(

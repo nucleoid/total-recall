@@ -173,6 +173,51 @@ export interface UpsertResult {
   ids: string[];
 }
 
+export interface MediaEventUpsertPreviewItem {
+  event: MediaEventInput;
+  status: 'would_insert' | 'tuple_conflict' | 'possible_legacy_duplicate';
+  conflicting_event_ids: string[];
+  legacy_duplicate_event_ids: string[];
+}
+
+export interface MediaEventUpsertPreview {
+  items: MediaEventUpsertPreviewItem[];
+  would_insert: number;
+  tuple_conflicts: number;
+  possible_legacy_duplicates: number;
+}
+
+function playedAtKey(value: Date | string): string {
+  return (value instanceof Date ? value : new Date(value)).toISOString();
+}
+
+function ytmusicLegacyBucketBounds(event: MediaEventInput): {
+  start: string;
+  end: string;
+} | null {
+  if (event.service !== 'ytmusic' || !event.service_id) return null;
+
+  const precision = event.metadata?.played_precision;
+  const start = event.metadata?.played_bucket_start;
+  const end = event.metadata?.played_bucket_end;
+  if (
+    precision === 'exact' ||
+    precision === 'instant' ||
+    typeof start !== 'string' ||
+    typeof end !== 'string'
+  ) {
+    return null;
+  }
+
+  const startTime = Date.parse(start);
+  const endTime = Date.parse(end);
+  if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || startTime >= endTime) {
+    return null;
+  }
+
+  return { start, end };
+}
+
 export function parsePublicMediaEventBatch(body: unknown): PublicMediaEventInput[] {
   return publicMediaEventBatchSchema.parse(body).events;
 }
@@ -202,6 +247,26 @@ async function upsertMediaEventsWithQuery(
   for (const e of events) {
     if (!e.client_id || e.client_id !== scope.keyId) {
       throw new Error('Trusted media event client_id must match database scope');
+    }
+
+    const legacyBounds = ytmusicLegacyBucketBounds(e);
+    if (legacyBounds) {
+      const legacy = await query<{ id: string }>(
+        `SELECT id FROM media_events
+         WHERE client_id = $1
+           AND service = $2
+           AND service_id = $3
+           AND NOT (metadata ? 'played_raw')
+           AND NOT (metadata ? 'played_bucket')
+           AND played_at >= $4::timestamptz
+           AND played_at < $5::timestamptz
+         LIMIT 1`,
+        [scope.keyId, e.service, e.service_id, legacyBounds.start, legacyBounds.end]
+      );
+      if (legacy.rows.length > 0) {
+        skipped++;
+        continue;
+      }
     }
 
     const res = await query<{ id: string }>(
@@ -266,6 +331,119 @@ export async function upsertMediaEventsOnClient(
 }
 
 export const upsertMediaEventsWithClient = upsertMediaEventsOnClient;
+
+/**
+ * Read-only view of how media events would behave under the database tuple key.
+ * This reports recovery candidates without writing, merging, deleting, or
+ * relinking historical rows.
+ */
+export async function previewMediaEventUpsertsWithQuery(
+  service: string,
+  events: MediaEventInput[],
+  scope: DbScope,
+  query: <T extends QueryResultRow>(text: string, params?: unknown[]) => Promise<{ rows: T[] }>
+): Promise<MediaEventUpsertPreview> {
+  type PreviewRow = {
+    id: string;
+    service_id: string;
+    played_at: Date | string;
+    metadata: Record<string, unknown>;
+  };
+
+  const serviceIds = [
+    ...new Set(
+      events
+        .filter((event) => event.service === service)
+        .map((event) => event.service_id)
+        .filter((id): id is string => Boolean(id))
+    ),
+  ];
+
+  const existing = serviceIds.length > 0
+    ? await query<PreviewRow>(
+        `SELECT id, service_id, played_at, metadata FROM media_events
+         WHERE client_id = $1 AND service = $2 AND service_id = ANY($3)`,
+        [scope.keyId, service, serviceIds]
+      )
+    : { rows: [] };
+
+  const byServiceId = new Map<string, PreviewRow[]>();
+  for (const row of existing.rows) {
+    const related = byServiceId.get(row.service_id) ?? [];
+    related.push(row);
+    byServiceId.set(row.service_id, related);
+  }
+
+  const items = events.map<MediaEventUpsertPreviewItem>((event) => {
+    if (event.service !== service || !event.service_id) {
+      return {
+        event,
+        status: 'would_insert',
+        conflicting_event_ids: [],
+        legacy_duplicate_event_ids: [],
+      };
+    }
+
+    const playedAt = playedAtKey(event.played_at);
+    const related = byServiceId.get(event.service_id) ?? [];
+    const conflicting = related
+      .filter((row) => playedAtKey(row.played_at) === playedAt)
+      .map((row) => row.id);
+    if (conflicting.length > 0) {
+      return {
+        event,
+        status: 'tuple_conflict',
+        conflicting_event_ids: conflicting,
+        legacy_duplicate_event_ids: [],
+      };
+    }
+
+    const bounds = ytmusicLegacyBucketBounds(event);
+    const start = bounds ? Date.parse(bounds.start) : Number.NaN;
+    const end = bounds ? Date.parse(bounds.end) : Number.NaN;
+    const legacyDuplicates = bounds
+      ? related
+          .filter((row) => {
+            const metadata = row.metadata ?? {};
+            const rowTime = new Date(row.played_at).getTime();
+            return (
+              !Object.hasOwn(metadata, 'played_raw') &&
+              !Object.hasOwn(metadata, 'played_bucket') &&
+              rowTime >= start &&
+              rowTime < end
+            );
+          })
+          .map((row) => row.id)
+      : [];
+
+    return {
+      event,
+      status: legacyDuplicates.length > 0 ? 'possible_legacy_duplicate' : 'would_insert',
+      conflicting_event_ids: [],
+      legacy_duplicate_event_ids: legacyDuplicates,
+    };
+  });
+
+  return {
+    items,
+    would_insert: items.filter((item) => item.status === 'would_insert').length,
+    tuple_conflicts: items.filter((item) => item.status === 'tuple_conflict').length,
+    possible_legacy_duplicates: items.filter((item) => item.status === 'possible_legacy_duplicate').length,
+  };
+}
+
+export async function previewMediaEventUpserts(
+  service: string,
+  events: MediaEventInput[],
+  scope: DbScope
+): Promise<MediaEventUpsertPreview> {
+  return previewMediaEventUpsertsWithQuery(
+    service,
+    events,
+    scope,
+    (text, params) => queryScoped(scope, text, params)
+  );
+}
 
 export async function listMediaEvents(auth: AuthContext, scope: DbScope, filters: MediaListFilters = {}): Promise<MediaEvent[]> {
   const isAdmin = auth.permissions.includes('admin');

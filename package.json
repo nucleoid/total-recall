@@ -7,7 +7,7 @@
     "build": "tsc",
     "pretest": "npm run build",
     "typecheck:scripts": "tsc --project tsconfig.scripts.json",
-    "test": "node --test --test-concurrency=1 --import ./test/setup-embedding-env.mjs --import tsx \"test/**/*.test.ts\" && npm run test:daily-sync && npm run test:access-level:db",
+    "test": "node --test --test-concurrency=1 --import ./test/setup-embedding-env.mjs --import tsx \"test/**/*.test.ts\" && npm run test:python && npm run test:daily-sync && npm run test:access-level:db",
     "test:daily-sync": "node scripts/run-daily-sync-tests.mjs",
     "test:integration": "node --import ./test/setup-embedding-env.mjs --import tsx --test test/*.integration.test.ts",
     "test:watcher": "node --test --test-concurrency=1 --import ./test/setup-embedding-env.mjs --import tsx \"test/watcher/**/*.test.ts\"",
@@ -45,11 +45,13 @@
     "repair:media-event-duplicates": "tsx scripts/repair-media-event-duplicates.ts",
     "ytmusic:auth": "tsx scripts/ytmusic-auth.ts",
     "ytmusic:auth-browser": "tsx scripts/ytmusic-auth-browser.ts",
+    "ytmusic:preview-recovery": "tsx scripts/ytmusic-preview-recovery.ts",
     "ytmusic:sync": "tsx scripts/ytmusic-sync.ts",
     "plex:auth": "tsx scripts/plex-auth.ts",
     "plex:sync": "tsx scripts/plex-sync.ts",
     "preflight:media-keys": "tsx scripts/preflight-media-keys.ts",
-    "test:plex": "node --test --import tsx test/connectors/plex-connector.test.ts"
+    "test:plex": "node --test --import tsx test/connectors/plex-connector.test.ts",
+    "test:python": "tsx scripts/run-python-tests.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

@@ -8,10 +8,11 @@ import { dirname } from 'node:path';
 import { BaseConnector } from '../base.js';
 import {
   getConnectorCredentials,
+  previewMediaEventUpserts,
   setConnectorCredentials,
   type MediaEventInput,
+  type MediaEventUpsertPreview,
 } from '../../media.js';
-import { queryScoped } from '../../db.js';
 import type { ConnectorContext } from '../base.js';
 import { toMediaEvent, type YtHistoryItem } from './transform.js';
 
@@ -33,7 +34,17 @@ interface ChildResult {
   code: number;
 }
 
-function runPython(args: string[], inheritStdio = false, stdinPayload?: string): Promise<ChildResult> {
+export type YtmusicHelperRunner = (
+  args: string[],
+  inheritStdio?: boolean,
+  stdinPayload?: string
+) => Promise<ChildResult>;
+
+export interface YtmusicConnectorOptions {
+  runHelper?: YtmusicHelperRunner;
+}
+
+const runPython: YtmusicHelperRunner = (args, inheritStdio = false, stdinPayload) => {
   return new Promise((resolve, reject) => {
     const stdinMode = stdinPayload !== undefined ? 'pipe' : (inheritStdio ? 'inherit' : 'pipe');
     const stderrMode = inheritStdio ? 'inherit' : 'pipe';
@@ -51,10 +62,16 @@ function runPython(args: string[], inheritStdio = false, stdinPayload?: string):
       child.stdin.end();
     }
   });
-}
+};
 
 export class YtmusicConnector extends BaseConnector {
   readonly service = 'ytmusic';
+  private readonly runHelper: YtmusicHelperRunner;
+
+  constructor(options: YtmusicConnectorOptions = {}) {
+    super();
+    this.runHelper = options.runHelper ?? runPython;
+  }
 
   /**
    * One-time OAuth auth flow. Runs the Python helper with inherited stdio
@@ -66,7 +83,7 @@ export class YtmusicConnector extends BaseConnector {
    * Prefer `authorizeBrowser` until/unless Google fixes this.
    */
   async authorize(clientId: string, clientSecret: string): Promise<void> {
-    const result = await runPython(
+    const result = await this.runHelper(
       ['auth', '--client-id', clientId, '--client-secret', clientSecret],
       true
     );
@@ -84,7 +101,7 @@ export class YtmusicConnector extends BaseConnector {
    * entirely and uses the same session as the web app.
    */
   async authorizeBrowser(rawHeaders: string): Promise<void> {
-    const result = await runPython(['auth-browser'], false, rawHeaders);
+    const result = await this.runHelper(['auth-browser'], false, rawHeaders);
     if (result.code !== 0) {
       throw new Error(`ytmusic browser auth failed: ${result.stderr || 'exit ' + result.code}`);
     }
@@ -92,12 +109,22 @@ export class YtmusicConnector extends BaseConnector {
     await setConnectorCredentials(this.service, config);
   }
 
-  protected async fetchSince(_since: Date | null, ctx: ConnectorContext): Promise<{
+  protected async fetchSince(_since: Date | null, _ctx: ConnectorContext): Promise<{
     events: MediaEventInput[];
     cursor?: string;
     advanceLastEventAt?: boolean;
   }> {
-    const stored = await getConnectorCredentials(this.service);
+    const events = await this.fetchHistoryEvents();
+    return { events, advanceLastEventAt: false };
+  }
+
+  async previewRecovery(ctx: ConnectorContext): Promise<MediaEventUpsertPreview> {
+    const events = await this.fetchHistoryEvents(false);
+    return previewMediaEventUpserts(this.service, events, ctx.scope);
+  }
+
+  protected async fetchHistoryEvents(persistCredentials = true): Promise<MediaEventInput[]> {
+    const stored = await this.credentials();
     if (!stored) {
       throw new Error('No ytmusic credentials. Run scripts/ytmusic-auth.ts first.');
     }
@@ -110,7 +137,7 @@ export class YtmusicConnector extends BaseConnector {
 
       const args = buildYtmusicFetchArgs(tokenPath);
 
-      const result = await runPython(args);
+      const result = await this.runHelper(args);
       if (result.code !== 0) {
         throw new Error(`ytmusic fetch failed: ${result.stderr || 'exit ' + result.code}`);
       }
@@ -122,46 +149,28 @@ export class YtmusicConnector extends BaseConnector {
           try { return JSON.parse(line); } catch { return null; }
         })
         .find((obj) => obj && typeof obj === 'object' && 'token_update' in obj);
-      if (refreshMatch?.token_update) {
-        await setConnectorCredentials(this.service, refreshMatch.token_update);
+      if (persistCredentials && refreshMatch?.token_update) {
+        await this.saveCredentials(refreshMatch.token_update);
       }
 
       const parsed = JSON.parse(result.stdout) as { items: YtHistoryItem[] };
-      const events = (parsed.items ?? [])
+      return (parsed.items ?? [])
         .map(toMediaEvent)
         .filter((e): e is MediaEventInput => e !== null);
-
-      // YouTube Music returns relative "played" buckets that drift across
-      // syncs ("Today" → "Yesterday" the next day). Without extra dedup
-      // we'd insert a fresh row every time a bucket rolls. Suppress any
-      // event whose videoId already exists in media_events for this service.
-      if (events.length === 0) return { events, advanceLastEventAt: false };
-
-      const videoIds = [...new Set(events.map((e) => e.service_id).filter(Boolean))] as string[];
-      const existingRows = await queryScoped<{ service_id: string }>(
-        ctx.scope,
-        `SELECT DISTINCT service_id FROM media_events
-         WHERE client_id = $1 AND service = 'ytmusic' AND service_id = ANY($2)`,
-        [ctx.scope.keyId, videoIds]
-      );
-      const seen = new Set(existingRows.rows.map((r) => r.service_id));
-      const fresh = events.filter((e) => e.service_id && !seen.has(e.service_id));
-
-      return { events: fresh, advanceLastEventAt: false };
     } finally {
       // We also read the file back so the Python helper's refreshed token
       // is captured even if it didn't emit the stderr notice (some
       // ytmusicapi versions just rewrite the file silently).
       try {
         const after = JSON.parse(await readFile(tokenPath, 'utf-8'));
-        if (JSON.stringify(after) !== JSON.stringify(stored)) {
+        if (persistCredentials && JSON.stringify(after) !== JSON.stringify(stored)) {
           // preserve client creds bundled by the auth flow
           const merged = {
             ...after,
             _client_id: stored._client_id ?? after._client_id,
             _client_secret: stored._client_secret ?? after._client_secret,
           };
-          await setConnectorCredentials(this.service, merged);
+          await this.saveCredentials(merged);
         }
       } catch {
         /* nothing to merge */
