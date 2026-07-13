@@ -4,6 +4,8 @@ import path from 'path';
 import {
   buildWatchSpecs,
   exclusionReason,
+  fileSizeExclusionReason,
+  formatExclusionLog,
   matchWatchSpec,
   resolveWorkspaceFile,
   resolveWorkspaceRoot,
@@ -50,7 +52,11 @@ async function processFile(filePath: string, work: PathWork): Promise<void> {
 
   const identity = resolveWorkspaceFile(WORKSPACE, filePath);
   const { absolutePath, relativePath: relPath } = identity;
-  if (exclusionReason(relPath.split('/').join(path.sep))) return;
+  const pathExclusion = exclusionReason(relPath.split('/').join(path.sep));
+  if (pathExclusion) {
+    console.log(formatExclusionLog(relPath, pathExclusion));
+    return;
+  }
 
   const commitAbsence = () => commitIfCurrent({
     filePath: absolutePath,
@@ -61,7 +67,11 @@ async function processFile(filePath: string, work: PathWork): Promise<void> {
   });
 
   try {
-    if (fs.statSync(absolutePath).size > 1_000_000) return;
+    const sizeExclusion = fileSizeExclusionReason(fs.statSync(absolutePath).size);
+    if (sizeExclusion) {
+      console.log(formatExclusionLog(relPath, sizeExclusion));
+      return;
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     await commitAbsence();
@@ -76,7 +86,6 @@ async function processFile(filePath: string, work: PathWork): Promise<void> {
     await commitAbsence();
     return;
   }
-  if (content.includes('DELIVERABLE')) return;
   const hash = fingerprintContent(content);
 
   const storedHash = await getStoredHash(relPath);

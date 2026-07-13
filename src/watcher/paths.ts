@@ -137,9 +137,17 @@ export function canonicalWorkspaceFile(
   return resolveWorkspaceFile(workspace, candidate, implementation).relativePath;
 }
 
+export type ExclusionCode =
+  | 'not-markdown'
+  | 'environment-file'
+  | 'deliverables-directory'
+  | 'file-too-large';
+
 export interface ExclusionReason {
-  code: 'not-markdown' | 'environment-file' | 'deliverables-directory';
+  code: ExclusionCode;
 }
+
+export const MAX_WATCHED_FILE_BYTES = 1_000_000;
 
 export function exclusionReason(
   canonicalRelativePath: string,
@@ -153,4 +161,15 @@ export function exclusionReason(
     return { code: 'deliverables-directory' };
   }
   return null;
+}
+
+export function fileSizeExclusionReason(size: number): ExclusionReason | null {
+  return size > MAX_WATCHED_FILE_BYTES ? { code: 'file-too-large' } : null;
+}
+
+export function formatExclusionLog(
+  canonicalRelativePath: string,
+  reason: ExclusionReason,
+): string {
+  return `[watcher] Skipped ${canonicalRelativePath}: ${reason.code}`;
 }

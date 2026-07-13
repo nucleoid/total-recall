@@ -29,15 +29,8 @@ test('watcher checks the file size before reading content into memory', () => {
   assert.ok(stat < contentRead);
 });
 
-test('watcher preserves the body-content DELIVERABLE exclusion owned by issue #32', () => {
-  const processFile = source.indexOf('async function processFile(');
-  const contentRead = source.indexOf("content = fs.readFileSync(absolutePath, 'utf-8')", processFile);
-  const exclusion = source.indexOf("if (content.includes('DELIVERABLE')) return;", processFile);
-  const hash = source.indexOf('fingerprintContent(content)', processFile);
-
-  assert.ok(contentRead >= 0);
-  assert.ok(exclusion > contentRead, 'content exclusion must run after reading the file');
-  assert.ok(exclusion < hash, 'content exclusion must run before hashing, embedding, or persistence');
+test('watcher does not suppress files based on body text', () => {
+  assert.doesNotMatch(source, /content\.includes\(['"]DELIVERABLE['"]\)/);
 });
 
 test('watcher hashes preparation and currentness reads through the same UTF-8 decoding', () => {
