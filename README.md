@@ -292,14 +292,35 @@ Key files are monitored for changes, diffed by content hash, chunked, and upsert
 **Workspace setup:**
 - Set `OPENCLAW_WORKSPACE` to an existing workspace directory (for example, `C:\Users\me\.openclaw\workspace` on Windows). Relative values resolve from the watcher process's working directory.
 - If the variable is absent, the watcher retains the Linux compatibility default `/home/fuego/.openclaw/workspace`; a blank value or missing/non-directory root fails startup. Optional files and child directories may be absent.
-- Restart the watcher after changing the root. Existing `file-sync` rows are not rewritten or removed, so audit/back up rows before changing an established root and stop duplicate watcher instances first.
+- Restart the watcher after changing the root. A root change does not authorize historical deletion: audit and back up existing `file-sync` rows, then stop duplicate watcher instances before changing an established root.
 
 **Sync mechanics:**
-- `sync_state` table tracks `file_path → content_hash` using `/`-separated, workspace-relative identities on every OS. The same portable identity is used for metadata and source keys.
+- `sync_state` tracks `file_path → watcher:v2:<content hash>` using `/`-separated, workspace-relative identities on every OS. The same portable identity is used for metadata and source keys.
 - Native absolute paths are used only for filesystem access and Chokidar.
-- On change: re-chunk, re-embed, **upsert** (deterministic ID from `source_file + heading_path`)
+- A successful read/parse is a complete desired set. The watcher prepares embeddings first, then atomically upserts current chunks, deletes stale rows owned by `client_id='file-sync'` for that exact path, and advances the fingerprint. A valid empty/frontmatter-only/too-short file therefore removes its old watcher chunks without embedding.
+- Directly observed deletion is serialized with add/change work and atomically removes only exact-path `file-sync` rows and matching sync state. Manual/preseed rows are not watcher-owned and survive.
 - Symlinks are followed. Containment is lexical rather than a security boundary: a symlink below the workspace may point outside it.
-- No duplicates, no stale entries
+- Read, embedding, SQL, or transaction failure leaves the preceding complete snapshot unchanged. Files deleted before deployment emit no event and are never inferred safe to delete by startup scanning.
+
+**One-time historical orphan repair (explicit operator approval only):**
+
+Deploy migration 020 (#49 DELETE authority) before the corrected watcher; because every reconciliation now includes a scoped stale-row DELETE, deploying the watcher first makes all file sync fail closed until migration 020 is applied. Enforce migrate-before-watcher-restart ordering. Stop every old watcher process during cutover, deploy the transaction/queue foundations and watcher together, then start one watcher. Its first scan upgrades present files to v2 fingerprints and may consume embedding-provider quota. It does **not** sweep absent paths.
+
+For possible pre-deployment orphans, first take and verify a **verified restorable backup**. Verify that `OPENCLAW_WORKSPACE` is the authoritative, correctly mounted/configured workspace, then produce a content-free bounded preview with an owner/BYPASSRLS maintenance connection:
+
+```bash
+MAINTENANCE_DATABASE_URL=postgresql://<owner-role>@<host>/<database> \
+  npm run repair:watcher-orphans -- --workspace /authoritative/workspace --preview watcher-orphans.json
+```
+
+Preview writes nothing. Independently confirm every candidate against the authoritative workspace; absence alone, a changed exclude, an unmounted root, or path/case uncertainty is not proof. Approval must name exact row IDs and paths. Create a version-1 manifest with `backupVerified: true`, `workspaceVerified: true`, the exact preview `workspaceRoot`, and one approval per confirmed path containing its exact `memoryIds`, `rowFingerprint`, and `syncStateHash`. Counts, paths without IDs, wildcard policy, and approval of the command are not row approval. Apply only that manifest:
+
+```bash
+MAINTENANCE_DATABASE_URL=postgresql://<owner-role>@<host>/<database> \
+  npm run repair:watcher-orphans -- --workspace /authoritative/workspace --apply approved-watcher-orphans.json
+```
+
+Apply locks and rechecks every approved row/path and current fingerprint in one transaction. Present files, drift, unapproved rows, missing backup/workspace acknowledgement, or broad/path-only inference abort without deletion. It deletes only approved exact IDs still owned by `client_id='file-sync'` at the exact path plus matching sync state. Manual/preseed, present, uncertain, and unapproved rows remain unchanged. This repair is never invoked at boot, watcher startup, migration, or package installation.
 
 #### Linux watcher ownership and scheduled diagnostics
 

@@ -12,10 +12,12 @@
     "scripts/preseed-chatgpt.ts",
     "scripts/preseed-gemini.ts",
     "scripts/repair-gemini-source-keys.ts",
+    "scripts/repair-watcher-orphans.ts",
     "scripts/lib/preseed-embedding.ts",
     "test/preseed-chatgpt.test.ts",
     "test/preseed-gemini.test.ts",
     "test/gemini-key-repair.integration.test.ts",
+    "test/repair-watcher-orphans.integration.test.ts",
     "test/migrate-runner.integration.test.ts",
     "test/provisioning.integration.test.ts"
   ],

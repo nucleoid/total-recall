@@ -21,11 +21,19 @@ test('watcher routes add, change, and unlink through the per-path queue', () => 
   assert.doesNotMatch(source, /const pending = new Map/);
 });
 
+test('watcher checks the file size before reading content into memory', () => {
+  const processFile = source.indexOf('async function processFile(');
+  const stat = source.indexOf('fs.statSync(absolutePath)', processFile);
+  const contentRead = source.indexOf("content = fs.readFileSync(absolutePath, 'utf-8')", processFile);
+  assert.ok(stat >= 0);
+  assert.ok(stat < contentRead);
+});
+
 test('watcher preserves the body-content DELIVERABLE exclusion owned by issue #32', () => {
   const processFile = source.indexOf('async function processFile(');
-  const contentRead = source.indexOf("const content = fs.readFileSync(absolutePath, 'utf-8')", processFile);
+  const contentRead = source.indexOf("content = fs.readFileSync(absolutePath, 'utf-8')", processFile);
   const exclusion = source.indexOf("if (content.includes('DELIVERABLE')) return;", processFile);
-  const hash = source.indexOf("crypto.createHash('sha256').update(content)", processFile);
+  const hash = source.indexOf('fingerprintContent(content)', processFile);
 
   assert.ok(contentRead >= 0);
   assert.ok(exclusion > contentRead, 'content exclusion must run after reading the file');
