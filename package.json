@@ -10,6 +10,7 @@
     "test": "node --test --test-concurrency=1 --import tsx \"test/**/*.test.ts\" && npm run test:daily-sync && npm run test:access-level:db",
     "test:daily-sync": "node scripts/run-daily-sync-tests.mjs",
     "test:integration": "node --import tsx --test test/*.integration.test.ts",
+    "test:watcher": "node --test --test-concurrency=1 --import tsx \"test/watcher/**/*.test.ts\"",
     "test:access-level": "tsx test/access-level.integration.test.ts",
     "test:access-level:db": "tsx test/access-level.db.ts",
     "test:agent-tenancy": "tsx --test test/agent-tenancy.integration.test.ts",

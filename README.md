@@ -296,6 +296,7 @@ Key files are monitored for changes, diffed by content hash, chunked, and upsert
 
 **Sync mechanics:**
 - `sync_state` tracks `file_path → watcher:v2:<content hash>` using `/`-separated, workspace-relative identities on every OS. The same portable identity is used for metadata and source keys.
+- Duplicate headings use their one-based occurrence among identical, trimmed structured heading paths. The first occurrence retains its legacy source key; later H2 or H3 occurrences use a length-prefixed tuple digest named `file-sync:v2:<sha256>`. Chunk metadata records `h2_occurrence` and, for H3 chunks, `h3_occurrence`. Occurrences are positional and include syntactic sections whose bodies are later filtered, so inserting, deleting, or reordering duplicates deterministically updates the corresponding rows.
 - Native absolute paths are used only for filesystem access and Chokidar.
 - A successful read/parse is a complete desired set. The watcher prepares embeddings first, then atomically upserts current chunks, deletes stale rows owned by `client_id='file-sync'` for that exact path, and advances the fingerprint. A valid empty/frontmatter-only/too-short file therefore removes its old watcher chunks without embedding.
 - Directly observed deletion is serialized with add/change work and atomically removes only exact-path `file-sync` rows and matching sync state. Manual/preseed rows are not watcher-owned and survive.
@@ -304,7 +305,7 @@ Key files are monitored for changes, diffed by content hash, chunked, and upsert
 
 **One-time historical orphan repair (explicit operator approval only):**
 
-Deploy migration 020 (#49 DELETE authority) before the corrected watcher; because every reconciliation now includes a scoped stale-row DELETE, deploying the watcher first makes all file sync fail closed until migration 020 is applied. Enforce migrate-before-watcher-restart ordering. Stop every old watcher process during cutover, deploy the transaction/queue foundations and watcher together, then start one watcher. Its first scan upgrades present files to v2 fingerprints and may consume embedding-provider quota. It does **not** sweep absent paths.
+Deploy migration 020 (#49 DELETE authority) before the corrected watcher; because every reconciliation now includes a scoped stale-row DELETE, deploying the watcher first makes all file sync fail closed until migration 020 is applied. Enforce migrate-before-watcher-restart ordering. Stop every old watcher process during cutover, deploy the transaction/queue foundations and watcher together, then start one watcher. Its first scan upgrades present files to v2 fingerprints, repairs formerly collapsed duplicate-heading rows, and may consume embedding-provider quota. It does **not** sweep absent paths. A rollback to the old chunker does not understand `file-sync:v2:` duplicate keys and can leave those rows stale; prefer rolling forward, or use the corrected reconciliation to remove them before reverting.
 
 For possible pre-deployment orphans, first take and verify a **verified restorable backup**. Verify that `OPENCLAW_WORKSPACE` is the authoritative, correctly mounted/configured workspace, then produce a content-free bounded preview with an owner/BYPASSRLS maintenance connection:
 

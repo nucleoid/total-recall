@@ -327,3 +327,48 @@ test('zero-chunk files remove all exact-path watcher chunks and advance sync sta
   assert.equal(client.committedHash, 'new-hash');
   assert.ok(client.calls.some(({ text }) => text.includes('DELETE FROM memories')));
 });
+
+test('v2 reconciliation repairs a legacy collapsed duplicate row and then stays idempotent', async () => {
+  const relPath = 'notes/duplicates.md';
+  const content = [
+    '## Notes',
+    'first body',
+    '## Notes',
+    'second body',
+    '## Notes',
+    'third body',
+  ].join('\n');
+  const legacyHash = crypto.createHash('sha256').update(content).digest('hex');
+  const currentHash = fingerprintContent(content);
+  assert.notEqual(legacyHash, currentHash, 'legacy sync state must not skip v2 reconciliation');
+
+  const client = new TransactionClient(402);
+  client.committedHash = legacyHash;
+  client.committed.set(`file-sync:${relPath}:## Notes`, 'third body from collapsed legacy upserts');
+  client.committed.set(`owned:${relPath}:obsolete-collision-key`, 'obsolete');
+  setPoolForTesting(new SequencedPool([client, client]) as unknown as pg.Pool);
+
+  const chunks = await prepareChunks(
+    chunkMarkdown(content, 'test-source', relPath),
+    async value => [value.length],
+  );
+  const sync = () => commitPreparedFile({
+    relPath,
+    hash: currentHash,
+    namespace: 'projects',
+    source: 'test-source',
+    agentId: 'agent-1',
+    chunks,
+  });
+
+  await sync();
+  const desired = new Map(chunks.map(chunk => [chunk.sourceKey, chunk.content]));
+  assert.deepEqual(client.committed, desired);
+  assert.equal(client.committedHash, currentHash);
+  assert.equal(client.committed.get(`file-sync:${relPath}:## Notes`), '## Notes\nfirst body');
+  assert.equal(client.committed.size, 3);
+
+  await sync();
+  assert.deepEqual(client.committed, desired);
+  assert.equal(client.committed.size, 3, 'an identical resync must not add rows');
+});
