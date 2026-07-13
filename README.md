@@ -276,6 +276,21 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | GET | `/api/media/events` | List structured media events with filters |
 | POST | `/api/media/rollup` | Trigger pending events → summary memories |
 
+### Media summary calendar time zone
+
+Media summary dates use the optional `MEDIA_TIME_ZONE` IANA time zone (for example, `America/Chicago`). When unset or blank it defaults explicitly to `UTC`; the host locale and `TZ` do not change rollup output. Configure the same value on every HTTP and scheduled rollup worker and restart them. Structured `played_at` timestamps and rollup metadata remain UTC instants.
+
+Existing summaries are not changed automatically. Preview the resumable, tuple-checkpointed repair before applying it:
+
+```bash
+npm run media:repair-dates
+npm run media:repair-dates -- --apply --batch-size 100
+# Resume using the checkpoint printed by the prior run:
+npm run media:repair-dates -- --apply --after-played-at <ISO_TIMESTAMP> --after-id <EVENT_UUID>
+```
+
+Dry-run is the default and performs no embedding or writes. Applying consumes embedding quota and atomically refreshes summary text, vector, tags, and metadata only when the linked event and media memory still match. Back up/review first, stop overlapping rollup or repair workers, and use optional `--service`, `--played-after`, and `--played-before` filters as needed. A provider or row failure aborts immediately, reports one bounded error without summary content, leaves the checkpoint before that row for a retry, and makes the command exit nonzero. A concurrent change likewise stops the scan with the checkpoint before that row; resume from that checkpoint after quiescing overlapping workers. If `skippedConcurrent` is greater than zero, always finish with a final no-cursor reconciliation pass (omit both `--after-*` options) so no concurrently skipped row is permanently passed.
+
 ## Data Sources & Sync Model
 
 ### Automatic (MCP — ongoing)

@@ -34,6 +34,7 @@
     "repair:last-boosted-at": "tsx scripts/repair-last-boosted-at.ts",
     "repair:media-event-at": "tsx scripts/repair-media-event-at.ts",
     "media:repair-tags": "tsx scripts/repair-media-rollup-tags.ts",
+    "media:repair-dates": "tsx scripts/repair-media-rollup-dates.ts",
     "repair:document-chunk-counts": "tsx scripts/repair-document-chunk-counts.ts",
     "repair:watcher-orphans": "tsx scripts/repair-watcher-orphans.ts",
     "index:media-event-at": "tsx scripts/create-media-event-at-index.ts",

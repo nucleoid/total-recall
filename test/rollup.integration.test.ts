@@ -170,6 +170,43 @@ async function withEmbeddingMock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+test('invalid MEDIA_TIME_ZONE fails before fetching events or opening a transaction', async () => {
+  const pool = new FakePool();
+  setPoolForTesting(pool as unknown as pg.Pool);
+  const previous = process.env.MEDIA_TIME_ZONE;
+  process.env.MEDIA_TIME_ZONE = 'Mars/Olympus_Mons';
+  try {
+    const { rollupPendingEvents } = await import('../src/rollup.js');
+    await assert.rejects(rollupPendingEvents(AUTH, SCOPE), /Invalid MEDIA_TIME_ZONE/);
+    assert.equal(pool.clients.length, 0);
+    assert.equal(pool.db.memories.length, 0);
+  } finally {
+    if (previous === undefined) delete process.env.MEDIA_TIME_ZONE;
+    else process.env.MEDIA_TIME_ZONE = previous;
+  }
+});
+
+test('missing MEDIA_TIME_ZONE preserves UTC output regardless of host TZ', async () => {
+  const pool = new FakePool();
+  pool.db.events[0].played_at = new Date('2026-01-02T02:00:00Z');
+  setPoolForTesting(pool as unknown as pg.Pool);
+  const previousZone = process.env.MEDIA_TIME_ZONE;
+  const previousHostZone = process.env.TZ;
+  delete process.env.MEDIA_TIME_ZONE;
+  process.env.TZ = 'America/Los_Angeles';
+  try {
+    const { rollupPendingEvents } = await import('../src/rollup.js');
+    await withEmbeddingMock(() => rollupPendingEvents(AUTH, SCOPE));
+    assert.match(pool.db.memories[0].content, /on 2026-01-02 via plex/);
+    assert.equal(pool.db.memories[0].metadata.played_at, '2026-01-02T02:00:00.000Z');
+  } finally {
+    if (previousZone === undefined) delete process.env.MEDIA_TIME_ZONE;
+    else process.env.MEDIA_TIME_ZONE = previousZone;
+    if (previousHostZone === undefined) delete process.env.TZ;
+    else process.env.TZ = previousHostZone;
+  }
+});
+
 test('failure between memory insert and event link rolls back both writes', async () => {
   const pool = new FakePool('link');
   setPoolForTesting(pool as unknown as pg.Pool);

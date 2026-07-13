@@ -134,6 +134,8 @@ Rolled-up memories read like:
 
 Every rollup has one exclusive media-kind tag: Plex `metadata.plex_type` maps `track` to `music`, `episode` to `tv`, and `movie` to `movie`. Canonical artist/show/episode fields are used when that trusted type is absent; otherwise the kind is `unknown` rather than assuming a generic watch is a movie.
 
+The summary's calendar date uses the optional `MEDIA_TIME_ZONE` IANA zone (for example, `America/Chicago`) and defaults explicitly to `UTC`; it never inherits the host `TZ`. Use the same setting for every rollup worker. The structured `played_at` instant remains unchanged. Existing summaries require the dry-run-by-default `npm run media:repair-dates` command if you choose to repair them.
+
 ## Troubleshooting
 
 **`No Plex credentials. Run scripts/plex-auth.ts first.`** - exactly what it says. Run `npm run plex:auth`.

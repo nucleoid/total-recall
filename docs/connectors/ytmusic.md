@@ -179,6 +179,8 @@ Each event rolls up to a summary memory like:
 
 Every rollup has one exclusive media-kind tag. YouTube Music `play` events are tagged `music` even if artist metadata is missing; events without trusted service or canonical field evidence use `unknown` rather than defaulting to `movie`.
 
+The summary's calendar date uses the optional `MEDIA_TIME_ZONE` IANA zone (for example, `America/Chicago`) and defaults explicitly to `UTC`; it never inherits the host `TZ`. Use the same setting for every rollup worker. The structured `played_at` instant (including an approximate bucket timestamp) remains unchanged. Existing summaries require the dry-run-by-default `npm run media:repair-dates` command if you choose to repair them.
+
 ## Troubleshooting
 
 **`ytmusicapi not installed`** — install into the venv and set `YTMUSIC_PYTHON` to its python3 binary.

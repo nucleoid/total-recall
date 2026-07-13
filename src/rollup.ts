@@ -26,6 +26,8 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
     throw new Error(`Permission denied: requires '${MEDIA_NAMESPACE}' namespace`);
   }
 
+  const timeZone = resolveMediaTimeZone(process.env.MEDIA_TIME_ZONE);
+  const dateFormatter = createMediaDateFormatter(timeZone);
   const events = await getRollupPendingEvents(auth, scope, batchSize);
   let rolled = 0;
   let failed = 0;
@@ -33,25 +35,9 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
 
   for (const event of events) {
     try {
-      const summary = buildSummary(event);
+      const summary = buildSummary(event, dateFormatter);
       const tags = buildTags(event);
-      const metadata = {
-        service: event.service,
-        service_id: event.service_id,
-        event_type: event.event_type,
-        played_at: event.played_at,
-        title: event.title,
-        ...(event.artist && { artist: event.artist }),
-        ...(event.album && { album: event.album }),
-        ...(event.show && { show: event.show }),
-        ...(event.season !== null && { season: event.season }),
-        ...(event.episode !== null && { episode: event.episode }),
-        ...(event.year !== null && { year: event.year }),
-        ...(event.duration_ms !== null && { duration_ms: event.duration_ms }),
-        ...(event.played_ms !== null && { played_ms: event.played_ms }),
-        ...(event.completed !== null && { completed: event.completed }),
-        ...event.metadata,
-      };
+      const metadata = buildMetadata(event);
 
       const vec = await embed(summary);
       const vecStr = `[${vec.join(',')}]`;
@@ -93,8 +79,52 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
   return { rolled, failed, errors };
 }
 
-function buildSummary(e: MediaEvent): string {
-  const date = new Date(e.played_at).toISOString().slice(0, 10);
+export type MediaDateFormatter = Intl.DateTimeFormat;
+
+export function resolveMediaTimeZone(configured: string | undefined): string {
+  const timeZone = configured?.trim() || 'UTC';
+  try {
+    createMediaDateFormatter(timeZone);
+  } catch (error) {
+    throw new Error(`Invalid MEDIA_TIME_ZONE '${timeZone}': expected an IANA time zone`, { cause: error });
+  }
+  return timeZone;
+}
+
+export function createMediaDateFormatter(timeZone: string): MediaDateFormatter {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    calendar: 'gregory',
+    numberingSystem: 'latn',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+}
+
+export function formatMediaDate(
+  playedAt: Date | string,
+  formatter: MediaDateFormatter
+): string {
+  const instant = playedAt instanceof Date ? playedAt : new Date(playedAt);
+  if (!Number.isFinite(instant.getTime())) {
+    throw new Error(`Invalid played_at timestamp: ${String(playedAt)}`);
+  }
+
+  const parts = new Map(
+    formatter.formatToParts(instant)
+      .filter((part) => part.type === 'year' || part.type === 'month' || part.type === 'day')
+      .map((part) => [part.type, part.value])
+  );
+  const date = `${parts.get('year') ?? ''}-${parts.get('month') ?? ''}-${parts.get('day') ?? ''}`;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new Error(`Unable to format played_at as an ASCII calendar date: ${String(playedAt)}`);
+  }
+  return date;
+}
+
+export function buildSummary(e: MediaEvent, formatter: MediaDateFormatter): string {
+  const date = formatMediaDate(e.played_at, formatter);
   const completion = e.completed === true ? ' Completed.' : e.completed === false ? ' Did not finish.' : '';
   const genres = e.genres?.length ? ` Genres: ${e.genres.join(', ')}.` : '';
 
@@ -112,6 +142,26 @@ function buildSummary(e: MediaEvent): string {
 
   const year = e.year ? ` (${e.year})` : '';
   return `Watched "${e.title}"${year} on ${date} via ${e.service}.${completion}${genres}`;
+}
+
+export function buildMetadata(e: MediaEvent): Record<string, unknown> {
+  return {
+    service: e.service,
+    service_id: e.service_id,
+    event_type: e.event_type,
+    played_at: e.played_at,
+    title: e.title,
+    ...(e.artist && { artist: e.artist }),
+    ...(e.album && { album: e.album }),
+    ...(e.show && { show: e.show }),
+    ...(e.season !== null && { season: e.season }),
+    ...(e.episode !== null && { episode: e.episode }),
+    ...(e.year !== null && { year: e.year }),
+    ...(e.duration_ms !== null && { duration_ms: e.duration_ms }),
+    ...(e.played_ms !== null && { played_ms: e.played_ms }),
+    ...(e.completed !== null && { completed: e.completed }),
+    ...e.metadata,
+  };
 }
 
 export type MediaKind = 'music' | 'tv' | 'movie' | 'unknown';
