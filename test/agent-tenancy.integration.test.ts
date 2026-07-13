@@ -6,6 +6,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import pg from 'pg';
 import type { AuthContext } from '../src/types.js';
+import { provisionDatabase } from '../scripts/provision-db.js';
 
 type AgentsModule = typeof import('../src/agents.js') & {
   upsertSystemAgent?: (params: {
@@ -90,6 +91,10 @@ async function resetDatabase(options: {
     await client.query('DROP SCHEMA public CASCADE');
     await client.query('CREATE SCHEMA public');
     await client.query('CREATE EXTENSION IF NOT EXISTS vector');
+    await provisionDatabase(client, {
+      appPassword: decodeURIComponent(new URL(appUrl).password),
+      rotateAppPassword: false,
+    });
 
     const files = readdirSync('migrations').filter((f) => f.endsWith('.sql')).sort();
     const tenantMigration = '010_tenant_scoped_agents.sql';

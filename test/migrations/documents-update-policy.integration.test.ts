@@ -9,6 +9,7 @@ import {
   repairDocumentChunkCounts,
   type DocumentChunkCountRepairProgress,
 } from '../../scripts/repair-document-chunk-counts.js';
+import { provisionDatabase } from '../../scripts/provision-db.js';
 
 const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const migrationsDir = join(repoRoot, 'migrations');
@@ -273,6 +274,10 @@ async function resetDatabase(): Promise<void> {
   try {
     await owner.query('CREATE EXTENSION IF NOT EXISTS vector');
     await owner.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+    await provisionDatabase(owner, {
+      appPassword: decodeURIComponent(new URL(appUrl!).password),
+      rotateAppPassword: false,
+    });
   } finally {
     await owner.end();
   }

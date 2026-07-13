@@ -7,8 +7,10 @@ import { fileURLToPath } from 'node:url';
 import test, { after } from 'node:test';
 import pg from 'pg';
 import {
+  isCompatibleAppliedChecksum,
   loadMigrationInventory,
   parseMigrationLockTimeout,
+  resolveMigrationDatabaseUrl,
   runMigrations,
 } from '../scripts/migrate.js';
 
@@ -61,6 +63,31 @@ test('migration lock timeout is bounded and validated', () => {
   for (const invalid of ['', '0', '-1', '1.5', '600001', 'wat']) {
     assert.throws(() => parseMigrationLockTimeout(invalid), /MIGRATION_LOCK_TIMEOUT_MS/i);
   }
+});
+
+test('migration runner requires the owner-only URL without a runtime fallback', () => {
+  assert.equal(
+    resolveMigrationDatabaseUrl({ MIGRATION_DATABASE_URL: 'postgresql://owner@db/custom' }),
+    'postgresql://owner@db/custom',
+  );
+  assert.throws(
+    () => resolveMigrationDatabaseUrl({ DATABASE_URL: 'postgresql://total_recall_app@db/custom' }),
+    /MIGRATION_DATABASE_URL.*required/i,
+  );
+});
+
+test('the reviewed 003 sanitization is the only accepted applied-checksum transition', () => {
+  for (const legacy003 of [
+    '453417ae58829f930186b2a034b592db3df644a4045e5afcd87a67c4e0d6b615',
+    '3fc2cdc1814ab6da989106733a2b78da175263bb66a747fdc49800a80395aac5',
+  ]) {
+    assert.equal(isCompatibleAppliedChecksum('003_rls', legacy003), true);
+  }
+  assert.equal(isCompatibleAppliedChecksum('003_rls', '0'.repeat(64)), false);
+  assert.equal(
+    isCompatibleAppliedChecksum('004_audit', '453417ae58829f930186b2a034b592db3df644a4045e5afcd87a67c4e0d6b615'),
+    false,
+  );
 });
 
 const databaseUrl = process.env.MIGRATION_TEST_DATABASE_URL;

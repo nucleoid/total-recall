@@ -21,6 +21,8 @@ npx tsx scripts/create-key.ts --name "client-name" --namespaces "ns1,ns2"
 
 Total Recall revalidates authentication and ACLs for every MCP tool call. Disabling or deleting a key, or changing its namespaces, permissions, or access ceiling, therefore applies on the next call. Local stdio clients keep the `TOTAL_RECALL_API_KEY` value with which their process started, so replacing that environment secret requires restarting the client process. Remote HTTP MCP sessions are bound to the key that initialized them; after a server restart clients must initialize a new in-memory session, but they can keep using the same valid API key.
 
+Database credentials are separate from Total Recall API keys. Runtime clients use the `total_recall_app` `DATABASE_URL`; never put owner-only `MIGRATION_DATABASE_URL` or one-shot `APP_DATABASE_PASSWORD` in these client configurations. A coordinated database-password rotation requires restarting each DB-backed process with its updated `DATABASE_URL`, but the API keys shown below remain unchanged.
+
 ---
 
 ## 1. OpenClaw (Cass)
@@ -39,7 +41,7 @@ mcp:
         - /home/fuego/projects/total-recall/dist/index.js
       env:
         TOTAL_RECALL_API_KEY: "tr_<your-openclaw-key>"
-        DATABASE_URL: "postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall"
+        DATABASE_URL: "postgresql://total_recall_app:<app-password>@localhost:5432/total_recall"
         OLLAMA_URL: "http://localhost:11434"
         EMBEDDING_MODEL: "nomic-embed-text"
 ```
@@ -90,7 +92,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
       "args": ["/home/fuego/projects/total-recall/dist/index.js"],
       "env": {
         "TOTAL_RECALL_API_KEY": "tr_<your-claude-work-key>",
-        "DATABASE_URL": "postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall",
+        "DATABASE_URL": "postgresql://total_recall_app:<app-password>@localhost:5432/total_recall",
         "OLLAMA_URL": "http://localhost:11434",
         "EMBEDDING_MODEL": "nomic-embed-text"
       }
@@ -148,7 +150,7 @@ Add to `~/.claude.json` (global) or `CLAUDE.md` in your project:
       "args": ["/home/fuego/projects/total-recall/dist/index.js"],
       "env": {
         "TOTAL_RECALL_API_KEY": "tr_<your-key>",
-        "DATABASE_URL": "postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall",
+        "DATABASE_URL": "postgresql://total_recall_app:<app-password>@localhost:5432/total_recall",
         "OLLAMA_URL": "http://localhost:11434",
         "EMBEDDING_MODEL": "nomic-embed-text"
       }
@@ -181,7 +183,7 @@ You have Total Recall MCP tools available. When working on this project:
       "args": ["/home/fuego/projects/total-recall/dist/index.js"],
       "env": {
         "TOTAL_RECALL_API_KEY": "tr_<your-key>",
-        "DATABASE_URL": "postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall",
+        "DATABASE_URL": "postgresql://total_recall_app:<app-password>@localhost:5432/total_recall",
         "OLLAMA_URL": "http://localhost:11434",
         "EMBEDDING_MODEL": "nomic-embed-text"
       }
