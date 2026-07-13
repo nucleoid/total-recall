@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { ScopedClient } from '../db.js';
 import { withScopedClient } from '../db.js';
 import type { PathWork } from './queue.js';
+import { embeddingDescriptorParams } from '../embedding.js';
 
 export const WATCHER_FINGERPRINT_VERSION = 'watcher:v2:';
 
@@ -30,11 +31,14 @@ export interface FileSyncInput {
 }
 
 const UPSERT_SQL = `
-INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, agent_id)
-VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'file-sync', $7, $8)
+INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, agent_id, embedding_provider, embedding_model, embedding_dimensions)
+VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'file-sync', $7, $8, $9, $10, $11)
 ON CONFLICT (source_key) DO UPDATE SET
   content = EXCLUDED.content,
   embedding = EXCLUDED.embedding,
+  embedding_provider = EXCLUDED.embedding_provider,
+  embedding_model = EXCLUDED.embedding_model,
+  embedding_dimensions = EXCLUDED.embedding_dimensions,
   source = EXCLUDED.source,
   namespace = EXCLUDED.namespace,
   tags = EXCLUDED.tags,
@@ -132,6 +136,7 @@ export async function reconcilePreparedFile(
       JSON.stringify(chunk.metadata),
       chunk.sourceKey,
       input.agentId,
+      ...embeddingDescriptorParams(),
     ]);
   }
 

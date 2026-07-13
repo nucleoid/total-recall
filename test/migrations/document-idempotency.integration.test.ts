@@ -37,7 +37,7 @@ test.after(async () => {
 test('real PostgreSQL enforces document idempotency migration, RLS, concurrency, CHECK, rollback, and completeness', async (t) => {
   await ensureDatabase();
   await resetDatabase();
-  await applyMigrationsThrough('017_document_idempotency');
+  await applyMigrationsThrough('023_embedding_identity');
   await seedApiKeys();
 
   await t.test('CHECK accepts only the canonical versioned lowercase SHA-256 format', async () => {
@@ -72,9 +72,12 @@ test('real PostgreSQL enforces document idempotency migration, RLS, concurrency,
     assert.equal(retry.indexValid, true);
   });
 
-  process.env.GEMINI_API_KEY = '';
+  process.env.EMBEDDING_PROVIDER = 'gemini';
+  process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+  process.env.EMBEDDING_DIMENSIONS = '768';
+  process.env.GEMINI_API_KEY = 'test-only-key';
   globalThis.fetch = (async () => new Response(
-    JSON.stringify({ embeddings: [[...Array.from({ length: 768 }, () => 0)]] }),
+    JSON.stringify({ embedding: { values: Array.from({ length: 768 }, () => 0) } }),
     { status: 200, headers: { 'content-type': 'application/json' } }
   )) as typeof fetch;
 

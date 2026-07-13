@@ -1,10 +1,10 @@
 import {
   CANONICAL_EMBEDDING_DESCRIPTOR,
-  type EmbeddingProfile,
+  type EmbeddingDescriptor,
 } from '../../src/embedding.js';
 
 export interface PreparedEmbeddingBatch {
-  descriptor: Omit<EmbeddingProfile, 'apiKey'>;
+  descriptor: EmbeddingDescriptor;
   embeddings: number[][];
 }
 
@@ -30,9 +30,9 @@ export async function prepareCanonicalEmbeddingBatch(
 }
 
 /**
- * #41 may not guess the storage contract owned by blocked prerequisite #9.
- * Keep import commands unavailable until #9 supplies an atomic vector+identity writer.
+ * #41's fail-closed call sites remain in place. Reaching this implementation means
+ * #9's canonical descriptor and atomic identity writers are linked into the command.
  */
-export function requireEmbeddingIdentityWriter(): void {
-  throw new Error('Preseed is disabled until #9 provides the embedding identity schema and atomic descriptor writer');
+export function requireEmbeddingIdentityWriter(): EmbeddingDescriptor {
+  return CANONICAL_EMBEDDING_DESCRIPTOR;
 }

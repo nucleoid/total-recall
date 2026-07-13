@@ -347,24 +347,28 @@ Bootstrap from existing AI conversation history across platforms.
 
 | Source | Script | Format | Status |
 |--------|--------|--------|--------|
-| OpenClaw | `preseed-openclaw.ts` | Markdown files | Gated on #9 |
-| ChatGPT | `preseed-chatgpt.ts` | JSON export | Gated on #9 |
-| Claude | `preseed-claude.ts` | JSON export | Gated on #9 |
-| Gemini | `preseed-gemini.ts` | HTML export | Gated on #9 |
+| OpenClaw | `preseed-openclaw.ts` | Markdown files | Active after migration 023 |
+| ChatGPT | `preseed-chatgpt.ts` | JSON export | Active after migration 023 |
+| Claude | `preseed-claude.ts` | JSON export | Active after migration 023 |
+| Gemini | `preseed-gemini.ts` | HTML export | Active after migration 023 |
 
-Preseed commands currently fail closed before reading exports, connecting to PostgreSQL, or calling an embedding provider. Issue #9 must first supply the approved embedding-identity schema and atomic vector+descriptor writer; issue #61 mixed-aware readers must then be deployed everywhere before preseed can create mixed-vintage writes. #41 deliberately does not guess column names or stamp provenance onto vectors whose identity is unknown.
+The #41 fail-closed call sites now resolve to #9's canonical descriptor and atomic writer. Apply
+`023_embedding_identity.sql` and deploy identity-aware readers before running preseed; an older
+schema rejects the descriptor columns instead of accepting unlabelled vectors. Every import embeds
+the exact persisted content, validates the complete batch, and writes vector plus descriptor in one
+statement.
 
-After that gate opens, Claude and OpenClaw preseed require the least-privileged app-role `DATABASE_URL`; never provide `MIGRATION_DATABASE_URL`, a superuser, a `BYPASSRLS` role, or the owner of `memories`. Both commands verify the connected role before reading sensitive source files. Each group contains at most ten fully embedded rows; only then does it begin a transaction, set the exact JSON `app.allowed_namespaces` subset transaction-locally, upsert, and commit. Provider work never holds a database transaction, failures roll back the current group, and no namespace context survives client reuse. This changes only operator command credentials: API keys, sessions, and user reauthentication are unaffected.
+Claude and OpenClaw preseed require the least-privileged app-role `DATABASE_URL`; never provide `MIGRATION_DATABASE_URL`, a superuser, a `BYPASSRLS` role, or the owner of `memories`. Both commands verify the connected role before reading sensitive source files. Each group contains at most ten fully embedded rows; only then does it begin a transaction, set the exact JSON `app.allowed_namespaces` subset transaction-locally, upsert, and commit. Provider work never holds a database transaction, failures roll back the current group, and no namespace context survives client reuse. This changes only operator command credentials: API keys, sessions, and user reauthentication are unaffected.
 
 Claude requires `CLAUDE_IMPORTS_DIR` (or one directory argument) containing required `conversations.json` and `memories.json`. Empty Claude arrays, absent or empty `chat_messages`, and absent or blank `conversations_memory` produce an explicit zero-write successful summary. Missing files, malformed JSON/shapes, and invalid importable timestamps fail nonzero. Memory content without a valid conversation date uses `--memory-timestamp <ISO timestamp>` when supplied; this explicit operator value takes precedence over the once-captured `memories.json` mtime, which is the fallback when the option is absent.
 
 OpenClaw requires `OPENCLAW_WORKSPACE` (or one directory argument). `OPENCLAW_CORTEX_CONTENT` and `OPENCLAW_SECOND_BRAIN` optionally override their defaults beneath the workspace. Discovered files are canonicalized and deduplicated before batching, including alternate paths.
 
-Once that gate is implemented, ChatGPT import requires `CHATGPT_IMPORTS_DIR` or a directory as the first CLI argument. The directory scanner accepts only `conversations.json` and `conversations-<digits>.json` (unsuffixed first, then numeric suffix order); backups and unrelated files are ignored. Each root array is streamed one conversation at a time, output chunks are committed in batches of at most ten, and reruns converge through stable source keys. A failed later file or batch leaves earlier batches committed. The default single-conversation limit is 16 MiB; `--max-conversation-bytes <bytes>` permits an explicit positive override up to 64 MiB, with correspondingly higher Node heap risk.
+After migration 023 and the identity-aware runtime are deployed, ChatGPT import requires `CHATGPT_IMPORTS_DIR` or a directory as the first CLI argument. The directory scanner accepts only `conversations.json` and `conversations-<digits>.json` (unsuffixed first, then numeric suffix order); backups and unrelated files are ignored. Each root array is streamed one conversation at a time, output chunks are committed in batches of at most ten, and reruns converge through stable source keys. A failed later file or batch leaves earlier batches committed. The default single-conversation limit is 16 MiB; `--max-conversation-bytes <bytes>` permits an explicit positive override up to 64 MiB, with correspondingly higher Node heap risk.
 
 #### Gemini Takeout identity and historical repair
 
-After the same #9/#61 gate is implemented, set `GEMINI_TAKEOUT_HTML_PATH` (or pass one HTML path) and run `npm run preseed:gemini`. The importer preserves the existing `Q: …\n\nA: …` format and 4,000-character cap, then assigns `gemini-conv:v2:<sha256>` from the exact persisted content and normalized UTC instant. Export reorder or prepend therefore cannot renumber existing conversations. Prompt/response differences beyond 4,000 characters are indistinguishable and cannot be recovered from historical rows.
+After migration 023 and identity-aware readers are deployed, set `GEMINI_TAKEOUT_HTML_PATH` (or pass one HTML path) and run `npm run preseed:gemini`. The importer preserves the existing `Q: …\n\nA: …` format and 4,000-character cap, then assigns `gemini-conv:v2:<sha256>` from the exact persisted content and normalized UTC instant. Export reorder or prepend therefore cannot renumber existing conversations. Prompt/response differences beyond 4,000 characters are indistinguishable and cannot be recovered from historical rows.
 
 Timestamp parsing is deliberately explicit and host-timezone independent. Supported named forms are NZST and NZDT, followed by UTC/GMT/Z and numeric offsets such as `+05:30`, `-0330`, `UTC+12:45`, or `GMT-03:30`. English abbreviated month names and 12-hour clocks are required. Unknown/ambiguous abbreviations and localized month names are reported as omissions and make a non-empty partial import exit nonzero; they are never passed to host-local `Date` parsing.
 
@@ -397,7 +401,7 @@ Deduplicator (skip if >0.92 cosine similarity to existing)
     ↓
 Namespace Tagger (auto-classify or rule-based)
     ↓
-Gated preseed embedder (explicit Gemini gemini-embedding-2-preview, 768d)
+Canonical embedder (explicit Gemini gemini-embedding-2-preview, 768d)
     ↓
 PostgreSQL + pgvector (upsert)
 ```
@@ -407,7 +411,7 @@ PostgreSQL + pgvector (upsert)
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
 | Database | PostgreSQL 16 + pgvector | Battle-tested, vector search built-in, HNSW indexes |
-| Embedding target | Gemini `gemini-embedding-2-preview` (768d) | Canonical target for gated preseed/repair; live fallback remains until #9/#61 |
+| Embedding target | Gemini `gemini-embedding-2-preview` (768d) | One explicit descriptor for all readers and writers; no implicit fallback |
 | Protocol | MCP (Model Context Protocol) | Standard for LLM tool integration |
 | REST API | Express 5 | For non-MCP consumers (Cortex dashboard, Custom GPTs) |
 | Auth | API keys + namespace ACLs + RLS | Per-client scoping with row-level security |
@@ -664,7 +668,7 @@ Deploy server support for `memory_store.idempotency_key` before deploying the ne
 ## Development Status
 
 - [x] PostgreSQL + pgvector setup, schema, basic CRUD
-- [x] Embedding pipeline (Gemini Embedding 2 + Ollama fallback)
+- [x] Embedding pipeline (explicit Gemini Embedding 2 descriptor and identity-scoped search)
 - [x] MCP server with core tools (store, search, recall, list, stats)
 - [x] Auth layer, API keys, namespace ACLs, row-level security
 - [x] Pre-seed pipeline (OpenClaw, ChatGPT, Claude, Gemini)
@@ -731,38 +735,45 @@ reauthentication is required.
 
 All-row decay and re-embedding prefer an operator-only owner/BYPASSRLS
 `MAINTENANCE_DATABASE_URL`, then preserve the owner-capable `MIGRATION_DATABASE_URL` and
-deprecated `OWNER_DATABASE_URL` compatibility fallbacks. When none is set, they use
-`DATABASE_URL`; an RLS-scoped runtime app role fails the same all-row preflight rather than
-partially updating visible namespaces. The commands run `SET row_security = off` and read
-`public.memories` before doing any work. They print only safe identity from
+deprecated `OWNER_DATABASE_URL` compatibility fallbacks. Re-embedding additionally accepts
+`REEMBED_DATABASE_URL` as its highest-priority one-command override. When none is set, the
+commands use `DATABASE_URL`; an RLS-scoped runtime app role fails the same all-row preflight
+rather than partially updating visible namespaces. They run `SET row_security = off` and read
+`public.memories` before any provider work. They print only safe identity from
 `current_database()` and `current_user` (plus server address), never the connection URL. Do
 not grant `BYPASSRLS` to the service role or place maintenance credentials in long-running
 service environments. The separately approval-gated relevance repair retains its #34
 migration-owner fallback.
 
-Live store/search/rollup embedding loads dotenv without overriding shell or service
-environment values. To avoid mixed writes before #9 and #61, those existing paths retain their
-current import-time provider selection until the coordinated cutover. Do not switch their provider
-piecemeal. Canonical preseed and repair require `EMBEDDING_PROVIDER=gemini`, a nonblank
-`GEMINI_API_KEY`, `EMBEDDING_MODEL=gemini-embedding-2-preview`, and
-`EMBEDDING_DIMENSIONS=768`; their gates currently stop before use. Once mixed-aware rollout is
-possible, a failed Gemini request must never fall back to another vector space. Audit configuration
-in every HoT service and operator shell before rollout and record the audit.
+Every live store/search/rollup/watcher and preseed process now requires the exact profile
+`EMBEDDING_PROVIDER=gemini`, a nonblank `GEMINI_API_KEY`,
+`EMBEDDING_MODEL=gemini-embedding-2-preview`, and `EMBEDDING_DIMENSIONS=768`. Dotenv never
+overrides shell or service values. Missing or mismatched configuration fails before serving;
+a failed Gemini request never falls back to another vector space. Every vector write stores the
+provider, model, and dimensions in the same SQL statement. Search compares only rows with the
+complete active descriptor; unknown and unsupported rows remain text-only and eligible for text search with no
+fabricated cosine score.
 
-`npm run reembed` is currently gated and exits nonzero before provider or database access. Do not
-remove that gate until #9 identity storage exists and #61 mixed-aware readers are deployed on every
-instance. Then take a verified restorable backup, inventory vector vintages, and prove the intended
-maintenance database and provider capacity. Unknown rows are text-only until actually re-embedded;
-never assign them a guessed legacy or target identity.
+For rollout, take a verified restorable backup, apply additive migration
+`023_embedding_identity.sql`, audit configuration for the exact profile in every service and operator shell, and
+deploy all identity-aware readers/writers before mixed writes begin. Existing descriptors remain
+NULL because historical provenance cannot be inferred. Run `npm run reembed` with an owner or
+`BYPASSRLS` maintenance connection. Optional controls are `REEMBED_NAMESPACES` (comma-separated;
+empty means all, including `media`), `REEMBED_BATCH_SIZE`, `REEMBED_DELAY_MS`,
+`REEMBED_MAX_ERRORS` (hard provider/response/database errors only), and
+`REEMBED_FULL_REPAIR=true` for deliberate repair of already-labelled rows. Batches preserve the
+exact PostgreSQL concurrency token, advance a stable UUID cursor, and atomically commit each new
+Gemini vector with its descriptor. Concurrent row changes are reported but do not consume the hard
+error budget; the final nonzero exit requests another pass. Interrupted or failed runs are safe to
+restart; no command metadata-only relabels uncertain rows.
 
 Pause scheduled decay while the #34 relevance migration/repair is in progress. Run
 `npm run decay:update` only after every historical relevance base is classified; it updates
-and reports every namespace, including `media` and future names. After #9 and #61 are delivered,
-repair must claim bounded batches, generate canonical vectors outside the transaction, and commit
-each vector with its complete descriptor atomically. Retry failures without metadata-only stamps.
-Do not declare rollout complete until verification reports **zero active legacy/unknown** rows.
-Only then disable and remove legacy query profiles and credentials. PostgreSQL maintains HNSW on
-updates, so no manual index rebuild is required, but plan for substantial WAL/index/IO load.
+and reports every namespace, including `media` and future names. Re-embedding exits nonzero when
+rows fail or scoped verification reports nonzero `unknown_count` or `legacy_count`. Retry failures
+and rerun until both counts are zero for the same namespace scope. Only then disable and remove
+legacy query profiles and credentials. PostgreSQL maintains HNSW on updates, so no manual index
+rebuild is required, but plan for provider cost and substantial WAL/index/IO load.
 
 Rollback cannot reconstruct compounded scores or infer prior custom bases. Keep the
 added column and corrected function on application rollback and roll forward. Old code is unsafe

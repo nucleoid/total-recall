@@ -136,11 +136,23 @@ async function commitBatch(rows: GeminiConversation[], client: GeminiQueryClient
   const prepared = await prepareCanonicalEmbeddingBatch(unique.map(row => row.content), embedder);
   const values: unknown[] = [];
   const tuples = unique.map((row, index) => {
-    const base = index * 8;
-    values.push(row.content, `[${prepared.embeddings[index].join(',')}]`, SOURCE, NAMESPACE, '{}', JSON.stringify({}), row.sourceKey, row.timestamp);
-    return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, '${CLIENT_ID}', $${base + 7}, $${base + 8})`;
+    const base = index * 11;
+    values.push(
+      row.content,
+      `[${prepared.embeddings[index].join(',')}]`,
+      SOURCE,
+      NAMESPACE,
+      '{}',
+      JSON.stringify({}),
+      row.sourceKey,
+      row.timestamp,
+      prepared.descriptor.provider,
+      prepared.descriptor.model,
+      prepared.descriptor.dimensions,
+    );
+    return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, '${CLIENT_ID}', $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11})`;
   });
-  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at)\nVALUES ${tuples.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, created_at = EXCLUDED.created_at, updated_at = NOW()`;
+  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at, embedding_provider, embedding_model, embedding_dimensions)\nVALUES ${tuples.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, embedding_provider = EXCLUDED.embedding_provider, embedding_model = EXCLUDED.embedding_model, embedding_dimensions = EXCLUDED.embedding_dimensions, created_at = EXCLUDED.created_at, updated_at = NOW()`;
   let began = false;
   try {
     await client.query('BEGIN'); began = true;

@@ -58,10 +58,12 @@ function result<T extends pg.QueryResultRow>(rows: T[]): pg.QueryResult<T> {
 
 async function loadSearch(): Promise<typeof import('../src/search.js')> {
   process.env.HNSW_EF_SEARCH = '321';
-  process.env.GEMINI_API_KEY = '';
-  process.env.OLLAMA_URL = 'http://embedding.test';
+  process.env.EMBEDDING_PROVIDER = 'gemini';
+  process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+  process.env.EMBEDDING_DIMENSIONS = '768';
+  process.env.GEMINI_API_KEY = 'test-only-key';
   globalThis.fetch = async () =>
-    new Response(JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }), {
+    new Response(JSON.stringify({ embedding: { values: Array(768).fill(0.1) } }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     });

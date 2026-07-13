@@ -2,6 +2,7 @@ export const MAINTENANCE_EMBEDDING_MODEL = 'gemini-embedding-2-preview';
 export const MAINTENANCE_EMBEDDING_DIMENSIONS = 768;
 
 export interface MaintenanceEmbeddingEnvironment {
+  EMBEDDING_PROVIDER?: string;
   GEMINI_API_KEY?: string;
   EMBEDDING_MODEL?: string;
   EMBEDDING_DIMENSIONS?: string;
@@ -22,6 +23,9 @@ export interface MaintenanceEmbeddingProfile {
 export function validateMaintenanceEmbeddingProfile(
   env: MaintenanceEmbeddingEnvironment,
 ): MaintenanceEmbeddingProfile {
+  if (env.EMBEDDING_PROVIDER !== 'gemini') {
+    throw new Error('Maintenance re-embedding requires explicit EMBEDDING_PROVIDER=gemini');
+  }
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey?.trim()) {
     throw new Error('Maintenance re-embedding requires Gemini via a nonblank GEMINI_API_KEY; Ollama fallback is not allowed');

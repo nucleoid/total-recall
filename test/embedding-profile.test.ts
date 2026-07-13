@@ -36,18 +36,24 @@ test('empty embedding batches do not call the provider', async () => {
   assert.deepEqual(await module.embedBatch([]), []);
 });
 
-test('an empty Ollama response fails with an explicit provider error', () => {
+test('missing Gemini configuration fails closed without an implicit Ollama request', () => {
   const embeddingModule = new URL('../src/embedding.ts', import.meta.url).href;
   const script = `
-    globalThis.fetch = async () => new Response(JSON.stringify({ embeddings: [] }), { status: 200 });
-    const { embed } = await import(${JSON.stringify(embeddingModule)});
-    await embed('content');
+    globalThis.fetch = async () => { throw new Error('provider must not be called'); };
+    await import(${JSON.stringify(embeddingModule)});
   `;
   const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
-    env: { ...process.env, GEMINI_API_KEY: '', OLLAMA_URL: 'http://embedding.invalid' },
+    env: {
+      ...process.env,
+      EMBEDDING_PROVIDER: '',
+      EMBEDDING_MODEL: '',
+      EMBEDDING_DIMENSIONS: '',
+      GEMINI_API_KEY: '',
+      OLLAMA_URL: 'http://embedding.invalid',
+    },
     encoding: 'utf8',
   });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /No embedding returned from Ollama/);
-  assert.doesNotMatch(result.stderr, /undefined|\.join/);
+  assert.match(result.stderr, /EMBEDDING_PROVIDER=gemini/);
+  assert.doesNotMatch(result.stderr, /provider must not be called|Ollama embed/);
 });

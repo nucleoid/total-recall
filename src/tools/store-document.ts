@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type pg from 'pg';
 import { dbScopeFromAuth, withScopedClient } from '../db.js';
-import { embed } from '../embedding.js';
+import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 
@@ -260,11 +260,11 @@ export async function memoryStoreDocument(
     const id = docRes.rows[0].id as string;
 
     for (let i = 0; i < chunks.length; i++) {
-      const vecStr = `[${embeddings[i].join(',')}]`;
+      const vecStr = serializeEmbeddingVector(embeddings[i]);
 
       await client.query(
-        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, document_id, chunk_index)
-         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, document_id, chunk_index, embedding_provider, embedding_model, embedding_dimensions)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
         [
           chunks[i],
           vecStr,
@@ -276,6 +276,7 @@ export async function memoryStoreDocument(
           auth.keyId,
           id,
           i,
+          ...embeddingDescriptorParams(),
         ]
       );
     }

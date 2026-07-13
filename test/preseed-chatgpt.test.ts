@@ -110,9 +110,11 @@ test('embeds a deduplicated batch before one atomic transaction and uses transac
   assert.equal(committed, 2);
   assert.deepEqual(events, ['embed:replacement|other', 'BEGIN', "SELECT set_config('app.current_namespace', 'personal', true)", 'insert', 'COMMIT']);
   assert.match(queries[2].text, /INSERT INTO memories[\s\S]*VALUES[\s\S]*ON CONFLICT \(source_key\)/);
-  assert.equal(queries[2].values?.length, 16);
+  assert.equal(queries[2].values?.length, 22);
   assert.equal(queries[2].values?.[0], 'replacement');
   assert.equal(queries[2].values?.[6], 'same');
+  assert.deepEqual(queries[2].values?.slice(8, 11), ['gemini', 'gemini-embedding-2-preview', 768]);
+  assert.match(queries[2].text, /embedding_provider[\s\S]*embedding_model[\s\S]*embedding_dimensions/);
 });
 
 test('embedding, SQL, and commit failures never leave a partial batch', async () => {

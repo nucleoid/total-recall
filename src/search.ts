@@ -1,5 +1,5 @@
 import { withScopedClient, type DbScope } from './db.js';
-import { embed } from './embedding.js';
+import { ACTIVE_EMBEDDING_DESCRIPTOR, embed, serializeEmbeddingVector } from './embedding.js';
 import { accessLevelSql } from './auth.js';
 import { hnswEfSearchFromEnv } from './config.js';
 import type { AccessLevel, SearchParams, SearchResult } from './types.js';
@@ -8,14 +8,25 @@ dotenv.config();
 
 const EF_SEARCH = hnswEfSearchFromEnv();
 
+// Legacy vector queries are allowed only for truthfully labelled legacy rows.
+// No legacy profile is configured after the verified Gemini-only cutover.
+export const LEGACY_EMBEDDING_PROFILES: readonly never[] = Object.freeze([]);
+
 export async function hybridSearch(
   params: SearchParams,
   namespaces: string[],
   scope: DbScope,
   maxAccessLevel: AccessLevel
 ): Promise<SearchResult[]> {
-  const embedding = await embed(params.query);
-  const vecStr = `[${embedding.join(',')}]`;
+  let vecStr: string | null = null;
+  let vectorAvailable = true;
+  try {
+    const embedding = await embed(params.query);
+    vecStr = serializeEmbeddingVector(embedding);
+  } catch (error) {
+    vectorAvailable = false;
+    console.warn('[search] Embedding provider unavailable; using text-only search fallback');
+  }
   const limit = Math.min(params.limit ?? 10, 50);
   const threshold = params.threshold ?? 0.3;
 
@@ -32,6 +43,9 @@ export async function hybridSearch(
     const pLimit = p(limit);
     const pThreshold = p(threshold);
     const pMaxAccessLevel = p(maxAccessLevel);
+    const pProvider = p(ACTIVE_EMBEDDING_DESCRIPTOR.provider);
+    const pModel = p(ACTIVE_EMBEDDING_DESCRIPTOR.model);
+    const pDimensions = p(ACTIVE_EMBEDDING_DESCRIPTOR.dimensions);
     const accessWhere = `AND ${accessLevelSql('m.access_level', pMaxAccessLevel)}`;
 
     const conditions: string[] = [];
@@ -70,17 +84,21 @@ export async function hybridSearch(
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+          AND ${vectorAvailable ? `embedding IS NOT NULL
+          AND embedding_provider = ${pProvider}
+          AND embedding_model = ${pModel}
+          AND embedding_dimensions = ${pDimensions}` : 'FALSE'}
         ORDER BY embedding <=> ${pVec}::vector
         LIMIT 50
       ),
       text_only_results AS (
         SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
           updated_at, accessed_at, access_count, access_level, client_id,
-          1 - (embedding <=> ${pVec}::vector) AS vec_score
+          NULL::double precision AS vec_score
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
-          AND id NOT IN (SELECT id FROM vector_results)
+          AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
         LIMIT 20
       ),
       combined AS (
@@ -98,14 +116,14 @@ export async function hybridSearch(
       scored AS MATERIALIZED (
         SELECT c.*,
           COALESCE(t.text_score, 0) AS text_score,
-          (c.vec_score * 0.3 + COALESCE(t.text_score, 0) * 0.7 + CASE WHEN COALESCE(t.text_score, 0) > 0 THEN 0.5 ELSE 0 END) AS base_score,
+          (COALESCE(c.vec_score, 0) * 0.3 + COALESCE(t.text_score, 0) * 0.7 + CASE WHEN COALESCE(t.text_score, 0) > 0 THEN 0.5 ELSE 0 END) AS base_score,
           calculate_relevance(c.relevance_base_score, c.decay_rate, c.accessed_at, c.access_count) AS relevance
         FROM combined c
         LEFT JOIN text_scores t ON c.id = t.id
-        WHERE c.vec_score >= ${pThreshold} OR t.text_score > 0
+        WHERE COALESCE(c.vec_score, 0) >= ${pThreshold} OR t.text_score > 0
       )
       SELECT s.*,
-        (s.vec_score * 0.3 + s.text_score * 0.7 + CASE WHEN s.text_score > 0 THEN 2.0 ELSE 0 END)
+        (COALESCE(s.vec_score, 0) * 0.3 + s.text_score * 0.7 + CASE WHEN s.text_score > 0 THEN 2.0 ELSE 0 END)
           * LEAST(s.relevance, 2.0) AS final_score
       FROM scored s
       ORDER BY final_score DESC

@@ -8,7 +8,7 @@ const readme = await fs.readFile(new URL('../../README.md', import.meta.url), 'u
 test('watcher tests have one common unit and DB reconciliation command', () => {
   assert.equal(
     packageJson.scripts['test:watcher'],
-    'node --test --test-concurrency=1 --import tsx "test/watcher/**/*.test.ts"',
+    'node --test --test-concurrency=1 --import ./test/setup-embedding-env.mjs --import tsx "test/watcher/**/*.test.ts"',
   );
 });
 

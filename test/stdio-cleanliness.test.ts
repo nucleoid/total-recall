@@ -8,7 +8,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 const entrypoint = path.join(repoRoot, 'dist', 'index.js');
-const providerAnnouncement = /^\[embedding\] (?:Using Gemini API \(.+?, \d+d\)|No GEMINI_API_KEY found, falling back to Ollama \(.+?\))$/gm;
+const canonicalEmbeddingEnv = {
+  EMBEDDING_PROVIDER: 'gemini',
+  EMBEDDING_MODEL: 'gemini-embedding-2-preview',
+  EMBEDDING_DIMENSIONS: '768',
+  GEMINI_API_KEY: 'test-secret',
+};
 
 function waitFor(
   child: ChildProcessWithoutNullStreams,
@@ -23,10 +28,12 @@ function waitFor(
       clearTimeout(deadline);
       child.stdout.off('data', check);
       child.stderr.off('data', check);
+      child.off('exit', check);
       resolve();
     };
     child.stdout.on('data', check);
     child.stderr.on('data', check);
+    child.on('exit', check);
     check();
   });
 }
@@ -83,56 +90,55 @@ function parseProtocolOutput(raw: string): any[] {
   });
 }
 
-for (const provider of [
-  {
-    name: 'Gemini',
-    env: { GEMINI_API_KEY: 'test-secret', EMBEDDING_MODEL: 'test-model', EMBEDDING_DIMENSIONS: '768' },
-    announcement: '[embedding] Using Gemini API (test-model, 768d)',
-  },
-  {
-    name: 'Ollama',
-    env: { GEMINI_API_KEY: '', OLLAMA_MODEL: 'test-ollama' },
-    announcement: '[embedding] No GEMINI_API_KEY found, falling back to Ollama (test-ollama)',
-  },
-]) {
-  test(`stdio startup and protocol output remain clean with ${provider.name}`, async () => {
-    const server = await startServer(provider.env);
-    try {
-      await waitFor(server.child, () => server.stderr().includes('MCP server running on stdio'), 'server startup');
-      assert.equal(server.stdout(), '', 'stdout must be empty before the first MCP request');
-      assert.equal(server.stderr().match(providerAnnouncement)?.length, 1);
-      assert.match(server.stderr(), new RegExp(provider.announcement.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-      assert.doesNotMatch(server.stderr(), /test-secret|generativelanguage\.googleapis\.com/);
+test('stdio startup and protocol output remain clean with the canonical Gemini profile', async () => {
+  const server = await startServer(canonicalEmbeddingEnv);
+  try {
+    await waitFor(server.child, () => server.stderr().includes('MCP server running on stdio'), 'server startup');
+    assert.equal(server.stdout(), '', 'stdout must be empty before the first MCP request');
+    assert.doesNotMatch(server.stderr(), /test-secret|generativelanguage\.googleapis\.com/);
 
-      send(server.child, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'initialize',
-        params: {
-          protocolVersion: '2024-11-05',
-          capabilities: {},
-          clientInfo: { name: 'stdio-cleanliness-test', version: '1.0.0' },
-        },
-      });
-      send(server.child, { jsonrpc: '2.0', method: 'notifications/initialized' });
-      send(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+    send(server.child, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'stdio-cleanliness-test', version: '1.0.0' },
+      },
+    });
+    send(server.child, { jsonrpc: '2.0', method: 'notifications/initialized' });
+    send(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
 
-      await waitFor(
-        server.child,
-        () => parseProtocolOutput(server.stdout()).some((message) => message.id === 2),
-        'initialize/list-tools responses',
-      );
-      const messages = parseProtocolOutput(server.stdout());
-      assert.ok(messages.some((message) => message.id === 1 && message.result));
-      assert.ok(messages.some((message) => message.id === 2 && Array.isArray(message.result?.tools)));
-    } finally {
-      await server.cleanup();
-    }
+    await waitFor(
+      server.child,
+      () => parseProtocolOutput(server.stdout()).some((message) => message.id === 2),
+      'initialize/list-tools responses',
+    );
+    const messages = parseProtocolOutput(server.stdout());
+    assert.ok(messages.some((message) => message.id === 1 && message.result));
+    assert.ok(messages.some((message) => message.id === 2 && Array.isArray(message.result?.tools)));
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test('stdio startup rejects missing embedding identity config instead of falling back', async () => {
+  const server = await startServer({
+    EMBEDDING_PROVIDER: '', EMBEDDING_MODEL: '', EMBEDDING_DIMENSIONS: '', GEMINI_API_KEY: '',
   });
-}
+  try {
+    await waitFor(server.child, () => server.child.exitCode !== null, 'configuration failure');
+    assert.equal(server.stdout(), '');
+    assert.match(server.stderr(), /EMBEDDING_PROVIDER=gemini/);
+    assert.doesNotMatch(server.stderr(), /Ollama|falling back/i);
+  } finally {
+    await server.cleanup();
+  }
+});
 
 test('missing API key errors remain JSON-RPC-only on stdout', async () => {
-  const server = await startServer({ GEMINI_API_KEY: '' });
+  const server = await startServer(canonicalEmbeddingEnv);
   try {
     await waitFor(server.child, () => server.stderr().includes('MCP server running on stdio'), 'server startup');
     send(server.child, {
@@ -158,7 +164,7 @@ test('missing API key errors remain JSON-RPC-only on stdout', async () => {
 });
 
 test('invalid API key failures remain JSON-RPC-only on stdout', async () => {
-  const server = await startServer({ GEMINI_API_KEY: '', TOTAL_RECALL_API_KEY: 'tr_invalid' });
+  const server = await startServer({ ...canonicalEmbeddingEnv, TOTAL_RECALL_API_KEY: 'tr_invalid' });
   try {
     await waitFor(server.child, () => server.stderr().includes('MCP server running on stdio'), 'server startup');
     send(server.child, {

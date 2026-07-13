@@ -60,7 +60,7 @@ export async function commitImportBatch(
   const prepared = await prepareCanonicalEmbeddingBatch(unique.map(row => row.content), embedder);
   const values: unknown[] = [];
   const tuples = unique.map((row, index) => {
-    const base = index * 9;
+    const base = index * 12;
     values.push(
       row.content,
       `[${prepared.embeddings[index].join(',')}]`,
@@ -71,11 +71,14 @@ export async function commitImportBatch(
       clientId,
       row.sourceKey,
       row.createdAt ?? null,
+      prepared.descriptor.provider,
+      prepared.descriptor.model,
+      prepared.descriptor.dimensions,
     );
-    return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, COALESCE($${base + 9}::timestamptz, NOW()))`;
+    return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, COALESCE($${base + 9}::timestamptz, NOW()), $${base + 10}, $${base + 11}, $${base + 12})`;
   });
   const createdAtUpdate = options.updateCreatedAtOnConflict === false ? '' : '\n  created_at = EXCLUDED.created_at,';
-  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at)\nVALUES ${tuples.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET\n  content = EXCLUDED.content,\n  embedding = EXCLUDED.embedding,${createdAtUpdate}\n  updated_at = NOW()`;
+  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at, embedding_provider, embedding_model, embedding_dimensions)\nVALUES ${tuples.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET\n  content = EXCLUDED.content,\n  embedding = EXCLUDED.embedding,\n  embedding_provider = EXCLUDED.embedding_provider,\n  embedding_model = EXCLUDED.embedding_model,\n  embedding_dimensions = EXCLUDED.embedding_dimensions,${createdAtUpdate}\n  updated_at = NOW()`;
   const namespaces = [...new Set(unique.map(row => row.namespace))].sort();
 
   let began = false;

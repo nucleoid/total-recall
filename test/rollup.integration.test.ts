@@ -159,7 +159,7 @@ function result<T extends pg.QueryResultRow>(rows: T[], rowCount = rows.length):
 
 async function withEmbeddingMock<T>(fn: () => Promise<T>): Promise<T> {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => new Response(JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }), {
+  globalThis.fetch = (async () => new Response(JSON.stringify({ embedding: { values: Array(768).fill(0.1) } }), {
     status: 200,
     headers: { 'content-type': 'application/json' },
   })) as typeof fetch;
@@ -173,7 +173,10 @@ async function withEmbeddingMock<T>(fn: () => Promise<T>): Promise<T> {
 test('failure between memory insert and event link rolls back both writes', async () => {
   const pool = new FakePool('link');
   setPoolForTesting(pool as unknown as pg.Pool);
-  process.env.GEMINI_API_KEY = '';
+  process.env.EMBEDDING_PROVIDER = 'gemini';
+  process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+  process.env.EMBEDDING_DIMENSIONS = '768';
+  process.env.GEMINI_API_KEY = 'test-only-key';
   const { rollupPendingEvents } = await import('../src/rollup.js');
 
   const outcome = await withEmbeddingMock(() => rollupPendingEvents(AUTH, SCOPE));
@@ -245,7 +248,7 @@ test('embedding rejection opens no write transaction and leaves the event pendin
     const outcome = await rollupPendingEvents(AUTH, SCOPE);
     assert.equal(outcome.rolled, 0);
     assert.equal(outcome.failed, 1);
-    assert.match(outcome.errors[0], /embed failed \(503\)/);
+    assert.match(outcome.errors[0], /embedContent failed \(503\)/);
   } finally {
     globalThis.fetch = originalFetch;
   }

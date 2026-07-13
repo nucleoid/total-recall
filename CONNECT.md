@@ -42,8 +42,10 @@ mcp:
       env:
         TOTAL_RECALL_API_KEY: "tr_<your-openclaw-key>"
         DATABASE_URL: "postgresql://total_recall_app:<app-password>@localhost:5432/total_recall"
-        OLLAMA_URL: "http://localhost:11434"
-        EMBEDDING_MODEL: "nomic-embed-text"
+        EMBEDDING_PROVIDER: "gemini"
+        GEMINI_API_KEY: "<your-gemini-key>"
+        EMBEDDING_MODEL: "gemini-embedding-2-preview"
+        EMBEDDING_DIMENSIONS: "768"
 ```
 
 ### System Prompt Addition (AGENTS.md or equivalent)
@@ -93,8 +95,10 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
       "env": {
         "TOTAL_RECALL_API_KEY": "tr_<your-claude-work-key>",
         "DATABASE_URL": "postgresql://total_recall_app:<app-password>@localhost:5432/total_recall",
-        "OLLAMA_URL": "http://localhost:11434",
-        "EMBEDDING_MODEL": "nomic-embed-text"
+        "EMBEDDING_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "<your-gemini-key>",
+        "EMBEDDING_MODEL": "gemini-embedding-2-preview",
+        "EMBEDDING_DIMENSIONS": "768"
       }
     }
   }
@@ -151,8 +155,10 @@ Add to `~/.claude.json` (global) or `CLAUDE.md` in your project:
       "env": {
         "TOTAL_RECALL_API_KEY": "tr_<your-key>",
         "DATABASE_URL": "postgresql://total_recall_app:<app-password>@localhost:5432/total_recall",
-        "OLLAMA_URL": "http://localhost:11434",
-        "EMBEDDING_MODEL": "nomic-embed-text"
+        "EMBEDDING_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "<your-gemini-key>",
+        "EMBEDDING_MODEL": "gemini-embedding-2-preview",
+        "EMBEDDING_DIMENSIONS": "768"
       }
     }
   }
@@ -184,8 +190,10 @@ You have Total Recall MCP tools available. When working on this project:
       "env": {
         "TOTAL_RECALL_API_KEY": "tr_<your-key>",
         "DATABASE_URL": "postgresql://total_recall_app:<app-password>@localhost:5432/total_recall",
-        "OLLAMA_URL": "http://localhost:11434",
-        "EMBEDDING_MODEL": "nomic-embed-text"
+        "EMBEDDING_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "<your-gemini-key>",
+        "EMBEDDING_MODEL": "gemini-embedding-2-preview",
+        "EMBEDDING_DIMENSIONS": "768"
       }
     }
   }
@@ -318,7 +326,7 @@ After configuring any tool, test with:
 If it doesn't work:
 - Check the tool's MCP server logs
 - Verify the API key is correct
-- Ensure Postgres and Ollama are running on the server
+- Ensure Postgres is running and the configured Gemini credential can reach the Gemini API
 - For remote: verify Cloudflare Tunnel is up (`curl https://recall.stakewatch.dev/health`)
 
 ---

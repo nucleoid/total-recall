@@ -13,13 +13,15 @@ const TEST_AGENT_NAME = 'media-search-filter-test-agent';
 const VECTOR = `[1,${Array(767).fill(0).join(',')}]`;
 const ORTHOGONAL_VECTOR = `[0,1,${Array(766).fill(0).join(',')}]`;
 
-process.env.OLLAMA_URL = 'http://total-recall-test-ollama.invalid';
-process.env.GEMINI_API_KEY = '';
+process.env.EMBEDDING_PROVIDER = 'gemini';
+process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+process.env.EMBEDDING_DIMENSIONS = '768';
+process.env.GEMINI_API_KEY = 'test-only-key';
 
 globalThis.fetch = async (input) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  if (url === `${process.env.OLLAMA_URL}/api/embed`) {
-    return new Response(JSON.stringify({ embeddings: [[1, ...Array(767).fill(0)]] }), {
+  if (url.includes('generativelanguage.googleapis.com') && url.includes(':embedContent')) {
+    return new Response(JSON.stringify({ embedding: { values: [1, ...Array(767).fill(0)] } }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
