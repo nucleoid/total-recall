@@ -1,7 +1,11 @@
 openapi: 3.1.0
 info:
   title: Total Recall Memory API
-  description: Store and search memories with semantic search. Used by AI assistants to maintain long-term memory.
+  description: >-
+    Store and search memories with semantic search. Used by AI assistants to maintain long-term memory.
+    JSON request bodies are limited to 8 MiB and must use identity Content-Encoding. Memory content is
+    limited to 100,000 JavaScript characters; document content to 1048576 UTF-8 bytes; per-request metadata to
+    65536 serialized JSON bytes, depth 16, and 1000 keys total across the metadata value; tags to 100 tags and 256 JavaScript characters per tag.
   version: 1.0.0
 servers:
   - url: https://recall.stakewatch.dev
@@ -47,6 +51,12 @@ paths:
           description: Unauthorized
         "403":
           description: Forbidden
+        "400":
+          description: Invalid search request; malformed JSON returns `{code: "invalid_json"}`.
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedContentEncoding"
   /api/store:
     post:
       operationId: storeMemory
@@ -61,14 +71,21 @@ paths:
               properties:
                 content:
                   type: string
-                  description: Memory content text
+                  description: Memory content text; maximum 100,000 JavaScript characters (UTF-16 code units).
                 namespace:
                   type: string
-                  description: "Namespace to store in (e.g. work, shared)"
+                  description: "Namespace to store in (e.g. work, shared); maximum 512 JavaScript characters."
                 tags:
                   type: array
+                  maxItems: 100
+                  description: Maximum 100 tags.
                   items:
                     type: string
+                    description: Maximum 256 JavaScript characters per tag.
+                metadata:
+                  type: object
+                  description: Per-request maximum 65536 serialized JSON bytes, depth 16, and 1000 keys total across the metadata value.
+                  additionalProperties: true
                 source:
                   type: string
                   description: Source identifier (defaults to key name)
@@ -96,6 +113,12 @@ paths:
           description: Unauthorized
         "403":
           description: Forbidden
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedContentEncoding"
   /api/store-document:
     post:
       operationId: storeDocument
@@ -110,15 +133,24 @@ paths:
               properties:
                 title:
                   type: string
+                  description: Maximum 512 JavaScript characters.
                 content:
                   type: string
-                  description: Nonblank document content. The authoritative limit is 1 MiB of decoded UTF-8 (not characters); content is preserved losslessly in embedding chunks of at most 2,000 UTF-8 bytes.
+                  description: Nonblank document content. The authoritative limit is 1 MiB (1048576 decoded UTF-8 bytes, not characters); content is preserved losslessly in embedding chunks of at most 2,000 UTF-8 bytes.
                 namespace:
                   type: string
+                  description: Maximum 512 JavaScript characters.
                 tags:
                   type: array
+                  maxItems: 100
+                  description: Maximum 100 tags.
                   items:
                     type: string
+                    description: Maximum 256 JavaScript characters per tag.
+                metadata:
+                  type: object
+                  description: Per-request maximum 65536 serialized JSON bytes, depth 16, and 1000 keys total across the metadata value; applied to stored chunks.
+                  additionalProperties: true
                 source:
                   type: string
                 idempotency_key:
@@ -137,7 +169,8 @@ paths:
                   chunks:
                     type: integer
         "400":
-          description: Invalid request, including blank content or decoded UTF-8 content over 1 MiB
+          description: Invalid request, including blank content or decoded UTF-8 content over 1 MiB; malformed JSON and metadata envelope failures use the documented stable codes.
+          $ref: "#/components/responses/InvalidRequest"
         "401":
           description: Unauthorized
         "403":
@@ -145,7 +178,10 @@ paths:
         "409":
           description: Idempotency conflict or incomplete prior document write
         "413":
-          description: JSON transport envelope exceeds the independently configured HTTP parser limit
+          description: JSON transport envelope exceeds the independently configured HTTP parser limit.
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedContentEncoding"
   /api/media/events:
     post:
       operationId: ingestMediaEvents
@@ -205,12 +241,43 @@ paths:
         "200":
           description: Media events ingested
         "400":
-          description: Invalid request
+          description: Invalid media event request; malformed JSON returns `{code: "invalid_json"}`.
         "401":
           description: Unauthorized
         "403":
           description: Forbidden
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedContentEncoding"
 components:
+  responses:
+    InvalidRequest:
+      description: Malformed JSON returns `{code: "invalid_json"}`; metadata envelope violations on memory, document, and agent requests return `{code: "invalid_metadata"}`; decoded schema violations use the validation-error shape.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - type: object
+                required: [code]
+                properties:
+                  code:
+                    type: string
+                    enum: [invalid_json, invalid_metadata]
+              - type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  details:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+    PayloadTooLarge:
+      description: Encoded JSON exceeds 8 MiB; returns `{code: "payload_too_large"}`.
+    UnsupportedContentEncoding:
+      description: Non-identity Content-Encoding; returns `{code: "unsupported_content_encoding"}`.
   schemas:
     Memory:
       type: object

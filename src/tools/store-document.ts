@@ -5,14 +5,22 @@ import { dbScopeFromAuth, withScopedClient } from '../db.js';
 import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
+import {
+  DOCUMENT_TITLE_MAX_CHARS,
+  MEBIBYTE,
+  TAG_MAX_CHARS,
+  TAG_MAX_COUNT,
+  TEXT_FIELD_MAX_CHARS,
+  metadataSchema,
+} from '../http-limits.js';
 
-export const MAX_DOCUMENT_CONTENT_BYTES = 1024 * 1024;
+export const MAX_DOCUMENT_CONTENT_BYTES = MEBIBYTE;
 export const MAX_DOCUMENT_CHUNK_BYTES = 2_000;
 // Greedy packing can create at most two chunks per chunk-sized span, plus one.
 const MAX_DOCUMENT_CHUNKS = Math.ceil((MAX_DOCUMENT_CONTENT_BYTES * 2) / MAX_DOCUMENT_CHUNK_BYTES) + 1;
 
 export const storeDocumentSchema = z.object({
-  title: z.string().min(1),
+  title: z.string().min(1).max(DOCUMENT_TITLE_MAX_CHARS),
   content: z.string().superRefine((value, ctx) => {
     if (value.trim().length === 0) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Document content must contain non-whitespace text' });
@@ -24,9 +32,10 @@ export const storeDocumentSchema = z.object({
       });
     }
   }),
-  namespace: z.string().default('shared'),
-  tags: z.array(z.string()).default([]),
-  source: z.string().default('manual'),
+  namespace: z.string().min(1).max(TEXT_FIELD_MAX_CHARS).default('shared'),
+  tags: z.array(z.string().max(TAG_MAX_CHARS)).max(TAG_MAX_COUNT).default([]),
+  source: z.string().max(TEXT_FIELD_MAX_CHARS).default('manual'),
+  metadata: metadataSchema.optional(),
   idempotency_key: z.string().min(1).max(200).optional(),
 });
 
@@ -138,7 +147,19 @@ function normalizeTags(tags: string[]): string[] {
   return [...new Set(tags)].sort();
 }
 
-function canonicalRequestHash(params: StoreDocumentParams): string {
+function canonicalizeJsonObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeJsonObjectKeys);
+  if (value === null || typeof value !== 'object') return value;
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, child]) => [key, canonicalizeJsonObjectKeys(child)])
+  );
+}
+
+export function canonicalDocumentRequestHash(params: StoreDocumentParams): string {
+  const metadata = params.metadata;
   const canonical = JSON.stringify({
     version: 1,
     title: params.title,
@@ -146,6 +167,9 @@ function canonicalRequestHash(params: StoreDocumentParams): string {
     namespace: params.namespace,
     source: params.source,
     tags: normalizeTags(params.tags),
+    ...(metadata && Object.keys(metadata).length > 0
+      ? { metadata: canonicalizeJsonObjectKeys(metadata) }
+      : {}),
   });
   const digest = createHash('sha256').update(canonical, 'utf8').digest('hex');
   return `sha256:v1:${digest}`;
@@ -218,7 +242,7 @@ export async function memoryStoreDocument(
     throw new Error(`Document has too many chunks (${chunks.length}); maximum is ${MAX_DOCUMENT_CHUNKS}`);
   }
 
-  const requestHash = canonicalRequestHash(params);
+  const requestHash = canonicalDocumentRequestHash(params);
   if (params.idempotency_key) {
     const existing = await withScopedClient(dbScopeFromAuth(auth), async (client) =>
       findExistingDocument(client, auth, ns, params.idempotency_key!)
@@ -271,7 +295,7 @@ export async function memoryStoreDocument(
           params.source,
           ns,
           params.tags,
-          '{}',
+          JSON.stringify(params.metadata ?? {}),
           'normal',
           auth.keyId,
           id,
