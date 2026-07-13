@@ -204,13 +204,13 @@ async function upsertMediaEventsWithQuery(
       throw new Error('Trusted media event client_id must match database scope');
     }
 
-    const res = await query<{ id: string; inserted: boolean }>(
+    const res = await query<{ id: string }>(
       `INSERT INTO media_events
          (service, service_id, event_type, title, artist, album, show, season, episode, year,
           genres, duration_ms, played_ms, completed, played_at, metadata, client_id, agent_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-       ON CONFLICT (client_id, service, service_id, played_at) DO NOTHING
-       RETURNING id, (xmax = 0) AS inserted`,
+       ON CONFLICT DO NOTHING
+       RETURNING id`,
       [
         e.service,
         e.service_id ?? null,
@@ -245,9 +245,10 @@ async function upsertMediaEventsWithQuery(
 }
 
 /**
- * Idempotent batch upsert of media events. Conflict key is
- * (client_id, service, service_id, played_at). Events without a service_id
- * always insert because PostgreSQL treats NULLs as distinct in unique indexes.
+ * Idempotent batch insert of media events. The database owns the effective
+ * identity contract, including fallback identity for null/blank service IDs.
+ * Untargeted conflict handling intentionally honors every applicable unique
+ * rule; RETURNING alone determines whether each event inserted or skipped.
  */
 export async function upsertMediaEvents(events: TrustedMediaEventInput[], scope: DbScope): Promise<UpsertResult> {
   if (events.length === 0) return { inserted: 0, skipped: 0, ids: [] };
