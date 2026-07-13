@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   MAX_DOCUMENT_CHUNK_BYTES,
   MAX_DOCUMENT_CONTENT_BYTES,
+  canonicalDocumentRequestHash,
   chunkDocumentContent,
   storeDocumentSchema,
 } from '../src/tools/store-document.js';
@@ -90,4 +92,56 @@ test('document schema rejects empty and whitespace-only decoded content', () => 
     assert.equal(result.success, false);
     if (!result.success) assert.match(result.error.message, /non-whitespace/i);
   }
+});
+
+test('empty document metadata preserves the legacy v1 idempotency hash across deployment', () => {
+  const parsed = storeDocumentSchema.parse({
+    title: 'doc',
+    content: 'content',
+    namespace: 'shared',
+    tags: ['b', 'a'],
+    source: 'manual',
+  });
+  const legacyCanonical = JSON.stringify({
+    version: 1,
+    title: parsed.title,
+    content: parsed.content,
+    namespace: parsed.namespace,
+    source: parsed.source,
+    tags: ['a', 'b'],
+  });
+  const legacyHash = `sha256:v1:${createHash('sha256').update(legacyCanonical, 'utf8').digest('hex')}`;
+
+  assert.equal(canonicalDocumentRequestHash(parsed), legacyHash);
+  assert.notEqual(canonicalDocumentRequestHash({ ...parsed, metadata: { owner: 'agent' } }), legacyHash);
+});
+
+test('document idempotency hash recursively canonicalizes metadata object key order', () => {
+  const base = storeDocumentSchema.parse({
+    title: 'doc',
+    content: 'content',
+    metadata: {
+      z: { beta: 2, alpha: 1 },
+      a: [{ right: true, left: false }, { value: 2 }],
+    },
+  });
+  const reordered = storeDocumentSchema.parse({
+    title: 'doc',
+    content: 'content',
+    metadata: {
+      a: [{ left: false, right: true }, { value: 2 }],
+      z: { alpha: 1, beta: 2 },
+    },
+  });
+  const reorderedArray = storeDocumentSchema.parse({
+    title: 'doc',
+    content: 'content',
+    metadata: {
+      a: [{ value: 2 }, { left: false, right: true }],
+      z: { alpha: 1, beta: 2 },
+    },
+  });
+
+  assert.equal(canonicalDocumentRequestHash(base), canonicalDocumentRequestHash(reordered));
+  assert.notEqual(canonicalDocumentRequestHash(reordered), canonicalDocumentRequestHash(reorderedArray));
 });

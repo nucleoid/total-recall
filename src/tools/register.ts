@@ -8,7 +8,7 @@ import type { AuthContext } from '../types.js';
 import { dbScopeFromAuth } from '../db.js';
 import { checkPermission } from '../auth.js';
 import { storeSchema, memoryStore } from './store.js';
-import { storeDocumentSchema, memoryStoreDocument } from './store-document.js';
+import { MAX_DOCUMENT_CONTENT_BYTES, storeDocumentSchema, memoryStoreDocument } from './store-document.js';
 import { searchSchema, memorySearch } from './search.js';
 import { recallSchema, memoryRecall } from './recall.js';
 import { listNamespacesSchema, memoryListNamespaces } from './list-namespaces.js';
@@ -16,14 +16,25 @@ import { listSchema, memoryList } from './list.js';
 import { statsSchema, memoryStats } from './stats.js';
 import { mediaSearchSchema, mediaSearch } from './media-search.js';
 import { upsertAgent, listAgents } from '../agents.js';
+import {
+  DOCUMENT_TITLE_MAX_CHARS,
+  MEMORY_CONTENT_MAX_CHARS,
+  METADATA_MAX_BYTES,
+  METADATA_MAX_DEPTH,
+  METADATA_MAX_KEYS,
+  TAG_MAX_CHARS,
+  TAG_MAX_COUNT,
+  TEXT_FIELD_MAX_CHARS,
+  metadataSchema,
+} from '../http-limits.js';
 
-const agentRegisterSchema = z.object({
-  name: z.string().min(1),
-  type: z.string().default('llm'),
-  model: z.string().optional(),
-  runtime: z.string().optional(),
-  parent_agent_name: z.string().optional(),
-  metadata: z.record(z.unknown()).default({}),
+export const agentRegisterSchema = z.object({
+  name: z.string().min(1).max(TEXT_FIELD_MAX_CHARS),
+  type: z.string().max(TEXT_FIELD_MAX_CHARS).default('llm'),
+  model: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  runtime: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  parent_agent_name: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  metadata: metadataSchema.default({}),
 });
 
 const agentListSchema = z.object({});
@@ -38,11 +49,11 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object' as const,
       properties: {
-        content: { type: 'string', description: 'The memory content to store' },
+        content: { type: 'string', maxLength: MEMORY_CONTENT_MAX_CHARS, description: `The memory content to store (maximum ${MEMORY_CONTENT_MAX_CHARS} JavaScript characters)` },
         namespace: { type: 'string', description: 'Namespace (default: shared)' },
         source: { type: 'string', description: 'Source identifier' },
-        tags: { type: 'array', items: { type: 'string' }, description: 'Tags for categorization' },
-        metadata: { type: 'object', description: 'Additional metadata' },
+        tags: { type: 'array', maxItems: TAG_MAX_COUNT, items: { type: 'string', maxLength: TAG_MAX_CHARS }, description: 'Tags for categorization' },
+        metadata: { type: 'object', description: `Additional metadata (maximum ${METADATA_MAX_BYTES} serialized JSON bytes, depth ${METADATA_MAX_DEPTH}, ${METADATA_MAX_KEYS} keys total)` },
         access_level: { type: 'string', enum: ['normal', 'sensitive', 'secret'] },
         agent_name: {
           type: 'string',
@@ -68,11 +79,12 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object' as const,
       properties: {
-        title: { type: 'string', description: 'Document title' },
-        content: { type: 'string', description: 'Nonblank document content (maximum 1 MiB decoded UTF-8; embedded losslessly in chunks of at most 2,000 UTF-8 bytes)' },
-        namespace: { type: 'string', description: 'Namespace (default: shared)' },
-        tags: { type: 'array', items: { type: 'string' }, description: 'Tags for categorization' },
-        source: { type: 'string', description: 'Source identifier (default: manual)' },
+        title: { type: 'string', maxLength: DOCUMENT_TITLE_MAX_CHARS, description: 'Document title' },
+        content: { type: 'string', description: `Nonblank document content (maximum ${MAX_DOCUMENT_CONTENT_BYTES} decoded UTF-8 bytes; embedded losslessly in chunks of at most 2,000 UTF-8 bytes)` },
+        namespace: { type: 'string', maxLength: TEXT_FIELD_MAX_CHARS, description: 'Namespace (default: shared)' },
+        tags: { type: 'array', maxItems: TAG_MAX_COUNT, items: { type: 'string', maxLength: TAG_MAX_CHARS }, description: 'Tags for categorization' },
+        source: { type: 'string', maxLength: TEXT_FIELD_MAX_CHARS, description: 'Source identifier (default: manual)' },
+        metadata: { type: 'object', description: `Chunk metadata (maximum ${METADATA_MAX_BYTES} serialized JSON bytes, depth ${METADATA_MAX_DEPTH}, ${METADATA_MAX_KEYS} keys total)` },
         idempotency_key: {
           type: 'string',
           description: 'Optional retry key. Reusing the same key with the same document returns the committed document; a different document returns an error.',

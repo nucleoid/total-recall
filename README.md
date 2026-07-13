@@ -151,6 +151,19 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         └─────────────────────────────┘
 ```
 
+## Request limits
+
+All public REST and MCP requests use the same bounded JSON contract:
+
+- encoded JSON body: **8 MiB**; use identity `Content-Encoding` only;
+- memory content: **100,000 JavaScript characters** (UTF-16 code units);
+- document content: **1048576 UTF-8 bytes**, losslessly chunked to at most 2000 UTF-8 bytes per embedding;
+- per-request metadata: **65536 serialized JSON bytes**, maximum **depth 16** and **1000 keys total** across the complete metadata value;
+- tags: **100 tags**, each at most **256 JavaScript characters per tag**;
+- document titles and other bounded identifier/source fields: 512 JavaScript characters.
+
+Set reverse-proxy body limits to 8 MiB or slightly larger and also enforce appropriate request-rate and concurrency controls. The application returns JSON `400` with `{ "code": "invalid_json" }` for malformed JSON, `400` with `{ "code": "invalid_metadata" }` when memory, document, or agent metadata exceeds its per-request envelope, `413` with `{ "code": "payload_too_large" }` for an oversized encoded body, and `415` with `{ "code": "unsupported_content_encoding" }` for compressed/non-identity requests. Decoded field-limit violations return JSON `400` validation errors. Media-event metadata retains its endpoint-specific compatibility contract rather than inheriting the memory/document/agent envelope. Agent re-registration merges supplied metadata keys into the stored agent record, so the limit applies to each request value rather than the accumulated stored JSON.
+
 ## MCP Tools
 
 ### `memory_store`

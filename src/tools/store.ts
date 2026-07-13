@@ -5,19 +5,26 @@ import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../e
 import type { AuthContext } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
+import {
+  MEMORY_CONTENT_MAX_CHARS,
+  TAG_MAX_CHARS,
+  TAG_MAX_COUNT,
+  TEXT_FIELD_MAX_CHARS,
+  metadataSchema,
+} from '../http-limits.js';
 
 export const storeSchema = z.object({
-  content: z.string().min(1).max(100000),
-  namespace: z.string().default('shared'),
-  source: z.string().optional(),
-  tags: z.array(z.string()).default([]),
-  metadata: z.record(z.unknown()).default({}),
+  content: z.string().min(1).max(MEMORY_CONTENT_MAX_CHARS),
+  namespace: z.string().min(1).max(TEXT_FIELD_MAX_CHARS).default('shared'),
+  source: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  tags: z.array(z.string().max(TAG_MAX_CHARS)).max(TAG_MAX_COUNT).default([]),
+  metadata: metadataSchema.default({}),
   access_level: z.enum(['normal', 'sensitive', 'secret']).default('normal'),
-  agent_name: z.string().optional(),
-  agent_type: z.string().optional(),
-  agent_model: z.string().optional(),
-  agent_runtime: z.string().optional(),
-  session_id: z.string().optional(),
+  agent_name: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  agent_type: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  agent_model: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  agent_runtime: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  session_id: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
   idempotency_key: z.string().min(1).max(512).optional(),
 });
 

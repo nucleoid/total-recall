@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -7,7 +8,7 @@ import dotenv from 'dotenv';
 import { dbScopeFromAuth, shutdown } from './db.js';
 import { checkPermission, validateKey } from './auth.js';
 import type { AuthContext } from './types.js';
-import { registerTools } from './tools/register.js';
+import { agentRegisterSchema, registerTools } from './tools/register.js';
 import { memorySearch, searchSchema } from './tools/search.js';
 import { memoryStore, storeSchema } from './tools/store.js';
 import {
@@ -22,6 +23,7 @@ import { listTraces } from './traces.js';
 import { listAudit } from './audit.js';
 import { parsePublicMediaEventBatch, toTrustedRestMediaEvents, upsertMediaEvents, listMediaEvents } from './media.js';
 import { rollupPendingEvents } from './rollup.js';
+import { JSON_BODY_LIMIT_BYTES, validateMetadataInRequest } from './http-limits.js';
 
 dotenv.config();
 
@@ -185,8 +187,54 @@ function resolveOwnedSession(
   return record;
 }
 
-export const app = express();
-app.use(express.json());
+const METADATA_CONTRACT_REST_PATHS = new Set([
+  '/api/store',
+  '/api/store-document',
+  '/api/agents',
+]);
+const METADATA_CONTRACT_MCP_TOOLS = new Set([
+  'memory_store',
+  'memory_store_document',
+  'agent_register',
+]);
+
+function metadataContractPayloads(req: express.Request): unknown[] {
+  if (req.method !== 'POST') return [];
+  if (METADATA_CONTRACT_REST_PATHS.has(req.path)) return [req.body];
+  if (req.path !== '/mcp') return [];
+
+  const messages = Array.isArray(req.body) ? req.body : [req.body];
+  const payloads: unknown[] = [];
+  for (const message of messages) {
+    if (message === null || typeof message !== 'object') continue;
+    const params = (message as { params?: unknown }).params;
+    if (params === null || typeof params !== 'object') continue;
+    const { name, arguments: args } = params as { name?: unknown; arguments?: unknown };
+    if (typeof name === 'string' && METADATA_CONTRACT_MCP_TOOLS.has(name)) {
+      payloads.push(args);
+    }
+  }
+  return payloads;
+}
+
+export function createApp(): express.Express {
+const app = express();
+app.use((req, res, next) => {
+  const encoding = req.headers['content-encoding'];
+  if (encoding !== undefined && String(encoding).trim().toLowerCase() !== 'identity') {
+    res.status(415).json({ code: 'unsupported_content_encoding' });
+    return;
+  }
+  next();
+});
+app.use(express.json({ limit: JSON_BODY_LIMIT_BYTES, inflate: false }));
+app.use((req, res, next) => {
+  if (metadataContractPayloads(req).some((payload) => !validateMetadataInRequest(payload))) {
+    res.status(400).json({ code: 'invalid_metadata' });
+    return;
+  }
+  next();
+});
 
 // Health check
 app.get('/health', (_req, res) => {
@@ -450,19 +498,10 @@ app.post('/api/agents', async (req, res) => {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
     checkPermission(auth, 'write');
-    const { name, type, model, runtime, parent_agent_name, metadata } = req.body;
-    if (!name) {
-      res.status(400).json({ error: 'name is required' });
-      return;
-    }
+    const params = agentRegisterSchema.parse(req.body);
     const result = await upsertAgent({
-      name,
-      type,
-      model,
-      runtime,
-      parent_agent_name,
+      ...params,
       api_key_id: auth.keyId,
-      metadata,
     }, dbScopeFromAuth(auth));
     res.json(result);
   } catch (err: any) {
@@ -563,29 +602,50 @@ app.post('/api/media/rollup', async (req, res) => {
   }
 });
 
-if (process.env.NODE_ENV !== 'test') {
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const parserError = err as { type?: unknown; status?: unknown; body?: unknown };
+  if (parserError.type === 'entity.too.large' || parserError.status === 413) {
+    res.status(413).json({ code: 'payload_too_large' });
+    return;
+  }
+  if (parserError.type === 'entity.parse.failed' ||
+      (err instanceof SyntaxError && parserError.status === 400 && 'body' in parserError)) {
+    res.status(400).json({ code: 'invalid_json' });
+    return;
+  }
+  next(err);
+});
+
+return app;
+}
+
+export const app = createApp();
+
+async function closeAllSessions(): Promise<void> {
+  for (const [sid, record] of sessions) {
+    record.closing = true;
+    await record.transport.close();
+    sessions.delete(sid);
+  }
+  await shutdown();
+}
+
+const isDirectExecution = process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectExecution) {
   app.listen(PORT, () => {
     console.error(`[total-recall] HTTP server listening on port ${PORT}`);
   });
+
+  process.on('SIGINT', async () => {
+    console.error('[total-recall] Shutting down HTTP server...');
+    await closeAllSessions();
+    process.exit(0);
+  });
+
+  process.on('SIGTERM', async () => {
+    await closeAllSessions();
+    process.exit(0);
+  });
 }
-
-process.on('SIGINT', async () => {
-  console.error('[total-recall] Shutting down HTTP server...');
-  for (const [sid, record] of sessions) {
-    record.closing = true;
-    await record.transport.close();
-    sessions.delete(sid);
-  }
-  await shutdown();
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  for (const [sid, record] of sessions) {
-    record.closing = true;
-    await record.transport.close();
-    sessions.delete(sid);
-  }
-  await shutdown();
-  process.exit(0);
-});
