@@ -99,10 +99,31 @@ The OAuth device-code flow returns HTTP 400 from YouTube Music for browse / libr
 Each play becomes one `media_events` row with:
 
 - `service = 'ytmusic'`
-- `service_id = videoId` (deduplicates re-plays of the same track on the same timestamp)
+- `service_id = videoId` (deduplicates only the same tenant/video/stored timestamp tuple)
 - `event_type = 'play'`
 - `title`, `artist` (joined from `artists[]`), `album`, `duration_ms`, `played_at`
-- `metadata` with `video_id`, watch URL, thumbnail, like status, etc.
+- `metadata` with `video_id`, watch URL, thumbnail, like status, the source's
+  `played_raw` label, precision, absolute bucket identity, and bucket bounds.
+
+The connector favors completeness over suppressing possible fuzzy duplicates.
+A `videoId` is not a lifetime play identity: the same track in a later absolute
+bucket is retained as another play. Replaying the same video in the same bucket
+still resolves to the same database tuple and remains idempotent. For old rows
+that predate fuzzy-time metadata, dedupe is limited to the new event's absolute
+bucket bounds; moving labels such as `Today` or `This week` are never compared
+across syncs.
+
+To inspect recoverable provider history without changing credentials, events,
+memories, links, or sync state, run:
+
+```bash
+npm run ytmusic:preview-recovery
+```
+
+The preview reads the full retained YouTube Music history window and reports
+`would_insert`, `tuple_conflict`, and bounded `possible_legacy_duplicate`
+statuses. It never merges or deletes existing history. Suppressed plays outside
+the provider's retained window cannot be reconstructed automatically.
 
 YouTube Music often returns history positions as labels rather than exact
 instants. The connector accepts exact offset-aware ISO timestamps and these
@@ -127,9 +148,12 @@ English bucket labels:
 
 These timestamps are deterministic UTC representatives, not exact play times.
 The helper preserves the original label as `played_raw` and records
-`played_precision`, `played_bucket`, and `played_cursor_eligible` in event
-metadata so downstream users can audit the approximation and the sync cursor
-does not advance from future-dated representatives.
+`played_precision`, an absolute `played_bucket` (for example,
+`day:2026-07-12`), `played_bucket_start`, `played_bucket_end`, and
+`played_cursor_eligible` in event metadata. The representative timestamps above
+remain unchanged from the #17/#18 behavior; the added absolute identity and
+bounds make the approximation auditable without treating a moving label as an
+event identity.
 
 Sync intentionally does not pass `--since` to the Python helper and does not
 advance the generic `last_event_at` high-water mark. A new item in an
