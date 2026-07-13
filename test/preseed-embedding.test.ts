@@ -9,7 +9,7 @@ import { CANONICAL_EMBEDDING_DESCRIPTOR } from '../src/embedding.js';
 
 const scripts = ['chatgpt', 'claude', 'gemini', 'openclaw'];
 
-test('all preseed scripts use the shared embedder and fail closed behind the #9 identity writer', async () => {
+test('all preseed scripts use the shared canonical embedder and identity writer', async () => {
   for (const name of scripts) {
     const source = await readFile(new URL(`../scripts/preseed-${name}.ts`, import.meta.url), 'utf8');
     assert.match(source, /from ['"]\.\.\/src\/embedding\.js['"]/);
@@ -17,7 +17,7 @@ test('all preseed scripts use the shared embedder and fail closed behind the #9 
     assert.doesNotMatch(source, /\/api\/embed|nomic-embed-text|function getEmbedding|text\.slice\(0, 8000\)/);
     assert.match(source, /pathToFileURL/);
   }
-  assert.throws(() => requireEmbeddingIdentityWriter(), /#9.*identity.*schema/i);
+  assert.doesNotThrow(() => requireEmbeddingIdentityWriter());
 });
 
 test('canonical preseed batches embed exact persisted content and validate all vectors before writes', async () => {

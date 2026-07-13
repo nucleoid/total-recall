@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+
 dotenv.config();
 
 export const CANONICAL_EMBEDDING_DESCRIPTOR = Object.freeze({
@@ -7,6 +8,10 @@ export const CANONICAL_EMBEDDING_DESCRIPTOR = Object.freeze({
   dimensions: 768 as const,
 });
 
+export const ACTIVE_EMBEDDING_DESCRIPTOR = CANONICAL_EMBEDDING_DESCRIPTOR;
+
+export type EmbeddingDescriptor = typeof CANONICAL_EMBEDDING_DESCRIPTOR;
+
 export interface EmbeddingEnvironment {
   EMBEDDING_PROVIDER?: string;
   GEMINI_API_KEY?: string;
@@ -14,90 +19,91 @@ export interface EmbeddingEnvironment {
   EMBEDDING_DIMENSIONS?: string;
 }
 
-export interface EmbeddingProfile {
-  provider: typeof CANONICAL_EMBEDDING_DESCRIPTOR.provider;
-  model: typeof CANONICAL_EMBEDDING_DESCRIPTOR.model;
-  dimensions: typeof CANONICAL_EMBEDDING_DESCRIPTOR.dimensions;
+export interface EmbeddingProfile extends EmbeddingDescriptor {
   apiKey: string;
 }
 
 export function validateEmbeddingProfile(env: EmbeddingEnvironment): EmbeddingProfile {
   if (env.EMBEDDING_PROVIDER !== CANONICAL_EMBEDDING_DESCRIPTOR.provider) {
-    throw new Error('Embedding requires explicit EMBEDDING_PROVIDER=gemini; implicit Ollama fallback is disabled');
+    throw new Error('Embedding requires explicit EMBEDDING_PROVIDER=gemini; implicit provider fallback is disabled');
   }
   if (!env.GEMINI_API_KEY?.trim()) throw new Error('Embedding requires a nonblank GEMINI_API_KEY');
   if (env.EMBEDDING_MODEL !== CANONICAL_EMBEDDING_DESCRIPTOR.model) {
     throw new Error(`Embedding requires EMBEDDING_MODEL=${CANONICAL_EMBEDDING_DESCRIPTOR.model}`);
   }
-  if (env.EMBEDDING_DIMENSIONS !== String(CANONICAL_EMBEDDING_DESCRIPTOR.dimensions)) {
+  if (!/^\d+$/.test(env.EMBEDDING_DIMENSIONS ?? '')) {
     throw new Error(`Embedding requires EMBEDDING_DIMENSIONS=${CANONICAL_EMBEDDING_DESCRIPTOR.dimensions}`);
+  }
+  const dimensions = Number(env.EMBEDDING_DIMENSIONS);
+  if (!Number.isSafeInteger(dimensions) || dimensions !== CANONICAL_EMBEDDING_DESCRIPTOR.dimensions) {
+    throw new Error(`Embedding requires EMBEDDING_DIMENSIONS=${CANONICAL_EMBEDDING_DESCRIPTOR.dimensions}; dimension changes need a separate migration`);
   }
   return { ...CANONICAL_EMBEDDING_DESCRIPTOR, apiKey: env.GEMINI_API_KEY };
 }
 
-// Existing live readers/writers retain their import-time profile until #9 and #61 make
-// a coordinated provider cutover safe. Canonical preseed/repair entry points are gated.
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-004';
-const EMBEDDING_DIMENSIONS = parseInt(process.env.EMBEDDING_DIMENSIONS || '768', 10);
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'nomic-embed-text';
-const useGemini = !!GEMINI_API_KEY;
+const ACTIVE_EMBEDDING_PROFILE = validateEmbeddingProfile(process.env);
 
-if (useGemini) {
-  console.error(`[embedding] Using Gemini API (${EMBEDDING_MODEL}, ${EMBEDDING_DIMENSIONS}d)`);
-} else {
-  console.error(`[embedding] No GEMINI_API_KEY found, falling back to Ollama (${OLLAMA_MODEL})`);
+export function embeddingDescriptorParams(): [string, string, number] {
+  return [
+    ACTIVE_EMBEDDING_DESCRIPTOR.provider,
+    ACTIVE_EMBEDDING_DESCRIPTOR.model,
+    ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
+  ];
 }
 
-async function embedGemini(text: string): Promise<number[]> {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${GEMINI_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: `models/${EMBEDDING_MODEL}`,
-      content: { parts: [{ text }] },
-      outputDimensionality: EMBEDDING_DIMENSIONS,
-    }),
-  });
-  if (!res.ok) throw new Error(`Gemini embed failed (${res.status}): ${await res.text()}`);
-  const data = await res.json() as { embedding?: { values?: number[] } };
-  if (!data.embedding?.values) throw new Error('No embedding returned from Gemini');
-  return data.embedding.values;
-}
-
-async function embedOllama(texts: string[]): Promise<number[][]> {
-  const res = await fetch(`${OLLAMA_URL}/api/embed`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: OLLAMA_MODEL, input: texts.length === 1 ? texts[0] : texts }),
-  });
-  if (!res.ok) throw new Error(`Ollama embed failed (${res.status}): ${await res.text()}`);
-  const data = await res.json() as { embeddings?: number[][] };
-  if (!Array.isArray(data.embeddings) || data.embeddings.length === 0) {
-    throw new Error('No embedding returned from Ollama');
+export function validateEmbeddingVector(values: unknown, context: string): number[] {
+  if (!Array.isArray(values)) throw new Error(`${context} embedding response did not contain a vector array`);
+  if (values.length !== ACTIVE_EMBEDDING_DESCRIPTOR.dimensions) {
+    throw new Error(`${context} embedding length ${values.length} does not match ${ACTIVE_EMBEDDING_DESCRIPTOR.dimensions}`);
   }
-  return data.embeddings;
+  return values.map((value, index) => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new Error(`${context} embedding value at index ${index} must be finite`);
+    }
+    return value;
+  });
+}
+
+export function validateEmbeddingBatch(values: unknown, expectedCount: number): number[][] {
+  if (!Array.isArray(values)) throw new Error('Batch embedding response did not contain an embeddings array');
+  if (values.length !== expectedCount) {
+    throw new Error(`Batch embedding count ${values.length} does not match requested count ${expectedCount}`);
+  }
+  return values.map((value, index) => validateEmbeddingVector(value, `batch[${index}]`));
+}
+
+export function serializeEmbeddingVector(values: number[]): string {
+  return `[${validateEmbeddingVector(values, 'serialize').join(',')}]`;
+}
+
+async function requestGemini(path: 'embedContent' | 'batchEmbedContents', body: unknown): Promise<Response> {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${ACTIVE_EMBEDDING_PROFILE.model}:${path}?key=${ACTIVE_EMBEDDING_PROFILE.apiKey}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+  );
+  if (!response.ok) throw new Error(`Gemini ${path} failed (${response.status}): ${await response.text()}`);
+  return response;
 }
 
 export async function embed(text: string): Promise<number[]> {
-  return useGemini ? embedGemini(text) : (await embedOllama([text]))[0];
+  const response = await requestGemini('embedContent', {
+    model: `models/${ACTIVE_EMBEDDING_PROFILE.model}`,
+    content: { parts: [{ text }] },
+    outputDimensionality: ACTIVE_EMBEDDING_PROFILE.dimensions,
+  });
+  const data = await response.json() as { embedding?: { values?: unknown } };
+  return validateEmbeddingVector(data.embedding?.values, 'Gemini scalar');
 }
 
 export async function embedBatch(texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
-  if (!useGemini) return embedOllama(texts);
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:batchEmbedContents?key=${GEMINI_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ requests: texts.map(text => ({
-      model: `models/${EMBEDDING_MODEL}`,
+  const response = await requestGemini('batchEmbedContents', {
+    requests: texts.map(text => ({
+      model: `models/${ACTIVE_EMBEDDING_PROFILE.model}`,
       content: { parts: [{ text }] },
-      outputDimensionality: EMBEDDING_DIMENSIONS,
-    })) }),
+      outputDimensionality: ACTIVE_EMBEDDING_PROFILE.dimensions,
+    })),
   });
-  if (!res.ok) throw new Error(`Gemini batch embed failed (${res.status}): ${await res.text()}`);
-  const data = await res.json() as { embeddings?: Array<{ values?: number[] }> };
-  if (!Array.isArray(data.embeddings)) throw new Error('No embeddings returned from Gemini');
-  return data.embeddings.map(item => item.values ?? []);
+  const data = await response.json() as { embeddings?: Array<{ values?: unknown }> };
+  return validateEmbeddingBatch(data.embeddings?.map(item => item.values), texts.length);
 }

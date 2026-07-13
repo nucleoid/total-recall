@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
-import { embed } from '../embedding.js';
+import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
@@ -54,7 +54,7 @@ export async function memoryStore(
   );
 
   const embedding = await embed(params.content);
-  const vecStr = `[${embedding.join(',')}]`;
+  const vecStr = serializeEmbeddingVector(embedding);
 
   const values = [
     params.content,
@@ -67,13 +67,14 @@ export async function memoryStore(
     auth.keyId,
     agentId,
     params.session_id ?? null,
+    ...embeddingDescriptorParams(),
   ];
 
   if (!params.idempotency_key) {
     const res = await queryScoped(
       dbScopeFromAuth(auth),
-      `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id)
-       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions)
+       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING id, namespace`,
       values
     );
@@ -90,11 +91,14 @@ export async function memoryStore(
   try {
     res = await queryScoped(
       dbScopeFromAuth(auth),
-      `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, source_key)
-       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key)
+       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (source_key) DO UPDATE SET
          content = EXCLUDED.content,
          embedding = EXCLUDED.embedding,
+         embedding_provider = EXCLUDED.embedding_provider,
+         embedding_model = EXCLUDED.embedding_model,
+         embedding_dimensions = EXCLUDED.embedding_dimensions,
          source = EXCLUDED.source,
          namespace = EXCLUDED.namespace,
          tags = EXCLUDED.tags,
@@ -104,8 +108,8 @@ export async function memoryStore(
          agent_id = EXCLUDED.agent_id,
          session_id = EXCLUDED.session_id,
          updated_at = NOW()
-       WHERE memories.namespace = ANY($12::text[])
-         AND EXCLUDED.namespace = ANY($12::text[])
+       WHERE memories.namespace = ANY($15::text[])
+         AND EXCLUDED.namespace = ANY($15::text[])
        RETURNING id, namespace`,
       [...values, sourceKey, auth.namespaces]
     );

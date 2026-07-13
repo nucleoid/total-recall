@@ -30,7 +30,7 @@ export interface ApiKey {
 }
 
 export interface SearchResult extends Memory {
-  vec_score: number;
+  vec_score: number | null;
   text_score: number;
   final_score: number;
 }

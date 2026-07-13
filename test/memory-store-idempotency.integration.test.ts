@@ -21,10 +21,10 @@ class FakePool {
       if (/INSERT INTO agents/i.test(sql)) return result([{ id: `agent-${params[0]}` }]);
       if (/INSERT INTO memories/i.test(sql)) {
         const keyed = /source_key/i.test(sql);
-        const sourceKey = keyed ? String(params[10]) : null;
+        const sourceKey = keyed ? String(params[13]) : null;
         let row = sourceKey ? this.rows.find(r => r.source_key === sourceKey) : undefined;
         if (row) {
-          const allowedNamespaces = params[11] as string[] | undefined;
+          const allowedNamespaces = params[14] as string[] | undefined;
           if (allowedNamespaces && !allowedNamespaces.includes(row.namespace)) {
             const error = new Error('duplicate key value violates unique constraint "memories_source_key_key"') as Error & { code: string };
             error.code = '23505';
@@ -50,9 +50,12 @@ test('memory_store keyed retries upsert per API key while unkeyed calls append',
   const pool = new FakePool();
   setPoolForTesting(pool as unknown as pg.Pool);
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => new Response(JSON.stringify({ embeddings: [[0.1, 0.2]] }), { status: 200 })) as typeof fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ embedding: { values: Array(768).fill(0.1) } }), { status: 200 })) as typeof fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
-  process.env.GEMINI_API_KEY = '';
+  process.env.EMBEDDING_PROVIDER = 'gemini';
+  process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+  process.env.EMBEDDING_DIMENSIONS = '768';
+  process.env.GEMINI_API_KEY = 'test-only-key';
   const { memoryStore, storeSchema } = await import('../src/tools/store.js');
 
   assert.equal(storeSchema.parse({ content: 'x', idempotency_key: 'k' }).idempotency_key, 'k');
@@ -93,9 +96,12 @@ test('memory_store normalizes inaccessible keyed conflicts without leaking row e
   const pool = new FakePool();
   setPoolForTesting(pool as unknown as pg.Pool);
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => new Response(JSON.stringify({ embeddings: [[0.1, 0.2]] }), { status: 200 })) as typeof fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ embedding: { values: Array(768).fill(0.1) } }), { status: 200 })) as typeof fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
-  process.env.GEMINI_API_KEY = '';
+  process.env.EMBEDDING_PROVIDER = 'gemini';
+  process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+  process.env.EMBEDDING_DIMENSIONS = '768';
+  process.env.GEMINI_API_KEY = 'test-only-key';
   const { memoryStore, storeSchema } = await import('../src/tools/store.js');
 
   await memoryStore(storeSchema.parse({ content: 'original', namespace: 'private', idempotency_key: 'hidden' }), AUTH_A);

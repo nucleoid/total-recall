@@ -1,5 +1,5 @@
 import { withScopedClient, type DbScope } from './db.js';
-import { embed } from './embedding.js';
+import { embed, embeddingDescriptorParams } from './embedding.js';
 import { getRollupPendingEvents, linkEventToMemoryWithClient, type MediaEvent } from './media.js';
 import { checkPermission } from './auth.js';
 import type { AuthContext } from './types.js';
@@ -60,8 +60,8 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
         { namespaces: [MEDIA_NAMESPACE], keyId: auth.keyId },
         async (client) => {
           const insert = await client.query<{ id: string }>(
-            `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, event_at, client_id, agent_id)
-             VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9)
+            `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, event_at, client_id, agent_id, embedding_provider, embedding_model, embedding_dimensions)
+             VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              RETURNING id`,
             [
               summary,
@@ -73,6 +73,7 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
               event.played_at,
               event.client_id,
               event.agent_id,
+              ...embeddingDescriptorParams(),
             ]
           );
 

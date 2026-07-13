@@ -22,19 +22,22 @@ test('decay reports actual returned totals for personal, media, and future names
 test('reembed processes every selected namespace and reports concurrent insert drift', async () => {
   const updates: string[] = [];
   let inventoryCalls = 0;
+  let selectCalls = 0;
   const client = { async query(sql: string, values?: unknown[]) {
-    if (/SELECT id, content, namespace/i.test(sql)) return { rows: [
-      { id: 'p', content: 'personal secret', namespace: 'personal' },
-      { id: 'm', content: 'media secret', namespace: 'media' },
-      { id: 'f', content: 'future secret', namespace: 'future' },
-    ] };
-    if (/UPDATE public\.memories/i.test(sql)) { updates.push(String(values?.[1])); return { rows: [], rowCount: 1 }; }
+    if (/SELECT id, content, namespace/i.test(sql)) return { rows: selectCalls++ === 0 ? [
+      { id: 'p', content: 'personal secret', namespace: 'personal', updated_at: '2026-01-01 00:00:00.000001+00' },
+      { id: 'm', content: 'media secret', namespace: 'media', updated_at: '2026-01-01 00:00:00.000002+00' },
+      { id: 'f', content: 'future secret', namespace: 'future', updated_at: '2026-01-01 00:00:00.000003+00' },
+    ] : [] };
+    if (/UPDATE public\.memories/i.test(sql)) { updates.push(String(values?.[4])); return { rows: [], rowCount: 1 }; }
+    if (/COUNT\(\*\) FILTER/i.test(sql)) return { rows: [{ unknown_count: '0', legacy_count: '0' }] };
     if (/GROUP BY namespace/i.test(sql)) {
       inventoryCalls++;
       return { rows: inventoryCalls === 1
         ? [{ namespace: 'personal', count: '1' }, { namespace: 'media', count: '1' }, { namespace: 'future', count: '1' }]
         : [{ namespace: 'personal', count: '2' }, { namespace: 'media', count: '1' }, { namespace: 'future', count: '1' }] };
     }
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql.trim())) return { rows: [] };
     throw new Error(`unexpected SQL category`);
   } };
   const result = await reembedWithClient(client as never, async texts => texts.map(() => [0.1, 0.2]), { batchSize: 10, delayMs: 0, dimensions: 2 });
@@ -45,18 +48,25 @@ test('reembed processes every selected namespace and reports concurrent insert d
 
 test('reembed emits durable batch progress for long-running full-store operations', async () => {
   const progress: Array<{ processed: number; selected: number; succeeded: number; failed: number }> = [];
+  let selectCalls = 0;
+  const batches = [
+    [
+      { id: 'a', content: 'first', namespace: 'personal', updated_at: '2026-01-01 00:00:00.000001+00' },
+      { id: 'b', content: 'second', namespace: 'media', updated_at: '2026-01-01 00:00:00.000002+00' },
+    ],
+    [{ id: 'c', content: 'third', namespace: 'future', updated_at: '2026-01-01 00:00:00.000003+00' }],
+    [],
+  ];
   const client = { async query(sql: string) {
-    if (/SELECT id, content, namespace/i.test(sql)) return { rows: [
-      { id: 'a', content: 'first', namespace: 'personal' },
-      { id: 'b', content: 'second', namespace: 'media' },
-      { id: 'c', content: 'third', namespace: 'future' },
-    ] };
+    if (/SELECT id, content, namespace/i.test(sql)) return { rows: batches[selectCalls++] };
     if (/UPDATE public\.memories/i.test(sql)) return { rows: [], rowCount: 1 };
+    if (/COUNT\(\*\) FILTER/i.test(sql)) return { rows: [{ unknown_count: '0', legacy_count: '0' }] };
     if (/GROUP BY namespace/i.test(sql)) return { rows: [
       { namespace: 'future', count: '1' },
       { namespace: 'media', count: '1' },
       { namespace: 'personal', count: '1' },
     ] };
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql.trim())) return { rows: [] };
     throw new Error('unexpected SQL');
   } };
 
@@ -68,20 +78,23 @@ test('reembed emits durable batch progress for long-running full-store operation
   });
 
   assert.deepEqual(progress, [
-    { processed: 2, selected: 3, succeeded: 2, failed: 0 },
+    { processed: 2, selected: 2, succeeded: 2, failed: 0 },
     { processed: 3, selected: 3, succeeded: 3, failed: 0 },
   ]);
 });
 
 test('provider mismatch falls back safely, counts each selected row once, and sanitizes errors', async () => {
   const updates: string[] = [];
+  let selectCalls = 0;
   const client = { async query(sql: string, values?: unknown[]) {
-    if (/SELECT id, content, namespace/i.test(sql)) return { rows: [
-      { id: 'a', content: 'TOP SECRET A', namespace: 'media' },
-      { id: 'b', content: 'TOP SECRET B', namespace: 'future' },
-    ] };
-    if (/UPDATE public\.memories/i.test(sql)) { updates.push(String(values?.[1])); return { rows: [], rowCount: 1 }; }
+    if (/SELECT id, content, namespace/i.test(sql)) return { rows: selectCalls++ === 0 ? [
+      { id: 'a', content: 'TOP SECRET A', namespace: 'media', updated_at: '2026-01-01 00:00:00.000001+00' },
+      { id: 'b', content: 'TOP SECRET B', namespace: 'future', updated_at: '2026-01-01 00:00:00.000002+00' },
+    ] : [] };
+    if (/UPDATE public\.memories/i.test(sql)) { updates.push(String(values?.[4])); return { rows: [], rowCount: 1 }; }
+    if (/COUNT\(\*\) FILTER/i.test(sql)) return { rows: [{ unknown_count: '1', legacy_count: '0' }] };
     if (/GROUP BY namespace/i.test(sql)) return { rows: [{ namespace: 'media', count: '1' }, { namespace: 'future', count: '1' }] };
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql.trim())) return { rows: [] };
     throw new Error('unexpected SQL');
   } };
   const embed = async (texts: string[]) => {
@@ -104,6 +117,7 @@ test('live embedding import preserves process environment precedence over dotenv
 
 test('maintenance validates the canonical Gemini 768 profile without mutating environment', () => {
   const valid = {
+    EMBEDDING_PROVIDER: 'gemini',
     GEMINI_API_KEY: 'configured-key',
     EMBEDDING_MODEL: 'gemini-embedding-2-preview',
     EMBEDDING_DIMENSIONS: '768',
@@ -115,11 +129,13 @@ test('maintenance validates the canonical Gemini 768 profile without mutating en
     dimensions: 768,
   });
   assert.deepEqual(valid, {
+    EMBEDDING_PROVIDER: 'gemini',
     GEMINI_API_KEY: 'configured-key',
     EMBEDDING_MODEL: 'gemini-embedding-2-preview',
     EMBEDDING_DIMENSIONS: '768',
   });
   assert.throws(() => validateMaintenanceEmbeddingProfile({
+    EMBEDDING_PROVIDER: 'gemini',
     EMBEDDING_MODEL: 'gemini-embedding-2-preview',
     EMBEDDING_DIMENSIONS: '768',
   }), /Gemini.*GEMINI_API_KEY/i);
@@ -139,9 +155,9 @@ test('reembed uses the validated maintenance embedding client rather than the li
   assert.match(source, /validateMaintenanceEmbeddingProfile/);
 });
 
-test('runbook supersedes unsafe full-store retries with the mixed-vector prerequisite gate', async () => {
+test('runbook supersedes unsafe full-store retries with identity-aware scoped repair', async () => {
   const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
-  assert.match(readme, /reembed[^.]*gated|gated[^.]*reembed/i);
-  assert.match(readme, /#9[^.]*#61/i);
-  assert.doesNotMatch(readme, /re-embeds the full store|full-store re-embedding/i);
+  assert.match(readme, /npm run reembed/i);
+  assert.match(readme, /identity-aware readers/i);
+  assert.match(readme, /unknown_count[^.]*legacy_count/i);
 });

@@ -210,7 +210,7 @@ function installEmbeddingMock(failAt?: number): { calls: () => number } {
     if (failAt === calls) {
       return new Response('embedding failed', { status: 500 });
     }
-    return new Response(JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }), {
+    return new Response(JSON.stringify({ embedding: { values: Array(768).fill(0.1) } }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -219,7 +219,10 @@ function installEmbeddingMock(failAt?: number): { calls: () => number } {
 }
 
 async function loadStoreDocument() {
-  process.env.GEMINI_API_KEY = '';
+  process.env.EMBEDDING_PROVIDER = 'gemini';
+  process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+  process.env.EMBEDDING_DIMENSIONS = '768';
+  process.env.GEMINI_API_KEY = 'test-only-key';
   return import('../src/tools/store-document.js');
 }
 
@@ -257,7 +260,7 @@ test('embed failure at chunk 7 opens no database transaction', async () => {
         tags: [],
         source: 'manual',
       }, AUTH_A),
-    /embed failed/
+    /embed.*failed/i
   );
 
   assert.equal(pool.clients.length, 0);
@@ -269,7 +272,7 @@ test('malformed provider vectors are reported as provider failures, not invalid 
   const pool = new FakePool();
   setPoolForTesting(pool as unknown as pg.Pool);
   globalThis.fetch = (async () => new Response(
-    JSON.stringify({ embeddings: [[]] }),
+    JSON.stringify({ embedding: { values: [] } }),
     { status: 200, headers: { 'content-type': 'application/json' } }
   )) as typeof fetch;
   const { memoryStoreDocument } = await loadStoreDocument();
@@ -278,7 +281,7 @@ test('malformed provider vectors are reported as provider failures, not invalid 
     () => memoryStoreDocument({
       title: 'doc', content: 'one chunk', namespace: 'shared', tags: [], source: 'manual',
     }, AUTH_A),
-    /^Error: Embedding provider returned an invalid vector for chunk 0$/
+    /Gemini scalar embedding length 0 does not match 768/
   );
   assert.equal(pool.clients.length, 0);
 });

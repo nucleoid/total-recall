@@ -33,6 +33,13 @@ test('maintenance URL keeps #35 aliases and identifies the exact runtime DATABAS
     connectionString: encoded,
     source: 'DATABASE_URL',
   });
+  assert.deepEqual(resolveMaintenanceDatabaseConfig({
+    REEMBED_DATABASE_URL: 'postgres://reembed/only',
+    MAINTENANCE_DATABASE_URL: 'postgres://maintenance/shared',
+  }), {
+    connectionString: 'postgres://maintenance/shared',
+    source: 'MAINTENANCE_DATABASE_URL',
+  }, 'shared maintenance commands must ignore the reembed-only override');
 });
 
 test('missing or blank maintenance configuration fails before client construction without leaking values', async () => {
@@ -67,7 +74,14 @@ test('process DATABASE_URL wins over dotenv before and after importing live embe
   `;
   const result = spawnSync(process.execPath, ['--import', import.meta.resolve('tsx'), '--input-type=module', '--eval', script], {
     cwd: directory,
-    env: { ...process.env, DATABASE_URL: 'postgres://process/selected' },
+    env: {
+      ...process.env,
+      DATABASE_URL: 'postgres://process/selected',
+      EMBEDDING_PROVIDER: 'gemini',
+      EMBEDDING_MODEL: 'gemini-embedding-2-preview',
+      EMBEDDING_DIMENSIONS: '768',
+      GEMINI_API_KEY: 'test-only-key',
+    },
     encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr);
@@ -134,7 +148,7 @@ test('DATABASE_URL fallback completes the all-row capability gate before invokin
   assert.equal(ended, 1);
 });
 
-test('operator configuration and runbook document audited, gated mixed-aware reembedding', async () => {
+test('operator configuration and runbook document audited mixed-aware reembedding', async () => {
   const envExample = await readFile(new URL('../.env.example', import.meta.url), 'utf8');
   assert.match(envExample, /DATABASE_URL=/);
   assert.match(envExample, /# MAINTENANCE_DATABASE_URL=/);
@@ -146,8 +160,8 @@ test('operator configuration and runbook document audited, gated mixed-aware ree
   assert.match(readme, /current_database\(\).*current_user/is);
   assert.match(readme, /MAINTENANCE_DATABASE_URL/);
   assert.match(readme, /BYPASSRLS/);
-  assert.match(readme, /reembed[^.]*gated|gated[^.]*reembed/i);
+  assert.match(readme, /npm run reembed/i);
   assert.match(readme, /GEMINI_API_KEY[^.]*EMBEDDING_MODEL[^.]*EMBEDDING_DIMENSIONS/is);
   assert.match(readme, /audit configuration/i);
-  assert.match(readme, /#9[^.]*#61/i);
+  assert.match(readme, /023_embedding_identity\.sql[^.]*identity-aware readers/is);
 });

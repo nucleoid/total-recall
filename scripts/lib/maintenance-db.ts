@@ -1,6 +1,7 @@
 import pg from 'pg';
 
 export interface MaintenanceEnvironment {
+  REEMBED_DATABASE_URL?: string;
   MAINTENANCE_DATABASE_URL?: string;
   MIGRATION_DATABASE_URL?: string;
   OWNER_DATABASE_URL?: string;
@@ -29,11 +30,19 @@ export interface MaintenanceDatabaseConfig {
   source: MaintenanceDatabaseSource;
 }
 
+export interface MaintenanceDatabaseOptions {
+  allowReembedOverride?: boolean;
+}
+
 /** Resolve owner-capable operator configuration without normalizing or exposing it. */
 export function resolveMaintenanceDatabaseConfig(
   env: MaintenanceEnvironment,
   warn: (message: string) => void = console.warn,
+  options: MaintenanceDatabaseOptions = {},
 ): MaintenanceDatabaseConfig {
+  if (options.allowReembedOverride && env.REEMBED_DATABASE_URL?.trim()) {
+    return { connectionString: env.REEMBED_DATABASE_URL, source: 'REEMBED_DATABASE_URL' };
+  }
   if (env.MAINTENANCE_DATABASE_URL?.trim()) return { connectionString: env.MAINTENANCE_DATABASE_URL, source: 'MAINTENANCE_DATABASE_URL' };
   if (env.MIGRATION_DATABASE_URL?.trim()) return { connectionString: env.MIGRATION_DATABASE_URL, source: 'MIGRATION_DATABASE_URL' };
   if (env.OWNER_DATABASE_URL?.trim()) {
@@ -88,8 +97,9 @@ export type MaintenanceClientFactory = (connectionString: string) => pg.Client;
 export async function connectMaintenanceClient(
   env: MaintenanceEnvironment = process.env,
   createClient: MaintenanceClientFactory = connectionString => new pg.Client({ connectionString }),
+  options: MaintenanceDatabaseOptions = {},
 ): Promise<{ client: pg.Client; identity: MaintenanceIdentity; source: MaintenanceDatabaseSource }> {
-  const { connectionString, source } = resolveMaintenanceDatabaseConfig(env);
+  const { connectionString, source } = resolveMaintenanceDatabaseConfig(env, console.warn, options);
   const client = createClient(connectionString);
   try {
     await client.connect();
@@ -105,8 +115,9 @@ export async function withMaintenanceClient<T>(
   env: MaintenanceEnvironment,
   operation: (client: pg.Client, identity: MaintenanceIdentity, source: MaintenanceDatabaseSource) => Promise<T>,
   createClient?: MaintenanceClientFactory,
+  options: MaintenanceDatabaseOptions = {},
 ): Promise<T> {
-  const { client, identity, source } = await connectMaintenanceClient(env, createClient);
+  const { client, identity, source } = await connectMaintenanceClient(env, createClient, options);
   try {
     return await operation(client, identity, source);
   } finally {

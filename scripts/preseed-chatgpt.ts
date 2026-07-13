@@ -228,7 +228,7 @@ export async function commitChunkBatch(
   const prepared = await prepareCanonicalEmbeddingBatch(unique.map(chunk => chunk.content), embedder);
   const values: unknown[] = [];
   const rows = unique.map((chunk, index) => {
-    const base = index * 8;
+    const base = index * 11;
     values.push(
       chunk.content,
       `[${prepared.embeddings[index].join(',')}]`,
@@ -238,10 +238,13 @@ export async function commitChunkBatch(
       chunk.metadata,
       chunk.sourceKey,
       chunk.createdAt,
+      prepared.descriptor.provider,
+      prepared.descriptor.model,
+      prepared.descriptor.dimensions,
     );
-    return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, 'preseed-chatgpt', $${base + 7}, $${base + 8})`;
+    return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, 'preseed-chatgpt', $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11})`;
   });
-  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at)\nVALUES ${rows.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET\n  content = EXCLUDED.content,\n  embedding = EXCLUDED.embedding,\n  created_at = EXCLUDED.created_at,\n  updated_at = NOW()`;
+  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at, embedding_provider, embedding_model, embedding_dimensions)\nVALUES ${rows.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET\n  content = EXCLUDED.content,\n  embedding = EXCLUDED.embedding,\n  embedding_provider = EXCLUDED.embedding_provider,\n  embedding_model = EXCLUDED.embedding_model,\n  embedding_dimensions = EXCLUDED.embedding_dimensions,\n  created_at = EXCLUDED.created_at,\n  updated_at = NOW()`;
 
   let began = false;
   try {

@@ -6,7 +6,7 @@ Universal AI memory system. Postgres/pgvector backend, MCP server interface, API
 ## Stack
 - **Runtime:** Node.js + TypeScript
 - **Database:** PostgreSQL 16 + pgvector (HNSW)
-- **Embedding:** nomic-embed-text (768d) via Ollama (localhost:11434)
+- **Embedding:** Gemini `gemini-embedding-2-preview` (768d), explicitly configured
 - **Protocol:** MCP (Model Context Protocol) over stdio
 - **Auth:** API key → namespace ACL mapping
 
@@ -23,6 +23,9 @@ CREATE TABLE memories (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   content TEXT NOT NULL,
   embedding VECTOR(768),
+  embedding_provider TEXT,
+  embedding_model TEXT,
+  embedding_dimensions INTEGER,
   source TEXT NOT NULL,
   namespace TEXT NOT NULL DEFAULT 'shared',
   tags TEXT[] DEFAULT '{}',
@@ -112,10 +115,11 @@ Get usage statistics.
 - namespace?: string
 
 ## Embedding Pipeline
-- Ollama API: POST http://localhost:11434/api/embed
-- Model: nomic-embed-text
-- Returns 768-dimensional vector
-- Batch support for bulk ingestion
+- Gemini API: `embedContent` / `batchEmbedContents`
+- Model: `gemini-embedding-2-preview`, output dimensionality 768
+- Explicit provider/model/dimensions validation; no credential-driven fallback
+- Scalar and batch response cardinality, dimension, and finite-number validation
+- Vector and complete descriptor are written atomically
 
 ## Hybrid Search Query
 ```sql
@@ -126,6 +130,9 @@ WITH vector_results AS (
     1 - (embedding <=> $1) AS vec_score
   FROM memories
   WHERE namespace = ANY($2)
+    AND embedding_provider = 'gemini'
+    AND embedding_model = 'gemini-embedding-2-preview'
+    AND embedding_dimensions = 768
   ORDER BY embedding <=> $1
   LIMIT 50
 ),
@@ -173,7 +180,7 @@ total-recall/
 ```
 
 ## Environment Variables
-The canonical variables below are for the currently gated preseed/repair commands. Live readers and writers still select Ollama when no Gemini key is present until #9 identity storage and #61 mixed-aware readers permit a coordinated cutover.
+The canonical embedding variables are mandatory for every runtime, watcher, preseed, and re-embedding command. Missing or mismatched values fail before embedding work; no provider is inferred from credential presence.
 
 ```
 # Runtime and preseed app role; owner migration credentials are separate.
@@ -190,6 +197,8 @@ GEMINI_API_KEY=your-gemini-api-key-here
 EMBEDDING_MODEL=gemini-embedding-2-preview
 EMBEDDING_DIMENSIONS=768
 HNSW_EF_SEARCH=200
+# Optional one-command owner/BYPASSRLS override for npm run reembed:
+REEMBED_DATABASE_URL=postgresql://<owner-role>:<owner-password>@localhost:5432/<database>
 ```
 
 ## Build & Run
@@ -208,7 +217,7 @@ Schema migrations use only owner-capable `MIGRATION_DATABASE_URL`; runtime servi
 Migration `009_api_key_access_ceiling.sql` backfills existing `api_keys.max_access_level` values to `secret` to preserve upgraded installations, then sets the default for newly created keys to `normal`. Use `--max-access-level sensitive` or `--max-access-level secret` only for clients that should read and write higher-classification memories.
 
 ## Preseed Import Safety
-After the #9/#61 gate opens, preseed commands use `DATABASE_URL` and reject any superuser,
+After migration 023 and identity-aware readers are deployed, preseed commands use `DATABASE_URL` and reject any superuser,
 `BYPASSRLS` identity, or owner of `memories` before reading exports. They embed bounded groups
 before beginning a transaction, set only that group's `app.allowed_namespaces` transaction-locally,
 and roll back the complete group on failure. Owner credentials remain exclusive to migrations and
@@ -228,5 +237,6 @@ requires explicit `--memory-timestamp`; run time is never substituted. Claude us
 4. HNSW index with high ef_search for best real-time recall
 5. Access tracking (accessed_at, access_count) updated on search hits
 6. Embedding is explicitly Gemini `gemini-embedding-2-preview` at 768 dimensions; failures never fall back across vector spaces
-7. Preseed and repair remain fail-closed until #9 identity storage and #61 mixed-aware readers exist; unknown rows are text-only
-8. Migration completion requires zero active legacy/unknown rows before operators disable legacy querying
+7. Vector candidates require the exact stored provider/model/dimensions descriptor; unknown or unsupported rows are text-only
+8. Preseed and re-embedding atomically write vectors with the canonical descriptor, never metadata-only relabel uncertain rows
+9. Migration completion requires zero scoped active legacy/unknown rows before operators disable legacy querying
