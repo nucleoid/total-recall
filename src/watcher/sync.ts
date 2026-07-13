@@ -1,6 +1,13 @@
+import crypto from 'node:crypto';
 import type { ScopedClient } from '../db.js';
 import { withScopedClient } from '../db.js';
 import type { PathWork } from './queue.js';
+
+export const WATCHER_FINGERPRINT_VERSION = 'watcher:v2:';
+
+export function fingerprintContent(content: string): string {
+  return `${WATCHER_FINGERPRINT_VERSION}${crypto.createHash('sha256').update(content).digest('hex')}`;
+}
 
 export interface SyncChunk {
   content: string;
@@ -35,6 +42,21 @@ ON CONFLICT (source_key) DO UPDATE SET
   agent_id = EXCLUDED.agent_id,
   updated_at = NOW()
 `;
+
+const DELETE_STALE_SQL = `
+DELETE FROM memories
+WHERE client_id = 'file-sync'
+  AND metadata->>'file' = $1
+  AND (source_key IS NULL OR NOT (source_key = ANY($2::text[])))
+`;
+
+const DELETE_FILE_SQL = `
+DELETE FROM memories
+WHERE client_id = 'file-sync'
+  AND metadata->>'file' = $1
+`;
+
+const DELETE_STATE_SQL = `DELETE FROM sync_state WHERE file_path = $1`;
 
 const UPDATE_HASH_SQL = `
 INSERT INTO sync_state (file_path, content_hash, last_synced)
@@ -74,6 +96,21 @@ export async function commitIfCurrent<T>(input: CurrentCommit<T>): Promise<T | u
   return input.commit();
 }
 
+export interface ObservedFileDelete {
+  relPath: string;
+  namespace: string;
+}
+
+export async function deleteObservedFile(input: ObservedFileDelete): Promise<void> {
+  await withScopedClient(
+    { namespaces: [input.namespace], keyId: 'file-sync', isAdmin: false },
+    async (client) => {
+      await client.query(DELETE_FILE_SQL, [input.relPath]);
+      await client.query(DELETE_STATE_SQL, [input.relPath]);
+    }
+  );
+}
+
 export async function commitPreparedFile(input: FileSyncInput): Promise<void> {
   await withScopedClient(
     { namespaces: [input.namespace], keyId: 'file-sync', isAdmin: false },
@@ -98,5 +135,9 @@ export async function reconcilePreparedFile(
     ]);
   }
 
+  await client.query(DELETE_STALE_SQL, [
+    input.relPath,
+    input.chunks.map(chunk => chunk.sourceKey),
+  ]);
   await client.query(UPDATE_HASH_SQL, [input.relPath, input.hash]);
 }

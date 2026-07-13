@@ -1,7 +1,6 @@
 import chokidar from 'chokidar';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
 import {
   buildWatchSpecs,
   exclusionReason,
@@ -11,7 +10,13 @@ import {
 } from './watcher/paths.js';
 import { queryUnscoped, shutdown } from './db.js';
 import { embed } from './embedding.js';
-import { commitIfCurrent, commitPreparedFile, prepareChunks } from './watcher/sync.js';
+import {
+  commitIfCurrent,
+  commitPreparedFile,
+  deleteObservedFile,
+  fingerprintContent,
+  prepareChunks,
+} from './watcher/sync.js';
 import { PathWorkQueue, type PathWork } from './watcher/queue.js';
 import { shutdownWatcher } from './watcher/lifecycle.js';
 import { chunkMarkdown } from './watcher/chunking.js';
@@ -23,15 +28,6 @@ dotenv.config();
 const WORKSPACE = resolveWorkspaceRoot(process.env.OPENCLAW_WORKSPACE, fs.statSync);
 const WATCH_SPECS = buildWatchSpecs(WORKSPACE);
 
-function shouldExclude(filePath: string, relPath: string): boolean {
-  if (exclusionReason(relPath.split('/').join(path.sep))) return true;
-  try {
-    const stat = fs.statSync(filePath);
-    if (stat.size > 1_000_000) return true;
-  } catch { return true; }
-  return false;
-}
-
 let watcherAgentId: string | null = null;
 
 async function getStoredHash(filePath: string): Promise<string | null> {
@@ -41,7 +37,7 @@ async function getStoredHash(filePath: string): Promise<string | null> {
 
 function fingerprintFile(filePath: string): Promise<string | null> {
   return fs.promises.readFile(filePath, 'utf8')
-    .then((content) => crypto.createHash('sha256').update(content).digest('hex'))
+    .then(fingerprintContent)
     .catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null;
       throw error;
@@ -54,11 +50,34 @@ async function processFile(filePath: string, work: PathWork): Promise<void> {
 
   const identity = resolveWorkspaceFile(WORKSPACE, filePath);
   const { absolutePath, relativePath: relPath } = identity;
-  if (shouldExclude(absolutePath, relPath)) return;
+  if (exclusionReason(relPath.split('/').join(path.sep))) return;
 
-  const content = fs.readFileSync(absolutePath, 'utf-8');
+  const commitAbsence = () => commitIfCurrent({
+    filePath: absolutePath,
+    preparedFingerprint: null,
+    readFingerprint: fingerprintFile,
+    work,
+    commit: () => deleteObservedFile({ relPath, namespace: spec.namespace }),
+  });
+
+  try {
+    if (fs.statSync(absolutePath).size > 1_000_000) return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    await commitAbsence();
+    return;
+  }
+
+  let content: string;
+  try {
+    content = fs.readFileSync(absolutePath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    await commitAbsence();
+    return;
+  }
   if (content.includes('DELIVERABLE')) return;
-  const hash = crypto.createHash('sha256').update(content).digest('hex');
+  const hash = fingerprintContent(content);
 
   const storedHash = await getStoredHash(relPath);
   if (storedHash === hash) return;
