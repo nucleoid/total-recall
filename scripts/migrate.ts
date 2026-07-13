@@ -66,6 +66,14 @@ export function loadMigrationInventory(migrationsDir: string): MigrationFile[] {
   return migrations.sort((left, right) => left.number - right.number);
 }
 
+export function resolveMigrationDatabaseUrl(env: Record<string, string | undefined>): string {
+  const connectionString = env.MIGRATION_DATABASE_URL?.trim();
+  if (!connectionString) {
+    throw new Error('MIGRATION_DATABASE_URL is required; DATABASE_URL is runtime-only and is never used for migrations');
+  }
+  return connectionString;
+}
+
 export function parseMigrationLockTimeout(value: string | undefined): number {
   if (value === undefined) return DEFAULT_LOCK_TIMEOUT_MS;
   if (!/^\d+$/.test(value)) {
@@ -98,8 +106,7 @@ async function rejectRuntimeMigrationRole(client: pg.Client): Promise<void> {
 
   throw new Error(
     'total_recall_app is the runtime role and cannot run migrations. ' +
-      'Set MIGRATION_DATABASE_URL to the original schema owner or a superuser. ' +
-      'DATABASE_URL fallback only works when DATABASE_URL is an owner-capable migration connection.'
+      'Set MIGRATION_DATABASE_URL to the original schema owner or a superuser.'
   );
 }
 
@@ -174,14 +181,26 @@ async function assertCanGrantForMigration(
   throw new Error(
     `Migration ${file} (${version}) cannot grant required privileges as role "${role.currentUser}". ` +
       `Missing grant authority for: ${missing.join('; ')}. ` +
-      'Set MIGRATION_DATABASE_URL to the original schema owner or a superuser before running npm run migrate. ' +
-      'DATABASE_URL fallback only works when DATABASE_URL is an owner-capable migration connection.'
+      'Set MIGRATION_DATABASE_URL to the original schema owner or a superuser before running npm run migrate.'
   );
 }
 
 const MIGRATION_LOCK_KEY_1 = 1_414_676_812;
 const MIGRATION_LOCK_KEY_2 = 1_296_650_834;
 const CHECKSUM_PATTERN = /^[0-9a-f]{64}$/;
+const COMPATIBLE_APPLIED_CHECKSUMS: Readonly<Record<string, ReadonlySet<string>>> = {
+  // The only mutable-history exception: #49 sanitizes 003 for fresh installs while
+  // migration 020 carries the capability change for already-applied databases.
+  // Accept exact LF and CRLF hashes from the pre-sanitization migration.
+  '003_rls': new Set([
+    '453417ae58829f930186b2a034b592db3df644a4045e5afcd87a67c4e0d6b615',
+    '3fc2cdc1814ab6da989106733a2b78da175263bb66a747fdc49800a80395aac5',
+  ]),
+};
+
+export function isCompatibleAppliedChecksum(version: string, checksum: string): boolean {
+  return COMPATIBLE_APPLIED_CHECKSUMS[version]?.has(checksum) === true;
+}
 
 export type MigrationRunOptions = {
   lockTimeoutMs: number;
@@ -248,6 +267,7 @@ export async function runMigrations(
     const applied = await client.query<LedgerRow>(
       'SELECT version, checksum FROM schema_migrations ORDER BY version',
     );
+    const compatibleTransitions: LedgerRow[] = [];
     for (const row of applied.rows) {
       const migration = byVersion.get(row.version);
       if (!migration) {
@@ -257,7 +277,11 @@ export async function runMigrations(
         throw new Error(`Malformed checksum for applied migration ${row.version}`);
       }
       if (row.checksum !== null && row.checksum !== migration.checksum) {
-        throw new Error(`Checksum mismatch for applied migration ${row.version}`);
+        if (isCompatibleAppliedChecksum(row.version, row.checksum)) {
+          compatibleTransitions.push(row);
+        } else {
+          throw new Error(`Checksum mismatch for applied migration ${row.version}`);
+        }
       }
     }
 
@@ -276,18 +300,26 @@ export async function runMigrations(
     }
 
     const unbaselined = applied.rows.filter(row => row.checksum === null);
-    if (unbaselined.length > 0) {
-      options.warn?.(
-        'WARNING: baselining legacy migration checksums from this reviewed checkout; ' +
-          'PostgreSQL cannot detect edits made before this baseline. Verify this immutable release first.',
-      );
+    if (unbaselined.length > 0 || compatibleTransitions.length > 0) {
+      if (unbaselined.length > 0) {
+        options.warn?.(
+          'WARNING: baselining legacy migration checksums from this reviewed checkout; ' +
+            'PostgreSQL cannot detect edits made before this baseline. Verify this immutable release first.',
+        );
+      }
+      if (compatibleTransitions.length > 0) {
+        options.warn?.(
+          'WARNING: recording the reviewed #49 sanitization checksum transition for applied migration 003_rls; ' +
+            'existing schema changes are delivered by forward migration 020_memory_delete_policy.',
+        );
+      }
       await client.query('BEGIN');
       try {
-        for (const row of unbaselined) {
+        for (const row of [...unbaselined, ...compatibleTransitions]) {
           const migration = byVersion.get(row.version)!;
           const update = await client.query(
-            'UPDATE schema_migrations SET checksum = $1 WHERE version = $2 AND checksum IS NULL',
-            [migration.checksum, row.version],
+            'UPDATE schema_migrations SET checksum = $1 WHERE version = $2 AND checksum IS NOT DISTINCT FROM $3',
+            [migration.checksum, row.version, row.checksum],
           );
           if (update.rowCount !== 1) {
             throw new Error(`Migration ledger changed while baselining ${row.version}`);
@@ -353,10 +385,7 @@ export async function runMigrations(
 }
 
 async function migrate() {
-  const connectionString = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL;
-  if (!connectionString) {
-    throw new Error('MIGRATION_DATABASE_URL or DATABASE_URL must be set');
-  }
+  const connectionString = resolveMigrationDatabaseUrl(process.env);
 
   const migrations = loadMigrationInventory(join(__dirname, '..', 'migrations'));
   const lockTimeoutMs = parseMigrationLockTimeout(process.env.MIGRATION_LOCK_TIMEOUT_MS);

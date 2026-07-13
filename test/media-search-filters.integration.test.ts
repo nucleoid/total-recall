@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test, { after, before, beforeEach } from 'node:test';
 import pg from 'pg';
 import type { AuthContext, SearchResult } from '../src/types.js';
+import { provisionDatabase } from '../scripts/provision-db.js';
 
 const API_KEY_ID = '11111111-1111-4111-8111-111111111111';
 const TEST_SOURCE_PREFIX = 'media-search-filter-test';
@@ -127,6 +128,10 @@ async function applyMigrations(url: string): Promise<void> {
   await client.connect();
   try {
     await client.query('CREATE EXTENSION IF NOT EXISTS vector');
+    await provisionDatabase(client, {
+      appPassword: decodeURIComponent(new URL(appRoleUrl(url)).password),
+      rotateAppPassword: false,
+    });
     const files = readdirSync('migrations').filter((file) => file.endsWith('.sql')).sort();
     for (const file of files) {
       await client.query(readFileSync(join('migrations', file), 'utf8'));

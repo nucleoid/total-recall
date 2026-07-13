@@ -8,6 +8,7 @@ import pg from 'pg';
 import { setPoolForTesting, shutdown } from '../../src/db.js';
 import type { AuthContext } from '../../src/types.js';
 import { createDocumentIdempotencyIndex } from '../../scripts/document-idempotency-index.js';
+import { provisionDatabase } from '../../scripts/provision-db.js';
 
 const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const migrationsDir = join(repoRoot, 'migrations');
@@ -304,6 +305,10 @@ async function resetDatabase() {
   try {
     await owner.query('CREATE EXTENSION IF NOT EXISTS vector');
     await owner.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+    await provisionDatabase(owner, {
+      appPassword: decodeURIComponent(new URL(appUrl!).password),
+      rotateAppPassword: false,
+    });
   } finally {
     await owner.end();
   }

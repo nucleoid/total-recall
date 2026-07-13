@@ -1,12 +1,6 @@
--- Create app role that the MCP server will use
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'total_recall_app') THEN
-    CREATE ROLE total_recall_app LOGIN PASSWORD 'total_recall_app_dev';
-  END IF;
-END $$;
-
--- Grant necessary permissions
-GRANT CONNECT ON DATABASE total_recall TO total_recall_app;
+-- The owner-run provisioning command creates the fixed app role and grants
+-- database CONNECT before migrations are applied.
+-- Grant necessary schema and table permissions.
 GRANT USAGE ON SCHEMA public TO total_recall_app;
 GRANT SELECT, INSERT, UPDATE ON memories TO total_recall_app;
 GRANT SELECT, INSERT, UPDATE ON documents TO total_recall_app;

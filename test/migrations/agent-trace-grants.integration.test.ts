@@ -9,6 +9,7 @@ import { resolveAgent, listAgents } from '../../src/agents.js';
 import { queryScoped, shutdown, type DbScope } from '../../src/db.js';
 import { logTrace, listTraces } from '../../src/traces.js';
 import type { AuthContext } from '../../src/types.js';
+import { provisionDatabase } from '../../scripts/provision-db.js';
 
 const execFile = promisify(execFileCallback);
 
@@ -56,6 +57,14 @@ async function withAppClient<T>(fn: (client: pg.Client) => Promise<T>): Promise<
   }
 }
 
+async function provisionTestAppRole(): Promise<void> {
+  const password = decodeURIComponent(new URL(appDatabaseUrl!).password);
+  await withOwnerClient(client => provisionDatabase(client, {
+    appPassword: password,
+    rotateAppPassword: false,
+  }));
+}
+
 async function resetScratchDatabase(): Promise<void> {
   await ensureDatabase();
   await shutdown();
@@ -74,6 +83,7 @@ async function resetScratchDatabase(): Promise<void> {
       await client.query('CREATE EXTENSION IF NOT EXISTS vector');
       await client.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
     });
+    await provisionTestAppRole();
     return;
   }
 
@@ -88,6 +98,7 @@ async function resetScratchDatabase(): Promise<void> {
     await client.query('CREATE EXTENSION IF NOT EXISTS vector');
     await client.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
   });
+  await provisionTestAppRole();
 }
 
 async function ensureDatabase(): Promise<void> {
@@ -234,6 +245,26 @@ async function assertRequiredPrivileges(): Promise<void> {
 }
 
 async function assertRuntimeRoleIsScoped(): Promise<void> {
+  await withOwnerClient(async (client) => {
+    await client.query("DELETE FROM memories WHERE source = 'issue-49-delete-policy-test'");
+    await client.query(`
+      INSERT INTO memories (content, source, namespace, client_id)
+      VALUES
+        ('deletable', 'issue-49-delete-policy-test', 'shared', 'issue-49'),
+        ('isolated', 'issue-49-delete-policy-test', 'private', 'issue-49')
+    `);
+    const ownership = await client.query<{ owned: number }>(`
+      SELECT count(*)::int AS owned
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_roles r ON r.oid = c.relowner
+      WHERE n.nspname = 'public'
+        AND c.relkind IN ('r', 'p')
+        AND r.rolname = 'total_recall_app'
+    `);
+    assert.equal(ownership.rows[0].owned, 0);
+  });
+
   await withAppClient(async (client) => {
     const settings = await client.query<{ row_security: string; current_user: string; bypasses_rls: boolean }>(`
       SELECT
@@ -246,6 +277,29 @@ async function assertRuntimeRoleIsScoped(): Promise<void> {
     assert.equal(settings.rows[0].row_security, 'on');
     assert.equal(settings.rows[0].current_user, 'total_recall_app');
     assert.equal(settings.rows[0].bypasses_rls, false);
+    assert.equal((await client.query("SELECT has_table_privilege(current_user, 'memories', 'DELETE') AS allowed")).rows[0].allowed, true);
+    assert.equal((await client.query("SELECT count(*)::int AS count FROM pg_policies WHERE schemaname = 'public' AND tablename = 'memories' AND policyname = 'namespace_delete'")).rows[0].count, 1);
+    await assert.rejects(client.query('CREATE TABLE issue_49_forbidden_ddl (id int)'), /permission denied/i);
+
+    await client.query('BEGIN');
+    try {
+      await client.query("SELECT set_config('app.allowed_namespaces', $1, true)", [JSON.stringify(['shared'])]);
+      const deleted = await client.query<{ namespace: string }>(
+        "DELETE FROM memories WHERE source = 'issue-49-delete-policy-test' RETURNING namespace",
+      );
+      assert.deepEqual(deleted.rows, [{ namespace: 'shared' }]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    }
+  });
+
+  await withOwnerClient(async (client) => {
+    const remaining = await client.query<{ namespace: string }>(
+      "SELECT namespace FROM memories WHERE source = 'issue-49-delete-policy-test'",
+    );
+    assert.deepEqual(remaining.rows, [{ namespace: 'private' }]);
   });
 }
 
@@ -398,8 +452,8 @@ test('migration rejects runtime and non-owner roles before grant repair', async 
     DATABASE_URL: appDatabaseUrl,
     MIGRATION_DATABASE_URL: undefined,
   });
-  assert.match(appRoleFailure, /total_recall_app is the runtime role and cannot run migrations/);
-  assert.match(appRoleFailure, /Set MIGRATION_DATABASE_URL/);
+  assert.match(appRoleFailure, /MIGRATION_DATABASE_URL is required/);
+  assert.match(appRoleFailure, /DATABASE_URL is runtime-only and is never used for migrations/);
 
   await resetScratchDatabase();
   await applyMigrationsBefore008();
@@ -427,10 +481,10 @@ test('documented environment separates owner migrations from runtime app role', 
   const envExample = await readFile(join(process.cwd(), '.env.example'), 'utf8');
   const readme = await readFile(join(process.cwd(), 'README.md'), 'utf8');
 
-  assert.match(envExample, /^MIGRATION_DATABASE_URL=postgresql:\/\/total_recall:/m);
+  assert.match(envExample, /^MIGRATION_DATABASE_URL=postgresql:\/\/<owner-role>:/m);
   assert.match(envExample, /^DATABASE_URL=postgresql:\/\/total_recall_app:/m);
   assert.match(readme, /MIGRATION_DATABASE_URL/);
-  assert.match(readme, /fallback only works when DATABASE_URL is an owner-capable/);
+  assert.match(readme, /MIGRATION_DATABASE_URL is required.*no.*DATABASE_URL fallback/is);
   assert.match(readme, /DATABASE_URL=postgresql:\/\/total_recall_app:/);
   assert.match(readme, /Agent and trace listing endpoints are scoped to the authenticated API key/);
 });

@@ -104,12 +104,8 @@ List memories with filters (no vector search).
 - limit?: number (default 20)
 - offset?: number
 
-### memory_forget
-Delete memories by ID or filter.
-- ids?: string[]
-- namespace?: string
-- before?: string
-- tags?: string[]
+### memory_forget (planned; not currently registered)
+Issue #51 owns the public deletion lifecycle, tombstones, retention, purge behavior, and document invariants. Migration 020 supplies only an RLS-scoped table capability; this tool is not exposed by issue #49.
 
 ### memory_stats
 Get usage statistics.
@@ -180,9 +176,11 @@ total-recall/
 The canonical variables below are for the currently gated preseed/repair commands. Live readers and writers still select Ollama when no Gemini key is present until #9 identity storage and #61 mixed-aware readers permit a coordinated cutover.
 
 ```
-# Runtime and preseed app role; migration/maintenance credentials are separate.
-DATABASE_URL=postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall
-MIGRATION_DATABASE_URL=postgresql://total_recall:total_recall_dev@localhost:5432/total_recall
+# Runtime and preseed app role; owner migration credentials are separate.
+DATABASE_URL=postgresql://total_recall_app:<app-password>@localhost:5432/<database>
+MIGRATION_DATABASE_URL=postgresql://<owner-role>:<owner-password>@localhost:5432/<database>
+# One-shot provisioning/rotation input; never retain in runtime environments.
+APP_DATABASE_PASSWORD=<new-app-password>
 CLAUDE_IMPORTS_DIR=/absolute/path/to/claude-export
 OPENCLAW_WORKSPACE=/absolute/path/to/.openclaw/workspace
 OPENCLAW_CORTEX_CONTENT=/absolute/path/to/cortex/content
@@ -198,6 +196,8 @@ HNSW_EF_SEARCH=200
 ```bash
 npm install
 npm run build
+# Owner-only, before the first migration (add -- --rotate-app-password only for a coordinated rotation):
+npm run provision
 npm run migrate
 npm run create-key -- --name "openclaw" --namespaces "personal,work,shared" --max-access-level normal
 node dist/index.js

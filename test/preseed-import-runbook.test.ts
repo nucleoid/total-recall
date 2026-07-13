@@ -11,7 +11,7 @@ test('preseed runbook distinguishes app and owner credentials and documents Clau
     readFile(new URL('../scripts/preseed-openclaw.ts', import.meta.url), 'utf8'),
   ]);
   assert.match(env, /DATABASE_URL=postgresql:\/\/total_recall_app:/);
-  assert.match(env, /MIGRATION_DATABASE_URL=postgresql:\/\/total_recall:/);
+  assert.match(env, /MIGRATION_DATABASE_URL=postgresql:\/\/<owner-role>:/);
   for (const variable of ['CLAUDE_IMPORTS_DIR', 'OPENCLAW_WORKSPACE', 'OPENCLAW_CORTEX_CONTENT', 'OPENCLAW_SECOND_BRAIN']) {
     assert.match(env, new RegExp(variable));
     assert.match(readme, new RegExp(variable));

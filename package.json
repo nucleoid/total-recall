@@ -14,6 +14,7 @@
     "test:access-level:db": "tsx test/access-level.db.ts",
     "test:agent-tenancy": "tsx --test test/agent-tenancy.integration.test.ts",
     "start": "node dist/index.js",
+    "provision": "tsx scripts/provision-db.ts",
     "migrate": "tsx scripts/migrate.ts",
     "test:migrations": "tsx --test test/migrations/decay.integration.test.ts",
     "create-key": "tsx scripts/create-key.ts",

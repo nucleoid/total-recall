@@ -8,16 +8,32 @@ Every AI tool you use (OpenClaw, Cursor, Claude, work tools) operates in isolati
 
 ## Database Configuration
 
-Run migrations with a schema-owner connection and run the application with the scoped app role:
+Provision and migrate with a schema-owner connection, then run every application process with the scoped app role:
 
 ```bash
-MIGRATION_DATABASE_URL=postgresql://total_recall:total_recall_dev@localhost:5432/total_recall
-DATABASE_URL=postgresql://total_recall_app:total_recall_app_dev@localhost:5432/total_recall
+MIGRATION_DATABASE_URL=postgresql://<owner-role>:<owner-password>@localhost:5432/<database>
+APP_DATABASE_PASSWORD='<new-app-password>' npm run provision
+MIGRATION_DATABASE_URL=postgresql://<owner-role>:<owner-password>@localhost:5432/<database> npm run migrate
+DATABASE_URL=postgresql://total_recall_app:<app-password>@localhost:5432/<database>
 ```
 
-`npm run migrate` uses `MIGRATION_DATABASE_URL` when it is set. The fallback only works when DATABASE_URL is an owner-capable migration connection; the runtime `total_recall_app` role is rejected before migrations run. The MCP server and REST API use `DATABASE_URL`.
+MIGRATION_DATABASE_URL is required by both owner-only commands; there is no DATABASE_URL fallback. Keep the owner URL and one-shot `APP_DATABASE_PASSWORD` out of runtime/service environments. The MCP server, REST API, importers, watcher, connector syncs, rollup, and other DB-backed processes use only `DATABASE_URL`. Provisioning keeps the fixed `total_recall_app` role required by the migrations, discovers the connected database rather than assuming its name, and preserves an existing password unless `npm run provision -- --rotate-app-password` is explicitly requested.
 
 Recall queries set pgvector's transaction-local HNSW search breadth from `HNSW_EF_SEARCH`. The value must be a decimal integer from `1` to `1000`; when unset, empty, or whitespace-only, Total Recall uses `200`. Invalid non-blank values fail during startup before the MCP server or REST API starts accepting traffic.
+
+### Coordinated database password rotation
+
+Treat the formerly committed application-role password as compromised. Use one controlled, backed-up deployment window:
+
+1. Confirm a verified restorable database backup and inventory every DB-backed process.
+2. Prepare the new `DATABASE_URL` secret for every DB-backed process.
+3. With owner-only `MIGRATION_DATABASE_URL` and one-shot `APP_DATABASE_PASSWORD`, run `npm run provision -- --rotate-app-password`, then activate the updated service secrets in the same coordinated window.
+4. Run `npm run migrate` with `MIGRATION_DATABASE_URL`.
+5. Restart every DB-backed process; do not leave any process running with the old password.
+6. Verify RLS namespace isolation and application connectivity with the runtime app role.
+7. Remove the old secret only after verification. If credential rollback is needed, perform another controlled rotation rather than restoring the compromised password.
+
+This rotation changes only the PostgreSQL app-role password. Total Recall API keys remain unchanged, so it causes no API-key reauthentication or token replacement. After migration 020, `total_recall_app` holds live DELETE capability on `memories`, constrained by namespace RLS, ahead of the #51 consumer; this issue exposes no deletion tool or endpoint and #51 owns that lifecycle. There is no memory backfill or reindex, and no data is deleted by this rollout. The additive policy migration remains safe if application code is rolled back.
 
 ## Architecture
 
@@ -377,12 +393,12 @@ PostgreSQL + pgvector (upsert)
 Run all schema setup through the numbered SQL migrations:
 
 ```bash
-DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run migrate
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/<database> npm run migrate
 ```
 
-The migration connection must use a database owner or migration role that can create roles, grant privileges, alter tables, create functions, and manage indexes. The runtime application URL for `total_recall_app` is intentionally narrower and should not be used for DDL.
+`MIGRATION_DATABASE_URL` is mandatory and must use a database owner or migration role that can grant privileges, alter tables, create functions, and manage indexes. `DATABASE_URL` is runtime-only and is never a migration fallback. Provision `total_recall_app` before the first migration with `npm run provision`; the runtime role is intentionally narrower and must not receive DDL, superuser, ownership, or `BYPASSRLS` capability.
 
-Migration files are immutable after distribution. The runner records the SHA-256 of each file's exact bytes and stops before pending migrations if applied history is changed, missing, renamed, malformed, or ambiguous. On the first checksum-aware run, legacy ledger rows are baselined atomically from the reviewed checkout. This trust boundary cannot detect edits made before that baseline, so run it only from a reconciled, immutable release.
+Migration files are immutable after distribution. The runner records the SHA-256 of each file's exact bytes and stops before pending migrations if applied history is changed, missing, renamed, malformed, or ambiguous. On the first checksum-aware run, legacy ledger rows are baselined atomically from the reviewed checkout. This trust boundary cannot detect edits made before that baseline, so run it only from a reconciled, immutable release. The sole reviewed compatibility exception is the exact pre-#49 checksum of migration 003: the runner records its sanitized checkout checksum under the advisory lock, while migration 020 carries the DELETE grant/policy forward for databases where 003 was already applied. No other checksum drift is accepted.
 
 Migration runners serialize on a database-local advisory lock before reading or upgrading the ledger and hold it through the last migration. `MIGRATION_LOCK_TIMEOUT_MS` controls the bounded wait (default `30000`, accepted range `1`–`600000` milliseconds). A timeout makes no ledger or schema changes; increase it only when the expected migration duration justifies a longer deployment wait.
 

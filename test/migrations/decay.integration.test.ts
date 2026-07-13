@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import pg from 'pg';
 import { repairLastBoostedAt } from '../../scripts/repair-last-boosted-at.js';
+import { provisionDatabase } from '../../scripts/provision-db.js';
 
 const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const migrationsDir = join(repoRoot, 'migrations');
@@ -541,6 +542,10 @@ async function resetDatabase() {
     try {
       await owner.query('CREATE EXTENSION IF NOT EXISTS vector');
       await owner.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+      await provisionDatabase(owner, {
+        appPassword: decodeURIComponent(new URL(appUrl!).password),
+        rotateAppPassword: false,
+      });
     } finally {
       await owner.end();
     }
@@ -553,6 +558,10 @@ async function resetDatabase() {
     await client.query('CREATE SCHEMA public');
     await client.query('CREATE EXTENSION IF NOT EXISTS vector');
     await client.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+    await provisionDatabase(client, {
+      appPassword: decodeURIComponent(new URL(appUrl!).password),
+      rotateAppPassword: false,
+    });
   } finally {
     await client.end();
   }
