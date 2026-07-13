@@ -463,9 +463,9 @@ test('migration rejects runtime and non-owner roles before grant repair', async 
     DATABASE_URL: appDatabaseUrl,
     MIGRATION_DATABASE_URL: skewedMigratorDatabaseUrl,
   });
-  assert.match(ownerSkewFailure, /008_agent_trace_grants/);
-  assert.match(ownerSkewFailure, /cannot grant required privileges/);
-  assert.match(ownerSkewFailure, /original schema owner or a superuser/);
+  assert.match(ownerSkewFailure, /migration authority preflight/i);
+  assert.match(ownerSkewFailure, /issue_3_migrator/);
+  assert.match(ownerSkewFailure, /schema\/table owner or a superuser/);
 
   await withOwnerClient(async (client) => {
     const applied = await client.query<{ count: string }>(
