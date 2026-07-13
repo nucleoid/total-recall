@@ -1,4 +1,4 @@
-import type { MediaEventInput } from '../media.js';
+import type { MediaEventInput, TrustedMediaEventInput } from '../media.js';
 import { withScopedClient, type DbScope } from '../db.js';
 import {
   getSyncState,
@@ -17,6 +17,22 @@ export interface ConnectorContext {
   agentId?: string;
   /** Explicit service-key database scope for protected connector writes. */
   scope: DbScope;
+}
+
+export function trustConnectorMediaEvents(
+  events: MediaEventInput[],
+  ctx: Pick<ConnectorContext, 'apiKeyId' | 'agentId'>
+): TrustedMediaEventInput[] {
+  if (!ctx.apiKeyId) {
+    throw new Error('Connector attribution requires apiKeyId');
+  }
+  const apiKeyId = ctx.apiKeyId;
+
+  return events.map((event) => ({
+    ...event,
+    client_id: apiKeyId,
+    agent_id: ctx.agentId ?? null,
+  }));
 }
 
 export interface SyncResult {
@@ -151,11 +167,7 @@ export abstract class BaseConnector {
       errors.push(...valid.errors);
       skipped += valid.skipped;
 
-      const enriched = valid.events.map((e) => ({
-        ...e,
-        client_id: e.client_id ?? ctx.apiKeyId,
-        agent_id: e.agent_id ?? ctx.agentId,
-      }));
+      const enriched = trustConnectorMediaEvents(valid.events, ctx);
 
       await withScopedClient(ctx.scope, async (client) => {
         const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
@@ -201,11 +213,7 @@ export abstract class BaseConnector {
       errors.push(...valid.errors);
       skipped += valid.skipped;
 
-      const enriched = valid.events.map((e) => ({
-        ...e,
-        client_id: e.client_id ?? ctx.apiKeyId,
-        agent_id: e.agent_id ?? ctx.agentId,
-      }));
+      const enriched = trustConnectorMediaEvents(valid.events, ctx);
       await withScopedClient(ctx.scope, async (client) => {
         const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
         ingested = result.inserted;

@@ -20,7 +20,7 @@ import { mediaSearch, mediaSearchSchema } from './tools/media-search.js';
 import { upsertAgent, listAgents } from './agents.js';
 import { listTraces } from './traces.js';
 import { listAudit } from './audit.js';
-import { upsertMediaEvents, listMediaEvents, type MediaEventInput } from './media.js';
+import { parsePublicMediaEventBatch, toTrustedRestMediaEvents, upsertMediaEvents, listMediaEvents } from './media.js';
 import { rollupPendingEvents } from './rollup.js';
 
 dotenv.config();
@@ -521,15 +521,8 @@ app.post('/api/media/events', async (req, res) => {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
     checkPermission(auth, 'write');
-    const body = req.body as { events?: MediaEventInput[] };
-    if (!Array.isArray(body.events)) {
-      res.status(400).json({ error: 'events array required' });
-      return;
-    }
-    const enriched = body.events.map((e) => ({
-      ...e,
-      client_id: auth.keyId,
-    }));
+    const events = parsePublicMediaEventBatch(req.body);
+    const enriched = toTrustedRestMediaEvents(events, auth);
     const result = await upsertMediaEvents(enriched, dbScopeFromAuth(auth));
     res.json(result);
   } catch (err: any) {

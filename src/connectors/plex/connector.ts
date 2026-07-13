@@ -1,6 +1,7 @@
 import {
   BaseConnector,
   filterValidMediaEventDates,
+  trustConnectorMediaEvents,
   type ConnectorContext,
   type SyncResult,
 } from '../base.js';
@@ -401,11 +402,7 @@ export class PlexConnector extends BaseConnector {
       errors.push(...valid.errors);
       skipped += valid.skipped;
 
-      const enriched = valid.events.map((event) => ({
-        ...event,
-        client_id: event.client_id ?? ctx.apiKeyId,
-        agent_id: event.agent_id ?? ctx.agentId,
-      }));
+      const enriched = trustConnectorMediaEvents(valid.events, ctx);
 
       await withScopedClient(ctx.scope, async (client) => {
         const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);

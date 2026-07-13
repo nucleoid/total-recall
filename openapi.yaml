@@ -146,6 +146,70 @@ paths:
           description: Idempotency conflict or incomplete prior document write
         "413":
           description: JSON transport envelope exceeds the independently configured HTTP parser limit
+  /api/media/events:
+    post:
+      operationId: ingestMediaEvents
+      summary: Ingest media playback or viewing events
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events:
+                  type: array
+                  maxItems: 500
+                  items:
+                    type: object
+                    required: [service, event_type, title, played_at]
+                    properties:
+                      service:
+                        type: string
+                      service_id:
+                        type: string
+                      event_type:
+                        type: string
+                      title:
+                        type: string
+                      artist:
+                        type: string
+                      album:
+                        type: string
+                      show:
+                        type: string
+                      season:
+                        type: integer
+                      episode:
+                        type: integer
+                      year:
+                        type: integer
+                      genres:
+                        type: array
+                        items:
+                          type: string
+                      duration_ms:
+                        type: integer
+                      played_ms:
+                        type: integer
+                      completed:
+                        type: boolean
+                      played_at:
+                        type: string
+                        format: date-time
+                      metadata:
+                        type: object
+                        additionalProperties: true
+      responses:
+        "200":
+          description: Media events ingested
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
 components:
   schemas:
     Memory:

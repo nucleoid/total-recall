@@ -1,4 +1,5 @@
-import { queryScoped, queryUnscoped, type DbScope, type ScopedClient } from './db.js';
+import { z } from 'zod';
+import { queryScoped, queryUnscoped, withScopedClient, type DbScope, type ScopedClient } from './db.js';
 import type { AuthContext } from './types.js';
 import type { QueryResultRow } from 'pg';
 
@@ -26,7 +27,109 @@ export interface MediaEvent {
   created_at: Date;
 }
 
-export interface MediaEventInput {
+const INT32_MIN = -2147483648;
+const INT32_MAX = 2147483647;
+const MAX_TEXT_LENGTH = 4096;
+const MAX_SHORT_TEXT_LENGTH = 512;
+const MAX_GENRES = 50;
+const MAX_METADATA_BYTES = 16 * 1024;
+
+export const MAX_MEDIA_EVENT_BATCH = 500;
+
+const requiredText = (max = MAX_SHORT_TEXT_LENGTH) => z.string().trim().min(1).max(max);
+const optionalText = (max = MAX_TEXT_LENGTH) =>
+  z.preprocess(
+    (value) => typeof value === 'string' && value.trim().length === 0 ? undefined : value,
+    z
+      .string()
+      .trim()
+      .min(1)
+      .max(max)
+      .nullish()
+      .transform((value) => value ?? undefined)
+  );
+const optionalInt32 = z
+  .number()
+  .finite()
+  .int()
+  .min(INT32_MIN)
+  .max(INT32_MAX)
+  .nullish()
+  .transform((value) => value ?? undefined);
+const timestampPattern =
+  /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$/i;
+const timestampOffsetPattern = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/i;
+const calendarDatePattern = /^(\d{4})-(\d{2})-(\d{2})/;
+
+const hasValidCalendarDate = (value: string) => {
+  const match = calendarDatePattern.exec(value);
+  if (!match) return false;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (year < 1 || month < 1 || month > 12 || day < 1) return false;
+
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day <= daysInMonth[month - 1];
+};
+
+const normalizeTimestampForParse = (value: string) => {
+  const normalized = value.replace(' ', 'T');
+  if (!timestampOffsetPattern.test(normalized)) return `${normalized}Z`;
+  return normalized.replace(/([+-]\d{2})$/, '$1:00').replace(/([+-]\d{2})(\d{2})$/, '$1:$2');
+};
+const normalizeTimestampForPostgres = (value: string) => {
+  const trimmed = value.trim();
+  if (timestampOffsetPattern.test(trimmed)) return trimmed;
+  return `${trimmed.replace(' ', 'T')}Z`;
+};
+const timestamp = z
+  .string()
+  .trim()
+  .refine(
+    (value) =>
+      timestampPattern.test(value) &&
+      hasValidCalendarDate(value) &&
+      Number.isFinite(Date.parse(normalizeTimestampForParse(value))),
+    { message: 'played_at must be a valid timestamp' }
+  )
+  .transform(normalizeTimestampForPostgres);
+
+const metadataSchema = z
+  .record(z.unknown())
+  .refine((value) => JSON.stringify(value).length <= MAX_METADATA_BYTES, {
+    message: `metadata must be ${MAX_METADATA_BYTES} bytes or less`,
+  })
+  .optional();
+
+export const publicMediaEventSchema = z
+  .object({
+    service: requiredText(128),
+    service_id: optionalText(512),
+    event_type: requiredText(128),
+    title: requiredText(MAX_TEXT_LENGTH),
+    artist: optionalText(),
+    album: optionalText(),
+    show: optionalText(),
+    season: optionalInt32,
+    episode: optionalInt32,
+    year: optionalInt32,
+    genres: z.array(requiredText(256)).max(MAX_GENRES).optional(),
+    duration_ms: optionalInt32,
+    played_ms: optionalInt32,
+    completed: z.boolean().nullish().transform((value) => value ?? undefined),
+    played_at: timestamp,
+    metadata: metadataSchema,
+  })
+  .strip();
+
+export const publicMediaEventBatchSchema = z.object({
+  events: z.array(publicMediaEventSchema).max(MAX_MEDIA_EVENT_BATCH),
+});
+
+export interface PublicMediaEventInput {
   service: string;
   service_id?: string;
   event_type: string;
@@ -43,9 +146,17 @@ export interface MediaEventInput {
   completed?: boolean;
   played_at: Date | string;
   metadata?: Record<string, unknown>;
-  client_id?: string;
-  agent_id?: string;
 }
+
+export type MediaEventInput = PublicMediaEventInput & {
+  client_id?: string | null;
+  agent_id?: string | null;
+};
+
+export type TrustedMediaEventInput = PublicMediaEventInput & {
+  client_id: string;
+  agent_id?: string | null;
+};
 
 export interface MediaListFilters {
   service?: string;
@@ -62,8 +173,23 @@ export interface UpsertResult {
   ids: string[];
 }
 
+export function parsePublicMediaEventBatch(body: unknown): PublicMediaEventInput[] {
+  return publicMediaEventBatchSchema.parse(body).events;
+}
+
+export function toTrustedRestMediaEvents(
+  events: PublicMediaEventInput[],
+  auth: AuthContext
+): TrustedMediaEventInput[] {
+  return events.map((event) => ({
+    ...event,
+    client_id: auth.keyId,
+    agent_id: null,
+  }));
+}
+
 async function upsertMediaEventsWithQuery(
-  events: MediaEventInput[],
+  events: TrustedMediaEventInput[],
   scope: DbScope,
   query: <T extends QueryResultRow>(text: string, params?: unknown[]) => Promise<{ rows: T[] }>
 ): Promise<UpsertResult> {
@@ -74,12 +200,16 @@ async function upsertMediaEventsWithQuery(
   let skipped = 0;
 
   for (const e of events) {
+    if (!e.client_id || e.client_id !== scope.keyId) {
+      throw new Error('Trusted media event client_id must match database scope');
+    }
+
     const res = await query<{ id: string; inserted: boolean }>(
       `INSERT INTO media_events
          (service, service_id, event_type, title, artist, album, show, season, episode, year,
           genres, duration_ms, played_ms, completed, played_at, metadata, client_id, agent_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-       ON CONFLICT (service, service_id, played_at) DO NOTHING
+       ON CONFLICT (client_id, service, service_id, played_at) DO NOTHING
        RETURNING id, (xmax = 0) AS inserted`,
       [
         e.service,
@@ -98,7 +228,7 @@ async function upsertMediaEventsWithQuery(
         e.completed ?? null,
         e.played_at,
         JSON.stringify(e.metadata ?? {}),
-        scope.keyId,
+        e.client_id,
         e.agent_id ?? null,
       ]
     );
@@ -116,23 +246,25 @@ async function upsertMediaEventsWithQuery(
 
 /**
  * Idempotent batch upsert of media events. Conflict key is
- * (service, service_id, played_at). Events without a service_id always insert.
+ * (client_id, service, service_id, played_at). Events without a service_id
+ * always insert because PostgreSQL treats NULLs as distinct in unique indexes.
  */
-export async function upsertMediaEvents(events: MediaEventInput[], scope: DbScope): Promise<UpsertResult> {
-  return upsertMediaEventsWithQuery(events, scope, (text, params) =>
-    queryScoped(scope, text, params)
+export async function upsertMediaEvents(events: TrustedMediaEventInput[], scope: DbScope): Promise<UpsertResult> {
+  if (events.length === 0) return { inserted: 0, skipped: 0, ids: [] };
+  return withScopedClient(scope, (client) =>
+    upsertMediaEventsWithQuery(events, scope, (text, params) => client.query(text, params))
   );
 }
 
-export async function upsertMediaEventsWithClient(
-  client: ScopedClient,
-  events: MediaEventInput[],
+export async function upsertMediaEventsOnClient(
+  client: Pick<ScopedClient, 'query'>,
+  events: TrustedMediaEventInput[],
   scope: DbScope
 ): Promise<UpsertResult> {
-  return upsertMediaEventsWithQuery(events, scope, (text, params) =>
-    client.query(text, params)
-  );
+  return upsertMediaEventsWithQuery(events, scope, (text, params) => client.query(text, params));
 }
+
+export const upsertMediaEventsWithClient = upsertMediaEventsOnClient;
 
 export async function listMediaEvents(auth: AuthContext, scope: DbScope, filters: MediaListFilters = {}): Promise<MediaEvent[]> {
   const isAdmin = auth.permissions.includes('admin');
