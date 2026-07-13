@@ -88,7 +88,9 @@ export function parseMigrationLockTimeout(value: string | undefined): number {
 
 type CurrentRole = {
   currentUser: string;
+  currentDatabase?: string;
   rolsuper: boolean;
+  canCreateInPublic?: boolean;
 };
 
 async function currentRole(client: pg.Client): Promise<CurrentRole> {
@@ -100,13 +102,64 @@ async function currentRole(client: pg.Client): Promise<CurrentRole> {
   return res.rows[0];
 }
 
-async function rejectRuntimeMigrationRole(client: pg.Client): Promise<void> {
-  const role = await currentRole(client);
-  if (role.currentUser !== 'total_recall_app') return;
+const MIGRATION_OWNED_TABLES = [
+  'agents',
+  'api_keys',
+  'audit_log',
+  'connector_credentials',
+  'connector_sync_state',
+  'documents',
+  'media_events',
+  'memories',
+  'recall_traces',
+  'schema_migrations',
+  'sync_state',
+] as const;
+
+async function assertMigrationAuthority(client: pg.Client): Promise<void> {
+  const identity = await client.query<CurrentRole>(`
+    SELECT current_user AS "currentUser",
+           current_database() AS "currentDatabase",
+           r.rolsuper,
+           has_schema_privilege(current_user, 'public', 'CREATE') AS "canCreateInPublic"
+    FROM pg_roles r
+    WHERE r.rolname = current_user
+  `);
+  const role = identity.rows[0];
+  if (!role) throw new Error('Migration authority preflight could not identify the connected PostgreSQL role');
+  if (role.currentUser === 'total_recall_app') {
+    throw new Error(
+      'total_recall_app is the runtime role and cannot run migrations, even if it was accidentally elevated. ' +
+        'Set MIGRATION_DATABASE_URL to the schema/table owner or a superuser and remove the app-role elevation.'
+    );
+  }
+  if (role.rolsuper) return;
+
+  const relations = await client.query<{ relation: string; owner: string }>(`
+    SELECT c.relname AS relation,
+           pg_get_userbyid(c.relowner) AS owner
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p')
+      AND c.relname = ANY($1::text[])
+      AND c.relowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+      AND NOT pg_has_role(current_user, c.relowner, 'USAGE')
+    ORDER BY c.relname
+  `, [MIGRATION_OWNED_TABLES]);
+
+  const missing: string[] = [];
+  if (role.canCreateInPublic !== true) missing.push('schema public CREATE privilege');
+  if (relations.rows.length > 0) {
+    missing.push(`owner authority for ${relations.rows.map(row => `${row.relation} (owner: ${row.owner})`).join(', ')}`);
+  }
+  if (missing.length === 0) return;
 
   throw new Error(
-    'total_recall_app is the runtime role and cannot run migrations. ' +
-      'Set MIGRATION_DATABASE_URL to the original schema owner or a superuser.'
+    `Migration authority preflight failed for current user "${role.currentUser}" ` +
+      `on database "${role.currentDatabase}": missing ${missing.join('; ')}. ` +
+      'Set MIGRATION_DATABASE_URL to the schema/table owner or a superuser. ' +
+      'Do not grant DDL privileges or ownership to total_recall_app.'
   );
 }
 
@@ -249,7 +302,7 @@ export async function runMigrations(
     await acquireMigrationLock(client, options);
     lockAcquired = true;
     interrupted(options.signal);
-    await rejectRuntimeMigrationRole(client);
+    await assertMigrationAuthority(client);
     if (await schemaMigrationsTableExists(client)) {
       const existingVersions = await client.query<{ version: string }>(
         'SELECT version FROM schema_migrations ORDER BY version',

@@ -203,6 +203,8 @@ npm run create-key -- --name "openclaw" --namespaces "personal,work,shared" --ma
 node dist/index.js
 ```
 
+Schema migrations use only owner-capable `MIGRATION_DATABASE_URL`; runtime services use the least-privileged `DATABASE_URL`; all-row decay and repair use an explicitly verified maintenance-capable connection. The numbered migration runner preflights schema creation and ownership of existing managed tables and never promotes the runtime role. The obsolete standalone decay DDL command must not be restored.
+
 Migration `009_api_key_access_ceiling.sql` backfills existing `api_keys.max_access_level` values to `secret` to preserve upgraded installations, then sets the default for newly created keys to `normal`. Use `--max-access-level sensitive` or `--max-access-level secret` only for clients that should read and write higher-classification memories.
 
 ## Preseed Import Safety
