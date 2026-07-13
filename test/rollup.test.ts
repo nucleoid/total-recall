@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { MediaEvent } from '../src/media.js';
-import { buildTags, classifyMediaKind, type MediaKind } from '../src/rollup.js';
+import {
+  buildSummary,
+  buildTags,
+  classifyMediaKind,
+  createMediaDateFormatter,
+  formatMediaDate,
+  resolveMediaTimeZone,
+  type MediaKind,
+} from '../src/rollup.js';
 
 function event(overrides: Partial<MediaEvent> = {}): MediaEvent {
   return {
@@ -62,4 +70,53 @@ test('buildTags keeps completion and normalized genres without contradictory kin
 test('buildTags tolerates malformed genres', () => {
   assert.doesNotThrow(() => buildTags(event({ genres: [null, 42, 'Rock'] as unknown as string[] })));
   assert.deepEqual(buildTags(event({ genres: [null, 42, 'Rock'] as unknown as string[] })), ['media', 'other', 'watch', 'unknown', 'rock']);
+});
+
+function timezoneEvent(overrides: Partial<MediaEvent> = {}): MediaEvent {
+  return {
+    id: 'event-1', service: 'plex', service_id: 'item-1', event_type: 'watch',
+    title: 'Arrival', artist: null, album: null, show: null, season: null,
+    episode: null, year: 2016, genres: [], duration_ms: null, played_ms: null,
+    completed: true, played_at: new Date('2026-01-02T02:00:00Z'), metadata: {},
+    client_id: 'client-1', agent_id: null, memory_id: null,
+    created_at: new Date('2026-01-02T02:01:00Z'), ...overrides,
+  };
+}
+
+test('formats the same instant on the configured IANA calendar day', () => {
+  assert.equal(formatMediaDate(timezoneEvent().played_at, createMediaDateFormatter('America/Chicago')), '2026-01-01');
+  assert.equal(formatMediaDate(timezoneEvent().played_at, createMediaDateFormatter('UTC')), '2026-01-02');
+});
+
+test('handles DST boundaries, positive rollovers, non-hour offsets, and ASCII output', () => {
+  const chicago = createMediaDateFormatter('America/Chicago');
+  assert.equal(formatMediaDate(new Date('2026-03-08T07:59:59Z'), chicago), '2026-03-08');
+  assert.equal(formatMediaDate(new Date('2026-03-08T08:00:00Z'), chicago), '2026-03-08');
+  assert.equal(formatMediaDate(new Date('2026-11-01T06:59:59Z'), chicago), '2026-11-01');
+  assert.equal(formatMediaDate(new Date('2026-11-01T07:00:00Z'), chicago), '2026-11-01');
+  assert.equal(formatMediaDate(new Date('2026-01-01T23:30:00Z'), createMediaDateFormatter('Pacific/Kiritimati')), '2026-01-02');
+  const kathmandu = formatMediaDate(new Date('2026-01-01T18:30:00Z'), createMediaDateFormatter('Asia/Kathmandu'));
+  assert.equal(kathmandu, '2026-01-02');
+  assert.match(kathmandu, /^\d{4}-\d{2}-\d{2}$/);
+});
+
+test('music, episode, and movie summaries use the supplied formatter without mutating events', () => {
+  const formatter = createMediaDateFormatter('America/Chicago');
+  const music = timezoneEvent({ service: 'spotify', title: 'Track', artist: 'Artist', album: 'Album' });
+  const episode = timezoneEvent({ title: 'Pilot', show: 'The Show', season: 1, episode: 2, completed: false });
+  const movie = timezoneEvent();
+  const originalPlayedAt = movie.played_at;
+
+  assert.equal(buildSummary(music, formatter), 'Listened to "Track" by Artist from "Album" on 2026-01-01 via spotify.');
+  assert.equal(buildSummary(episode, formatter), 'Watched The Show S01E02 "Pilot" on 2026-01-01 via plex. Did not finish.');
+  assert.equal(buildSummary(movie, formatter), 'Watched "Arrival" (2016) on 2026-01-01 via plex. Completed.');
+  assert.equal(movie.played_at, originalPlayedAt);
+  assert.equal(movie.played_at.toISOString(), '2026-01-02T02:00:00.000Z');
+});
+
+test('configuration defaults to UTC, trims valid zones, and rejects invalid zones and timestamps', () => {
+  assert.equal(resolveMediaTimeZone(undefined), 'UTC');
+  assert.equal(resolveMediaTimeZone('  America/Chicago  '), 'America/Chicago');
+  assert.throws(() => resolveMediaTimeZone('Mars/Olympus_Mons'), /Invalid MEDIA_TIME_ZONE/);
+  assert.throws(() => formatMediaDate(new Date('invalid'), createMediaDateFormatter('UTC')), /Invalid played_at/);
 });
