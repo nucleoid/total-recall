@@ -131,7 +131,7 @@ describe('public REST media event auth and validation', () => {
 });
 
 describe('trusted media persistence', () => {
-  it('uses tenant-local deduplication', async () => {
+  it('uses trusted tenant attribution while every database identity rule arbitrates', async () => {
     const inserts: string[] = [];
     const client = new FakeClient([
       { rows: [{ id: 'event-a' }] },
@@ -151,7 +151,8 @@ describe('trusted media persistence', () => {
     assert.equal(keyAResult.inserted + keyBResult.inserted, 2);
     assert.equal(keyAResult.skipped + keyBResult.skipped, 1);
     assert.deepEqual([...keyAResult.ids, ...keyBResult.ids], ['event-a', 'event-b']);
-    assert.match(inserts[0], /ON CONFLICT \(client_id, service, service_id, played_at\) DO NOTHING/);
+    assert.match(inserts[0], /ON CONFLICT DO NOTHING/);
+    assert.doesNotMatch(inserts[0], /ON CONFLICT\s*\([^)]/);
   });
 
   it('propagates a later-row failure to the scoped transaction', async () => {

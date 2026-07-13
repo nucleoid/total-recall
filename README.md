@@ -547,6 +547,65 @@ Media progress is nullable by design: `duration_ms` describes the item's duratio
 
 Historical Spotify rows that asserted `played_ms=duration_ms` and `completed=true` are not automatically rewritten because their ingestion provenance is ambiguous. `npm run spotify:repair-progress` is preview-only by default and writes nothing. For an authorized repair, pause Spotify sync, take and verify a restorable backup, independently prove connector provenance per candidate, and create an approval manifest containing only exact previewed event IDs, client IDs, and fingerprints. Apply requires both `--apply --confirm-backup --approval-manifest <file>`; broad predicates, counts, date ranges, and approval of the command itself are rejected. Unverified rows stay unchanged. See [the Spotify connector guide](docs/connectors/spotify.md#historical-progress-repair) for the full workflow.
 
+### Nullable media provider IDs and migration 022
+
+Migration 022 follows migration 021's tenant-local provider identity constraint and makes nullable or blank provider IDs idempotent without collapsing different content played at the same instant. PostgreSQL owns the effective identity: a nonblank `service_id` keeps its exact bytes, while a null/blank ID uses a versioned SHA-256 identity over the stable canonical event fields. Mutable genres, progress, completion, metadata, provenance, agent, and memory-link fields do not alter identity. The migration requires PostgreSQL 16 and owner permission to `CREATE EXTENSION IF NOT EXISTS pgcrypto`; the runtime role receives function execution only and is not granted DDL.
+
+The migration reports counts and aborts if historical effective-identity duplicates exist. It never chooses, merges, or deletes historical rows. This count-only audit uses the same canonical grouping dimensions without exposing private titles:
+
+```sql
+WITH identified AS (
+  SELECT jsonb_build_object(
+    'client', client_id, 'service', service, 'played', played_at,
+    'kind', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN 'fallback:v1' ELSE 'id' END,
+    'id', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN NULL ELSE service_id END,
+    'event_type', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN event_type END,
+    'title', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN title END,
+    'artist', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN artist END,
+    'album', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN album END,
+    'show', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN show END,
+    'season', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN season END,
+    'episode', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN episode END,
+    'year', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN year END,
+    'duration_ms', CASE WHEN NULLIF(BTRIM(service_id), '') IS NULL THEN duration_ms END
+  ) AS identity
+  FROM media_events WHERE client_id IS NOT NULL
+), groups AS (
+  SELECT count(*) AS rows FROM identified GROUP BY identity HAVING count(*) > 1
+)
+SELECT count(*) AS duplicate_groups, COALESCE(sum(rows), 0) AS duplicate_rows FROM groups;
+```
+
+Reconciliation is disabled by default and is never invoked by migration or boot. Its mandatory preview emits an opaque database-generated group key plus bounded event/link IDs and current-state fingerprints, and writes nothing:
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall \
+  npm run repair:media-event-duplicates -- --max-groups 100 --max-events-per-group 100
+```
+
+The normal scan deliberately caps each group at 1,000 rows. If it reports an incomplete oversized group, preview only that exact opaque key with a separately chosen higher safety bound (maximum 100,000); do not increase the global scan bound:
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall \
+  npm run repair:media-event-duplicates -- --group-key <opaque-key> --target-max-events-per-group 10000
+```
+
+Before any apply, stop all media ingestion and rollup workers, take and verify a verified restorable backup, and independently verify every event and linked memory in every complete preview group. Build an explicit approval manifest from that preview: name the opaque `groupKey`, group fingerprint, exact client/service/time, every event and memory ID plus fingerprint, exactly one retained event, exactly one retained linked memory when links exist, and an explicit `retain` or `delete` action for every row. Apply rechecks and locks the exact key. For an oversized targeted approval, repeat its reviewed bound on apply:
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall \
+  npm run repair:media-event-duplicates -- --apply --confirm-backup --approval-manifest ./approved-media-duplicates.json
+# Oversized targeted group only:
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall \
+  npm run repair:media-event-duplicates -- --apply --confirm-backup --approval-manifest ./approved-media-duplicates.json --target-max-events-per-group 10000
+```
+
+Broad or incomplete approval, ambiguous retention, changed keys or fingerprints, unapproved rows, external memory links, and truncated groups are refused transactionally. Unverified groups remain unchanged and continue to block migration. Re-run preview until it reports zero groups.
+
+For rollout, keep all #8 writers stopped, stage the new binary containing untargeted `ON CONFLICT DO NOTHING`, run owner `npm run migrate`, and start only the new binary. Migration 022 preserves migration 021's tenant-local `media_events_client_service_identity_key` provider constraint as the directly inspectable nonblank-ID invariant even though the effective-identity index overlaps it. Mixed versions are unsafe because the #8 writer's targeted conflict clause does not arbitrate the new expression index. The new expression index is transaction-built and takes a write lock, so use a maintenance window sized for `media_events`; do not run a forced backfill or reindex.
+
+Once new writers resume, migration 022 is **roll-forward-only**: never overlap #8 and #26 writers, and prefer restoring the #26 binary over weakening identity guarantees. If an emergency binary rollback to #8 is unavoidable, keep every media writer stopped, drop `media_events_effective_identity_uidx`, and only then deploy and start the #8 binary. Do not drop migration 021's `media_events_client_service_identity_key`; it is the provider conflict arbiter required by the #8 writer and preserves tenant-local behavior. Drop the helper only after its expression index is gone, and leave `pgcrypto` installed if anything else uses it. This emergency path does not rewrite events, but it removes null/blank-ID fallback deduplication until #26 is rolled forward again.
+
 ## Security Model
 
 Access levels are enforced in addition to namespace ACLs. Each key has `max_access_level` (`normal < sensitive < secret`); search, recall, list, namespace counts, stats, and agent memory counts hide rows above that ceiling before pagination or aggregation.

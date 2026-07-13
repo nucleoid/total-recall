@@ -42,6 +42,7 @@
     "spotify:auth": "tsx scripts/spotify-auth.ts",
     "spotify:sync": "tsx scripts/spotify-sync.ts",
     "spotify:repair-progress": "tsx scripts/repair-spotify-progress.ts",
+    "repair:media-event-duplicates": "tsx scripts/repair-media-event-duplicates.ts",
     "ytmusic:auth": "tsx scripts/ytmusic-auth.ts",
     "ytmusic:auth-browser": "tsx scripts/ytmusic-auth-browser.ts",
     "ytmusic:sync": "tsx scripts/ytmusic-sync.ts",
