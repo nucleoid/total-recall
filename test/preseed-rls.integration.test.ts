@@ -64,7 +64,7 @@ test('batch embeds before BEGIN, sets exact transaction-local namespaces, writes
   assert.ok(calls[2].values?.includes('preseed'));
 });
 
-test('batch reports tombstoned zero-row conflicts once without adding restoration behavior', async t => {
+test('batch reports tombstoned or superseded zero-row conflicts once without adding restoration behavior', async t => {
   const warnings: string[] = [];
   const calls: string[] = [];
   const originalWarn = console.warn;
@@ -86,9 +86,9 @@ test('batch reports tombstoned zero-row conflicts once without adding restoratio
   );
 
   assert.equal(written, 1);
-  assert.deepEqual(warnings, ['[preseed] Skipped 1 tombstoned source-key conflict(s)']);
+  assert.deepEqual(warnings, ['[preseed] Skipped 1 tombstoned or superseded source-key conflict(s)']);
   const insert = calls.find(text => text.startsWith('INSERT')) ?? '';
-  assert.match(insert, /WHERE memories\.deleted_at IS NULL[\s\S]*RETURNING id/);
+  assert.match(insert, /WHERE memories\.deleted_at IS NULL[\s\S]*memories\.superseded_at IS NULL[\s\S]*RETURNING id/);
   assert.doesNotMatch(insert, /deleted_at\s*=|deletion_reason\s*=|deleted_by_client_id\s*=/i);
 });
 

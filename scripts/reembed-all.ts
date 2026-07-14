@@ -23,6 +23,7 @@ interface MemoryRow {
   content: string;
   namespace: string;
   updated_at: string;
+  revision: number;
 }
 
 export interface ReembedProgress {
@@ -123,7 +124,7 @@ async function selectBatch(
   await client.query('BEGIN');
   try {
     const result = await client.query<MemoryRow>(`
-      SELECT id, content, namespace, updated_at::text AS updated_at
+      SELECT id, content, namespace, updated_at::text AS updated_at, revision
       FROM public.memories
       WHERE deleted_at IS NULL
         AND (cardinality($1::text[]) = 0 OR namespace = ANY($1))
@@ -159,9 +160,11 @@ async function updateEmbedding(
     WHERE id = $5::uuid
       AND deleted_at IS NULL
       AND updated_at = $6::timestamptz
-      AND (cardinality($7::text[]) = 0 OR namespace = ANY($7))
-      AND ${eligiblePredicate(8, 2, 3, 4)}
-  `, [vectorText(embedding), profile.provider, profile.model, profile.dimensions, row.id, row.updated_at, namespaces, fullRepair]);
+      AND content = $7
+      AND revision = $8
+      AND (cardinality($9::text[]) = 0 OR namespace = ANY($9))
+      AND ${eligiblePredicate(10, 2, 3, 4)}
+  `, [vectorText(embedding), profile.provider, profile.model, profile.dimensions, row.id, row.updated_at, row.content, row.revision, namespaces, fullRepair]);
   return result.rowCount === 1 ? 'updated' : 'concurrent_change';
 }
 

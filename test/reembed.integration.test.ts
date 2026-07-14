@@ -69,7 +69,8 @@ async function createFixture(): Promise<Fixture> {
           embedding_model text,
           embedding_dimensions integer,
           updated_at timestamptz NOT NULL DEFAULT NOW(),
-          deleted_at timestamptz
+          deleted_at timestamptz,
+          revision integer NOT NULL DEFAULT 0
         )
       `);
       await client.query(`
@@ -165,9 +166,11 @@ test('reembed is owner-gated, exact, scoped, resumable, and terminating in full 
         const writer = new pg.Client({ connectionString: fixture.ownerUrl });
         await writer.connect();
         try {
+          // Simulate a tags/metadata-only writer: revision changes while content
+          // and updated_at stay identical to the re-embed snapshot.
           await writer.query(
-            'UPDATE public.memories SET content = $1, updated_at = clock_timestamp() WHERE id = $2',
-            ['concurrently changed', IDS.media],
+            'UPDATE public.memories SET revision = revision + 1 WHERE id = $1',
+            [IDS.media],
           );
         } finally {
           await writer.end();
@@ -180,7 +183,7 @@ test('reembed is owner-gated, exact, scoped, resumable, and terminating in full 
     assert.equal(concurrent.summary.failed, 1);
     assert.equal(concurrent.summary.errors[0]?.category, 'concurrent_change');
     assert.deepEqual(concurrent.summary.verification, { unknown_count: '1', legacy_count: '0' });
-    assert.equal((await row(fixture.ownerUrl, IDS.media)).content, 'concurrently changed');
+    assert.equal((await row(fixture.ownerUrl, IDS.media)).content, 'media content');
 
     const resumed = await runReembedAgainstEnvironment(
       { REEMBED_DATABASE_URL: fixture.ownerUrl },

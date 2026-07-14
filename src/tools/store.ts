@@ -5,7 +5,7 @@ import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../e
 import type { AuthContext } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
-import { TombstonedSourceKeyConflictError } from '../errors.js';
+import { SupersededSourceKeyConflictError, TombstonedSourceKeyConflictError } from '../errors.js';
 import {
   MEMORY_CONTENT_MAX_CHARS,
   TAG_MAX_CHARS,
@@ -117,6 +117,7 @@ export async function memoryStore(
            session_id = EXCLUDED.session_id,
            updated_at = NOW()
          WHERE memories.deleted_at IS NULL
+           AND memories.superseded_at IS NULL
            AND memories.namespace = ANY($15::text[])
            AND EXCLUDED.namespace = ANY($15::text[])
          RETURNING id, namespace`,
@@ -137,6 +138,15 @@ export async function memoryStore(
       );
       if (tombstone.rows.length > 0) {
         throw new TombstonedSourceKeyConflictError();
+      }
+      const superseded = await client.query(
+        `SELECT 1 FROM memories
+         WHERE source_key = $1 AND deleted_at IS NULL AND superseded_at IS NOT NULL
+         LIMIT 1`,
+        [sourceKey]
+      );
+      if (superseded.rows.length > 0) {
+        throw new SupersededSourceKeyConflictError();
       }
       throw new Error('Access denied to existing idempotent memory');
     });

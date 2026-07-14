@@ -16,6 +16,11 @@ export interface Memory {
   accessed_at: Date;
   access_count: number;
   deleted_at?: Date | null;
+  supersedes_id?: string | null;
+  superseded_by_id?: string | null;
+  superseded_at?: Date | null;
+  is_superseded?: boolean;
+  revision?: number;
 }
 
 export interface ApiKey {
@@ -44,6 +49,14 @@ export interface StoreParams {
   metadata?: Record<string, unknown>;
   access_level?: AccessLevel;
   idempotency_key?: string;
+}
+
+export interface UpdateParams {
+  id: string;
+  content?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+  supersedes?: string;
 }
 
 export interface SearchParams {

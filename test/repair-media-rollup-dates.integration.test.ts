@@ -32,7 +32,7 @@ test('repair is dry-run by default, atomically applies matching rows, resumes by
       CREATE TABLE memories (
         id uuid PRIMARY KEY, content text NOT NULL, embedding vector(3), source text NOT NULL,
         namespace text NOT NULL, tags text[] NOT NULL DEFAULT '{}', metadata jsonb NOT NULL DEFAULT '{}',
-        updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz, client_id uuid
+        updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz, superseded_at timestamptz, client_id uuid
       );
       CREATE TABLE media_events (
         id uuid PRIMARY KEY, service text NOT NULL, service_id text, event_type text NOT NULL,

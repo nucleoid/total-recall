@@ -20,7 +20,7 @@ test('media tag repair is bounded, dry-run safe, deterministic, idempotent, and 
     await owner.query(`
       CREATE ROLE total_recall_app LOGIN PASSWORD 'repair_app';
       CREATE TABLE api_keys (id uuid PRIMARY KEY);
-      CREATE TABLE memories (id uuid PRIMARY KEY, source text NOT NULL, namespace text NOT NULL, tags text[] NOT NULL, client_id text NOT NULL, updated_at timestamptz DEFAULT now(), deleted_at timestamptz);
+      CREATE TABLE memories (id uuid PRIMARY KEY, source text NOT NULL, namespace text NOT NULL, tags text[] NOT NULL, client_id text NOT NULL, updated_at timestamptz DEFAULT now(), deleted_at timestamptz, superseded_at timestamptz);
       CREATE TABLE documents (id uuid PRIMARY KEY, namespace text NOT NULL);
       CREATE TABLE agents (id uuid PRIMARY KEY, name text, api_key_id uuid);
       CREATE TABLE recall_traces (id uuid PRIMARY KEY, client_id text);
