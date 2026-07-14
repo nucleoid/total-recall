@@ -4,3 +4,4 @@ imports/
 dist/
 __pycache__/
 *.pyc
+.fire-off/

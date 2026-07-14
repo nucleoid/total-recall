@@ -42,3 +42,8 @@ export function parseSupersededScoreFactor(raw: string | undefined): number {
 export function supersededScoreFactorFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   return parseSupersededScoreFactor(env.SUPERSEDED_SCORE_FACTOR);
 }
+
+/** Superseded-row ranking changes are an explicit rollout step, never implicit. */
+export function supersededSearchDemotionEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.SUPERSEDED_SEARCH_DEMOTION_ENABLED === 'true';
+}

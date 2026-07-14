@@ -6,7 +6,13 @@ import type { AuthContext } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
 import { TombstonedSourceKeyConflictError } from '../errors.js';
-import { maybeReviseBelief } from '../contradictions.js';
+import {
+  contradictionPolicyFromEnv,
+  maybeReviseBelief,
+  policyAllowsScope,
+  type ContradictionPolicy,
+  type SemanticMemoryInsert,
+} from '../contradictions.js';
 import {
   MEMORY_CONTENT_MAX_CHARS,
   TAG_MAX_CHARS,
@@ -30,9 +36,16 @@ export const storeSchema = z.object({
   idempotency_key: z.string().min(1).max(512).optional(),
 });
 
+export interface MemoryStoreRuntimeOptions {
+  contradictionPolicy?: ContradictionPolicy;
+  reviseBelief?: typeof maybeReviseBelief;
+  scheduleShadow?: (task: () => Promise<void>) => void;
+}
+
 export async function memoryStore(
   params: z.infer<typeof storeSchema>,
-  auth: AuthContext
+  auth: AuthContext,
+  runtime: MemoryStoreRuntimeOptions = {},
 ): Promise<{ id: string; namespace: string; idempotency_key_honored?: true }> {
   checkPermission(auth, 'write');
 
@@ -80,7 +93,7 @@ export async function memoryStore(
     ...embeddingDescriptorParams(),
   ];
 
-  const revised = await maybeReviseBelief({
+  const semanticMemory: SemanticMemoryInsert = {
     content: params.content,
     vector: vecStr,
     source,
@@ -91,8 +104,32 @@ export async function memoryStore(
     clientId: auth.keyId,
     agentId,
     sessionId: params.session_id ?? null,
-  }, auth, { allowMutation: !params.idempotency_key });
-  if (revised) return revised;
+  };
+  const reviseBelief = runtime.reviseBelief ?? maybeReviseBelief;
+  // Retry-safe/idempotent writes are updates to an existing observation, not a
+  // new belief event. They never query candidates or disclose text to #53.
+  const contradictionPolicy = params.idempotency_key
+    ? undefined
+    : (runtime.contradictionPolicy ?? contradictionPolicyFromEnv());
+
+  if (contradictionPolicy?.mutationEnabled) {
+    const revised = await reviseBelief(semanticMemory, auth, {
+      policy: contradictionPolicy,
+      allowMutation: true,
+    });
+    if (revised) return revised;
+  }
+
+  const scheduleShadowAfterCommit = (storedId: string): void => {
+    if (!contradictionPolicy || contradictionPolicy.mutationEnabled ||
+        !policyAllowsScope(contradictionPolicy, ns, params.access_level)) return;
+    const schedule = runtime.scheduleShadow ?? scheduleBestEffortShadow;
+    schedule(() => reviseBelief(semanticMemory, auth, {
+      policy: contradictionPolicy,
+      allowMutation: false,
+      excludeCandidateId: storedId,
+    }).then(() => undefined));
+  };
 
   if (!params.idempotency_key) {
     try {
@@ -103,10 +140,12 @@ export async function memoryStore(
          RETURNING id, namespace`,
         values
       );
-      return res.rows[0];
+      const stored = res.rows[0];
+      scheduleShadowAfterCommit(stored.id);
+      return stored;
     } catch (error) {
       // Preserve the repository's migration-by-migration integration harness.
-      // Production rollout still requires migration 025 before this writer.
+      // Production rollout still requires migration 026 before this writer.
       if (!isMissingBeliefSchema(error)) throw error;
       const legacy = await queryScoped(
         dbScopeFromAuth(auth),
@@ -115,7 +154,9 @@ export async function memoryStore(
          RETURNING id, namespace`,
         values,
       );
-      return legacy.rows[0];
+      const stored = legacy.rows[0];
+      scheduleShadowAfterCommit(stored.id);
+      return stored;
     }
   }
 
@@ -125,11 +166,13 @@ export async function memoryStore(
     .update(params.idempotency_key)
     .digest('hex');
   const sourceKey = `discord-safe:v1:${digest}`;
-  const executeKeyedStore = (beliefAware: boolean) => withScopedClient(dbScopeFromAuth(auth), async (client) => {
+  type KeyedStoreSchema = 'belief' | 'supersession' | 'legacy';
+  const executeKeyedStore = (schema: KeyedStoreSchema) => withScopedClient(dbScopeFromAuth(auth), async (client) => {
+      const beliefAware = schema === 'belief';
       const columns = beliefAware ? ', memory_kind, valid_from' : '';
       const insertedValues = beliefAware ? ", 'semantic', statement_timestamp()" : '';
       const kindUpdate = beliefAware ? '\n           memory_kind = EXCLUDED.memory_kind,' : '';
-      const currentGuard = beliefAware ? '\n           AND memories.superseded_at IS NULL' : '';
+      const currentGuard = schema !== 'legacy' ? '\n           AND memories.superseded_at IS NULL' : '';
       const upsert = await client.query(
         `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key${columns})
          VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14${insertedValues})
@@ -176,10 +219,17 @@ export async function memoryStore(
   let res;
   try {
     try {
-      res = await executeKeyedStore(true);
+      res = await executeKeyedStore('belief');
     } catch (error) {
-      if (!isMissingBeliefSchema(error)) throw error;
-      res = await executeKeyedStore(false);
+      if (!isMissingColumn(error, 'memory_kind')) throw error;
+      try {
+        // #52 already has supersession lifecycle columns. Preserve its guard
+        // while only omitting the not-yet-deployed #53 kind/validity columns.
+        res = await executeKeyedStore('supersession');
+      } catch (supersessionError) {
+        if (!isMissingColumn(supersessionError, 'superseded_at')) throw supersessionError;
+        res = await executeKeyedStore('legacy');
+      }
     }
   } catch (error) {
     // Under RLS, a hidden source_key conflict can surface as 23505 because the
@@ -192,8 +242,22 @@ export async function memoryStore(
   return { ...res.rows[0], idempotency_key_honored: true };
 }
 
+function scheduleBestEffortShadow(task: () => Promise<void>): void {
+  setImmediate(() => {
+    void task().catch(() => {
+      // Content-free: a shadow failure must never alter a committed store or
+      // disclose provider/SQL details through the request path.
+      console.warn('[contradictions] outcome=shadow_dispatch_error');
+    });
+  });
+}
+
 function isMissingBeliefSchema(error: unknown): boolean {
+  return isMissingColumn(error, 'memory_kind');
+}
+
+function isMissingColumn(error: unknown, column: 'memory_kind' | 'superseded_at'): boolean {
   return typeof error === 'object' && error !== null &&
     'code' in error && error.code === '42703' &&
-    'message' in error && typeof error.message === 'string' && error.message.includes('memory_kind');
+    'message' in error && typeof error.message === 'string' && error.message.includes(column);
 }

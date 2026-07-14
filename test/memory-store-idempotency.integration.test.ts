@@ -170,6 +170,59 @@ test('memory_store reports a visible tombstone as a typed conflict on the same s
   });
 });
 
+test('idempotent stores never classify and shadow classification starts only after commit', async t => {
+  const pool = new FakePool();
+  setPoolForTesting(pool as unknown as pg.Pool);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ embedding: { values: Array(768).fill(0.1) } }), { status: 200 })) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  process.env.EMBEDDING_PROVIDER = 'gemini';
+  process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
+  process.env.EMBEDDING_DIMENSIONS = '768';
+  process.env.GEMINI_API_KEY = 'test-only-key';
+  const { memoryStore, storeSchema } = await import('../src/tools/store.js');
+
+  let reviseCalls = 0;
+  let queued: (() => Promise<void>) | undefined;
+  let scheduledAfterCommit = false;
+  const policy = {
+    classificationEnabled: true,
+    provider: 'approved',
+    model: 'approved',
+    endpoint: 'https://generation.example.test/v1',
+    namespace: 'shared',
+    timeoutMs: 1000,
+    mutationConfidence: 0.95,
+    mutationEnabled: false,
+  };
+  const runtime = {
+    contradictionPolicy: policy,
+    reviseBelief: async (_memory: unknown, _auth: unknown, options: { excludeCandidateId?: string }) => {
+      reviseCalls += 1;
+      assert.match(options.excludeCandidateId ?? '', /^m-/);
+      return null;
+    },
+    scheduleShadow: (task: () => Promise<void>) => {
+      const latestTransaction = pool.clientSql.at(-1) ?? [];
+      scheduledAfterCommit = latestTransaction.some(sql => /INSERT INTO memories/i.test(sql)) &&
+        latestTransaction.at(-1) === 'COMMIT';
+      queued = task;
+    },
+  };
+
+  await memoryStore(storeSchema.parse({ content: 'retry-safe', idempotency_key: 'same' }), AUTH_A, runtime);
+  assert.equal(reviseCalls, 0);
+  assert.equal(queued, undefined);
+
+  const stored = await memoryStore(storeSchema.parse({ content: 'new observation' }), AUTH_A, runtime);
+  assert.equal(scheduledAfterCommit, true);
+  assert.equal(reviseCalls, 0);
+  assert.ok(queued);
+  await queued!();
+  assert.equal(reviseCalls, 1);
+  assert.match(stored.id, /^m-/);
+});
+
 test('OpenAPI documents the stable tombstoned idempotency conflict response', async () => {
   const openapi = await readFile(new URL('../openapi.yaml', import.meta.url), 'utf8');
   assert.match(openapi, /\/api\/store:[\s\S]*?"409":\s*\n\s*\$ref: "#\/components\/responses\/TombstonedIdempotencyKey"/);

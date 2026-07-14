@@ -340,7 +340,7 @@ export async function memoryStoreDocument(
     return await commitDocument(true);
   } catch (error) {
     // Keep older migration-focused integration harnesses usable. Operators must
-    // still apply migration 025 before deploying this writer in production.
+    // still apply migration 026 before deploying this writer in production.
     if (typeof error !== 'object' || error === null ||
         !('code' in error) || error.code !== '42703' ||
         !('message' in error) || typeof error.message !== 'string' || !error.message.includes('memory_kind')) throw error;

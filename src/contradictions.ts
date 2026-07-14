@@ -169,6 +169,7 @@ export async function findContradictionCandidates(
   vector: string,
   namespace: string,
   auth: AuthContext,
+  excludeMemoryId: string | null = null,
 ): Promise<ContradictionCandidate[]> {
   const result = await queryScoped<ContradictionCandidate>(
     dbScopeFromAuth(auth),
@@ -201,8 +202,9 @@ export async function findContradictionCandidates(
        AND m.embedding_model = $6
        AND m.embedding_dimensions = $7
        AND 1 - (m.embedding <=> $1::vector) >= $8
+       AND ($9::uuid IS NULL OR m.id <> $9::uuid)
      ORDER BY m.embedding <=> $1::vector, m.id
-     LIMIT $9`,
+     LIMIT $10`,
     [
       vector,
       namespace,
@@ -212,6 +214,7 @@ export async function findContradictionCandidates(
       ACTIVE_EMBEDDING_DESCRIPTOR.model,
       ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
       CANDIDATE_SIMILARITY,
+      excludeMemoryId,
       CANDIDATE_LIMIT,
     ],
   );
@@ -276,6 +279,7 @@ export async function maybeReviseBelief(
     policy?: ContradictionPolicy;
     provider?: GenerationProvider;
     allowMutation?: boolean;
+    excludeCandidateId?: string;
     metric?: (reason: ContradictionReason) => void;
   } = {},
 ): Promise<RevisionResult | null> {
@@ -288,7 +292,12 @@ export async function maybeReviseBelief(
 
   let candidates: ContradictionCandidate[];
   try {
-    candidates = await findContradictionCandidates(memory.vector, memory.namespace, auth);
+    candidates = await findContradictionCandidates(
+      memory.vector,
+      memory.namespace,
+      auth,
+      options.excludeCandidateId ?? null,
+    );
   } catch {
     metric('candidate_query_error'); // never include SQL or content
     return null;

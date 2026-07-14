@@ -1,17 +1,31 @@
 import { withScopedClient, type DbScope } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR, embed, serializeEmbeddingVector } from './embedding.js';
 import { accessLevelSql } from './auth.js';
-import { hnswEfSearchFromEnv, supersededScoreFactorFromEnv } from './config.js';
+import {
+  hnswEfSearchFromEnv,
+  supersededScoreFactorFromEnv,
+  supersededSearchDemotionEnabledFromEnv,
+} from './config.js';
 import type { AccessLevel, SearchParams, SearchResult } from './types.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
 const EF_SEARCH = hnswEfSearchFromEnv();
-const SUPERSEDED_SCORE_FACTOR = supersededScoreFactorFromEnv();
+const SUPERSEDED_SEARCH_DEMOTION_ENABLED = supersededSearchDemotionEnabledFromEnv();
+const SUPERSEDED_SCORE_FACTOR = SUPERSEDED_SEARCH_DEMOTION_ENABLED
+  ? supersededScoreFactorFromEnv()
+  : 1;
 
 // Legacy vector queries are allowed only for truthfully labelled legacy rows.
 // No legacy profile is configured after the verified Gemini-only cutover.
 export const LEGACY_EMBEDDING_PROFILES: readonly never[] = Object.freeze([]);
+
+type SearchSchemaCapabilities = {
+  belief_schema: boolean;
+  supersession_schema: boolean;
+  revision_schema: boolean;
+  validity_finalized: boolean;
+};
 
 export async function hybridSearch(
   params: SearchParams,
@@ -34,23 +48,46 @@ export async function hybridSearch(
   return withScopedClient(scope, async (client) => {
     await client.query("SELECT set_config('hnsw.ef_search', $1, true)", [String(EF_SEARCH)]);
 
-    if (params.valid_at) {
-      const finalized = await client.query<{ ready: boolean }>(`
-        SELECT a.attnotnull
-          AND EXISTS (
-            SELECT 1 FROM pg_constraint c
-            WHERE c.conrelid = 'public.memories'::regclass
-              AND c.conname = 'memories_validity_interval_check'
-              AND c.convalidated
-          ) AS ready
-        FROM pg_attribute a
-        WHERE a.attrelid = 'public.memories'::regclass
-          AND a.attname = 'valid_from'
-          AND NOT a.attisdropped
-      `);
-      if (finalized.rows[0]?.ready !== true) {
-        throw new Error('Invalid valid_at: temporal search is unavailable until memory validity finalization completes');
-      }
+    // Probe catalogs before constructing the query. This supports rolling a new
+    // reader onto #52 (or an older schema) without executing and then masking a
+    // failed SQL statement in the scoped transaction.
+    const capabilityResult = await client.query<SearchSchemaCapabilities>(`
+      SELECT
+        (SELECT count(*) = 5
+         FROM pg_attribute
+         WHERE attrelid = 'public.memories'::regclass
+           AND attname::text = ANY(ARRAY['memory_kind', 'valid_from', 'valid_to', 'supersedes_id', 'superseded_at']::text[])
+           AND NOT attisdropped) AS belief_schema,
+        (SELECT count(*) = 2
+         FROM pg_attribute
+         WHERE attrelid = 'public.memories'::regclass
+           AND attname::text = ANY(ARRAY['supersedes_id', 'superseded_at']::text[])
+           AND NOT attisdropped) AS supersession_schema,
+        EXISTS (
+          SELECT 1 FROM pg_attribute
+          WHERE attrelid = 'public.memories'::regclass
+            AND attname = 'revision' AND NOT attisdropped
+        ) AS revision_schema,
+        EXISTS (
+          SELECT 1 FROM pg_attribute a
+          WHERE a.attrelid = 'public.memories'::regclass
+            AND a.attname = 'valid_from' AND a.attnotnull AND NOT a.attisdropped
+        ) AND EXISTS (
+          SELECT 1 FROM pg_constraint c
+          WHERE c.conrelid = 'public.memories'::regclass
+            AND c.conname = 'memories_validity_interval_check'
+            AND c.convalidated
+        ) AS validity_finalized
+    `);
+    const capabilities: SearchSchemaCapabilities = capabilityResult.rows[0] ?? {
+      belief_schema: false,
+      supersession_schema: false,
+      revision_schema: false,
+      validity_finalized: false,
+    };
+
+    if (params.valid_at && !capabilities.validity_finalized) {
+      throw new Error('Invalid valid_at: temporal search is unavailable until memory validity finalization completes');
     }
 
     const values: unknown[] = [];
@@ -87,49 +124,73 @@ export async function hybridSearch(
       const operator = params.mediaFilters.eventBeforeExclusive ? '<' : '<=';
       conditions.push(`m.event_at ${operator} ${p(params.mediaFilters.eventBefore)}::timestamptz`);
     }
-    if (params.source) {
-      conditions.push(`m.source = ${p(params.source)}`);
-    }
-    if (params.after) {
-      conditions.push(`m.created_at >= ${p(params.after)}`);
-    }
-    if (params.before) {
-      conditions.push(`m.created_at <= ${p(params.before)}`);
-    }
+    if (params.source) conditions.push(`m.source = ${p(params.source)}`);
+    if (params.after) conditions.push(`m.created_at >= ${p(params.after)}`);
+    if (params.before) conditions.push(`m.created_at <= ${p(params.before)}`);
     if (params.valid_at) {
       conditions.push(`m.valid_from <= ${pValidAt}::timestamptz`);
       conditions.push(`(m.valid_to IS NULL OR ${pValidAt}::timestamptz < m.valid_to)`);
     }
-
     const extraWhere = conditions.length > 0 ? 'AND ' + conditions.join(' AND ') : '';
+
+    const beliefColumns = capabilities.belief_schema
+      ? 'm.memory_kind, m.valid_from, m.valid_to'
+      : "'unspecified'::text AS memory_kind, NULL::timestamptz AS valid_from, NULL::timestamptz AS valid_to";
+    const supersessionColumns = capabilities.supersession_schema
+      ? 'm.supersedes_id, m.superseded_at'
+      : 'NULL::uuid AS supersedes_id, NULL::timestamptz AS superseded_at';
+    const revisionColumn = capabilities.revision_schema ? 'm.revision' : '0::integer AS revision';
+    const selectedColumns = `id, content, metadata, tags, source, namespace, created_at, event_at,
+      relevance_score, relevance_base_score, decay_rate, updated_at, accessed_at, access_count,
+      access_level, client_id, ${beliefColumns}, ${supersessionColumns}, ${revisionColumn}`;
+
+    const lifecyclePredicates = capabilities.supersession_schema
+      ? ['m.superseded_at IS NULL', 'm.superseded_at IS NOT NULL']
+      : ['TRUE'];
+    const vectorPredicate = vectorAvailable ? `embedding IS NOT NULL
+      AND embedding_provider = ${pProvider}
+      AND embedding_model = ${pModel}
+      AND embedding_dimensions = ${pDimensions}` : 'FALSE';
+
+    const vectorBranches = lifecyclePredicates.map(lifecycle => `
+      (SELECT ${selectedColumns},
+        1 - (embedding <=> ${pVec}::vector) AS vec_score
+       FROM memories m
+       WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+         AND m.deleted_at IS NULL AND ${lifecycle}
+         AND ${vectorPredicate}
+       ORDER BY embedding <=> ${pVec}::vector, id
+       LIMIT 50)`).join('\nUNION ALL\n');
+
+    const textBranches = lifecyclePredicates.map(lifecycle => `
+      (SELECT ${selectedColumns}, NULL::double precision AS vec_score
+       FROM memories m
+       WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+         AND m.deleted_at IS NULL AND ${lifecycle}
+         AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
+         AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
+       ORDER BY ts_rank_cd(to_tsvector('english', content), plainto_tsquery(${pQuery})) DESC, id
+       LIMIT 20)`).join('\nUNION ALL\n');
+
+    const demotionMultiplier = capabilities.supersession_schema &&
+      SUPERSEDED_SEARCH_DEMOTION_ENABLED && !params.valid_at
+      ? `CASE WHEN s.superseded_at IS NOT NULL THEN ${pSupersededFactor}::double precision ELSE 1.0 END`
+      : '1.0';
+    const successorSelect = capabilities.supersession_schema
+      ? `(SELECT successor.id FROM memories successor
+         WHERE successor.supersedes_id = r.id
+           AND successor.namespace = r.namespace
+           AND successor.deleted_at IS NULL
+           AND ${accessLevelSql('successor.access_level', pMaxAccessLevel)}
+         LIMIT 1)`
+      : 'NULL::uuid';
 
     const sql = `
       WITH vector_results AS (
-        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
-          updated_at, accessed_at, access_count, access_level, client_id,
-          memory_kind, valid_from, valid_to, supersedes_id, superseded_at,
-          1 - (embedding <=> ${pVec}::vector) AS vec_score
-        FROM memories m
-        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
-          AND m.deleted_at IS NULL
-          AND ${vectorAvailable ? `embedding IS NOT NULL
-          AND embedding_provider = ${pProvider}
-          AND embedding_model = ${pModel}
-          AND embedding_dimensions = ${pDimensions}` : 'FALSE'}
-        ORDER BY embedding <=> ${pVec}::vector
-        LIMIT 50
+        ${vectorBranches}
       ),
       text_only_results AS (
-        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
-          updated_at, accessed_at, access_count, access_level, client_id,
-          memory_kind, valid_from, valid_to, supersedes_id, superseded_at,
-          NULL::double precision AS vec_score
-        FROM memories m
-        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
-          AND m.deleted_at IS NULL
-          AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
-          AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
-        LIMIT 20
+        ${textBranches}
       ),
       combined AS (
         SELECT * FROM vector_results
@@ -152,23 +213,19 @@ export async function hybridSearch(
         FROM combined c
         LEFT JOIN text_scores t ON c.id = t.id
         WHERE COALESCE(c.vec_score, 0) >= ${pThreshold} OR t.text_score > 0
+      ),
+      ranked AS (
+        SELECT s.*,
+          (COALESCE(s.vec_score, 0) * 0.3 + s.text_score * 0.7 + CASE WHEN s.text_score > 0 THEN 2.0 ELSE 0 END)
+            * LEAST(s.relevance, 2.0)
+            * ${demotionMultiplier} AS final_score
+        FROM scored s
       )
-      SELECT s.*,
-        s.superseded_at IS NOT NULL AS is_superseded,
-        (SELECT successor.id
-         FROM memories successor
-         WHERE successor.supersedes_id = s.id
-           AND successor.namespace = s.namespace
-           AND successor.deleted_at IS NULL
-         LIMIT 1) AS superseded_by_id,
-        (COALESCE(s.vec_score, 0) * 0.3 + s.text_score * 0.7 + CASE WHEN s.text_score > 0 THEN 2.0 ELSE 0 END)
-          * LEAST(s.relevance, 2.0)
-          * CASE
-              WHEN ${pValidAt}::timestamptz IS NULL AND s.superseded_at IS NOT NULL THEN ${pSupersededFactor}
-              ELSE 1.0
-            END AS final_score
-      FROM scored s
-      ORDER BY final_score DESC
+      SELECT r.*,
+        (r.superseded_at IS NOT NULL) AS is_superseded,
+        ${successorSelect} AS superseded_by_id
+      FROM ranked r
+      ORDER BY final_score DESC, id
       LIMIT ${pLimit};
     `;
 

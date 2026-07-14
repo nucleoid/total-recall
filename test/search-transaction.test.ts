@@ -11,6 +11,12 @@ class FakeClient {
   readonly calls: QueryCall[] = [];
   releaseArgs: unknown[] | undefined;
   rows: pg.QueryResultRow[] = [];
+  capabilities = {
+    belief_schema: false,
+    supersession_schema: false,
+    revision_schema: false,
+    validity_finalized: false,
+  };
   failOnSearch = false;
   failOnUpdate = false;
 
@@ -19,6 +25,10 @@ class FakeClient {
     params?: unknown[]
   ): Promise<pg.QueryResult<T>> {
     this.calls.push({ text, params });
+
+    if (text.includes('FROM pg_attribute') && text.includes('belief_schema')) {
+      return result([this.capabilities as unknown as T]);
+    }
 
     if (text.includes('WITH vector_results')) {
       if (this.failOnSearch) throw new Error('search failed');
@@ -56,8 +66,9 @@ function result<T extends pg.QueryResultRow>(rows: T[]): pg.QueryResult<T> {
   };
 }
 
-async function loadSearch(): Promise<typeof import('../src/search.js')> {
+async function loadSearch(demotionEnabled = false): Promise<typeof import('../src/search.js')> {
   process.env.HNSW_EF_SEARCH = '321';
+  process.env.SUPERSEDED_SEARCH_DEMOTION_ENABLED = demotionEnabled ? 'true' : 'false';
   process.env.EMBEDDING_PROVIDER = 'gemini';
   process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
   process.env.EMBEDDING_DIMENSIONS = '768';
@@ -101,13 +112,14 @@ test('hybridSearch sets local HNSW inside the scoped transaction before search a
       "SELECT set_config('app.current_key_id', $1, true)",
       "SELECT set_config('app.current_key_is_admin', $1, true)",
       "SELECT set_config('hnsw.ef_search', $1, true)",
+      'SCHEMA',
       'SEARCH',
       'UPDATE memories',
       'COMMIT',
     ]
   );
   assert.deepEqual(client.calls[5].params, ['321']);
-  assert.deepEqual(client.calls[7].params, [['memory-1']]);
+  assert.deepEqual(client.calls[8].params, [['memory-1']]);
   assert.deepEqual(client.releaseArgs, []);
 });
 
@@ -128,6 +140,7 @@ test('hybridSearch commits empty result searches without an access-count update'
       "SELECT set_config('app.current_key_id', $1, true)",
       "SELECT set_config('app.current_key_is_admin', $1, true)",
       "SELECT set_config('hnsw.ef_search', $1, true)",
+      'SCHEMA',
       'SEARCH',
       'COMMIT',
     ]
@@ -160,6 +173,7 @@ test('hybridSearch rolls back and releases when search or update fails', async (
       "SELECT set_config('app.current_key_id', $1, true)",
       "SELECT set_config('app.current_key_is_admin', $1, true)",
       "SELECT set_config('hnsw.ef_search', $1, true)",
+      'SCHEMA',
       'SEARCH',
       'UPDATE memories',
       'ROLLBACK',
@@ -168,7 +182,71 @@ test('hybridSearch rolls back and releases when search or update fails', async (
   assert.deepEqual(updateFailure.releaseArgs, []);
 });
 
+test('hybridSearch selects a pre-026 query shape without swallowing SQL failures', async () => {
+  const client = new FakeClient();
+  setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
+
+  const { hybridSearch } = await loadSearch();
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  const searchSql = client.calls.find(call => call.text.includes('WITH vector_results'))!.text;
+  assert.doesNotMatch(searchSql, /m\.(?:memory_kind|valid_from|valid_to)/);
+  assert.match(searchSql, /NULL::timestamptz AS valid_from/);
+
+  client.failOnSearch = true;
+  await assert.rejects(() => hybridSearch(params, ['shared'], scope, 'normal'), /search failed/);
+});
+
+test('hybridSearch preserves #52 lifecycle fields while belief-validity columns are absent', async () => {
+  const client = new FakeClient();
+  client.capabilities.supersession_schema = true;
+  client.capabilities.revision_schema = true;
+  setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
+
+  const { hybridSearch } = await loadSearch(true);
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  const searchSql = client.calls.find(call => call.text.includes('WITH vector_results'))!.text;
+  assert.match(searchSql, /m\.superseded_at/);
+  assert.match(searchSql, /m\.revision/);
+  assert.doesNotMatch(searchSql, /m\.(?:memory_kind|valid_from|valid_to)/);
+  assert.match(searchSql, /CASE WHEN s\.superseded_at IS NOT NULL THEN \$\d+::double precision/);
+  assert.match(searchSql, /successor\.access_level/);
+});
+
+test('finalized valid_at search filters both candidate paths without present-day demotion', async () => {
+  const client = new FakeClient();
+  client.capabilities = {
+    belief_schema: true,
+    supersession_schema: true,
+    revision_schema: true,
+    validity_finalized: true,
+  };
+  setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
+
+  const { hybridSearch } = await loadSearch(true);
+  await hybridSearch(
+    { ...params, valid_at: '2026-03-01T00:00:00Z' },
+    ['shared'], scope, 'normal',
+  );
+  const searchSql = client.calls.find(call => call.text.includes('WITH vector_results'))!.text;
+  assert.match(searchSql, /m\.valid_from <= \$\d+::timestamptz/);
+  assert.match(searchSql, /m\.valid_to IS NULL OR \$\d+::timestamptz < m\.valid_to/);
+  assert.doesNotMatch(searchSql, /CASE WHEN s\.superseded_at IS NOT NULL/);
+});
+
+test('valid_at fails closed before query construction until validity finalization', async () => {
+  const client = new FakeClient();
+  setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
+
+  const { hybridSearch } = await loadSearch();
+  await assert.rejects(
+    () => hybridSearch({ ...params, valid_at: '2026-03-01T00:00:00Z' }, ['shared'], scope, 'normal'),
+    /temporal search is unavailable/i,
+  );
+  assert.equal(client.calls.some(call => call.text.includes('WITH vector_results')), false);
+});
+
 function summarize(sql: string): string {
+  if (sql.includes('FROM pg_attribute') && sql.includes('belief_schema')) return 'SCHEMA';
   if (sql.includes('WITH vector_results')) return 'SEARCH';
   if (sql.startsWith('UPDATE memories')) return 'UPDATE memories';
   return sql;
