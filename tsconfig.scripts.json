@@ -9,6 +9,8 @@
   "include": [
     "scripts/migrate.ts",
     "scripts/provision-db.ts",
+    "scripts/consolidate-memories.ts",
+    "scripts/deconsolidate-memories.ts",
     "scripts/memory-lifecycle-finalizer.ts",
     "scripts/finalize-memory-lifecycle.ts",
     "scripts/backfill-memory-validity.ts",

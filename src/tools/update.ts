@@ -76,6 +76,8 @@ async function readCurrentTarget(id: string, auth: AuthContext): Promise<UpdateR
      WHERE m.id = $1::uuid
        AND m.deleted_at IS NULL
        AND m.superseded_at IS NULL
+       AND to_jsonb(m)->>'consolidated_into_id' IS NULL
+       AND to_jsonb(m)->>'memory_kind' IS DISTINCT FROM 'consolidation'
        AND m.namespace = ANY($2::text[])
        AND ${accessLevelSql('m.access_level', '$3')}`,
     [id, auth.namespaces, auth.maxAccessLevel],
@@ -134,6 +136,8 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
          WHERE m.id = ANY($1::uuid[])
            AND m.deleted_at IS NULL
            AND m.superseded_at IS NULL
+           AND to_jsonb(m)->>'consolidated_into_id' IS NULL
+           AND to_jsonb(m)->>'memory_kind' IS DISTINCT FROM 'consolidation'
            AND m.namespace = ANY($2::text[])
            AND ${accessLevelSql('m.access_level', '$3')}
          ORDER BY m.id
@@ -212,7 +216,7 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
         assignments.push(`updated_at = ${parameter(timestamp)}::timestamptz`);
         values.push(target.id);
         await client.query(
-          `UPDATE memories SET ${assignments.join(', ')} WHERE id = $${values.length}::uuid`,
+          `UPDATE memories SET ${assignments.join(', ')} WHERE id = $${values.length}::uuid AND to_jsonb(memories)->>'consolidated_into_id' IS NULL AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'`,
           values,
         );
       }
@@ -221,7 +225,7 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
         const validityClosure = validitySchema ? ', valid_to = $1::timestamptz' : '';
         const closed = await client.query(
           `UPDATE memories SET superseded_at = $1::timestamptz${validityClosure}, updated_at = $1::timestamptz
-           WHERE id = $2::uuid AND superseded_at IS NULL`,
+           WHERE id = $2::uuid AND superseded_at IS NULL AND to_jsonb(memories)->>'consolidated_into_id' IS NULL AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'`,
           [timestamp, predecessor.id],
         );
         if (closed.rowCount !== 1) {

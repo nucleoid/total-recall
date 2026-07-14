@@ -48,6 +48,7 @@ ON CONFLICT (source_key) DO UPDATE SET
   updated_at = NOW()
 WHERE memories.deleted_at IS NULL
   AND memories.superseded_at IS NULL
+  AND memories.consolidated_into_id IS NULL
 RETURNING id
 `;
 
@@ -55,6 +56,7 @@ const DELETE_STALE_SQL = `
 DELETE FROM memories
 WHERE client_id = 'file-sync'
   AND deleted_at IS NULL
+  AND consolidated_into_id IS NULL
   AND metadata->>'file' = $1
   AND (source_key IS NULL OR NOT (source_key = ANY($2::text[])))
 `;
@@ -63,6 +65,7 @@ const DELETE_FILE_SQL = `
 DELETE FROM memories
 WHERE client_id = 'file-sync'
   AND deleted_at IS NULL
+  AND consolidated_into_id IS NULL
   AND metadata->>'file' = $1
 `;
 

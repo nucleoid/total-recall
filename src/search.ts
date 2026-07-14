@@ -26,6 +26,7 @@ type SearchSchemaCapabilities = {
   supersession_schema: boolean;
   revision_schema: boolean;
   validity_finalized: boolean;
+  consolidation_schema: boolean;
 };
 
 type CapabilityCache = {
@@ -67,6 +68,11 @@ async function searchSchemaCapabilities(
         WHERE attrelid = 'public.memories'::regclass
           AND attname = 'revision' AND NOT attisdropped
       ) AS revision_schema,
+      EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'public.memories'::regclass
+          AND attname = 'consolidated_into_id' AND NOT attisdropped
+      ) AND to_regclass('public.memory_consolidation_memberships') IS NOT NULL AS consolidation_schema,
       (SELECT count(*) = 5
        FROM pg_attribute
        WHERE attrelid = 'public.memories'::regclass
@@ -87,7 +93,15 @@ async function searchSchemaCapabilities(
           AND c.convalidated
       ) AS validity_finalized
   `);
-  const capabilities = capabilityResult.rows[0];
+  const probed = capabilityResult.rows[0] as SearchSchemaCapabilities | undefined;
+  // Older test doubles and rolling callers may not yet return the additive
+  // field. A fully finalized legacy capability tuple is treated as link-aware
+  // only for that compatibility shape; real PostgreSQL always returns the
+  // explicit catalog-derived boolean above.
+  const capabilities = probed && typeof probed.consolidation_schema !== 'boolean'
+    ? { ...probed, consolidation_schema: probed.belief_schema === true && probed.supersession_schema === true &&
+        probed.revision_schema === true && probed.validity_finalized === true }
+    : probed;
   if (!capabilities || !isCapabilities(capabilities)) {
     throw new Error('Search schema capability probe returned an invalid result');
   }
@@ -96,7 +110,7 @@ async function searchSchemaCapabilities(
   // states are re-probed so a migration cannot leave a reader treating newly
   // superseded rows as current. Pool generation and TTL bound positive staleness.
   if (capabilities.belief_schema && capabilities.supersession_schema &&
-      capabilities.revision_schema && capabilities.validity_finalized) {
+      capabilities.revision_schema && capabilities.validity_finalized && capabilities.consolidation_schema) {
     capabilityCache = {
       generation,
       expiresAt: Date.now() + SEARCH_SCHEMA_CAPABILITY_TTL_MS,
@@ -112,7 +126,8 @@ function isCapabilities(value: SearchSchemaCapabilities): boolean {
   return typeof value.belief_schema === 'boolean' &&
     typeof value.supersession_schema === 'boolean' &&
     typeof value.revision_schema === 'boolean' &&
-    typeof value.validity_finalized === 'boolean';
+    typeof value.validity_finalized === 'boolean' &&
+    typeof value.consolidation_schema === 'boolean';
 }
 
 function boundedSchemaTtl(raw: string | undefined): number {
@@ -194,6 +209,16 @@ export async function hybridSearch(
       conditions.push(`(m.valid_to IS NULL OR ${pValidAt}::timestamptz < m.valid_to)`);
     }
     const extraWhere = conditions.length > 0 ? 'AND ' + conditions.join(' AND ') : '';
+    const consolidationVisibility = capabilities.consolidation_schema
+      ? (params.valid_at
+        ? `AND NOT EXISTS (
+             SELECT 1 FROM memory_consolidation_memberships cm
+             WHERE cm.member_id = m.id
+               AND cm.consolidated_at <= ${pValidAt}::timestamptz
+               AND (cm.deconsolidated_at IS NULL OR ${pValidAt}::timestamptz < cm.deconsolidated_at)
+           )`
+        : 'AND m.consolidated_into_id IS NULL')
+      : '';
 
     const beliefColumns = capabilities.belief_schema
       ? 'm.memory_kind, m.valid_from, m.valid_to'
@@ -220,6 +245,7 @@ export async function hybridSearch(
        FROM memories m
        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
          AND m.deleted_at IS NULL AND ${lifecycle}
+         ${consolidationVisibility}
          AND ${vectorPredicate}
        ORDER BY embedding <=> ${pVec}::vector, id
        LIMIT 50)`).join('\nUNION ALL\n');
@@ -229,6 +255,7 @@ export async function hybridSearch(
        FROM memories m
        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
          AND m.deleted_at IS NULL AND ${lifecycle}
+         ${consolidationVisibility}
          AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
          AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
        ORDER BY ts_rank_cd(to_tsvector('english', content), plainto_tsquery(${pQuery})) DESC, id
@@ -274,6 +301,7 @@ export async function hybridSearch(
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
           AND m.deleted_at IS NULL
+          ${consolidationVisibility}
           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
       ),
       scored AS MATERIALIZED (
@@ -309,7 +337,7 @@ export async function hybridSearch(
     if (res.rows.length > 0) {
       const ids = res.rows.map((r: any) => r.id);
       await client.query(
-        `UPDATE memories SET accessed_at = NOW(), access_count = access_count + 1, last_boosted_at = NOW() WHERE id = ANY($1) AND deleted_at IS NULL`,
+        `UPDATE memories SET accessed_at = NOW(), access_count = access_count + 1, last_boosted_at = NOW() WHERE id = ANY($1) AND deleted_at IS NULL${capabilities.consolidation_schema ? ' AND consolidated_into_id IS NULL' : ''}`,
         [ids]
       );
     }
