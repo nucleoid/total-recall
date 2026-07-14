@@ -115,6 +115,8 @@ paths:
           description: Forbidden
         "400":
           $ref: "#/components/responses/InvalidRequest"
+        "409":
+          $ref: "#/components/responses/TombstonedIdempotencyKey"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -155,7 +157,7 @@ paths:
                   type: string
                 idempotency_key:
                   type: string
-                  description: Optional retry key scoped to the authenticated API key. Reusing it with a different document returns 409.
+                  description: Optional retry key scoped to the authenticated API key and namespace. Reusing it with a different or incomplete document returns 409. If any visible chunk of the completed document was tombstoned, retry returns the stable idempotency_key_tombstoned 409 and never restores chunks.
       responses:
         "200":
           description: Document stored
@@ -176,7 +178,7 @@ paths:
         "403":
           description: Forbidden
         "409":
-          description: Idempotency conflict or incomplete prior document write
+          $ref: "#/components/responses/DocumentIdempotencyConflict"
         "413":
           description: JSON transport envelope exceeds the independently configured HTTP parser limit.
           $ref: "#/components/responses/PayloadTooLarge"
@@ -306,6 +308,33 @@ components:
       description: Encoded JSON exceeds 8 MiB; returns `{code: "payload_too_large"}`.
     UnsupportedContentEncoding:
       description: Non-identity Content-Encoding; returns `{code: "unsupported_content_encoding"}`.
+    TombstonedIdempotencyKey:
+      description: The supplied idempotency key resolves to a deleted memory visible to the authenticated caller. Deleted memories are never restored implicitly.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, code]
+            properties:
+              error:
+                type: string
+              code:
+                type: string
+                enum: [idempotency_key_tombstoned]
+    DocumentIdempotencyConflict:
+      description: The key identifies a different request or incomplete write, or a visible completed document has one or more tombstoned chunks. The tombstone case returns the stable idempotency_key_tombstoned code and never restores chunks; inaccessible rows remain undisclosed.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: string
+              code:
+                type: string
+                description: Present for the stable visible-tombstone conflict.
+                enum: [idempotency_key_tombstoned]
   schemas:
     ForgetRequest:
       type: object

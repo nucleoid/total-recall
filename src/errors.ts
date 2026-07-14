@@ -27,8 +27,22 @@ export class ForgetLimitError extends RequestValidationError {
   }
 }
 
+export class TombstonedSourceKeyConflictError extends Error {
+  readonly statusCode = 409;
+  readonly code = 'idempotency_key_tombstoned';
+
+  constructor() {
+    super('Idempotency key refers to a deleted memory');
+    this.name = 'TombstonedSourceKeyConflictError';
+  }
+}
+
 export function isPublicApiError(error: unknown): error is Error & { statusCode: number; code: string } {
   if (!(error instanceof Error)) return false;
   const candidate = error as Error & { statusCode?: unknown; code?: unknown };
-  return (candidate.statusCode === 400 || candidate.statusCode === 403) && typeof candidate.code === 'string';
+  return (
+    candidate.statusCode === 400 ||
+    candidate.statusCode === 403 ||
+    candidate.statusCode === 409
+  ) && typeof candidate.code === 'string';
 }

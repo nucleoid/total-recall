@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { dbScopeFromAuth, queryScoped } from '../db.js';
+import { dbScopeFromAuth, queryScoped, withScopedClient } from '../db.js';
 import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
+import { TombstonedSourceKeyConflictError } from '../errors.js';
 import {
   MEMORY_CONTENT_MAX_CHARS,
   TAG_MAX_CHARS,
@@ -96,31 +97,49 @@ export async function memoryStore(
   const sourceKey = `discord-safe:v1:${digest}`;
   let res;
   try {
-    res = await queryScoped(
-      dbScopeFromAuth(auth),
-      `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key)
-       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-       ON CONFLICT (source_key) DO UPDATE SET
-         content = EXCLUDED.content,
-         embedding = EXCLUDED.embedding,
-         embedding_provider = EXCLUDED.embedding_provider,
-         embedding_model = EXCLUDED.embedding_model,
-         embedding_dimensions = EXCLUDED.embedding_dimensions,
-         source = EXCLUDED.source,
-         namespace = EXCLUDED.namespace,
-         tags = EXCLUDED.tags,
-         metadata = EXCLUDED.metadata,
-         access_level = EXCLUDED.access_level,
-         client_id = EXCLUDED.client_id,
-         agent_id = EXCLUDED.agent_id,
-         session_id = EXCLUDED.session_id,
-         updated_at = NOW()
-       WHERE memories.deleted_at IS NULL
-         AND memories.namespace = ANY($15::text[])
-         AND EXCLUDED.namespace = ANY($15::text[])
-       RETURNING id, namespace`,
-      [...values, sourceKey, auth.namespaces]
-    );
+    res = await withScopedClient(dbScopeFromAuth(auth), async (client) => {
+      const upsert = await client.query(
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         ON CONFLICT (source_key) DO UPDATE SET
+           content = EXCLUDED.content,
+           embedding = EXCLUDED.embedding,
+           embedding_provider = EXCLUDED.embedding_provider,
+           embedding_model = EXCLUDED.embedding_model,
+           embedding_dimensions = EXCLUDED.embedding_dimensions,
+           source = EXCLUDED.source,
+           namespace = EXCLUDED.namespace,
+           tags = EXCLUDED.tags,
+           metadata = EXCLUDED.metadata,
+           access_level = EXCLUDED.access_level,
+           client_id = EXCLUDED.client_id,
+           agent_id = EXCLUDED.agent_id,
+           session_id = EXCLUDED.session_id,
+           updated_at = NOW()
+         WHERE memories.deleted_at IS NULL
+           AND memories.namespace = ANY($15::text[])
+           AND EXCLUDED.namespace = ANY($15::text[])
+         RETURNING id, namespace`,
+        [...values, sourceKey, auth.namespaces]
+      );
+      if (upsert.rows.length > 0) return upsert;
+
+      // A tombstone remains SELECT-visible under the caller's RLS scope. Resolve
+      // the zero-row conflict before leaving this transaction/client so a hidden
+      // row stays indistinguishable from any other inaccessible conflict.
+      const tombstone = await client.query(
+        `SELECT 1
+         FROM memories
+         WHERE source_key = $1
+           AND deleted_at IS NOT NULL
+         LIMIT 1`,
+        [sourceKey]
+      );
+      if (tombstone.rows.length > 0) {
+        throw new TombstonedSourceKeyConflictError();
+      }
+      throw new Error('Access denied to existing idempotent memory');
+    });
   } catch (error) {
     // Under RLS, a hidden source_key conflict can surface as 23505 because the
     // conflicting row is not visible to ON CONFLICT. Do not leak its existence.
@@ -128,9 +147,6 @@ export async function memoryStore(
       throw new Error('Access denied to existing idempotent memory');
     }
     throw error;
-  }
-  if (res.rows.length === 0) {
-    throw new Error('Access denied to existing idempotent memory');
   }
   return { ...res.rows[0], idempotency_key_honored: true };
 }

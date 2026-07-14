@@ -54,6 +54,8 @@ test('historical preview is bounded, content-free, and performs no writes', asyn
   assert.match(preview.candidates[0].rowFingerprint, /^[a-f0-9]{64}$/);
   assert.ok(client.calls.every(call => /^\s*SELECT/i.test(call.sql)));
   assert.deepEqual(client.calls[0].values, [26, 0]);
+  assert.match(client.calls[0].sql, /m\.deleted_at IS NULL/i);
+  assert.match(client.calls[0].sql, /candidate\.deleted_at IS NULL/i);
   assert.equal(preview.nextOffset, null);
 });
 
@@ -109,6 +111,7 @@ test('apply locks and rechecks exact approved rows, rejecting fingerprint drift 
   );
   assert.equal(client.calls[0].sql, 'BEGIN');
   assert.match(client.calls[1].sql, /FOR UPDATE/i);
+  assert.match(client.calls[1].sql, /m\.deleted_at IS NULL/i);
   assert.equal(client.calls.at(-1)?.sql, 'ROLLBACK');
   assert.ok(client.calls.every(call => !/^DELETE/i.test(call.sql)));
 });
@@ -132,6 +135,7 @@ test('approved apply deletes only exact IDs plus exact watcher-owned path and ma
   assert.deepEqual(result, { pathsDeleted: 1, memoriesDeleted: 1 });
   const memoryDelete = client.calls.find(call => /^DELETE FROM memories/i.test(call.sql));
   assert.match(memoryDelete?.sql ?? '', /client_id\s*=\s*'file-sync'/i);
+  assert.match(memoryDelete?.sql ?? '', /deleted_at IS NULL/i);
   assert.match(memoryDelete?.sql ?? '', /metadata->>'file'\s*=\s*\$1/i);
   assert.match(memoryDelete?.sql ?? '', /id\s*=\s*ANY\(\$2::uuid\[\]\)/i);
   assert.deepEqual(memoryDelete?.values, ['notes/gone.md', approved.approvals[0].memoryIds]);

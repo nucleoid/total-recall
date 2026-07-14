@@ -57,6 +57,8 @@ export async function repairDocumentChunkCounts(
 
     while (updatedRows < maxRows) {
       const limit = Math.min(batchSize, maxRows - updatedRows);
+      // Intentionally count every physical chunk, including tombstones: chunk_count
+      // records immutable ingestion cardinality rather than currently recallable chunks.
       const result = await client.query<{ id: string }>(
         `
         WITH candidates AS MATERIALIZED (

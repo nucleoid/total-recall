@@ -73,6 +73,7 @@ export async function repairMediaRollupTags(
              JOIN memories m ON m.id = e.memory_id
              WHERE e.client_id = $1::uuid
                AND m.namespace = 'media'
+               AND m.deleted_at IS NULL
                AND m.client_id = e.client_id::text
                AND m.source = 'media:' || e.service
                AND ($2::timestamptz IS NULL OR (e.played_at, e.id) > ($2::timestamptz, $3::uuid))
@@ -98,6 +99,7 @@ export async function repairMediaRollupTags(
               `UPDATE memories m
                SET tags = $1, updated_at = NOW()
                WHERE m.id = $2
+                 AND m.deleted_at IS NULL
                  AND m.namespace = 'media'
                  AND m.client_id = $3
                  AND m.source = 'media:' || $4

@@ -52,6 +52,7 @@ export async function repairLastBoostedAt(
           SELECT id
           FROM public.memories
           WHERE last_boosted_at IS NULL
+            AND deleted_at IS NULL
           ORDER BY created_at, id
           LIMIT $1
           FOR UPDATE SKIP LOCKED
@@ -61,6 +62,7 @@ export async function repairLastBoostedAt(
             updated_at = NOW()
         FROM candidates
         WHERE memories.id = candidates.id
+          AND memories.deleted_at IS NULL
         RETURNING memories.id
         `,
         [limit]
@@ -90,6 +92,7 @@ async function countRemaining(client: pg.Client): Promise<number> {
     SELECT COUNT(*)::text AS count
     FROM public.memories
     WHERE last_boosted_at IS NULL
+      AND deleted_at IS NULL
   `);
   return Number.parseInt(result.rows[0].count, 10);
 }

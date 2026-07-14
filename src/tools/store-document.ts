@@ -5,6 +5,7 @@ import { dbScopeFromAuth, withScopedClient } from '../db.js';
 import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
+import { TombstonedSourceKeyConflictError } from '../errors.js';
 import {
   DOCUMENT_TITLE_MAX_CHARS,
   MEBIBYTE,
@@ -46,7 +47,8 @@ type ExistingDocumentRow = {
   title: string;
   chunk_count: number | string;
   request_hash: string | null;
-  actual_count: number | string;
+  active_count: number | string;
+  deleted_count: number | string;
 };
 
 export class StoreDocumentConflictError extends Error {
@@ -192,12 +194,12 @@ async function findExistingDocument(
             d.title,
             d.chunk_count,
             d.request_hash,
-            COUNT(m.id)::int AS actual_count
+            (COUNT(m.id) FILTER (WHERE m.deleted_at IS NULL))::int AS active_count,
+            (COUNT(m.id) FILTER (WHERE m.deleted_at IS NOT NULL))::int AS deleted_count
      FROM documents d
      LEFT JOIN memories m
        ON m.document_id = d.id
       AND m.client_id = $1
-      AND m.deleted_at IS NULL
      WHERE d.client_id = $1::uuid
        AND d.namespace = $2
        AND d.idempotency_key = $3
@@ -216,8 +218,23 @@ function completedExistingResult(
   }
 
   const chunkCount = Number(row.chunk_count);
-  const actualCount = Number(row.actual_count);
-  if (!Number.isInteger(chunkCount) || chunkCount <= 0 || actualCount !== chunkCount) {
+  const activeCount = Number(row.active_count);
+  const deletedCount = Number(row.deleted_count);
+  if (
+    !Number.isInteger(chunkCount) || chunkCount <= 0 ||
+    !Number.isInteger(activeCount) || activeCount < 0 ||
+    !Number.isInteger(deletedCount) || deletedCount < 0
+  ) {
+    throw new StoreDocumentConflictError('Idempotency key points to an incomplete document write');
+  }
+
+  // A complete physical chunk set with fewer active chunks was deliberately
+  // forgotten, not partially written. Use the same stable public conflict as
+  // memory_store, but only after the scoped/RLS-filtered query made it visible.
+  if (deletedCount > 0 && activeCount + deletedCount === chunkCount) {
+    throw new TombstonedSourceKeyConflictError();
+  }
+  if (activeCount !== chunkCount || deletedCount !== 0) {
     throw new StoreDocumentConflictError('Idempotency key points to an incomplete document write');
   }
 

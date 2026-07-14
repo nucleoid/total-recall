@@ -64,6 +64,34 @@ test('batch embeds before BEGIN, sets exact transaction-local namespaces, writes
   assert.ok(calls[2].values?.includes('preseed'));
 });
 
+test('batch reports tombstoned zero-row conflicts once without adding restoration behavior', async t => {
+  const warnings: string[] = [];
+  const calls: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (message?: unknown) => { warnings.push(String(message)); };
+  t.after(() => { console.warn = originalWarn; });
+
+  const written = await commitImportBatch(
+    [row('projects', 'active-key'), row('projects', 'tombstoned-key')],
+    async texts => texts.map(() => Array(768).fill(0.5)),
+    {
+      async query(text: string) {
+        calls.push(text);
+        return text.startsWith('INSERT')
+          ? { command: 'INSERT', rowCount: 1, rows: [{ id: 'active' }] }
+          : {};
+      },
+    },
+    'preseed',
+  );
+
+  assert.equal(written, 1);
+  assert.deepEqual(warnings, ['[preseed] Skipped 1 tombstoned source-key conflict(s)']);
+  const insert = calls.find(text => text.startsWith('INSERT')) ?? '';
+  assert.match(insert, /WHERE memories\.deleted_at IS NULL[\s\S]*RETURNING id/);
+  assert.doesNotMatch(insert, /deleted_at\s*=|deletion_reason\s*=|deleted_by_client_id\s*=/i);
+});
+
 test('batch validates provider output before SQL, rolls back DB failures, and never uses a session GUC', async () => {
   let calls = 0;
   await assert.rejects(commitImportBatch([row('work')], async () => [], {

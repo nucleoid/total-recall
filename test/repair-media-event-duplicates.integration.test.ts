@@ -60,6 +60,20 @@ test('preview is bounded and read-only; apply requires exact backup-backed appro
     assert.deepEqual(await snapshot(), before);
   });
 
+  await t.test('a tombstone appearing after preview is never hard-deleted and rolls the group back', async () => {
+    const owner = new pg.Client({ connectionString: url }); await owner.connect();
+    try {
+      await owner.query(`UPDATE memories SET deleted_at = NOW() WHERE id = $1`, [MEMORY_B]);
+      const tombstoned = await snapshot();
+      await assert.rejects(
+        repairMediaEventDuplicates({ connectionString: url, apply: true, confirmBackup: true, approvals: [approval] }),
+        /drift|fingerprint|incomplete/i,
+      );
+      assert.deepEqual(await snapshot(), tombstoned);
+      await owner.query(`UPDATE memories SET deleted_at = NULL WHERE id = $1`, [MEMORY_B]);
+    } finally { await owner.end(); }
+  });
+
   await setRoleTimezone('Pacific/Auckland');
   try {
     const owner = new pg.Client({ connectionString:url }); await owner.connect();
@@ -160,7 +174,7 @@ async function seed(): Promise<void> {
         namespace text DEFAULT 'media', tags text[] DEFAULT '{}', access_level text DEFAULT 'normal', client_id uuid,
         created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), accessed_at timestamptz DEFAULT now(),
         access_count integer DEFAULT 0, relevance_score float DEFAULT 1.0, decay_rate float DEFAULT 0.01,
-        last_boosted_at timestamptz DEFAULT now());
+        last_boosted_at timestamptz DEFAULT now(), deleted_at timestamptz);
       CREATE TABLE media_events(
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(), service text NOT NULL, service_id text, event_type text NOT NULL,
         title text NOT NULL, artist text, album text, show text, season integer, episode integer, year integer,
@@ -182,7 +196,7 @@ async function seedManyDuplicateGroups(): Promise<void> {
     await client.query(`DROP TABLE IF EXISTS media_events,memories CASCADE; DROP FUNCTION IF EXISTS public.media_event_effective_identity(text,text,text,text,text,text,integer,integer,integer,integer);`);
     await client.query(`
       CREATE EXTENSION IF NOT EXISTS pgcrypto;
-      CREATE TABLE memories(id uuid PRIMARY KEY, content text NOT NULL, metadata jsonb DEFAULT '{}');
+      CREATE TABLE memories(id uuid PRIMARY KEY, content text NOT NULL, metadata jsonb DEFAULT '{}', deleted_at timestamptz);
       CREATE TABLE media_events(
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(), service text NOT NULL, service_id text, event_type text NOT NULL,
         title text NOT NULL, artist text, album text, show text, season integer, episode integer, year integer,

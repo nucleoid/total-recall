@@ -86,6 +86,7 @@ export async function inventoryNamespaces(client: QueryClient): Promise<Namespac
   const result = await client.query<{ namespace: string; count: string | number }>(`
     SELECT namespace, count(*)::text AS count
     FROM public.memories
+    WHERE deleted_at IS NULL
     GROUP BY namespace
     ORDER BY namespace
   `);

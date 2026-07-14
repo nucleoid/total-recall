@@ -386,10 +386,10 @@ function sendApiError(res: express.Response, label: string, err: any): void {
     res.status(400).json({ error: 'Invalid request', details: err.errors });
   } else if (typeof err.message === 'string' && err.message.startsWith('Invalid ')) {
     res.status(400).json({ error: err.message });
-  } else if (isStoreDocumentConflictError(err)) {
-    res.status(409).json({ error: err.message });
   } else if (isPublicApiError(err)) {
     res.status(err.statusCode).json({ error: err.message, code: err.code });
+  } else if (isStoreDocumentConflictError(err)) {
+    res.status(409).json({ error: err.message });
   } else if (permissionDenied(err)) {
     res.status(403).json({ error: err.message });
   } else {

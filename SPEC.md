@@ -88,6 +88,8 @@ Store a nonblank document of at most **1 MiB decoded UTF-8**. Chunking prefers m
 - tags?: string[]
 - idempotency_key?: string
 
+A retry with the same request returns the completed document only while all original chunks remain active. If any visible chunk has been deliberately tombstoned, the retry returns the stable typed `idempotency_key_tombstoned` conflict (HTTP 409) and never restores chunks. A physical chunk-count mismatch without tombstones remains an incomplete-write conflict. Namespace RLS and the pre-query authorization check keep inaccessible documents and chunks undisclosed.
+
 ### memory_search
 Hybrid vector + full-text search.
 - query: string (required)
@@ -223,6 +225,12 @@ node dist/index.js
 ```
 
 Schema migrations use only owner-capable `MIGRATION_DATABASE_URL`; runtime services use the least-privileged `DATABASE_URL`; all-row decay and repair use an explicitly verified maintenance-capable connection. The numbered migration runner preflights schema creation and ownership of existing managed tables and never promotes the runtime role. The obsolete standalone decay DDL command must not be restored.
+
+### Memory lifecycle rollout and rollback
+
+Deletion remains disabled while operators run `npm run migrate`. Migration 024 adds the explicitly named deletion-reason CHECK and deleter FK as `NOT VALID` and does not validate either inside the transaction-wrapped migration, where earlier `ALTER TABLE` locks persist until commit. After migration commit, operators run `npm run finalize:memory-lifecycle` with the owner connection. The finalizer verifies definitions and validity, validates each constraint in a separate autocommit `ALTER TABLE ... VALIDATE CONSTRAINT` using PostgreSQL's lower-lock path, then builds both partial indexes concurrently. Failed validations, partial completion, and invalid interrupted-index leftovers are safely verified and retried through the same command; both constraints and both indexes must report valid. Operators must then deploy and restart all tombstone-aware processes—servers, watchers, importers, connectors/rollups, and maintenance readers/writers—before enabling memory deletion through `delete` permissions or invoking forget. Mixed tombstone-aware and unaware processes are unsupported.
+
+Disable forget/REST deletion and purge first during incident response or rollback. Before any tombstone is created, retaining the additive fields/indexes permits an application rollback. Once tombstones exist, rollback is **roll-forward-only**: every process must remain tombstone-aware, tombstone fields must remain intact, and fixes deploy forward. Hard-purged content is recoverable only from a verified backup.
 
 Migration `009_api_key_access_ceiling.sql` backfills existing `api_keys.max_access_level` values to `secret` to preserve upgraded installations, then sets the default for newly created keys to `normal`. Use `--max-access-level sensitive` or `--max-access-level secret` only for clients that should read and write higher-classification memories.
 

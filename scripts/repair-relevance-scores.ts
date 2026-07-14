@@ -111,7 +111,8 @@ export async function applyRelevanceRepair(connectionString: string, raw: Approv
       // when every referenced row already has its approved base.
       if (manifest.approvals.length > 0) {
         const existing = await client.query<{ id: string; relevance_base_score: number }>(
-          `SELECT id, relevance_base_score FROM public.memories WHERE id = ANY($1::uuid[])`,
+          `SELECT id, relevance_base_score FROM public.memories
+           WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
           [manifest.approvals.map(a => a.id)]
         );
         const expected = new Map(manifest.approvals.map(a => [a.id, a.baseScore!]));

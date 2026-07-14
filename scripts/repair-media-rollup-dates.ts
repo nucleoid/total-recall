@@ -165,6 +165,7 @@ async function loadCandidates(client: pg.Client, page: CandidatePage): Promise<C
          FROM media_events e
          JOIN memories m ON m.id = e.memory_id
         WHERE m.namespace = 'media'
+          AND m.deleted_at IS NULL
           AND m.source = 'media:' || e.service
           AND ($1::timestamptz IS NULL OR (e.played_at, e.id) > ($1::timestamptz, $2::uuid))
           AND ($3::text IS NULL OR e.service = $3)
@@ -205,6 +206,7 @@ async function applyIfUnchanged(
         WHERE e.id = $1
           AND m.id = $2
           AND m.namespace = 'media'
+          AND m.deleted_at IS NULL
           AND m.source = 'media:' || e.service
         FOR UPDATE OF m`,
       [captured.id, captured.memory_id]
@@ -215,16 +217,21 @@ async function applyIfUnchanged(
       return 'concurrent';
     }
 
-    await client.query(
+    const updated = await client.query(
       `UPDATE memories
           SET content = $1,
               embedding = $2::vector,
               tags = $3,
               metadata = $4,
               updated_at = NOW()
-        WHERE id = $5`,
+        WHERE id = $5
+          AND deleted_at IS NULL`,
       [content, `[${vector.join(',')}]`, tags, JSON.stringify(metadata), captured.memory_id]
     );
+    if (updated.rowCount !== 1) {
+      await client.query('ROLLBACK');
+      return 'concurrent';
+    }
     await client.query('COMMIT');
     return 'updated';
   } catch (error) {

@@ -23,6 +23,7 @@ type MemoryRow = {
   client_id: string;
   document_id: string;
   chunk_index: number;
+  deleted_at: string | null;
 };
 
 const AUTH_A: AuthContext = {
@@ -109,10 +110,12 @@ class FakeClient {
         (row) => row.client_id === keyId && row.namespace === namespace && row.idempotency_key === idempotencyKey
       );
       if (!doc) return this.result([]);
-      const actual_count = [...this.db.memories, ...this.pendingMemories].filter(
+      const linked = [...this.db.memories, ...this.pendingMemories].filter(
         (row) => row.document_id === doc.id && row.client_id === keyId
-      ).length;
-      return this.result([{ ...doc, actual_count } as T]);
+      );
+      const active_count = linked.filter(row => row.deleted_at === null).length;
+      const deleted_count = linked.filter(row => row.deleted_at !== null).length;
+      return this.result([{ ...doc, active_count, deleted_count } as T]);
     }
 
     if (/^INSERT INTO documents/i.test(normalized)) {
@@ -154,6 +157,7 @@ class FakeClient {
         client_id: String(params?.[7]),
         document_id: String(params?.[8]),
         chunk_index: Number(params?.[9]),
+        deleted_at: null,
       });
       return this.result([{ id: this.pendingMemories.at(-1)!.id } as T]);
     }
@@ -325,6 +329,35 @@ test('same namespace idempotency key converges and changed request conflicts; na
   const otherTenant = await memoryStoreDocument(params, AUTH_B);
   assert.notEqual(otherTenant.document_id, first.document_id);
   assert.equal(pool.db.docs.filter((row) => row.idempotency_key === 'upload-1').length, 3);
+});
+
+test('same-key retry reports a complete document with tombstoned chunks as the stable typed conflict', async () => {
+  const pool = new FakePool();
+  setPoolForTesting(pool as unknown as pg.Pool);
+  const embeddings = installEmbeddingMock();
+  const { memoryStoreDocument } = await loadStoreDocument();
+  const { TombstonedSourceKeyConflictError } = await import('../src/errors.js');
+  const params = {
+    title: 'forgotten document',
+    content: chunkedContent(2),
+    namespace: 'shared',
+    tags: [],
+    source: 'manual',
+    idempotency_key: 'forgotten-document',
+  };
+
+  const stored = await memoryStoreDocument(params, AUTH_A);
+  pool.db.memories.find(row => row.document_id === stored.document_id)!.deleted_at = '2026-07-14T00:00:00.000Z';
+
+  await assert.rejects(memoryStoreDocument(params, AUTH_A), (error: unknown) => {
+    assert.ok(error instanceof TombstonedSourceKeyConflictError);
+    assert.equal(error.statusCode, 409);
+    assert.equal(error.code, 'idempotency_key_tombstoned');
+    return true;
+  });
+  assert.equal(embeddings.calls(), 2, 'visible tombstones must conflict before re-embedding');
+  assert.equal(pool.db.docs.length, 1);
+  assert.equal(pool.db.memories.length, 2);
 });
 
 test('canonical tag ordering remains stable across locale/ICU changes', async () => {

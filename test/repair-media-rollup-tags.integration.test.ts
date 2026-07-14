@@ -20,7 +20,7 @@ test('media tag repair is bounded, dry-run safe, deterministic, idempotent, and 
     await owner.query(`
       CREATE ROLE total_recall_app LOGIN PASSWORD 'repair_app';
       CREATE TABLE api_keys (id uuid PRIMARY KEY);
-      CREATE TABLE memories (id uuid PRIMARY KEY, source text NOT NULL, namespace text NOT NULL, tags text[] NOT NULL, client_id text NOT NULL, updated_at timestamptz DEFAULT now());
+      CREATE TABLE memories (id uuid PRIMARY KEY, source text NOT NULL, namespace text NOT NULL, tags text[] NOT NULL, client_id text NOT NULL, updated_at timestamptz DEFAULT now(), deleted_at timestamptz);
       CREATE TABLE documents (id uuid PRIMARY KEY, namespace text NOT NULL);
       CREATE TABLE agents (id uuid PRIMARY KEY, name text, api_key_id uuid);
       CREATE TABLE recall_traces (id uuid PRIMARY KEY, client_id text);
@@ -44,11 +44,14 @@ test('media tag repair is bounded, dry-run safe, deterministic, idempotent, and 
         ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3', 'manual', 'media', ARRAY['movie'], '${KEY_ID}'),
         ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4', 'media:other', 'media', ARRAY['movie'], '${KEY_ID}'),
         ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5', 'media:spotify', 'media', ARRAY['movie'], '${KEY_ID}');
+      UPDATE memories SET deleted_at = '2026-01-01T00:00:00Z'
+       WHERE id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5';
       INSERT INTO media_events (id, service, event_type, title, artist, album, show, season, episode, year, genres, duration_ms, played_ms, completed, played_at, metadata, client_id, memory_id) VALUES
         ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1', 'spotify', 'play', 'Track', NULL, NULL, NULL, NULL, NULL, NULL, ARRAY['ROCK'], NULL, NULL, true, '2026-01-01', '{}', '${KEY_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'),
         ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2', 'plex', 'watch', 'Movie', NULL, NULL, NULL, NULL, NULL, NULL, ARRAY[]::text[], NULL, NULL, NULL, '2026-01-02', '{"plex_type":"movie"}', '${KEY_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2'),
         ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3', 'spotify', 'play', 'Manual', NULL, NULL, NULL, NULL, NULL, NULL, ARRAY[]::text[], NULL, NULL, NULL, '2026-01-03', '{}', '${KEY_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3'),
-        ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4', 'other', 'watch', 'Mystery', NULL, NULL, NULL, NULL, NULL, NULL, ARRAY['MOVIE','Drama'], NULL, NULL, NULL, '2026-01-04', '{}', '${KEY_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4');
+        ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4', 'other', 'watch', 'Mystery', NULL, NULL, NULL, NULL, NULL, NULL, ARRAY['MOVIE','Drama'], NULL, NULL, NULL, '2026-01-04', '{}', '${KEY_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4'),
+        ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb5', 'spotify', 'play', 'Deleted', NULL, NULL, NULL, NULL, NULL, NULL, ARRAY['ROCK'], NULL, NULL, true, '2026-01-05', '{}', '${KEY_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5');
     `);
 
     const connectionString = `postgresql://total_recall_app:repair_app@127.0.0.1:${port}/postgres`;

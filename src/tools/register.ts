@@ -89,7 +89,7 @@ const TOOL_DEFINITIONS = [
         metadata: { type: 'object', description: `Chunk metadata (maximum ${METADATA_MAX_BYTES} serialized JSON bytes, depth ${METADATA_MAX_DEPTH}, ${METADATA_MAX_KEYS} keys total)` },
         idempotency_key: {
           type: 'string',
-          description: 'Optional retry key. Reusing the same key with the same document returns the committed document; a different document returns an error.',
+          description: 'Optional retry key. Reusing the same key with the same active document returns it; a different/incomplete document conflicts, and visible tombstoned chunks return the stable idempotency_key_tombstoned conflict without restoration.',
         },
       },
       required: ['title', 'content'],

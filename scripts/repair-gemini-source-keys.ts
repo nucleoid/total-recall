@@ -164,6 +164,7 @@ export function buildGeminiRepairPreview(rows: RepairRow[], limit = DEFAULT_PREV
 const SELECT_SCOPE_SQL = `SELECT id, source_key, content, created_at, source, client_id, namespace, tags, metadata, updated_at, embedding::text AS embedding, event_at, access_level, agent_id
 FROM memories
 WHERE client_id = 'preseed-gemini' AND source = 'gemini-conversation'
+  AND deleted_at IS NULL
   AND source_key ~ '^gemini-conv:[0-9]+:'`;
 
 async function loadRows(client: RepairQueryClient, lock: boolean): Promise<RepairRow[]> {
@@ -172,7 +173,8 @@ async function loadRows(client: RepairQueryClient, lock: boolean): Promise<Repai
   if (targets.length === 0) return legacy.rows;
   const existing = await client.query(`SELECT id, source_key, content, created_at, source, client_id, namespace, tags, metadata, updated_at, embedding::text AS embedding, event_at, access_level, agent_id
 FROM memories
-WHERE client_id = 'preseed-gemini' AND source = 'gemini-conversation' AND source_key = ANY($1)${lock ? ' FOR UPDATE' : ''}`, [targets]);
+WHERE client_id = 'preseed-gemini' AND source = 'gemini-conversation'
+  AND deleted_at IS NULL AND source_key = ANY($1)${lock ? ' FOR UPDATE' : ''}`, [targets]);
   return [...new Map([...legacy.rows, ...existing.rows].map(row => [row.id, row])).values()];
 }
 
@@ -237,12 +239,12 @@ export async function applyGeminiKeyRepair(client: RepairQueryClient, manifest: 
       result.retained.push(retain.id);
       // Free a target held by an approved v2 duplicate before rekeying; the transaction restores deletes if rekey fails.
       for (const id of collision.ids.filter(id => id !== retain.id)) {
-        const deleted = await client.query('DELETE FROM memories WHERE id = $1', [id]);
+        const deleted = await client.query('DELETE FROM memories WHERE id = $1 AND deleted_at IS NULL', [id]);
         if (deleted.rowCount !== 1) throw new Error(`Failed to delete approved duplicate ${id}`);
         result.deleted.push(id);
       }
       if (inLegacyScope(retainedRow)) {
-        const updated = await client.query('UPDATE memories SET source_key = $1 WHERE id = $2', [collision.targetKey, retain.id]);
+        const updated = await client.query('UPDATE memories SET source_key = $1 WHERE id = $2 AND deleted_at IS NULL', [collision.targetKey, retain.id]);
         if (updated.rowCount !== 1) throw new Error(`Failed to rekey ${retain.id}`);
         result.rekeyed.push(retain.id);
       }
@@ -250,7 +252,7 @@ export async function applyGeminiKeyRepair(client: RepairQueryClient, manifest: 
     for (const candidate of preview.candidates) {
       if (collisionIds.has(candidate.id)) continue;
       if (approvals.get(candidate.id)!.action !== 'rekey') throw new Error(`Ordinary candidate ${candidate.id} requires rekey action`);
-      const updated = await client.query('UPDATE memories SET source_key = $1 WHERE id = $2', [candidate.targetKey, candidate.id]);
+      const updated = await client.query('UPDATE memories SET source_key = $1 WHERE id = $2 AND deleted_at IS NULL', [candidate.targetKey, candidate.id]);
       if (updated.rowCount !== 1) throw new Error(`Failed to rekey ${candidate.id}`);
       result.rekeyed.push(candidate.id);
     }
