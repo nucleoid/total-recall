@@ -448,6 +448,7 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
     let inputBytes = 0;
     let outputBytes = 0;
     let reservedCostMicroUsd = 0;
+    const mergedCanonicalIds: string[] = [];
     try {
       const effectiveCursor = options.cursor === undefined && options.mode === 'apply'
         ? await loadCheckpoint(client, scope, options.auth.keyId, options.namespace)
@@ -489,7 +490,6 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
         : undefined;
       runIdForFailure = runId;
       const previews: ConsolidationPreview[] = [];
-      const mergedCanonicalIds: string[] = [];
 
       for (const cluster of selection.clusters) {
         throwIfAborted(options.signal);
@@ -603,10 +603,10 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
         await withScopedTransactionOnClient(client, scope, scoped => scoped.query(
           `UPDATE memory_consolidation_runs
            SET status = $2, provider_calls = $3, input_bytes = $4, output_bytes = $5,
-               estimated_cost_micro_usd = $6, completed_at = statement_timestamp()
+               clusters_merged = $6, estimated_cost_micro_usd = $7, completed_at = statement_timestamp()
            WHERE id = $1::uuid AND status = 'running'`,
           [runIdForFailure, options.signal?.aborted ? 'cancelled' : 'failed', calls, inputBytes,
-            outputBytes, reservedCostMicroUsd],
+            outputBytes, mergedCanonicalIds.length, reservedCostMicroUsd],
         )).catch(() => undefined);
       }
       throw error;
