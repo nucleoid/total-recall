@@ -15,6 +15,7 @@ export const searchSchema = z.object({
   source: z.string().optional(),
   after: z.string().optional(),
   before: z.string().optional(),
+  valid_at: z.string().datetime({ offset: true }).optional(),
   agent_name: z.string().optional(),
   session_id: z.string().optional(),
 });

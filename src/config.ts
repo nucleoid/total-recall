@@ -1,6 +1,7 @@
 const HNSW_EF_SEARCH_DEFAULT = 200;
 const HNSW_EF_SEARCH_MIN = 1;
 const HNSW_EF_SEARCH_MAX = 1000;
+export const SUPERSEDED_SCORE_FACTOR_DEFAULT = 0.25;
 
 export function parseHnswEfSearch(raw: string | undefined): number {
   const trimmed = raw?.trim() ?? '';
@@ -28,8 +29,6 @@ export function hnswEfSearchFromEnv(env: NodeJS.ProcessEnv = process.env): numbe
   return parseHnswEfSearch(env.HNSW_EF_SEARCH);
 }
 
-export const SUPERSEDED_SCORE_FACTOR_DEFAULT = 0.25;
-
 export function parseSupersededScoreFactor(raw: string | undefined): number {
   const trimmed = raw?.trim() ?? '';
   if (trimmed === '') return SUPERSEDED_SCORE_FACTOR_DEFAULT;
@@ -42,4 +41,9 @@ export function parseSupersededScoreFactor(raw: string | undefined): number {
 
 export function supersededScoreFactorFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   return parseSupersededScoreFactor(env.SUPERSEDED_SCORE_FACTOR);
+}
+
+/** Superseded-row ranking changes are an explicit rollout step, never implicit. */
+export function supersededSearchDemotionEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.SUPERSEDED_SEARCH_DEMOTION_ENABLED === 'true';
 }

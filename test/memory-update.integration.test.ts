@@ -4,9 +4,10 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import pg from 'pg';
+import { backfillMemoryValidity } from '../scripts/backfill-memory-validity.js';
 import { finalizeMemorySupersession } from '../scripts/memory-supersession-finalizer.js';
+import { finalizeMemoryValidity } from '../scripts/finalize-memory-validity.js';
 import { setPoolForTesting } from '../src/db.js';
-import { hybridSearch } from '../src/search.js';
 import { memoryList } from '../src/tools/list.js';
 import { memoryRecall } from '../src/tools/recall.js';
 import { memoryUpdate } from '../src/tools/update.js';
@@ -47,6 +48,9 @@ function isCode(code: string): (error: unknown) => boolean {
 
 test('memory update enforces online-finalized, private, atomic, revisioned supersession history', { timeout: 120_000 }, async t => {
   if (!dockerAvailable()) { t.skip('Docker is unavailable'); return; }
+  const originalDemotionGate = process.env.SUPERSEDED_SEARCH_DEMOTION_ENABLED;
+  process.env.SUPERSEDED_SEARCH_DEMOTION_ENABLED = 'true';
+  const { hybridSearch } = await import('../src/search.js');
   const originalFetch = globalThis.fetch;
   const container = execFileSync('docker', [
     'run', '--rm', '-d', '-e', 'POSTGRES_PASSWORD=postgres', '-p', '127.0.0.1::5432',
@@ -70,7 +74,9 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
   try {
     await owner.query('CREATE EXTENSION IF NOT EXISTS vector');
     await owner.query("CREATE ROLE total_recall_app LOGIN PASSWORD 'app-password'");
-    for (const file of readdirSync(join(process.cwd(), 'migrations')).filter(file => /^\d+_.*\.sql$/.test(file)).sort()) {
+    const migrationFiles = readdirSync(join(process.cwd(), 'migrations'))
+      .filter(file => /^\d+_.*\.sql$/.test(file)).sort();
+    for (const file of migrationFiles.filter(file => Number(file.slice(0, 3)) <= 25)) {
       await owner.query(readFileSync(join(process.cwd(), 'migrations', file), 'utf8'));
     }
     const finalization = await finalizeMemorySupersession({ connectionString: ownerUrl });
@@ -82,6 +88,41 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
        VALUES ($1, 'update-hash', 'update-integration', ARRAY['shared','private'], ARRAY['read','write'], 'secret')`,
       [KEY],
     );
+    appPool = new pg.Pool({ connectionString: appUrl });
+    setPoolForTesting(appPool);
+
+    // The #52 runtime must procedurally omit #53 validity columns rather than
+    // executing broken SQL and catching a generic failure.
+    const preValidityOld = '10100000-0000-4000-8000-000000000001';
+    const preValidityNew = '10100000-0000-4000-8000-000000000002';
+    await owner.query(
+      `INSERT INTO memories (id, content, source, namespace, client_id)
+       VALUES ($1, 'pre validity old', 'compat', 'shared', $3),
+              ($2, 'pre validity new', 'compat', 'shared', $3)`,
+      [preValidityOld, preValidityNew, KEY],
+    );
+    const preValidityUpdated = await memoryUpdate({ id: preValidityNew, supersedes: preValidityOld }, auth);
+    assert.equal(preValidityUpdated.supersedes_id, preValidityOld);
+    assert.equal(preValidityUpdated.valid_from, null);
+
+    for (const file of migrationFiles.filter(file => Number(file.slice(0, 3)) > 25)) {
+      await owner.query(readFileSync(join(process.cwd(), 'migrations', file), 'utf8'));
+    }
+    const backfill = await backfillMemoryValidity(owner, { batchSize: 10, maxBatches: 10 });
+    assert.equal(backfill.pending, 0);
+    assert.equal((await owner.query(
+      `SELECT predecessor.valid_to = predecessor.superseded_at
+                AND predecessor.valid_to = successor.valid_from AS contiguous
+       FROM memories predecessor
+       JOIN memories successor ON successor.supersedes_id = predecessor.id
+       WHERE predecessor.id = $1`,
+      [preValidityOld],
+    )).rows[0].contiguous, true, 'pre-026 links backfill to one contiguous boundary');
+    await finalizeMemoryValidity(owner);
+    await owner.query('DELETE FROM audit_log WHERE memory_id = ANY($1::uuid[])', [[preValidityOld, preValidityNew]]);
+    await owner.query('DELETE FROM memories WHERE id = $1', [preValidityNew]);
+    await owner.query('DELETE FROM memories WHERE id = $1', [preValidityOld]);
+
     await owner.query(
       `INSERT INTO memories (id, content, source, namespace, tags, metadata, access_level, client_id)
        VALUES ($1, 'User lived in Denver', 'test', 'shared', ARRAY['profile'], '{}', 'normal', $4),
@@ -89,9 +130,6 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
               ($3, 'Other current fact', 'test', 'shared', ARRAY[]::text[], '{}', 'normal', $4)`,
       [OLD, CURRENT, OTHER, KEY],
     );
-
-    appPool = new pg.Pool({ connectionString: appUrl });
-    setPoolForTesting(appPool);
 
     const updated = await memoryUpdate({ id: CURRENT, tags: ['profile', 'location'], supersedes: OLD }, auth);
     assert.equal(updated.supersedes_id, OLD);
@@ -106,6 +144,34 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
       { id: OLD, supersedes_id: null, superseded: true, revision: 1 },
       { id: CURRENT, supersedes_id: OLD, superseded: false, revision: 1 },
     ]);
+    const interval = await owner.query<{
+      contiguous: boolean;
+      before_at: string;
+      boundary_at: string;
+      after_at: string;
+    }>(
+      `SELECT predecessor.valid_to = predecessor.superseded_at
+                AND predecessor.valid_to = successor.valid_from AS contiguous,
+              to_char((predecessor.valid_to - interval '1 microsecond') AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS before_at,
+              to_char(predecessor.valid_to AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS boundary_at,
+              to_char((predecessor.valid_to + interval '1 microsecond') AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS after_at
+       FROM memories predecessor
+       JOIN memories successor ON successor.supersedes_id = predecessor.id
+       WHERE predecessor.id = $1`,
+      [OLD],
+    );
+    assert.equal(interval.rows[0].contiguous, true);
+    globalThis.fetch = async () => embeddingResponse();
+    const searchAt = async (valid_at: string) => hybridSearch(
+      { query: 'User', source: 'test', threshold: 1, limit: 10, valid_at },
+      ['shared'], { namespaces: ['shared'], keyId: KEY }, 'normal',
+    );
+    assert.deepEqual((await searchAt(interval.rows[0].before_at)).map(row => row.id), [OLD]);
+    assert.deepEqual((await searchAt(interval.rows[0].boundary_at)).map(row => row.id), [CURRENT]);
+    assert.deepEqual((await searchAt(interval.rows[0].after_at)).map(row => row.id), [CURRENT]);
 
     const historical = await memoryRecall({ id: OLD }, auth);
     assert.equal(historical.is_superseded, true);
@@ -189,6 +255,11 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
        VALUES ($1, 'rollback old', 'test', 'shared', $3), ($2, 'rollback new', 'test', 'shared', $3)`,
       [rollbackOld, rollbackNew, KEY],
     );
+    const rollbackValidityBefore = await owner.query(
+      `SELECT id::text, valid_from::text, valid_to::text
+       FROM memories WHERE id = ANY($1::uuid[]) ORDER BY id`,
+      [[rollbackOld, rollbackNew]],
+    );
     await owner.query(`
       CREATE FUNCTION public.fail_supersession_audit() RETURNS trigger LANGUAGE plpgsql AS $$
       BEGIN
@@ -215,6 +286,11 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
       { id: rollbackNew, tags: [], supersedes_id: null, superseded_at: null, revision: 0 },
     ]);
     assert.equal((await auditCount(owner, rollbackOld)) + (await auditCount(owner, rollbackNew)), 0);
+    assert.deepEqual((await owner.query(
+      `SELECT id::text, valid_from::text, valid_to::text
+       FROM memories WHERE id = ANY($1::uuid[]) ORDER BY id`,
+      [[rollbackOld, rollbackNew]],
+    )).rows, rollbackValidityBefore.rows);
 
     // Mixed access-level links are visible only when the linked row is visible.
     const secretOld = '70000000-0000-4000-8000-000000000001';
@@ -315,6 +391,14 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
     assert.equal(race.filter(result => result.status === 'rejected').length, 1);
     assert.equal((await owner.query('SELECT COUNT(*)::int AS count FROM memories WHERE supersedes_id = $1', [raceOld])).rows[0].count, 1);
     assert.equal((await owner.query(
+      `SELECT predecessor.valid_to = predecessor.superseded_at
+                AND predecessor.valid_to = successor.valid_from AS contiguous
+       FROM memories predecessor
+       JOIN memories successor ON successor.supersedes_id = predecessor.id
+       WHERE predecessor.id = $1`,
+      [raceOld],
+    )).rows[0].contiguous, true);
+    assert.equal((await owner.query(
       `SELECT COUNT(*)::int AS count FROM audit_log
        WHERE (action = 'belief.supersede' AND memory_id = $1)
           OR (action = 'memory.update' AND memory_id = ANY($2::uuid[]))`,
@@ -336,9 +420,9 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
       rankRows.push(`90000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`);
     }
     await owner.query(
-      `INSERT INTO memories (id, content, source, namespace, client_id, embedding, embedding_provider, embedding_model, embedding_dimensions, superseded_at)
+      `INSERT INTO memories (id, content, source, namespace, client_id, embedding, embedding_provider, embedding_model, embedding_dimensions, valid_from, superseded_at)
        SELECT value::uuid, 'historical vector candidate', 'rank-vector', 'shared', $1,
-              $2::vector, 'gemini', 'gemini-embedding-2-preview', 768, NOW()
+              $2::vector, 'gemini', 'gemini-embedding-2-preview', 768, NOW() - interval '1 second', NOW()
        FROM unnest($3::text[]) value`,
       [KEY, vectorText(vector()), rankRows],
     );
@@ -359,8 +443,9 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
       `91000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`,
     );
     await owner.query(
-      `INSERT INTO memories (id, content, source, namespace, client_id, superseded_at)
-       SELECT value::uuid, 'crowdingkeyword historical text', 'rank-text', 'shared', $1, NOW()
+      `INSERT INTO memories (id, content, source, namespace, client_id, valid_from, superseded_at)
+       SELECT value::uuid, 'crowdingkeyword historical text', 'rank-text', 'shared', $1,
+              NOW() - interval '1 second', NOW()
        FROM unnest($2::text[]) value`,
       [KEY, textRows],
     );
@@ -413,6 +498,8 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
     assert.equal(afterDelete.superseded_by_id, null);
   } finally {
     globalThis.fetch = originalFetch;
+    if (originalDemotionGate === undefined) delete process.env.SUPERSEDED_SEARCH_DEMOTION_ENABLED;
+    else process.env.SUPERSEDED_SEARCH_DEMOTION_ENABLED = originalDemotionGate;
     setPoolForTesting(null);
     await appPool?.end().catch(() => undefined);
     await owner.end();

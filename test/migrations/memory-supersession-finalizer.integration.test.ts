@@ -8,6 +8,7 @@ import {
   ensureMemorySupersessionConstraints,
   finalizeMemorySupersession,
 } from '../../scripts/memory-supersession-finalizer.js';
+import { finalizeMemoryValidity } from '../../scripts/finalize-memory-validity.js';
 
 function dockerAvailable(): boolean {
   try { execFileSync('docker', ['version'], { stdio: 'ignore' }); return true; }
@@ -122,6 +123,39 @@ test('memory supersession finalization validates online and repairs interrupted 
       [true, true],
       [false, true],
     ]);
+    const boundary = (await owner.query<{ at: string }>(
+      'SELECT statement_timestamp()::text AS at',
+    )).rows[0].at;
+    await owner.query(
+      'UPDATE memories SET superseded_at = $2::timestamptz, valid_to = $2::timestamptz WHERE id = $1',
+      [predecessor, boundary],
+    );
+    await owner.query(
+      'UPDATE memories SET valid_from = $2::timestamptz WHERE id = $1',
+      [successorA, boundary],
+    );
+
+    // Migration 026 finalization must reuse migration 025's canonical durable
+    // uniqueness index instead of certifying or creating a duplicate index.
+    await finalizeMemoryValidity(owner);
+    await finalizeMemoryValidity(owner);
+    const supersessionIndexes = await owner.query<{ name: string; unique: boolean; ready: boolean; valid: boolean; partial: boolean }>(`
+      SELECT c.relname AS name, i.indisunique AS unique, i.indisready AS ready,
+             i.indisvalid AS valid, i.indpred IS NOT NULL AS partial
+      FROM pg_class c
+      JOIN pg_index i ON i.indexrelid = c.oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND i.indrelid = 'public.memories'::regclass
+        AND pg_get_indexdef(i.indexrelid, 1, true) = 'supersedes_id'
+    `);
+    assert.deepEqual(supersessionIndexes.rows, [{
+      name: 'memories_supersedes_id_unique',
+      unique: true,
+      ready: true,
+      valid: true,
+      partial: false,
+    }]);
   } finally {
     await owner.end();
   }

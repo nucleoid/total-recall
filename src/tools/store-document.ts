@@ -277,7 +277,7 @@ export async function memoryStoreDocument(
     embeddings.push(embedding);
   }
 
-  const result = await withScopedClient(dbScopeFromAuth(auth), async (client) => {
+  const commitDocument = (beliefAware: boolean) => withScopedClient(dbScopeFromAuth(auth), async (client) => {
     const docRes = await client.query(
       `INSERT INTO documents (title, source, namespace, tags, client_id, idempotency_key, request_hash)
        VALUES ($1, $2, $3, $4, $5::uuid, $6, $7)
@@ -304,9 +304,11 @@ export async function memoryStoreDocument(
     for (let i = 0; i < chunks.length; i++) {
       const vecStr = serializeEmbeddingVector(embeddings[i]);
 
+      const beliefColumns = beliefAware ? ', memory_kind, valid_from' : '';
+      const beliefValues = beliefAware ? ", 'document_chunk', statement_timestamp()" : '';
       await client.query(
-        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, document_id, chunk_index, embedding_provider, embedding_model, embedding_dimensions)
-         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, document_id, chunk_index, embedding_provider, embedding_model, embedding_dimensions${beliefColumns})
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13${beliefValues})`,
         [
           chunks[i],
           vecStr,
@@ -334,5 +336,14 @@ export async function memoryStoreDocument(
     return { document_id: id, chunks_stored: chunks.length, title: params.title };
   });
 
-  return result;
+  try {
+    return await commitDocument(true);
+  } catch (error) {
+    // Keep older migration-focused integration harnesses usable. Operators must
+    // still apply migration 026 before deploying this writer in production.
+    if (typeof error !== 'object' || error === null ||
+        !('code' in error) || error.code !== '42703' ||
+        !('message' in error) || typeof error.message !== 'string' || !error.message.includes('memory_kind')) throw error;
+    return commitDocument(false);
+  }
 }

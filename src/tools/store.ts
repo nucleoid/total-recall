@@ -7,6 +7,15 @@ import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../
 import { resolveAgent } from '../agents.js';
 import { SupersededSourceKeyConflictError, TombstonedSourceKeyConflictError } from '../errors.js';
 import {
+  contradictionPolicyFromEnv,
+  maybeReviseBelief,
+  policyAllowsScope,
+  scheduleShadowClassification,
+  type ContradictionPolicy,
+  type ContradictionReason,
+  type SemanticMemoryInsert,
+} from '../contradictions.js';
+import {
   MEMORY_CONTENT_MAX_CHARS,
   TAG_MAX_CHARS,
   TAG_MAX_COUNT,
@@ -29,9 +38,18 @@ export const storeSchema = z.object({
   idempotency_key: z.string().min(1).max(512).optional(),
 });
 
+export interface MemoryStoreRuntimeOptions {
+  contradictionPolicy?: ContradictionPolicy;
+  reviseBelief?: typeof maybeReviseBelief;
+  /** Test/embedding hook; production uses the bounded process-wide scheduler. */
+  scheduleShadow?: (task: () => Promise<void>) => void;
+  contradictionMetric?: (reason: ContradictionReason) => void;
+}
+
 export async function memoryStore(
   params: z.infer<typeof storeSchema>,
-  auth: AuthContext
+  auth: AuthContext,
+  runtime: MemoryStoreRuntimeOptions = {},
 ): Promise<{ id: string; namespace: string; idempotency_key_honored?: true }> {
   checkPermission(auth, 'write');
 
@@ -64,10 +82,11 @@ export async function memoryStore(
   const embedding = await embed(params.content);
   const vecStr = serializeEmbeddingVector(embedding);
 
+  const source = params.source || auth.name;
   const values = [
     params.content,
     vecStr,
-    params.source || auth.name,
+    source,
     ns,
     params.tags,
     JSON.stringify(params.metadata),
@@ -78,15 +97,74 @@ export async function memoryStore(
     ...embeddingDescriptorParams(),
   ];
 
+  const semanticMemory: SemanticMemoryInsert = {
+    content: params.content,
+    vector: vecStr,
+    source,
+    namespace: ns,
+    tags: params.tags,
+    metadata: params.metadata,
+    accessLevel: params.access_level,
+    clientId: auth.keyId,
+    agentId,
+    sessionId: params.session_id ?? null,
+  };
+  const reviseBelief = runtime.reviseBelief ?? maybeReviseBelief;
+  // Retry-safe/idempotent writes are updates to an existing observation, not a
+  // new belief event. They never query candidates or disclose text to #53.
+  const contradictionPolicy = params.idempotency_key
+    ? undefined
+    : (runtime.contradictionPolicy ?? contradictionPolicyFromEnv());
+
+  if (contradictionPolicy?.mutationEnabled) {
+    const revised = await reviseBelief(semanticMemory, auth, {
+      policy: contradictionPolicy,
+      allowMutation: true,
+      metric: runtime.contradictionMetric,
+    });
+    if (revised) return revised;
+  }
+
+  const scheduleShadowAfterCommit = (storedId: string): void => {
+    if (!contradictionPolicy || contradictionPolicy.mutationEnabled ||
+        !policyAllowsScope(contradictionPolicy, ns, params.access_level)) return;
+    const task = () => reviseBelief(semanticMemory, auth, {
+      policy: contradictionPolicy,
+      allowMutation: false,
+      excludeCandidateId: storedId,
+      metric: runtime.contradictionMetric,
+    }).then(() => undefined);
+    if (runtime.scheduleShadow) runtime.scheduleShadow(task);
+    else scheduleShadowClassification(contradictionPolicy, task, runtime.contradictionMetric);
+  };
+
   if (!params.idempotency_key) {
-    const res = await queryScoped(
-      dbScopeFromAuth(auth),
-      `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions)
-       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-       RETURNING id, namespace`,
-      values
-    );
-    return res.rows[0];
+    try {
+      const res = await queryScoped(
+        dbScopeFromAuth(auth),
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'semantic', statement_timestamp())
+         RETURNING id, namespace`,
+        values
+      );
+      const stored = res.rows[0];
+      scheduleShadowAfterCommit(stored.id);
+      return stored;
+    } catch (error) {
+      // Preserve the repository's migration-by-migration integration harness.
+      // Production rollout still requires migration 026 before this writer.
+      if (!isMissingBeliefSchema(error)) throw error;
+      const legacy = await queryScoped(
+        dbScopeFromAuth(auth),
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         RETURNING id, namespace`,
+        values,
+      );
+      const stored = legacy.rows[0];
+      scheduleShadowAfterCommit(stored.id);
+      return stored;
+    }
   }
 
   const digest = createHash('sha256')
@@ -95,12 +173,16 @@ export async function memoryStore(
     .update(params.idempotency_key)
     .digest('hex');
   const sourceKey = `discord-safe:v1:${digest}`;
-  let res;
-  try {
-    res = await withScopedClient(dbScopeFromAuth(auth), async (client) => {
+  type KeyedStoreSchema = 'belief' | 'supersession' | 'legacy';
+  const executeKeyedStore = (schema: KeyedStoreSchema) => withScopedClient(dbScopeFromAuth(auth), async (client) => {
+      const beliefAware = schema === 'belief';
+      const columns = beliefAware ? ', memory_kind, valid_from' : '';
+      const insertedValues = beliefAware ? ", 'semantic', statement_timestamp()" : '';
+      const kindUpdate = beliefAware ? '\n           memory_kind = EXCLUDED.memory_kind,' : '';
+      const currentGuard = schema !== 'legacy' ? '\n           AND memories.superseded_at IS NULL' : '';
       const upsert = await client.query(
-        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key)
-         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key${columns})
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14${insertedValues})
          ON CONFLICT (source_key) DO UPDATE SET
            content = EXCLUDED.content,
            embedding = EXCLUDED.embedding,
@@ -114,10 +196,9 @@ export async function memoryStore(
            access_level = EXCLUDED.access_level,
            client_id = EXCLUDED.client_id,
            agent_id = EXCLUDED.agent_id,
-           session_id = EXCLUDED.session_id,
+           session_id = EXCLUDED.session_id,${kindUpdate}
            updated_at = NOW()
-         WHERE memories.deleted_at IS NULL
-           AND memories.superseded_at IS NULL
+         WHERE memories.deleted_at IS NULL${currentGuard}
            AND memories.namespace = ANY($15::text[])
            AND EXCLUDED.namespace = ANY($15::text[])
          RETURNING id, namespace`,
@@ -139,17 +220,35 @@ export async function memoryStore(
       if (tombstone.rows.length > 0) {
         throw new TombstonedSourceKeyConflictError();
       }
-      const superseded = await client.query(
-        `SELECT 1 FROM memories
-         WHERE source_key = $1 AND deleted_at IS NULL AND superseded_at IS NOT NULL
-         LIMIT 1`,
-        [sourceKey]
-      );
-      if (superseded.rows.length > 0) {
-        throw new SupersededSourceKeyConflictError();
+      if (schema !== 'legacy') {
+        const superseded = await client.query(
+          `SELECT 1 FROM memories
+           WHERE source_key = $1 AND deleted_at IS NULL AND superseded_at IS NOT NULL
+           LIMIT 1`,
+          [sourceKey],
+        );
+        if (superseded.rows.length > 0) {
+          throw new SupersededSourceKeyConflictError();
+        }
       }
       throw new Error('Access denied to existing idempotent memory');
     });
+
+  let res;
+  try {
+    try {
+      res = await executeKeyedStore('belief');
+    } catch (error) {
+      if (!isMissingColumn(error, 'memory_kind')) throw error;
+      try {
+        // #52 already has supersession lifecycle columns. Preserve its guard
+        // while only omitting the not-yet-deployed #53 kind/validity columns.
+        res = await executeKeyedStore('supersession');
+      } catch (supersessionError) {
+        if (!isMissingColumn(supersessionError, 'superseded_at')) throw supersessionError;
+        res = await executeKeyedStore('legacy');
+      }
+    }
   } catch (error) {
     // Under RLS, a hidden source_key conflict can surface as 23505 because the
     // conflicting row is not visible to ON CONFLICT. Do not leak its existence.
@@ -159,4 +258,14 @@ export async function memoryStore(
     throw error;
   }
   return { ...res.rows[0], idempotency_key_honored: true };
+}
+
+function isMissingBeliefSchema(error: unknown): boolean {
+  return isMissingColumn(error, 'memory_kind');
+}
+
+function isMissingColumn(error: unknown, column: 'memory_kind' | 'superseded_at'): boolean {
+  return typeof error === 'object' && error !== null &&
+    'code' in error && error.code === '42703' &&
+    'message' in error && typeof error.message === 'string' && error.message.includes(column);
 }

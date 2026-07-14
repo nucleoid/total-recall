@@ -75,10 +75,10 @@ export async function commitImportBatch(
       prepared.descriptor.model,
       prepared.descriptor.dimensions,
     );
-    return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, COALESCE($${base + 9}::timestamptz, NOW()), $${base + 10}, $${base + 11}, $${base + 12})`;
+    return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, COALESCE($${base + 9}::timestamptz, NOW()), $${base + 10}, $${base + 11}, $${base + 12}, 'synced', COALESCE($${base + 9}::timestamptz, statement_timestamp()))`;
   });
   const createdAtUpdate = options.updateCreatedAtOnConflict === false ? '' : '\n  created_at = EXCLUDED.created_at,';
-  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at, embedding_provider, embedding_model, embedding_dimensions)\nVALUES ${tuples.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET\n  content = EXCLUDED.content,\n  embedding = EXCLUDED.embedding,\n  embedding_provider = EXCLUDED.embedding_provider,\n  embedding_model = EXCLUDED.embedding_model,\n  embedding_dimensions = EXCLUDED.embedding_dimensions,${createdAtUpdate}\n  updated_at = NOW()\nWHERE memories.deleted_at IS NULL\n  AND memories.superseded_at IS NULL\nRETURNING id`;
+  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at, embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from)\nVALUES ${tuples.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET\n  content = EXCLUDED.content,\n  embedding = EXCLUDED.embedding,\n  embedding_provider = EXCLUDED.embedding_provider,\n  embedding_model = EXCLUDED.embedding_model,\n  embedding_dimensions = EXCLUDED.embedding_dimensions,\n  memory_kind = EXCLUDED.memory_kind,${createdAtUpdate}\n  updated_at = NOW()\nWHERE memories.deleted_at IS NULL\n  AND memories.superseded_at IS NULL\nRETURNING id`;
   const namespaces = [...new Set(unique.map(row => row.namespace))].sort();
 
   let began = false;

@@ -62,23 +62,24 @@ export async function memoryList(
 
   const res = await queryScoped(
     scope,
-    `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.document_id, m.chunk_index,
-       m.created_at, m.updated_at, m.superseded_at, m.revision,
-       (SELECT predecessor.id FROM memories predecessor
-        WHERE predecessor.id = m.supersedes_id
-          AND predecessor.deleted_at IS NULL
-          AND predecessor.namespace = m.namespace
-          AND predecessor.namespace = ANY($1)
-          AND ${accessLevelSql('predecessor.access_level', '$2')}
-        LIMIT 1) AS supersedes_id,
-       (m.superseded_at IS NOT NULL) AS is_superseded,
-       (SELECT successor.id FROM memories successor
-        WHERE successor.supersedes_id = m.id
-          AND successor.deleted_at IS NULL
-          AND successor.namespace = m.namespace
-          AND successor.namespace = ANY($1)
-          AND ${accessLevelSql('successor.access_level', '$2')}
-        LIMIT 1) AS superseded_by_id
+    `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.document_id,
+            m.chunk_index, m.created_at, m.updated_at, m.memory_kind, m.valid_from, m.valid_to,
+            m.superseded_at, m.revision,
+            (SELECT predecessor.id FROM memories predecessor
+             WHERE predecessor.id = m.supersedes_id
+               AND predecessor.deleted_at IS NULL
+               AND predecessor.namespace = m.namespace
+               AND predecessor.namespace = ANY($1)
+               AND ${accessLevelSql('predecessor.access_level', '$2')}
+             LIMIT 1) AS supersedes_id,
+            m.superseded_at IS NOT NULL AS is_superseded,
+            (SELECT successor.id FROM memories successor
+             WHERE successor.supersedes_id = m.id
+               AND successor.deleted_at IS NULL
+               AND successor.namespace = m.namespace
+               AND successor.namespace = ANY($1)
+               AND ${accessLevelSql('successor.access_level', '$2')}
+             LIMIT 1) AS superseded_by_id
      FROM memories m WHERE ${where}
      ORDER BY m.created_at DESC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,

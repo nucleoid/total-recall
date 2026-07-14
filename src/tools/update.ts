@@ -46,8 +46,13 @@ type UpdateRow = Memory & {
   revision: number;
 };
 
-const UPDATE_RESULT_COLUMNS = `m.id, m.content, m.source, m.namespace, m.tags, m.metadata,
+function updateResultColumns(validitySchema: boolean): string {
+  const validityColumns = validitySchema
+    ? 'm.memory_kind, m.valid_from, m.valid_to,'
+    : "'unspecified'::text AS memory_kind, NULL::timestamptz AS valid_from, NULL::timestamptz AS valid_to,";
+  return `m.id, m.content, m.source, m.namespace, m.tags, m.metadata,
   m.access_level, m.created_at, m.updated_at, m.document_id, m.chunk_index,
+  ${validityColumns}
   m.superseded_at, m.revision,
   (SELECT predecessor.id FROM memories predecessor
    WHERE predecessor.id = m.supersedes_id
@@ -57,6 +62,7 @@ const UPDATE_RESULT_COLUMNS = `m.id, m.content, m.source, m.namespace, m.tags, m
      AND ${accessLevelSql('predecessor.access_level', '$3')}
    LIMIT 1) AS supersedes_id,
   (m.superseded_at IS NOT NULL) AS is_superseded`;
+}
 
 function notFound(): never {
   throw new MemoryNotFoundError();
@@ -150,7 +156,21 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
         throw new MemoryConflictError('The memory already has an immutable predecessor link');
       }
 
+      let validitySchema = false;
       if (predecessor) {
+        const validityColumns = await client.query<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM pg_attribute
+           WHERE attrelid = 'public.memories'::regclass
+             AND attname::text = ANY(ARRAY['memory_kind', 'valid_from', 'valid_to']::text[])
+             AND NOT attisdropped`,
+        );
+        const validityColumnCount = Number(validityColumns.rows[0]?.count ?? -1);
+        if (validityColumnCount !== 0 && validityColumnCount !== 3) {
+          throw new Error('Memory validity schema is partially deployed; refusing manual supersession');
+        }
+        validitySchema = validityColumnCount === 3;
+
         const successor = await client.query(
           'SELECT id FROM memories WHERE supersedes_id = $1::uuid LIMIT 1',
           [predecessor.id],
@@ -166,8 +186,10 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
       const metadataChanged = params.metadata !== undefined && !isDeepStrictEqual(params.metadata, target.metadata);
       const linkChanged = predecessor !== undefined;
       const targetChanged = contentChanged || tagsChanged || metadataChanged || linkChanged;
+      // Preserve PostgreSQL microseconds so a same-millisecond supersession
+      // cannot round valid_to down to or before the predecessor's valid_from.
       const timestamp = targetChanged
-        ? (await client.query<{ now: Date }>('SELECT statement_timestamp() AS now')).rows[0].now
+        ? (await client.query<{ now: string }>('SELECT statement_timestamp()::text AS now')).rows[0].now
         : undefined;
 
       if (targetChanged) {
@@ -183,7 +205,10 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
         }
         if (tagsChanged) assignments.push(`tags = ${parameter(params.tags)}::text[]`);
         if (metadataChanged) assignments.push(`metadata = ${parameter(JSON.stringify(params.metadata))}::jsonb`);
-        if (linkChanged) assignments.push(`supersedes_id = ${parameter(predecessor!.id)}::uuid`);
+        if (linkChanged) {
+          assignments.push(`supersedes_id = ${parameter(predecessor!.id)}::uuid`);
+          if (validitySchema) assignments.push(`valid_from = ${parameter(timestamp)}::timestamptz`);
+        }
         assignments.push(`updated_at = ${parameter(timestamp)}::timestamptz`);
         values.push(target.id);
         await client.query(
@@ -193,11 +218,15 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
       }
 
       if (predecessor) {
-        await client.query(
-          `UPDATE memories SET superseded_at = $1::timestamptz, updated_at = $1::timestamptz
+        const validityClosure = validitySchema ? ', valid_to = $1::timestamptz' : '';
+        const closed = await client.query(
+          `UPDATE memories SET superseded_at = $1::timestamptz${validityClosure}, updated_at = $1::timestamptz
            WHERE id = $2::uuid AND superseded_at IS NULL`,
           [timestamp, predecessor.id],
         );
+        if (closed.rowCount !== 1) {
+          throw new MemoryConflictError('The predecessor changed while supersession was being committed');
+        }
       }
 
       if (targetChanged) {
@@ -218,7 +247,7 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
       }
 
       const result = await client.query(
-        `SELECT ${UPDATE_RESULT_COLUMNS},
+        `SELECT ${updateResultColumns(validitySchema)},
            (SELECT successor.id FROM memories successor
             WHERE successor.supersedes_id = m.id
               AND successor.deleted_at IS NULL

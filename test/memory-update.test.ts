@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { parseSupersededScoreFactor } from '../src/config.js';
 import { memoryUpdate, updateSchema } from '../src/tools/update.js';
@@ -40,6 +41,17 @@ test('memory update denies missing write permission before database work', async
     memoryUpdate({ id: ID, tags: [] }, auth),
     (error: unknown) => error instanceof Error && (error as Error & { code?: string }).code === 'forbidden',
   );
+});
+
+test('memory update preserves one database clock and selects validity SQL before mutation', () => {
+  const source = readFileSync(new URL('../src/tools/update.ts', import.meta.url), 'utf8');
+  assert.match(source, /statement_timestamp\(\)::text AS now/);
+  assert.match(source, /FROM pg_attribute[\s\S]*memory_kind[\s\S]*valid_from[\s\S]*valid_to/);
+  assert.match(source, /valid_from = .*timestamp.*::timestamptz/);
+  assert.match(source, /valid_to = \$1::timestamptz/);
+  assert.match(source, /partially deployed; refusing manual supersession/);
+  assert.doesNotMatch(source, /query<\{ now: Date \}>/);
+  assert.doesNotMatch(source, /42703/);
 });
 
 test('superseded score factor defaults and fails closed outside (0, 1]', () => {
