@@ -48,7 +48,14 @@ type UpdateRow = Memory & {
 
 const UPDATE_RESULT_COLUMNS = `m.id, m.content, m.source, m.namespace, m.tags, m.metadata,
   m.access_level, m.created_at, m.updated_at, m.document_id, m.chunk_index,
-  m.supersedes_id, m.superseded_at, m.revision,
+  m.superseded_at, m.revision,
+  (SELECT predecessor.id FROM memories predecessor
+   WHERE predecessor.id = m.supersedes_id
+     AND predecessor.deleted_at IS NULL
+     AND predecessor.namespace = m.namespace
+     AND predecessor.namespace = ANY($2::text[])
+     AND ${accessLevelSql('predecessor.access_level', '$3')}
+   LIMIT 1) AS supersedes_id,
   (m.superseded_at IS NOT NULL) AS is_superseded`;
 
 function notFound(): never {
@@ -213,11 +220,18 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
       const result = await client.query(
         `SELECT ${UPDATE_RESULT_COLUMNS},
            (SELECT successor.id FROM memories successor
-            WHERE successor.supersedes_id = m.id AND successor.deleted_at IS NULL
-              AND ${accessLevelSql('successor.access_level', '$2')}
+            WHERE successor.supersedes_id = m.id
+              AND successor.deleted_at IS NULL
+              AND successor.namespace = m.namespace
+              AND successor.namespace = ANY($2::text[])
+              AND ${accessLevelSql('successor.access_level', '$3')}
             LIMIT 1) AS superseded_by_id
-         FROM memories m WHERE m.id = $1::uuid`,
-        [target.id, auth.maxAccessLevel],
+         FROM memories m
+         WHERE m.id = $1::uuid
+           AND m.deleted_at IS NULL
+           AND m.namespace = ANY($2::text[])
+           AND ${accessLevelSql('m.access_level', '$3')}`,
+        [target.id, auth.namespaces, auth.maxAccessLevel],
       );
       return result.rows[0] as Memory;
     });

@@ -114,7 +114,7 @@ than losing context.
 
 ## Update and Supersession Guidelines
 
-Use `memory_update` for corrections to the same current fact and for facts that change over time. Supply only fields that should change; `tags` and `metadata` replace their complete values rather than merging. When a new stored fact replaces an older one, call `memory_update` on the new current memory with `supersedes` set to the older memory ID. Do not overwrite the old row: the immutable link preserves history while demoting it in ordinary search. A historical row may still appear in direct recall/list results with `is_superseded: true`; treat the linked successor as current. Supersession cannot be undone implicitly by forgetting or purging the successor.
+Use `memory_update` for corrections to the same current fact and for facts that change over time. Supply only fields that should change; `tags` and `metadata` replace their complete values rather than merging. When a new stored fact replaces an older one, call `memory_update` on the new current memory with `supersedes` set to the older memory ID. Do not overwrite the old row: the immutable link preserves history while demoting it in ordinary search. A historical row may still appear in direct recall/list results with `is_superseded: true`; treat a visible linked successor as current. Linked IDs are intentionally null when the linked row is deleted, outside the requested namespace, or above the caller's access-level ceiling; never infer that a null link reopens a durable historical fact. Supersession cannot be undone implicitly by forgetting or purging the successor.
 
 ## Forget Guidelines
 

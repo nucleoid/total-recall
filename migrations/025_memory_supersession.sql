@@ -4,10 +4,14 @@ ALTER TABLE public.memories
   ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 0;
 
+-- Add constraints without scanning memories while this transaction still
+-- holds the preceding ALTER TABLE lock. NOT VALID still enforces both
+-- constraints for every new or changed row.
 DO $$ BEGIN
   ALTER TABLE public.memories
     ADD CONSTRAINT memories_supersedes_not_self
-    CHECK (supersedes_id IS NULL OR supersedes_id <> id);
+    CHECK (supersedes_id IS NULL OR supersedes_id <> id)
+    NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
@@ -16,17 +20,15 @@ DO $$ BEGIN
     ADD CONSTRAINT memories_supersedes_id_fkey
     FOREIGN KEY (supersedes_id)
     REFERENCES public.memories(id)
-    ON DELETE RESTRICT;
+    ON DELETE RESTRICT
+    NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- This is deliberately non-partial: deleting a successor must not permit a
--- second successor or silently reopen the predecessor's history.
-CREATE UNIQUE INDEX IF NOT EXISTS memories_supersedes_id_unique
-  ON public.memories (supersedes_id);
-CREATE INDEX IF NOT EXISTS memories_superseded_at_idx
-  ON public.memories (superseded_at)
-  WHERE superseded_at IS NOT NULL;
+-- Constraint validation and both indexes are deliberately completed by
+-- `npm run finalize:memory-supersession` after this migration commits. The
+-- unique index is non-partial so deleting a successor cannot permit a second
+-- successor or silently reopen the predecessor's history.
 
 CREATE OR REPLACE FUNCTION public.bump_memory_revision()
 RETURNS trigger

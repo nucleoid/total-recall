@@ -82,7 +82,7 @@ export async function hybridSearch(
     const sql = `
       WITH vector_results AS (
         (SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
-          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id, superseded_at, revision,
+          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id AS linked_supersedes_id, superseded_at, revision,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
          FROM memories m
          WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
@@ -95,7 +95,7 @@ export async function hybridSearch(
          LIMIT 50)
         UNION ALL
         (SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
-          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id, superseded_at, revision,
+          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id AS linked_supersedes_id, superseded_at, revision,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
          FROM memories m
          WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
@@ -109,7 +109,7 @@ export async function hybridSearch(
       ),
       text_only_results AS (
         (SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
-          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id, superseded_at, revision,
+          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id AS linked_supersedes_id, superseded_at, revision,
           NULL::double precision AS vec_score
          FROM memories m
          WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
@@ -120,7 +120,7 @@ export async function hybridSearch(
          LIMIT 20)
         UNION ALL
         (SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
-          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id, superseded_at, revision,
+          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id AS linked_supersedes_id, superseded_at, revision,
           NULL::double precision AS vec_score
          FROM memories m
          WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
@@ -159,10 +159,23 @@ export async function hybridSearch(
             * CASE WHEN s.superseded_at IS NOT NULL THEN ${pSupersededFactor}::double precision ELSE 1.0 END AS final_score
         FROM scored s
       )
-      SELECT r.*,
+      SELECT r.id, r.content, r.metadata, r.tags, r.source, r.namespace, r.created_at, r.event_at,
+        r.relevance_score, r.relevance_base_score, r.decay_rate, r.updated_at, r.accessed_at,
+        r.access_count, r.access_level, r.client_id, r.superseded_at, r.revision,
+        r.vec_score, r.text_score, r.base_score, r.relevance, r.final_score,
+        (SELECT predecessor.id FROM memories predecessor
+         WHERE predecessor.id = r.linked_supersedes_id
+           AND predecessor.deleted_at IS NULL
+           AND predecessor.namespace = r.namespace
+           AND predecessor.namespace = ANY(${pNs})
+           AND ${accessLevelSql('predecessor.access_level', pMaxAccessLevel)}
+         LIMIT 1) AS supersedes_id,
         (r.superseded_at IS NOT NULL) AS is_superseded,
         (SELECT successor.id FROM memories successor
-         WHERE successor.supersedes_id = r.id AND successor.deleted_at IS NULL
+         WHERE successor.supersedes_id = r.id
+           AND successor.deleted_at IS NULL
+           AND successor.namespace = r.namespace
+           AND successor.namespace = ANY(${pNs})
            AND ${accessLevelSql('successor.access_level', pMaxAccessLevel)}
          LIMIT 1) AS superseded_by_id
       FROM ranked r
