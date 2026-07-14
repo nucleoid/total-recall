@@ -43,6 +43,7 @@
     "finalize:memory-lifecycle": "tsx scripts/finalize-memory-lifecycle.ts",
     "backfill:memory-validity": "tsx scripts/backfill-memory-validity.ts",
     "finalize:memory-validity": "tsx scripts/finalize-memory-validity.ts",
+    "finalize:memory-supersession": "tsx scripts/finalize-memory-supersession.ts",
     "reembed": "tsx scripts/reembed-all.ts",
     "spotify:auth": "tsx scripts/spotify-auth.ts",
     "spotify:sync": "tsx scripts/spotify-sync.ts",

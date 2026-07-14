@@ -188,7 +188,9 @@ test('hybridSearch selects a pre-026 query shape without swallowing SQL failures
 
   const { hybridSearch } = await loadSearch();
   await hybridSearch(params, ['shared'], scope, 'normal');
-  const searchSql = client.calls.find(call => call.text.includes('WITH vector_results'))!.text;
+  const searchCall = client.calls.find(call => call.text.includes('WITH vector_results'))!;
+  const searchSql = searchCall.text;
+  assertContiguousParameters(searchCall);
   assert.doesNotMatch(searchSql, /m\.(?:memory_kind|valid_from|valid_to)/);
   assert.match(searchSql, /NULL::timestamptz AS valid_from/);
 
@@ -204,7 +206,9 @@ test('hybridSearch preserves #52 lifecycle fields while belief-validity columns 
 
   const { hybridSearch } = await loadSearch(true);
   await hybridSearch(params, ['shared'], scope, 'normal');
-  const searchSql = client.calls.find(call => call.text.includes('WITH vector_results'))!.text;
+  const searchCall = client.calls.find(call => call.text.includes('WITH vector_results'))!;
+  const searchSql = searchCall.text;
+  assertContiguousParameters(searchCall);
   assert.match(searchSql, /m\.superseded_at/);
   assert.match(searchSql, /m\.revision/);
   assert.doesNotMatch(searchSql, /m\.(?:memory_kind|valid_from|valid_to)/);
@@ -244,6 +248,14 @@ test('valid_at fails closed before query construction until validity finalizatio
   );
   assert.equal(client.calls.some(call => call.text.includes('WITH vector_results')), false);
 });
+
+function assertContiguousParameters(call: QueryCall): void {
+  const referenced = [...call.text.matchAll(/\$(\d+)/g)]
+    .map(match => Number(match[1]));
+  const actual = [...new Set(referenced)].sort((a, b) => a - b);
+  const expected = Array.from({ length: call.params?.length ?? 0 }, (_, index) => index + 1);
+  assert.deepEqual(actual, expected);
+}
 
 function summarize(sql: string): string {
   if (sql.includes('FROM pg_attribute') && sql.includes('belief_schema')) return 'SCHEMA';

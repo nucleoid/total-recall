@@ -77,10 +77,11 @@ export async function finalizeMemoryValidity(client: ValidityFinalizerClient): P
 
   await ensureConcurrentIndex(
     client,
-    'memories_supersedes_id_unique_idx',
-    `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS memories_supersedes_id_unique_idx
+    'memories_supersedes_id_unique',
+    `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS memories_supersedes_id_unique
        ON public.memories (supersedes_id)`,
     ['create unique index', '(supersedes_id)'],
+    'create unique index memories_supersedes_id_unique on public.memories using btree (supersedes_id)',
   );
 
   for (const sql of DEFERRED_CONSTRAINTS) await client.query(sql);
@@ -129,6 +130,7 @@ async function ensureConcurrentIndex(
   name: string,
   createSql: string,
   expectedFragments: string[],
+  exactDefinition?: string,
 ): Promise<void> {
   const load = () => client.query<{ valid: boolean; ready: boolean; definition: string }>(`
     SELECT i.indisvalid AS valid, i.indisready AS ready,
@@ -140,7 +142,8 @@ async function ensureConcurrentIndex(
   `, [name]);
   const before = await load();
   const existing = before.rows[0];
-  if (existing?.valid && existing.ready && !indexDefinitionMatches(existing.definition, expectedFragments)) {
+  if (existing?.valid && existing.ready &&
+      !indexDefinitionMatches(existing.definition, expectedFragments, exactDefinition)) {
     throw new Error(`Validity index ${name} has an unexpected definition; refusing to replace it`);
   }
   if (existing && (!existing.valid || !existing.ready)) {
@@ -148,13 +151,19 @@ async function ensureConcurrentIndex(
   }
   await client.query(createSql);
   const after = (await load()).rows[0];
-  if (!after?.valid || !after.ready || !indexDefinitionMatches(after.definition, expectedFragments)) {
+  if (!after?.valid || !after.ready ||
+      !indexDefinitionMatches(after.definition, expectedFragments, exactDefinition)) {
     throw new Error(`Validity index ${name} is missing, invalid, not ready, or has an unexpected definition`);
   }
 }
 
-function indexDefinitionMatches(definition: string, expectedFragments: string[]): boolean {
-  const normalized = definition.toLowerCase().replace(/\s+/g, ' ');
+function indexDefinitionMatches(
+  definition: string,
+  expectedFragments: string[],
+  exactDefinition?: string,
+): boolean {
+  const normalized = definition.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (exactDefinition) return normalized === exactDefinition;
   return expectedFragments.every(fragment => normalized.includes(fragment));
 }
 

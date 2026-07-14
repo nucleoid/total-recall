@@ -257,7 +257,7 @@ export async function commitChunkBatch(
     const written = writeResult.command === 'INSERT' && typeof writeResult.rowCount === 'number'
       ? writeResult.rowCount
       : unique.length;
-    if (written < unique.length) console.warn(`[preseed-chatgpt] Skipped ${unique.length - written} tombstoned source-key conflict(s)`);
+    if (written < unique.length) console.warn(`[preseed-chatgpt] Skipped ${unique.length - written} tombstoned or superseded source-key conflict(s)`);
     return written;
   } catch (error) {
     if (began) {

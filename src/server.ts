@@ -197,6 +197,7 @@ const METADATA_CONTRACT_REST_PATHS = new Set([
 const METADATA_CONTRACT_MCP_TOOLS = new Set([
   'memory_store',
   'memory_store_document',
+  'memory_update',
   'agent_register',
 ]);
 

@@ -112,9 +112,11 @@ than losing context.
 - **Self-check before session ends** — mentally review: did I store the key takeaways?
 ```
 
-## Belief Revision Guidelines
+## Update, Supersession, and Belief Revision Guidelines
 
-Ordinary stores are semantic facts and may be compared with current facts only when the operator has independently approved #53 processing for that exact low-sensitivity namespace. Duplicate, refinement, low-confidence, and review-only classifications still create normal unlinked memories; automatic supersession is separately gated and disabled by default. Agents must not treat a probabilistic revision as deletion: closed predecessors remain available to direct/list recall and to `memory_search` with a strict offset-aware `valid_at` instant. Do not try to reopen an interval by rewriting or re-storing a historical row.
+Use `memory_update` for corrections to the same current fact and for facts that change over time. Supply only fields that should change; `tags` and `metadata` replace their complete values rather than merging. When a new stored fact replaces an older one, call `memory_update` on the new current memory with `supersedes` set to the older memory ID. Do not overwrite the old row: the immutable link preserves history. A historical row may still appear in direct recall/list results with `is_superseded: true`; treat a visible linked successor as current. Linked IDs are intentionally null when the linked row is deleted, outside the requested namespace, or above the caller's access-level ceiling; never infer that a null link reopens a durable historical fact. Supersession cannot be undone implicitly by forgetting or purging the successor.
+
+Ordinary stores are semantic facts and may be compared with current facts only when the operator has independently approved #53 processing for that exact low-sensitivity namespace. Duplicate, refinement, low-confidence, and review-only classifications still create normal unlinked memories; automatic supersession is separately gated and disabled by default. Agents must not treat a probabilistic revision as deletion: closed predecessors remain available to direct/list recall and, after validity finalization, to `memory_search` with a strict offset-aware `valid_at` instant. Present-day search demotion is a separate operator-controlled rollout gate. Do not try to reopen an interval by rewriting or re-storing a historical row.
 
 ## Forget Guidelines
 

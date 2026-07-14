@@ -163,7 +163,7 @@ async function commitBatch(rows: GeminiConversation[], client: GeminiQueryClient
     const written = writeResult.command === 'INSERT' && typeof writeResult.rowCount === 'number'
       ? writeResult.rowCount
       : unique.length;
-    if (written < unique.length) console.warn(`[preseed-gemini] Skipped ${unique.length - written} tombstoned source-key conflict(s)`);
+    if (written < unique.length) console.warn(`[preseed-gemini] Skipped ${unique.length - written} tombstoned or superseded source-key conflict(s)`);
     return written;
   } catch (error) {
     if (began) try { await client.query('ROLLBACK'); } catch { /* preserve original error */ }

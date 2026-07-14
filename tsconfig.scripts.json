@@ -13,6 +13,8 @@
     "scripts/finalize-memory-lifecycle.ts",
     "scripts/backfill-memory-validity.ts",
     "scripts/finalize-memory-validity.ts",
+    "scripts/memory-supersession-finalizer.ts",
+    "scripts/finalize-memory-supersession.ts",
     "scripts/preseed-chatgpt.ts",
     "scripts/preseed-gemini.ts",
     "scripts/repair-gemini-source-keys.ts",

@@ -9,7 +9,8 @@ ALTER TABLE public.memories
   ADD COLUMN IF NOT EXISTS valid_to TIMESTAMPTZ;
 
 -- #53 builds on #52's durable supersession contract. These additions remain
--- idempotent for stacked-branch convergence; production must still apply #52 first.
+-- idempotent for stacked-branch convergence; production must still apply and
+-- finalize #52 first.
 ALTER TABLE public.memories
   ADD COLUMN IF NOT EXISTS supersedes_id UUID,
   ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
@@ -72,6 +73,7 @@ END $$;
 -- to updated legacy rows, so adding them here would break #52 writers during
 -- the rollout.
 --
--- The non-partial unique supersession index is also built by the owner-run
--- finalizer with CREATE UNIQUE INDEX CONCURRENTLY. Keeping it out of this
+-- The canonical non-partial memories_supersedes_id_unique index is verified or
+-- idempotently created by the owner-run finalizer with CREATE UNIQUE INDEX
+-- CONCURRENTLY. Keeping it out of this
 -- transaction-wrapped migration avoids a table-wide blocking index build.

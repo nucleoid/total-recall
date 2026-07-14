@@ -100,11 +100,13 @@ export async function hybridSearch(
     const pLimit = p(limit);
     const pThreshold = p(threshold);
     const pMaxAccessLevel = p(maxAccessLevel);
-    const pProvider = p(ACTIVE_EMBEDDING_DESCRIPTOR.provider);
-    const pModel = p(ACTIVE_EMBEDDING_DESCRIPTOR.model);
-    const pDimensions = p(ACTIVE_EMBEDDING_DESCRIPTOR.dimensions);
-    const pValidAt = p(params.valid_at ?? null);
-    const pSupersededFactor = p(SUPERSEDED_SCORE_FACTOR);
+    const pProvider = vectorAvailable ? p(ACTIVE_EMBEDDING_DESCRIPTOR.provider) : null;
+    const pModel = vectorAvailable ? p(ACTIVE_EMBEDDING_DESCRIPTOR.model) : null;
+    const pDimensions = vectorAvailable ? p(ACTIVE_EMBEDDING_DESCRIPTOR.dimensions) : null;
+    const pValidAt = params.valid_at ? p(params.valid_at) : null;
+    const shouldDemoteSuperseded = capabilities.supersession_schema &&
+      SUPERSEDED_SEARCH_DEMOTION_ENABLED && !params.valid_at;
+    const pSupersededFactor = shouldDemoteSuperseded ? p(SUPERSEDED_SCORE_FACTOR) : null;
     const accessWhere = `AND ${accessLevelSql('m.access_level', pMaxAccessLevel)}`;
 
     const conditions: string[] = [];
@@ -137,8 +139,8 @@ export async function hybridSearch(
       ? 'm.memory_kind, m.valid_from, m.valid_to'
       : "'unspecified'::text AS memory_kind, NULL::timestamptz AS valid_from, NULL::timestamptz AS valid_to";
     const supersessionColumns = capabilities.supersession_schema
-      ? 'm.supersedes_id, m.superseded_at'
-      : 'NULL::uuid AS supersedes_id, NULL::timestamptz AS superseded_at';
+      ? 'm.supersedes_id AS linked_supersedes_id, m.superseded_at'
+      : 'NULL::uuid AS linked_supersedes_id, NULL::timestamptz AS superseded_at';
     const revisionColumn = capabilities.revision_schema ? 'm.revision' : '0::integer AS revision';
     const selectedColumns = `id, content, metadata, tags, source, namespace, created_at, event_at,
       relevance_score, relevance_base_score, decay_rate, updated_at, accessed_at, access_count,
@@ -172,15 +174,24 @@ export async function hybridSearch(
        ORDER BY ts_rank_cd(to_tsvector('english', content), plainto_tsquery(${pQuery})) DESC, id
        LIMIT 20)`).join('\nUNION ALL\n');
 
-    const demotionMultiplier = capabilities.supersession_schema &&
-      SUPERSEDED_SEARCH_DEMOTION_ENABLED && !params.valid_at
+    const demotionMultiplier = shouldDemoteSuperseded
       ? `CASE WHEN s.superseded_at IS NOT NULL THEN ${pSupersededFactor}::double precision ELSE 1.0 END`
       : '1.0';
+    const predecessorSelect = capabilities.supersession_schema
+      ? `(SELECT predecessor.id FROM memories predecessor
+         WHERE predecessor.id = r.linked_supersedes_id
+           AND predecessor.deleted_at IS NULL
+           AND predecessor.namespace = r.namespace
+           AND predecessor.namespace = ANY(${pNs})
+           AND ${accessLevelSql('predecessor.access_level', pMaxAccessLevel)}
+         LIMIT 1)`
+      : 'NULL::uuid';
     const successorSelect = capabilities.supersession_schema
       ? `(SELECT successor.id FROM memories successor
          WHERE successor.supersedes_id = r.id
-           AND successor.namespace = r.namespace
            AND successor.deleted_at IS NULL
+           AND successor.namespace = r.namespace
+           AND successor.namespace = ANY(${pNs})
            AND ${accessLevelSql('successor.access_level', pMaxAccessLevel)}
          LIMIT 1)`
       : 'NULL::uuid';
@@ -221,7 +232,11 @@ export async function hybridSearch(
             * ${demotionMultiplier} AS final_score
         FROM scored s
       )
-      SELECT r.*,
+      SELECT r.id, r.content, r.metadata, r.tags, r.source, r.namespace, r.created_at, r.event_at,
+        r.relevance_score, r.relevance_base_score, r.decay_rate, r.updated_at, r.accessed_at,
+        r.access_count, r.access_level, r.client_id, r.memory_kind, r.valid_from, r.valid_to,
+        r.superseded_at, r.revision, r.vec_score, r.text_score, r.base_score, r.relevance, r.final_score,
+        ${predecessorSelect} AS supersedes_id,
         (r.superseded_at IS NOT NULL) AS is_superseded,
         ${successorSelect} AS superseded_by_id
       FROM ranked r

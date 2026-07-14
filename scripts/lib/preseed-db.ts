@@ -92,7 +92,7 @@ export async function commitImportBatch(
       ? result.rowCount
       : unique.length;
     if (written < unique.length) {
-      console.warn(`[preseed] Skipped ${unique.length - written} tombstoned source-key conflict(s)`);
+      console.warn(`[preseed] Skipped ${unique.length - written} tombstoned or superseded source-key conflict(s)`);
     }
     return written;
   } catch (error) {

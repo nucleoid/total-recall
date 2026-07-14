@@ -45,7 +45,7 @@ class FakeClient implements ValidityFinalizerClient {
     const created = sql.match(/CREATE (UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS (\w+)/i);
     if (created) {
       const [, unique, name] = created;
-      const definition = name === 'memories_supersedes_id_unique_idx'
+      const definition = name === 'memories_supersedes_id_unique'
         ? `CREATE ${unique ?? ''}INDEX ${name} ON public.memories USING btree (supersedes_id)`
         : name === 'memories_current_semantic_candidates_idx'
           ? `CREATE INDEX ${name} ON public.memories USING btree (namespace, access_level, id) WHERE deleted_at IS NULL AND superseded_at IS NULL AND valid_to IS NULL AND memory_kind = 'semantic'`
@@ -78,7 +78,7 @@ test('validity finalizer builds unique supersession index concurrently before va
   await finalizeMemoryValidity(client);
 
   const createUnique = client.queries.findIndex(query =>
-    query.startsWith('CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS memories_supersedes_id_unique_idx'));
+    query.startsWith('CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS memories_supersedes_id_unique'));
   const firstValidation = client.queries.findIndex(query => query.includes('VALIDATE CONSTRAINT'));
   assert.ok(createUnique >= 0);
   assert.ok(firstValidation > createUnique);
@@ -88,7 +88,7 @@ test('validity finalizer builds unique supersession index concurrently before va
 
   await finalizeMemoryValidity(client);
   assert.equal(client.queries.filter(query =>
-    query.startsWith('CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS memories_supersedes_id_unique_idx')).length, 2);
+    query.startsWith('CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS memories_supersedes_id_unique')).length, 2);
 });
 
 test('validity finalizer rejects duplicate predecessors before schema changes', async () => {
@@ -100,16 +100,28 @@ test('validity finalizer rejects duplicate predecessors before schema changes', 
   assert.equal(client.constraints.has('memories_valid_from_present'), false);
 });
 
+test('validity finalizer refuses a valid partial canonical-name uniqueness index', async () => {
+  const client = new FakeClient();
+  client.indexes.set('memories_supersedes_id_unique', {
+    valid: true,
+    ready: true,
+    definition: 'CREATE UNIQUE INDEX memories_supersedes_id_unique ON public.memories USING btree (supersedes_id) WHERE deleted_at IS NULL',
+  });
+
+  await assert.rejects(finalizeMemoryValidity(client), /unexpected definition; refusing to replace/i);
+  assert.equal(client.queries.some(query => query.startsWith('CREATE UNIQUE INDEX')), false);
+});
+
 test('validity finalizer repairs an invalid concurrent unique-index leftover', async () => {
   const client = new FakeClient();
-  client.indexes.set('memories_supersedes_id_unique_idx', {
+  client.indexes.set('memories_supersedes_id_unique', {
     valid: false,
     ready: false,
-    definition: 'CREATE UNIQUE INDEX memories_supersedes_id_unique_idx ON public.memories USING btree (supersedes_id)',
+    definition: 'CREATE UNIQUE INDEX memories_supersedes_id_unique ON public.memories USING btree (supersedes_id)',
   });
 
   await finalizeMemoryValidity(client);
   assert.ok(client.queries.includes(
-    'DROP INDEX CONCURRENTLY IF EXISTS public.memories_supersedes_id_unique_idx',
+    'DROP INDEX CONCURRENTLY IF EXISTS public.memories_supersedes_id_unique',
   ));
 });

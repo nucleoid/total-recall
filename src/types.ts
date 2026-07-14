@@ -55,6 +55,14 @@ export interface StoreParams {
   idempotency_key?: string;
 }
 
+export interface UpdateParams {
+  id: string;
+  content?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+  supersedes?: string;
+}
+
 export interface SearchParams {
   query: string;
   namespaces?: string[];

@@ -64,6 +64,7 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  MCP Tools:                 │
         │  • memory_store             │
         │  • memory_store_document    │
+        │  • memory_update            │
         │  • memory_search            │
         │  • memory_recall            │
         │  • memory_list              │
@@ -108,6 +109,9 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  │ document_id UUID FK │    │
         │  │ chunk_index INT     │    │
         │  │ source_key  TEXT UQ │    │
+        │  │ supersedes_id UUID  │    │
+        │  │ superseded_at TS    │    │
+        │  │ revision    INT     │    │
         │  │ created_at  TS      │    │
         │  │ updated_at  TS      │    │
         │  │ accessed_at TS      │    │
@@ -182,6 +186,20 @@ Store a single memory/fact with metadata. Optionally track which agent stored it
 ```
 
 `access_level` defaults to `normal` and may be `normal`, `sensitive`, or `secret`. The caller's API key must have a `max_access_level` at least as high as the memory being stored.
+
+### `memory_update`
+Patch an active current memory by UUID. At least one of `content`, `tags`, `metadata`, or `supersedes` is required; omitted fields are unchanged, while supplied tags and metadata replace the complete value (including `[]` and `{}`). Content must be nonblank and is re-embedded only when changed. Provenance, namespace, source, access level, document identity, creation/deletion state, and existing lifecycle links are immutable.
+
+```json
+{
+  "id": "<new-current-memory-uuid>",
+  "content": "User lives in Austin",
+  "tags": ["profile", "location"],
+  "supersedes": "<old-location-memory-uuid>"
+}
+```
+
+A supersession atomically closes the predecessor and creates one immutable successor link. Both rows must be active/current, distinct, visible, and in the same namespace. Historical rows remain available through list and direct recall with `supersedes_id`, `superseded_by_id`, `superseded_at`, `is_superseded`, and `revision`, but a linked UUID is returned only when that linked row is itself active, in the requested namespace, and visible at the caller's access-level ceiling. When the separately reviewed `SUPERSEDED_SEARCH_DEMOTION_ENABLED=true` gate is enabled, ordinary search demotes history by `SUPERSEDED_SCORE_FACTOR` (default `0.25`) before final ordering and limiting. Forgetting or purging a successor never reopens its predecessor; the predecessor marker is durable, and its purge is blocked while a successor still references it.
 
 ### `memory_store_document`
 Chunk and store a full document. Content must contain non-whitespace text and is limited to **1 MiB of decoded UTF-8**. Chunking prefers markdown headings and paragraph boundaries, then splits on Unicode code-point boundaries so every embedding chunk is at most **2,000 UTF-8 bytes** without dropping or changing source text. Chunks share a `document_id` for full-document retrieval.
@@ -495,11 +513,11 @@ A checksum mismatch is an operational stop, not a prompt to overwrite the ledger
 
 Migration 026 adds explicit memory kinds and nullable half-open validity intervals. It must follow #52 migration 025; do not renumber, combine, or apply these releases out of order. Roll it out in stages:
 
-1. Apply #52 migration 025 and deploy its supersession-aware readers/writers before any #53 schema or runtime.
+1. Apply #52 migration 025, run `npm run finalize:memory-supersession`, and deploy its supersession-aware readers/writers before any #53 schema or runtime.
 2. Apply migration 026 with contradiction classification, automatic mutation, and `SUPERSEDED_SEARCH_DEMOTION_ENABLED` all false. The transaction-wrapped migration does not build the unique supersession index and does not add checks that would reject updates to unbackfilled rows.
 3. Deploy all kind/validity-aware writers, still with classification disabled. Writer fallbacks are limited compatibility for migration-by-migration tests; production remains migrate-first.
 4. Run bounded, resumable batches with `MIGRATION_DATABASE_URL=... npm run backfill:memory-validity`. The backfill uses only `created_at` and durable `superseded_at`; it does not guess kinds or dates.
-5. When it reports `pending=0`, run `MIGRATION_DATABASE_URL=... npm run finalize:memory-validity`. The owner-run finalizer rejects duplicate predecessor links, creates the non-partial unique `supersedes_id` index with `CREATE UNIQUE INDEX CONCURRENTLY`, adds and validates the deferred checks, sets `valid_from NOT NULL`, and builds candidate/temporal indexes concurrently. An invalid interrupted index is dropped concurrently and rebuilt on retry.
+5. When it reports `pending=0`, run `MIGRATION_DATABASE_URL=... npm run finalize:memory-validity`. The owner-run finalizer rejects duplicate predecessor links, verifies or idempotently creates migration 025's canonical non-partial `memories_supersedes_id_unique` with `CREATE UNIQUE INDEX CONCURRENTLY`, adds and validates the deferred checks, sets `valid_from NOT NULL`, and builds candidate/temporal indexes concurrently. An invalid interrupted index is dropped concurrently and rebuilt on retry; it does not create a second uniqueness index.
 6. Deploy/enable `valid_at` readers. Ordinary search probes the catalog and safely uses its older query shape before migration 026; `valid_at` still fails closed until finalization. The fallback is selected before query construction and never catches or hides SQL, permission, timeout, or connection failures.
 7. Enable `SUPERSEDED_SEARCH_DEMOTION_ENABLED=true` only as a separately reviewed, reversible ranking rollout. Its restrictive default is false; `SUPERSEDED_SCORE_FACTOR` has no effect while the gate is off.
 8. Record every independent #53 approval in `.env`: exact gateway provider/model, privacy/retention/training terms, exactly one low-sensitivity namespace (initially `normal` access only), and a cost budget. Then enable shadow classification only.
@@ -612,6 +630,24 @@ The command runs each `ALTER TABLE ... VALIDATE CONSTRAINT` in a separate autoco
 5. Verify ordinary reads and maintenance exclude `deleted_at IS NOT NULL`, then enable deletion by granting/using `delete` permissions. Keep hard purge manual and wait for the retention window.
 
 Before any rollback or incident response, disable `memory_forget`/REST deletion and `purge:deleted` first and stop their callers. If no tombstones have ever been created, the runtime can be rolled back while retaining the additive columns and indexes. Once tombstones exist, application rollback is **roll-forward-only**: do not deploy any binary or job that is not tombstone-aware, do not clear or drop tombstone fields, and repair by deploying corrected tombstone-aware code. After hard purge, deleted content is recoverable only from a verified backup.
+
+### Memory supersession rollout and rollback
+
+Migration 025 is additive and online-safe: it adds nullable supersession columns, `revision`, and the narrow revision trigger, then adds the self-link CHECK and restrictive FK as `NOT VALID`. `NOT VALID` still enforces both constraints for new writes but avoids validating existing rows while the transaction-wrapped migration retains its earlier `ALTER TABLE` lock. The migration deliberately performs no index build or table validation. Roll out supersession in this order:
+
+1. Keep `memory_update` disabled and do not create supersession links.
+2. After migration 024 is complete, run `npm run migrate` with the owner-only `MIGRATION_DATABASE_URL` and let migration 025 commit.
+3. Complete validation and uniqueness outside the migration transaction:
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run finalize:memory-supersession
+```
+
+The finalizer runs each `ALTER TABLE ... VALIDATE CONSTRAINT` as a separate autocommit statement, then builds the non-partial `memories_supersedes_id_unique` with `CREATE UNIQUE INDEX CONCURRENTLY` and the historical lookup index with `CREATE INDEX CONCURRENTLY`. It verifies exact definitions and validity, safely resumes partial validation, refuses a wrong valid same-name object, and drops an invalid index left by an interrupted concurrent build before retry. It must report `allValid: true` for both constraints and both indexes. If unique-index creation finds duplicate legacy links, remediate those rows explicitly and rerun the same finalizer; never substitute a partial unique index.
+4. Deploy and restart every supersession-aware search/list/recall replica, `memory_update` handler, source-key writer, and re-embedding/maintenance writer. Verify linked UUIDs obey namespace and access-level visibility.
+5. Only after all readers and writers are upgraded and the finalizer reported `allValid: true`, enable `memory_update` and create the first link. Enable `SUPERSEDED_SEARCH_DEMOTION_ENABLED=true` only as a separately reviewed ranking rollout; tune `SUPERSEDED_SCORE_FACTOR` only within `(0,1]` (`0.25` is the default and has no effect while the gate is off).
+
+During rollback or incident response, disable `memory_update` and stop link creation first. Before any link exists, the runtime can be rolled back while retaining the additive schema. Once links exist, rollback is roll-forward-only: retain the columns, trigger, indexes, links, durable predecessor markers, and supersession-aware readers; never deploy an old reader that ranks historical rows as current and never drop or clear populated lifecycle fields.
 
 ## Namespace Design
 

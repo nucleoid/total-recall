@@ -166,6 +166,7 @@ async function loadCandidates(client: pg.Client, page: CandidatePage): Promise<C
          JOIN memories m ON m.id = e.memory_id
         WHERE m.namespace = 'media'
           AND m.deleted_at IS NULL
+          AND m.superseded_at IS NULL
           AND m.source = 'media:' || e.service
           AND ($1::timestamptz IS NULL OR (e.played_at, e.id) > ($1::timestamptz, $2::uuid))
           AND ($3::text IS NULL OR e.service = $3)
@@ -207,6 +208,7 @@ async function applyIfUnchanged(
           AND m.id = $2
           AND m.namespace = 'media'
           AND m.deleted_at IS NULL
+          AND m.superseded_at IS NULL
           AND m.source = 'media:' || e.service
         FOR UPDATE OF m`,
       [captured.id, captured.memory_id]
@@ -225,7 +227,8 @@ async function applyIfUnchanged(
               metadata = $4,
               updated_at = NOW()
         WHERE id = $5
-          AND deleted_at IS NULL`,
+          AND deleted_at IS NULL
+          AND superseded_at IS NULL`,
       [content, `[${vector.join(',')}]`, tags, JSON.stringify(metadata), captured.memory_id]
     );
     if (updated.rowCount !== 1) {

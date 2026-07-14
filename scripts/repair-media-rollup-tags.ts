@@ -100,6 +100,7 @@ export async function repairMediaRollupTags(
                SET tags = $1, updated_at = NOW()
                WHERE m.id = $2
                  AND m.deleted_at IS NULL
+                 AND m.superseded_at IS NULL
                  AND m.namespace = 'media'
                  AND m.client_id = $3
                  AND m.source = 'media:' || $4

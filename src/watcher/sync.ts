@@ -148,7 +148,7 @@ export async function reconcilePreparedFile(
     if (result.command === 'INSERT' && result.rowCount === 0) tombstonedConflicts++;
   }
   if (tombstonedConflicts > 0) {
-    console.warn(`[watcher] Skipped ${tombstonedConflicts} tombstoned source-key conflict(s)`);
+    console.warn(`[watcher] Skipped ${tombstonedConflicts} tombstoned or superseded source-key conflict(s)`);
   }
 
   await client.query(DELETE_STALE_SQL, [
