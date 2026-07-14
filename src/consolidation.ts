@@ -444,6 +444,10 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
     );
     if (lock.rows[0]?.locked !== true) throw new Error('Another consolidation run is active for this namespace');
     let runIdForFailure: string | undefined;
+    let calls = 0;
+    let inputBytes = 0;
+    let outputBytes = 0;
+    let reservedCostMicroUsd = 0;
     try {
       const effectiveCursor = options.cursor === undefined && options.mode === 'apply'
         ? await loadCheckpoint(client, scope, options.auth.keyId, options.namespace)
@@ -486,10 +490,6 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
       runIdForFailure = runId;
       const previews: ConsolidationPreview[] = [];
       const mergedCanonicalIds: string[] = [];
-      let calls = 0;
-      let inputBytes = 0;
-      let outputBytes = 0;
-      let reservedCostUsd = 0;
 
       for (const cluster of selection.clusters) {
         throwIfAborted(options.signal);
@@ -512,17 +512,20 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
           if (options.mode === 'apply') await advanceClusterCheckpoint(client, scope, options, cluster);
           continue;
         }
-        const requestReservation = policy.budget.estimatedRequestCostUsd +
-          bytes * policy.budget.estimatedInputCostUsdPerMillionBytes / 1_000_000 +
-          MAX_CONSOLIDATION_OUTPUT_BYTES * policy.budget.estimatedOutputCostUsdPerMillionBytes / 1_000_000;
+        const requestReservationMicroUsd =
+          Math.ceil(policy.budget.estimatedRequestCostUsd * 1_000_000) +
+          Math.ceil(bytes * policy.budget.estimatedInputCostUsdPerMillionBytes) +
+          Math.ceil(MAX_CONSOLIDATION_OUTPUT_BYTES * policy.budget.estimatedOutputCostUsdPerMillionBytes);
         if (calls + 1 > policy.budget.maxCallsPerInvocation ||
             inputBytes + bytes > policy.budget.maxInputBytesPerInvocation ||
-            reservedCostUsd + requestReservation > policy.budget.maxCostUsdPerInvocation) {
+            (calls + 1) * MAX_CONSOLIDATION_OUTPUT_BYTES > policy.budget.maxOutputBytesPerInvocation ||
+            reservedCostMicroUsd + requestReservationMicroUsd >
+              Math.floor(policy.budget.maxCostUsdPerInvocation * 1_000_000)) {
           throw new GenerationLimitError('Consolidation invocation budget exhausted');
         }
         calls += 1;
         inputBytes += bytes;
-        reservedCostUsd += requestReservation;
+        reservedCostMicroUsd += requestReservationMicroUsd;
         const raw = await generateBounded({
           provider,
           system: CONSOLIDATION_SYSTEM_PROMPT,
@@ -590,7 +593,7 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
                  completed_at = statement_timestamp()
              WHERE id = $1::uuid`,
             [runId, options.signal?.aborted ? 'cancelled' : 'completed', calls, inputBytes, outputBytes,
-              mergedCanonicalIds.length, Math.ceil(reservedCostUsd * 1_000_000)],
+              mergedCanonicalIds.length, reservedCostMicroUsd],
           );
         });
       }
@@ -598,9 +601,12 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
     } catch (error) {
       if (runIdForFailure) {
         await withScopedTransactionOnClient(client, scope, scoped => scoped.query(
-          `UPDATE memory_consolidation_runs SET status = $2, completed_at = statement_timestamp()
+          `UPDATE memory_consolidation_runs
+           SET status = $2, provider_calls = $3, input_bytes = $4, output_bytes = $5,
+               estimated_cost_micro_usd = $6, completed_at = statement_timestamp()
            WHERE id = $1::uuid AND status = 'running'`,
-          [runIdForFailure, options.signal?.aborted ? 'cancelled' : 'failed'],
+          [runIdForFailure, options.signal?.aborted ? 'cancelled' : 'failed', calls, inputBytes,
+            outputBytes, reservedCostMicroUsd],
         )).catch(() => undefined);
       }
       throw error;
