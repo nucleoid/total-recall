@@ -19,6 +19,7 @@ class FakeClient implements ValidityFinalizerClient {
   readonly constraints = initialConstraints();
   readonly indexes = new Map<string, IndexState>();
   duplicatePredecessors = 0;
+  nonContiguousLinks = 0;
 
   async query<T extends pg.QueryResultRow = pg.QueryResultRow>(
     text: string,
@@ -30,6 +31,7 @@ class FakeClient implements ValidityFinalizerClient {
     if (sql.includes('duplicatePredecessors')) {
       return { rows: [{
         missing: '0', invalid: '0', mismatched: '0',
+        nonContiguousLinks: String(this.nonContiguousLinks),
         duplicatePredecessors: String(this.duplicatePredecessors),
       } as unknown as T] };
     }
@@ -98,6 +100,14 @@ test('validity finalizer rejects duplicate predecessors before schema changes', 
   await assert.rejects(finalizeMemoryValidity(client), /duplicate_predecessors=1/);
   assert.equal(client.queries.some(query => query.includes('CREATE UNIQUE INDEX')), false);
   assert.equal(client.constraints.has('memories_valid_from_present'), false);
+});
+
+test('validity finalizer rejects non-contiguous successor boundaries before schema changes', async () => {
+  const client = new FakeClient();
+  client.nonContiguousLinks = 1;
+
+  await assert.rejects(finalizeMemoryValidity(client), /non_contiguous_links=1/);
+  assert.equal(client.queries.some(query => query.includes('CREATE UNIQUE INDEX')), false);
 });
 
 test('validity finalizer refuses a valid partial canonical-name uniqueness index', async () => {

@@ -49,12 +49,19 @@ export async function finalizeMemoryValidity(client: ValidityFinalizerClient): P
     missing: string;
     invalid: string;
     mismatched: string;
+    nonContiguousLinks: string;
     duplicatePredecessors: string;
   }>(`
     SELECT
       count(*) FILTER (WHERE valid_from IS NULL)::text AS missing,
       count(*) FILTER (WHERE valid_to IS NOT NULL AND valid_to <= valid_from)::text AS invalid,
       count(*) FILTER (WHERE valid_to IS DISTINCT FROM superseded_at)::text AS mismatched,
+      (SELECT count(*)::text
+       FROM public.memories successor
+       LEFT JOIN public.memories predecessor ON predecessor.id = successor.supersedes_id
+       WHERE successor.supersedes_id IS NOT NULL
+         AND successor.valid_from IS DISTINCT FROM predecessor.superseded_at
+      ) AS "nonContiguousLinks",
       (SELECT count(*)::text
        FROM (
          SELECT supersedes_id
@@ -67,10 +74,12 @@ export async function finalizeMemoryValidity(client: ValidityFinalizerClient): P
   `);
   const row = preflight.rows[0];
   if (Number(row?.missing ?? 0) > 0 || Number(row?.invalid ?? 0) > 0 ||
-      Number(row?.mismatched ?? 0) > 0 || Number(row?.duplicatePredecessors ?? 0) > 0) {
+      Number(row?.mismatched ?? 0) > 0 || Number(row?.nonContiguousLinks ?? 0) > 0 ||
+      Number(row?.duplicatePredecessors ?? 0) > 0) {
     throw new Error(
       `Validity finalization preflight failed: missing=${row?.missing ?? '0'} ` +
       `invalid=${row?.invalid ?? '0'} mismatched=${row?.mismatched ?? '0'} ` +
+      `non_contiguous_links=${row?.nonContiguousLinks ?? '0'} ` +
       `duplicate_predecessors=${row?.duplicatePredecessors ?? '0'}`,
     );
   }

@@ -28,6 +28,7 @@ type PreflightRow = {
   missingCreatedAt: string;
   invalidInterval: string;
   conflictingLifecycle: string;
+  linkedBoundaryMissing: string;
 };
 
 /** Bounded, idempotent, and resumable. Every UPDATE is its own transaction. */
@@ -44,25 +45,34 @@ export async function backfillMemoryValidity(
 
   const preflight = await client.query<PreflightRow>(`
     SELECT
-      count(*) FILTER (WHERE created_at IS NULL)::text AS "missingCreatedAt",
+      count(*) FILTER (WHERE m.created_at IS NULL)::text AS "missingCreatedAt",
       count(*) FILTER (
-        WHERE COALESCE(valid_from, created_at) IS NOT NULL
-          AND COALESCE(valid_to, superseded_at) IS NOT NULL
-          AND COALESCE(valid_to, superseded_at) <= COALESCE(valid_from, created_at)
+        WHERE COALESCE(m.valid_to, m.superseded_at) IS NOT NULL
+          AND COALESCE(m.valid_to, m.superseded_at) <= CASE
+            WHEN m.supersedes_id IS NOT NULL THEN predecessor.superseded_at
+            ELSE COALESCE(m.valid_from, m.created_at)
+          END
       )::text AS "invalidInterval",
       count(*) FILTER (
-        WHERE valid_to IS NOT NULL
-          AND valid_to IS DISTINCT FROM superseded_at
-      )::text AS "conflictingLifecycle"
-    FROM public.memories
+        WHERE m.valid_to IS NOT NULL
+          AND m.valid_to IS DISTINCT FROM m.superseded_at
+      )::text AS "conflictingLifecycle",
+      count(*) FILTER (
+        WHERE m.supersedes_id IS NOT NULL
+          AND predecessor.superseded_at IS NULL
+      )::text AS "linkedBoundaryMissing"
+    FROM public.memories m
+    LEFT JOIN public.memories predecessor ON predecessor.id = m.supersedes_id
   `);
   const state = preflight.rows[0];
   const inconsistencies = Number(state?.missingCreatedAt ?? 0) +
-    Number(state?.invalidInterval ?? 0) + Number(state?.conflictingLifecycle ?? 0);
+    Number(state?.invalidInterval ?? 0) + Number(state?.conflictingLifecycle ?? 0) +
+    Number(state?.linkedBoundaryMissing ?? 0);
   options.log?.(
     `Validity preflight: missing_created_at=${state?.missingCreatedAt ?? '0'} ` +
     `invalid_interval=${state?.invalidInterval ?? '0'} ` +
-    `conflicting_lifecycle=${state?.conflictingLifecycle ?? '0'}`,
+    `conflicting_lifecycle=${state?.conflictingLifecycle ?? '0'} ` +
+    `linked_boundary_missing=${state?.linkedBoundaryMissing ?? '0'}`,
   );
   if (inconsistencies > 0) {
     throw new Error('Memory validity preflight found inconsistent lifecycle data; no rows were changed');
@@ -73,16 +83,22 @@ export async function backfillMemoryValidity(
   while (batches < options.maxBatches) {
     const result = await client.query<{ id: string }>(`
       WITH batch AS (
-        SELECT id
-        FROM public.memories
-        WHERE valid_from IS NULL
-           OR valid_to IS DISTINCT FROM superseded_at
-        ORDER BY id
+        SELECT m.id, predecessor.superseded_at AS predecessor_boundary
+        FROM public.memories m
+        LEFT JOIN public.memories predecessor ON predecessor.id = m.supersedes_id
+        WHERE m.valid_from IS NULL
+           OR m.valid_to IS DISTINCT FROM m.superseded_at
+           OR (m.supersedes_id IS NOT NULL
+               AND m.valid_from IS DISTINCT FROM predecessor.superseded_at)
+        ORDER BY m.id
         LIMIT $1
-        FOR UPDATE SKIP LOCKED
+        FOR UPDATE OF m SKIP LOCKED
       )
       UPDATE public.memories m
-      SET valid_from = COALESCE(m.valid_from, m.created_at),
+      SET valid_from = CASE
+            WHEN m.supersedes_id IS NOT NULL THEN batch.predecessor_boundary
+            ELSE COALESCE(m.valid_from, m.created_at)
+          END,
           valid_to = m.superseded_at
       FROM batch
       WHERE m.id = batch.id
@@ -97,9 +113,12 @@ export async function backfillMemoryValidity(
 
   const remaining = await client.query<{ pending: string }>(`
     SELECT count(*)::text AS pending
-    FROM public.memories
-    WHERE valid_from IS NULL
-       OR valid_to IS DISTINCT FROM superseded_at
+    FROM public.memories m
+    LEFT JOIN public.memories predecessor ON predecessor.id = m.supersedes_id
+    WHERE m.valid_from IS NULL
+       OR m.valid_to IS DISTINCT FROM m.superseded_at
+       OR (m.supersedes_id IS NOT NULL
+           AND m.valid_from IS DISTINCT FROM predecessor.superseded_at)
   `);
   const pending = Number(remaining.rows[0]?.pending ?? 0);
   options.log?.(`Validity backfill complete: updated=${updated} batches=${batches} pending=${pending}`);

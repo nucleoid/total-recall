@@ -10,7 +10,9 @@ import {
   contradictionPolicyFromEnv,
   maybeReviseBelief,
   policyAllowsScope,
+  scheduleShadowClassification,
   type ContradictionPolicy,
+  type ContradictionReason,
   type SemanticMemoryInsert,
 } from '../contradictions.js';
 import {
@@ -39,7 +41,9 @@ export const storeSchema = z.object({
 export interface MemoryStoreRuntimeOptions {
   contradictionPolicy?: ContradictionPolicy;
   reviseBelief?: typeof maybeReviseBelief;
+  /** Test/embedding hook; production uses the bounded process-wide scheduler. */
   scheduleShadow?: (task: () => Promise<void>) => void;
+  contradictionMetric?: (reason: ContradictionReason) => void;
 }
 
 export async function memoryStore(
@@ -116,6 +120,7 @@ export async function memoryStore(
     const revised = await reviseBelief(semanticMemory, auth, {
       policy: contradictionPolicy,
       allowMutation: true,
+      metric: runtime.contradictionMetric,
     });
     if (revised) return revised;
   }
@@ -123,12 +128,14 @@ export async function memoryStore(
   const scheduleShadowAfterCommit = (storedId: string): void => {
     if (!contradictionPolicy || contradictionPolicy.mutationEnabled ||
         !policyAllowsScope(contradictionPolicy, ns, params.access_level)) return;
-    const schedule = runtime.scheduleShadow ?? scheduleBestEffortShadow;
-    schedule(() => reviseBelief(semanticMemory, auth, {
+    const task = () => reviseBelief(semanticMemory, auth, {
       policy: contradictionPolicy,
       allowMutation: false,
       excludeCandidateId: storedId,
-    }).then(() => undefined));
+      metric: runtime.contradictionMetric,
+    }).then(() => undefined);
+    if (runtime.scheduleShadow) runtime.scheduleShadow(task);
+    else scheduleShadowClassification(contradictionPolicy, task, runtime.contradictionMetric);
   };
 
   if (!params.idempotency_key) {
@@ -251,16 +258,6 @@ export async function memoryStore(
     throw error;
   }
   return { ...res.rows[0], idempotency_key_honored: true };
-}
-
-function scheduleBestEffortShadow(task: () => Promise<void>): void {
-  setImmediate(() => {
-    void task().catch(() => {
-      // Content-free: a shadow failure must never alter a committed store or
-      // disclose provider/SQL details through the request path.
-      console.warn('[contradictions] outcome=shadow_dispatch_error');
-    });
-  });
 }
 
 function isMissingBeliefSchema(error: unknown): boolean {

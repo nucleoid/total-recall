@@ -7,6 +7,7 @@ dotenv.config();
 const { Pool } = pg;
 
 let pool: pg.Pool | null = null;
+let poolGeneration = 0;
 
 export interface DbScope {
   namespaces: string[];
@@ -18,6 +19,7 @@ export type ScopedClient = pg.PoolClient;
 
 export function getPool(): pg.Pool {
   if (!pool) {
+    poolGeneration += 1;
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
       max: 10,
@@ -41,6 +43,12 @@ export function dbScopeFromAuth(auth: AuthContext): DbScope {
 
 export function setPoolForTesting(testPool: pg.Pool | null): void {
   pool = testPool;
+  poolGeneration += 1;
+}
+
+/** Changes whenever this process swaps or recreates its database pool. */
+export function getPoolGeneration(): number {
+  return poolGeneration;
 }
 
 export async function queryUnscoped<T extends pg.QueryResultRow = any>(
@@ -129,5 +137,6 @@ export async function shutdown(): Promise<void> {
   if (pool) {
     await pool.end();
     pool = null;
+    poolGeneration += 1;
   }
 }

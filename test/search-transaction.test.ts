@@ -66,13 +66,18 @@ function result<T extends pg.QueryResultRow>(rows: T[]): pg.QueryResult<T> {
   };
 }
 
-async function loadSearch(demotionEnabled = false): Promise<typeof import('../src/search.js')> {
+async function loadSearch(
+  demotionEnabled = false,
+  schemaTtlMs?: number,
+): Promise<typeof import('../src/search.js')> {
   process.env.HNSW_EF_SEARCH = '321';
   process.env.SUPERSEDED_SEARCH_DEMOTION_ENABLED = demotionEnabled ? 'true' : 'false';
   process.env.EMBEDDING_PROVIDER = 'gemini';
   process.env.EMBEDDING_MODEL = 'gemini-embedding-2-preview';
   process.env.EMBEDDING_DIMENSIONS = '768';
   process.env.GEMINI_API_KEY = 'test-only-key';
+  if (schemaTtlMs === undefined) delete process.env.SEARCH_SCHEMA_CAPABILITY_TTL_MS;
+  else process.env.SEARCH_SCHEMA_CAPABILITY_TTL_MS = String(schemaTtlMs);
   globalThis.fetch = async () =>
     new Response(JSON.stringify({ embedding: { values: Array(768).fill(0.1) } }), {
       status: 200,
@@ -216,6 +221,60 @@ test('hybridSearch preserves #52 lifecycle fields while belief-validity columns 
   assert.match(searchSql, /successor\.access_level/);
 });
 
+test('fully finalized ordinary searches cache capabilities until explicit invalidation', async () => {
+  const client = new FakeClient();
+  client.capabilities = {
+    belief_schema: true,
+    supersession_schema: true,
+    revision_schema: true,
+    validity_finalized: true,
+  };
+  setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
+
+  const { hybridSearch, invalidateSearchSchemaCapabilities } = await loadSearch();
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  assert.equal(client.calls.filter(call => summarize(call.text) === 'SCHEMA').length, 1);
+
+  invalidateSearchSchemaCapabilities();
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  assert.equal(client.calls.filter(call => summarize(call.text) === 'SCHEMA').length, 2);
+});
+
+test('search capability cache expires by TTL and cannot survive a pool generation change', async () => {
+  const first = new FakeClient();
+  first.capabilities = {
+    belief_schema: true,
+    supersession_schema: true,
+    revision_schema: true,
+    validity_finalized: true,
+  };
+  setPoolForTesting(new FakePool(first) as unknown as pg.Pool);
+  const { hybridSearch } = await loadSearch(false, 1);
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  await new Promise(resolve => setTimeout(resolve, 5));
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  assert.equal(first.calls.filter(call => summarize(call.text) === 'SCHEMA').length, 2);
+
+  const replacement = new FakeClient();
+  replacement.capabilities = { ...first.capabilities };
+  setPoolForTesting(new FakePool(replacement) as unknown as pg.Pool);
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  assert.equal(replacement.calls.filter(call => summarize(call.text) === 'SCHEMA').length, 1);
+});
+
+test('partial rollout states are never cached', async () => {
+  const client = new FakeClient();
+  client.capabilities.supersession_schema = true;
+  client.capabilities.revision_schema = true;
+  setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
+
+  const { hybridSearch } = await loadSearch();
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  await hybridSearch(params, ['shared'], scope, 'normal');
+  assert.equal(client.calls.filter(call => summarize(call.text) === 'SCHEMA').length, 2);
+});
+
 test('finalized valid_at search filters both candidate paths without present-day demotion', async () => {
   const client = new FakeClient();
   client.capabilities = {
@@ -231,6 +290,12 @@ test('finalized valid_at search filters both candidate paths without present-day
     { ...params, valid_at: '2026-03-01T00:00:00Z' },
     ['shared'], scope, 'normal',
   );
+  await hybridSearch(
+    { ...params, valid_at: '2026-03-01T00:00:00Z' },
+    ['shared'], scope, 'normal',
+  );
+  assert.equal(client.calls.filter(call => summarize(call.text) === 'SCHEMA').length, 2,
+    'valid_at always refreshes finalization proof');
   const searchSql = client.calls.find(call => call.text.includes('WITH vector_results'))!.text;
   assert.match(searchSql, /m\.valid_from <= \$\d+::timestamptz/);
   assert.match(searchSql, /m\.valid_to IS NULL OR \$\d+::timestamptz < m\.valid_to/);

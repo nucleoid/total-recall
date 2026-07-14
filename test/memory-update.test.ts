@@ -43,10 +43,15 @@ test('memory update denies missing write permission before database work', async
   );
 });
 
-test('memory update preserves the database clock microseconds for validity closure', () => {
+test('memory update preserves one database clock and selects validity SQL before mutation', () => {
   const source = readFileSync(new URL('../src/tools/update.ts', import.meta.url), 'utf8');
   assert.match(source, /statement_timestamp\(\)::text AS now/);
+  assert.match(source, /FROM pg_attribute[\s\S]*memory_kind[\s\S]*valid_from[\s\S]*valid_to/);
+  assert.match(source, /valid_from = .*timestamp.*::timestamptz/);
+  assert.match(source, /valid_to = \$1::timestamptz/);
+  assert.match(source, /partially deployed; refusing manual supersession/);
   assert.doesNotMatch(source, /query<\{ now: Date \}>/);
+  assert.doesNotMatch(source, /42703/);
 });
 
 test('superseded score factor defaults and fails closed outside (0, 1]', () => {

@@ -1,4 +1,4 @@
-import { withScopedClient, type DbScope } from './db.js';
+import { getPoolGeneration, withScopedClient, type DbScope, type ScopedClient } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR, embed, serializeEmbeddingVector } from './embedding.js';
 import { accessLevelSql } from './auth.js';
 import {
@@ -15,6 +15,7 @@ const SUPERSEDED_SEARCH_DEMOTION_ENABLED = supersededSearchDemotionEnabledFromEn
 const SUPERSEDED_SCORE_FACTOR = SUPERSEDED_SEARCH_DEMOTION_ENABLED
   ? supersededScoreFactorFromEnv()
   : 1;
+const SEARCH_SCHEMA_CAPABILITY_TTL_MS = boundedSchemaTtl(process.env.SEARCH_SCHEMA_CAPABILITY_TTL_MS);
 
 // Legacy vector queries are allowed only for truthfully labelled legacy rows.
 // No legacy profile is configured after the verified Gemini-only cutover.
@@ -26,6 +27,99 @@ type SearchSchemaCapabilities = {
   revision_schema: boolean;
   validity_finalized: boolean;
 };
+
+type CapabilityCache = {
+  generation: number;
+  expiresAt: number;
+  capabilities: SearchSchemaCapabilities;
+};
+
+let capabilityCache: CapabilityCache | null = null;
+
+/** Explicit hook for an in-process migration/finalizer or operational test. */
+export function invalidateSearchSchemaCapabilities(): void {
+  capabilityCache = null;
+}
+
+async function searchSchemaCapabilities(
+  client: ScopedClient,
+  forceRefresh: boolean,
+): Promise<SearchSchemaCapabilities> {
+  const generation = getPoolGeneration();
+  if (!forceRefresh && capabilityCache?.generation === generation && capabilityCache.expiresAt > Date.now()) {
+    return capabilityCache.capabilities;
+  }
+
+  const capabilityResult = await client.query<SearchSchemaCapabilities>(`
+    SELECT
+      (SELECT count(*) = 5
+       FROM pg_attribute
+       WHERE attrelid = 'public.memories'::regclass
+         AND attname::text = ANY(ARRAY['memory_kind', 'valid_from', 'valid_to', 'supersedes_id', 'superseded_at']::text[])
+         AND NOT attisdropped) AS belief_schema,
+      (SELECT count(*) = 2
+       FROM pg_attribute
+       WHERE attrelid = 'public.memories'::regclass
+         AND attname::text = ANY(ARRAY['supersedes_id', 'superseded_at']::text[])
+         AND NOT attisdropped) AS supersession_schema,
+      EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'public.memories'::regclass
+          AND attname = 'revision' AND NOT attisdropped
+      ) AS revision_schema,
+      (SELECT count(*) = 5
+       FROM pg_attribute
+       WHERE attrelid = 'public.memories'::regclass
+         AND attname::text = ANY(ARRAY['memory_kind', 'valid_from', 'valid_to', 'supersedes_id', 'superseded_at']::text[])
+         AND NOT attisdropped)
+      AND EXISTS (
+        SELECT 1 FROM pg_attribute a
+        WHERE a.attrelid = 'public.memories'::regclass
+          AND a.attname = 'valid_from' AND a.attnotnull AND NOT a.attisdropped
+      ) AND (
+        SELECT count(*) = 3 FROM pg_constraint c
+        WHERE c.conrelid = 'public.memories'::regclass
+          AND c.conname::text = ANY(ARRAY[
+            'memories_valid_from_present',
+            'memories_validity_interval_check',
+            'memories_validity_supersession_check'
+          ]::text[])
+          AND c.convalidated
+      ) AS validity_finalized
+  `);
+  const capabilities = capabilityResult.rows[0];
+  if (!capabilities || !isCapabilities(capabilities)) {
+    throw new Error('Search schema capability probe returned an invalid result');
+  }
+
+  // Cache only the fully finalized monotonic rollout state. Negative/partial
+  // states are re-probed so a migration cannot leave a reader treating newly
+  // superseded rows as current. Pool generation and TTL bound positive staleness.
+  if (capabilities.belief_schema && capabilities.supersession_schema &&
+      capabilities.revision_schema && capabilities.validity_finalized) {
+    capabilityCache = {
+      generation,
+      expiresAt: Date.now() + SEARCH_SCHEMA_CAPABILITY_TTL_MS,
+      capabilities,
+    };
+  } else {
+    capabilityCache = null;
+  }
+  return capabilities;
+}
+
+function isCapabilities(value: SearchSchemaCapabilities): boolean {
+  return typeof value.belief_schema === 'boolean' &&
+    typeof value.supersession_schema === 'boolean' &&
+    typeof value.revision_schema === 'boolean' &&
+    typeof value.validity_finalized === 'boolean';
+}
+
+function boundedSchemaTtl(raw: string | undefined): number {
+  if (!raw || !/^\d+$/.test(raw)) return 30_000;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 1 && value <= 300_000 ? value : 30_000;
+}
 
 export async function hybridSearch(
   params: SearchParams,
@@ -48,43 +142,9 @@ export async function hybridSearch(
   return withScopedClient(scope, async (client) => {
     await client.query("SELECT set_config('hnsw.ef_search', $1, true)", [String(EF_SEARCH)]);
 
-    // Probe catalogs before constructing the query. This supports rolling a new
-    // reader onto #52 (or an older schema) without executing and then masking a
-    // failed SQL statement in the scoped transaction.
-    const capabilityResult = await client.query<SearchSchemaCapabilities>(`
-      SELECT
-        (SELECT count(*) = 5
-         FROM pg_attribute
-         WHERE attrelid = 'public.memories'::regclass
-           AND attname::text = ANY(ARRAY['memory_kind', 'valid_from', 'valid_to', 'supersedes_id', 'superseded_at']::text[])
-           AND NOT attisdropped) AS belief_schema,
-        (SELECT count(*) = 2
-         FROM pg_attribute
-         WHERE attrelid = 'public.memories'::regclass
-           AND attname::text = ANY(ARRAY['supersedes_id', 'superseded_at']::text[])
-           AND NOT attisdropped) AS supersession_schema,
-        EXISTS (
-          SELECT 1 FROM pg_attribute
-          WHERE attrelid = 'public.memories'::regclass
-            AND attname = 'revision' AND NOT attisdropped
-        ) AS revision_schema,
-        EXISTS (
-          SELECT 1 FROM pg_attribute a
-          WHERE a.attrelid = 'public.memories'::regclass
-            AND a.attname = 'valid_from' AND a.attnotnull AND NOT a.attisdropped
-        ) AND EXISTS (
-          SELECT 1 FROM pg_constraint c
-          WHERE c.conrelid = 'public.memories'::regclass
-            AND c.conname = 'memories_validity_interval_check'
-            AND c.convalidated
-        ) AS validity_finalized
-    `);
-    const capabilities: SearchSchemaCapabilities = capabilityResult.rows[0] ?? {
-      belief_schema: false,
-      supersession_schema: false,
-      revision_schema: false,
-      validity_finalized: false,
-    };
+    // Ordinary finalized searches reuse a short-lived process/pool-generation
+    // cache. valid_at always refreshes the finalization proof and fails closed.
+    const capabilities = await searchSchemaCapabilities(client, params.valid_at !== undefined);
 
     if (params.valid_at && !capabilities.validity_finalized) {
       throw new Error('Invalid valid_at: temporal search is unavailable until memory validity finalization completes');

@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import express from 'express';
 import dotenv from 'dotenv';
+import { shutdownContradictionRuntime } from './contradictions.js';
 import { dbScopeFromAuth, shutdown } from './db.js';
 import { checkPermission, validateKey } from './auth.js';
 import type { AuthContext } from './types.js';
@@ -638,6 +639,10 @@ return app;
 export const app = createApp();
 
 async function closeAllSessions(): Promise<void> {
+  // Gate provider egress before awaiting any session close. The listener is
+  // stopped by the signal handler first, but already-running REST stores also
+  // observe this process-wide fail-closed gate.
+  await shutdownContradictionRuntime();
   for (const [sid, record] of sessions) {
     record.closing = true;
     await record.transport.close();
@@ -650,17 +655,19 @@ const isDirectExecution = process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isDirectExecution) {
-  app.listen(PORT, () => {
+  const httpServer = app.listen(PORT, () => {
     console.error(`[total-recall] HTTP server listening on port ${PORT}`);
   });
 
   process.on('SIGINT', async () => {
     console.error('[total-recall] Shutting down HTTP server...');
+    httpServer.close();
     await closeAllSessions();
     process.exit(0);
   });
 
   process.on('SIGTERM', async () => {
+    httpServer.close();
     await closeAllSessions();
     process.exit(0);
   });

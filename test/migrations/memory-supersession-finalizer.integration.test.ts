@@ -123,6 +123,17 @@ test('memory supersession finalization validates online and repairs interrupted 
       [true, true],
       [false, true],
     ]);
+    const boundary = (await owner.query<{ at: string }>(
+      'SELECT statement_timestamp()::text AS at',
+    )).rows[0].at;
+    await owner.query(
+      'UPDATE memories SET superseded_at = $2::timestamptz, valid_to = $2::timestamptz WHERE id = $1',
+      [predecessor, boundary],
+    );
+    await owner.query(
+      'UPDATE memories SET valid_from = $2::timestamptz WHERE id = $1',
+      [successorA, boundary],
+    );
 
     // Migration 026 finalization must reuse migration 025's canonical durable
     // uniqueness index instead of certifying or creating a duplicate index.

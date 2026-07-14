@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+import { shutdownContradictionRuntime } from './contradictions.js';
 import { shutdown } from './db.js';
 import { validateKey } from './auth.js';
 import type { AuthContext } from './types.js';
@@ -46,11 +47,13 @@ function isEntrypoint(): boolean {
 if (isEntrypoint()) {
   process.on('SIGINT', async () => {
     console.error('[total-recall] Shutting down...');
+    await shutdownContradictionRuntime();
     await shutdown();
     process.exit(0);
   });
 
   process.on('SIGTERM', async () => {
+    await shutdownContradictionRuntime();
     await shutdown();
     process.exit(0);
   });
