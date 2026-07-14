@@ -1,12 +1,13 @@
 import { withScopedClient, type DbScope } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR, embed, serializeEmbeddingVector } from './embedding.js';
 import { accessLevelSql } from './auth.js';
-import { hnswEfSearchFromEnv } from './config.js';
+import { hnswEfSearchFromEnv, supersededScoreFactorFromEnv } from './config.js';
 import type { AccessLevel, SearchParams, SearchResult } from './types.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
 const EF_SEARCH = hnswEfSearchFromEnv();
+const SUPERSEDED_SCORE_FACTOR = supersededScoreFactorFromEnv();
 
 // Legacy vector queries are allowed only for truthfully labelled legacy rows.
 // No legacy profile is configured after the verified Gemini-only cutover.
@@ -33,6 +34,25 @@ export async function hybridSearch(
   return withScopedClient(scope, async (client) => {
     await client.query("SELECT set_config('hnsw.ef_search', $1, true)", [String(EF_SEARCH)]);
 
+    if (params.valid_at) {
+      const finalized = await client.query<{ ready: boolean }>(`
+        SELECT a.attnotnull
+          AND EXISTS (
+            SELECT 1 FROM pg_constraint c
+            WHERE c.conrelid = 'public.memories'::regclass
+              AND c.conname = 'memories_validity_interval_check'
+              AND c.convalidated
+          ) AS ready
+        FROM pg_attribute a
+        WHERE a.attrelid = 'public.memories'::regclass
+          AND a.attname = 'valid_from'
+          AND NOT a.attisdropped
+      `);
+      if (finalized.rows[0]?.ready !== true) {
+        throw new Error('Invalid valid_at: temporal search is unavailable until memory validity finalization completes');
+      }
+    }
+
     const values: unknown[] = [];
     let idx = 0;
     const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
@@ -46,6 +66,8 @@ export async function hybridSearch(
     const pProvider = p(ACTIVE_EMBEDDING_DESCRIPTOR.provider);
     const pModel = p(ACTIVE_EMBEDDING_DESCRIPTOR.model);
     const pDimensions = p(ACTIVE_EMBEDDING_DESCRIPTOR.dimensions);
+    const pValidAt = p(params.valid_at ?? null);
+    const pSupersededFactor = p(SUPERSEDED_SCORE_FACTOR);
     const accessWhere = `AND ${accessLevelSql('m.access_level', pMaxAccessLevel)}`;
 
     const conditions: string[] = [];
@@ -74,6 +96,10 @@ export async function hybridSearch(
     if (params.before) {
       conditions.push(`m.created_at <= ${p(params.before)}`);
     }
+    if (params.valid_at) {
+      conditions.push(`m.valid_from <= ${pValidAt}::timestamptz`);
+      conditions.push(`(m.valid_to IS NULL OR ${pValidAt}::timestamptz < m.valid_to)`);
+    }
 
     const extraWhere = conditions.length > 0 ? 'AND ' + conditions.join(' AND ') : '';
 
@@ -81,6 +107,7 @@ export async function hybridSearch(
       WITH vector_results AS (
         SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
           updated_at, accessed_at, access_count, access_level, client_id,
+          memory_kind, valid_from, valid_to, supersedes_id, superseded_at,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
@@ -95,6 +122,7 @@ export async function hybridSearch(
       text_only_results AS (
         SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
           updated_at, accessed_at, access_count, access_level, client_id,
+          memory_kind, valid_from, valid_to, supersedes_id, superseded_at,
           NULL::double precision AS vec_score
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
@@ -126,8 +154,19 @@ export async function hybridSearch(
         WHERE COALESCE(c.vec_score, 0) >= ${pThreshold} OR t.text_score > 0
       )
       SELECT s.*,
+        s.superseded_at IS NOT NULL AS is_superseded,
+        (SELECT successor.id
+         FROM memories successor
+         WHERE successor.supersedes_id = s.id
+           AND successor.namespace = s.namespace
+           AND successor.deleted_at IS NULL
+         LIMIT 1) AS superseded_by_id,
         (COALESCE(s.vec_score, 0) * 0.3 + s.text_score * 0.7 + CASE WHEN s.text_score > 0 THEN 2.0 ELSE 0 END)
-          * LEAST(s.relevance, 2.0) AS final_score
+          * LEAST(s.relevance, 2.0)
+          * CASE
+              WHEN ${pValidAt}::timestamptz IS NULL AND s.superseded_at IS NOT NULL THEN ${pSupersededFactor}
+              ELSE 1.0
+            END AS final_score
       FROM scored s
       ORDER BY final_score DESC
       LIMIT ${pLimit};

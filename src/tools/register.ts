@@ -112,6 +112,7 @@ const TOOL_DEFINITIONS = [
         source: { type: 'string', description: 'Filter by source' },
         after: { type: 'string', description: 'Filter: created after ISO date' },
         before: { type: 'string', description: 'Filter: created before ISO date' },
+        valid_at: { type: 'string', format: 'date-time', description: 'Optional offset-aware ISO-8601 instant for half-open historical belief validity [valid_from, valid_to)' },
         agent_name: {
           type: 'string',
           description:

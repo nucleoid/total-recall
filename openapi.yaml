@@ -35,6 +35,10 @@ paths:
                   items:
                     type: string
                   description: Filter to specific namespaces
+                valid_at:
+                  type: string
+                  format: date-time
+                  description: Offset-aware ISO-8601 instant for historical belief validity using [valid_from, valid_to). Available after validity finalization.
       responses:
         "200":
           description: Search results
@@ -401,6 +405,23 @@ components:
         created_at:
           type: string
           format: date-time
+        memory_kind:
+          type: string
+          enum: [unspecified, semantic, document_chunk, synced, media_rollup, consolidation]
+        valid_from:
+          type: [string, "null"]
+          format: date-time
+        valid_to:
+          type: [string, "null"]
+          format: date-time
+        supersedes_id:
+          type: [string, "null"]
+          format: uuid
+        superseded_at:
+          type: [string, "null"]
+          format: date-time
+        is_superseded:
+          type: boolean
         final_score:
           type: number
   securitySchemes:

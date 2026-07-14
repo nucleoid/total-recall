@@ -1,4 +1,5 @@
 export type AccessLevel = 'normal' | 'sensitive' | 'secret';
+export type MemoryKind = 'unspecified' | 'semantic' | 'document_chunk' | 'synced' | 'media_rollup' | 'consolidation';
 
 export interface Memory {
   id: string;
@@ -16,6 +17,13 @@ export interface Memory {
   accessed_at: Date;
   access_count: number;
   deleted_at?: Date | null;
+  memory_kind?: MemoryKind;
+  valid_from?: Date | null;
+  valid_to?: Date | null;
+  supersedes_id?: string | null;
+  superseded_at?: Date | null;
+  superseded_by_id?: string | null;
+  is_superseded?: boolean;
 }
 
 export interface ApiKey {
@@ -55,6 +63,7 @@ export interface SearchParams {
   source?: string;
   after?: string;
   before?: string;
+  valid_at?: string;
   mediaFilters?: MediaSearchFilters;
 }
 

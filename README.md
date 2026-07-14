@@ -209,6 +209,8 @@ Hybrid semantic + keyword search with filters. Every search is logged as a recal
 }
 ```
 
+After memory-validity finalization, pass an offset-aware ISO-8601 `valid_at` to search the half-open interval `valid_from <= valid_at < valid_to` (or an open-ended interval). Historical search does not apply today's supersession demotion. Results, direct recall, and list output include `memory_kind`, `valid_from`, `valid_to`, and supersession fields.
+
 ### `memory_recall`
 Get a specific memory by ID, or all chunks of a document by `document_id`.
 
@@ -488,6 +490,19 @@ Migration files are immutable after distribution. The runner records the SHA-256
 Migration runners serialize on a database-local advisory lock before reading or upgrading the ledger and hold it through the last migration. `MIGRATION_LOCK_TIMEOUT_MS` controls the bounded wait (default `30000`, accepted range `1`–`600000` milliseconds). A timeout makes no ledger or schema changes; increase it only when the expected migration duration justifies a longer deployment wait.
 
 A checksum mismatch is an operational stop, not a prompt to overwrite the ledger. Restore the exact migration file from the reviewed release, inspect the ledger and actual schema, then make any required change through an audited forward repair migration. Connection loss can make commit acknowledgement ambiguous, so inspect both schema and ledger before retrying. Rolling back to the old runner ignores checksums and removes drift and concurrency protection; leave the additive `checksum` column in place and restore the checksum-aware runner instead.
+
+### Belief validity and contradiction rollout
+
+Migration 025 adds explicit memory kinds and nullable half-open validity intervals. Roll it out in stages; never enable temporal reads or contradiction processing before the relevant gate:
+
+1. Deploy the migration and all kind-aware writers with classification disabled.
+2. Run bounded, resumable batches with `MIGRATION_DATABASE_URL=... npm run backfill:memory-validity`. The backfill uses only `created_at` and durable `superseded_at`; it does not guess kinds or dates.
+3. When it reports `pending=0`, run `MIGRATION_DATABASE_URL=... npm run finalize:memory-validity`. This validates the NOT VALID checks in separate autocommit operations, sets `valid_from NOT NULL`, and builds the temporal index concurrently.
+4. Deploy/enable `valid_at` readers.
+5. Record every independent #53 approval in `.env`: exact gateway provider/model, privacy/retention/training terms, exactly one low-sensitivity namespace (initially `normal` access only), and a cost budget. Then enable shadow classification only.
+6. Review bounded content-free shadow metrics. Automatic mutation remains off until `CONTRADICTION_AUTO_MUTATION_ENABLED`, mutation approval, reviewed-metrics approval, and the exact deployment/mutation environment all match.
+
+The generation gateway contract is `POST {model, system, input, max_output_bytes, tools: []}` returning exactly `{output: string}`. No embedding key, provider setting, or approval for another generative feature enables #53. Provider failures, malformed/oversized output, low confidence, stale candidates, and review-only results all preserve normal unlinked storage. Roll back by disabling automatic mutation first and classification second; never reopen a closed interval automatically.
 
 Before deploying migration 007 to an existing database, check who owns the legacy decay function. Function signature: `public.calculate_relevance(double precision, double precision, timestamp with time zone, integer)`.
 

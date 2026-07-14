@@ -6,6 +6,7 @@ import type { AuthContext } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
 import { TombstonedSourceKeyConflictError } from '../errors.js';
+import { maybeReviseBelief } from '../contradictions.js';
 import {
   MEMORY_CONTENT_MAX_CHARS,
   TAG_MAX_CHARS,
@@ -64,10 +65,11 @@ export async function memoryStore(
   const embedding = await embed(params.content);
   const vecStr = serializeEmbeddingVector(embedding);
 
+  const source = params.source || auth.name;
   const values = [
     params.content,
     vecStr,
-    params.source || auth.name,
+    source,
     ns,
     params.tags,
     JSON.stringify(params.metadata),
@@ -78,15 +80,43 @@ export async function memoryStore(
     ...embeddingDescriptorParams(),
   ];
 
+  const revised = await maybeReviseBelief({
+    content: params.content,
+    vector: vecStr,
+    source,
+    namespace: ns,
+    tags: params.tags,
+    metadata: params.metadata,
+    accessLevel: params.access_level,
+    clientId: auth.keyId,
+    agentId,
+    sessionId: params.session_id ?? null,
+  }, auth, { allowMutation: !params.idempotency_key });
+  if (revised) return revised;
+
   if (!params.idempotency_key) {
-    const res = await queryScoped(
-      dbScopeFromAuth(auth),
-      `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions)
-       VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-       RETURNING id, namespace`,
-      values
-    );
-    return res.rows[0];
+    try {
+      const res = await queryScoped(
+        dbScopeFromAuth(auth),
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'semantic', statement_timestamp())
+         RETURNING id, namespace`,
+        values
+      );
+      return res.rows[0];
+    } catch (error) {
+      // Preserve the repository's migration-by-migration integration harness.
+      // Production rollout still requires migration 025 before this writer.
+      if (!isMissingBeliefSchema(error)) throw error;
+      const legacy = await queryScoped(
+        dbScopeFromAuth(auth),
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         RETURNING id, namespace`,
+        values,
+      );
+      return legacy.rows[0];
+    }
   }
 
   const digest = createHash('sha256')
@@ -95,12 +125,14 @@ export async function memoryStore(
     .update(params.idempotency_key)
     .digest('hex');
   const sourceKey = `discord-safe:v1:${digest}`;
-  let res;
-  try {
-    res = await withScopedClient(dbScopeFromAuth(auth), async (client) => {
+  const executeKeyedStore = (beliefAware: boolean) => withScopedClient(dbScopeFromAuth(auth), async (client) => {
+      const columns = beliefAware ? ', memory_kind, valid_from' : '';
+      const insertedValues = beliefAware ? ", 'semantic', statement_timestamp()" : '';
+      const kindUpdate = beliefAware ? '\n           memory_kind = EXCLUDED.memory_kind,' : '';
+      const currentGuard = beliefAware ? '\n           AND memories.superseded_at IS NULL' : '';
       const upsert = await client.query(
-        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key)
-         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key${columns})
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14${insertedValues})
          ON CONFLICT (source_key) DO UPDATE SET
            content = EXCLUDED.content,
            embedding = EXCLUDED.embedding,
@@ -114,9 +146,9 @@ export async function memoryStore(
            access_level = EXCLUDED.access_level,
            client_id = EXCLUDED.client_id,
            agent_id = EXCLUDED.agent_id,
-           session_id = EXCLUDED.session_id,
+           session_id = EXCLUDED.session_id,${kindUpdate}
            updated_at = NOW()
-         WHERE memories.deleted_at IS NULL
+         WHERE memories.deleted_at IS NULL${currentGuard}
            AND memories.namespace = ANY($15::text[])
            AND EXCLUDED.namespace = ANY($15::text[])
          RETURNING id, namespace`,
@@ -140,6 +172,15 @@ export async function memoryStore(
       }
       throw new Error('Access denied to existing idempotent memory');
     });
+
+  let res;
+  try {
+    try {
+      res = await executeKeyedStore(true);
+    } catch (error) {
+      if (!isMissingBeliefSchema(error)) throw error;
+      res = await executeKeyedStore(false);
+    }
   } catch (error) {
     // Under RLS, a hidden source_key conflict can surface as 23505 because the
     // conflicting row is not visible to ON CONFLICT. Do not leak its existence.
@@ -149,4 +190,10 @@ export async function memoryStore(
     throw error;
   }
   return { ...res.rows[0], idempotency_key_honored: true };
+}
+
+function isMissingBeliefSchema(error: unknown): boolean {
+  return typeof error === 'object' && error !== null &&
+    'code' in error && error.code === '42703' &&
+    'message' in error && typeof error.message === 'string' && error.message.includes('memory_kind');
 }

@@ -100,6 +100,9 @@ Hybrid vector + full-text search.
 - source?: string
 - after?: string (ISO date)
 - before?: string (ISO date)
+- valid_at?: string (strict offset-aware ISO-8601 instant; available after validity finalization)
+
+With `valid_at`, both vector and text candidates require `valid_from <= valid_at AND (valid_to IS NULL OR valid_at < valid_to)`. Today's supersession demotion is not applied to a predecessor that was valid at that instant. Without it, superseded active history remains eligible but receives `SUPERSEDED_SCORE_FACTOR` (default `0.25`) before final ordering and limiting. Search, list, and recall return additive kind/validity/supersession fields.
 
 ### memory_list
 List memories with filters (no vector search).
@@ -125,6 +128,16 @@ Hard purge has a fixed 30-day retention window and is a separately invoked, prev
 ### memory_stats
 Get usage statistics.
 - namespace?: string
+
+## Belief Revision and Validity
+
+`memory_kind` is one of `unspecified`, `semantic`, `document_chunk`, `synced`, `media_rollup`, or `consolidation`. Only ordinary `memory_store` writes `semantic`; only those rows can participate in contradiction classification. Validity is half-open `[valid_from, valid_to)`, and automatic contradiction uses one database timestamp for the predecessor's `superseded_at`/`valid_to` and the successor's `valid_from`.
+
+Classification is optional and fail-open for storage. Before candidate text is read or sent, #53 requires feature-specific approval for the exact provider/model, privacy/retention/training terms, one approved namespace at `normal` access, and a positive approved budget. Up to five current same-namespace semantic candidates at cosine `>=0.85` are supplied as untrusted data to a tool-free bounded classifier. Strict output is exactly one of `duplicate|refinement|contradiction|no_match`, confidence, and one supplied ID (or null for `no_match`). Failures and non-approved results emit content-free outcome codes only.
+
+Automatic supersession defaults off independently of classification. It additionally requires reviewed shadow metrics, explicit mutation approval, and an exact environment gate. Only an approved high-confidence contradiction mutates. The final scoped transaction locks and revalidates the predecessor, inserts the successor, closes the interval, and writes `belief.supersede` audit; a stale candidate inserts normally outside that transaction. Idempotent upserts are classification/shadow eligible but never automatic-mutation eligible.
+
+Rollout is migration 025 and kind-aware writers → `npm run backfill:memory-validity` until pending zero → `npm run finalize:memory-validity` → temporal readers → independently approved shadow classification → reviewed metrics → per-environment mutation approval. Rollback disables mutation, then classification, and never reopens history.
 
 ## Embedding Pipeline
 - Gemini API: `embedContent` / `batchEmbedContents`

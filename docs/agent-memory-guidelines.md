@@ -112,6 +112,10 @@ than losing context.
 - **Self-check before session ends** — mentally review: did I store the key takeaways?
 ```
 
+## Belief Revision Guidelines
+
+Ordinary stores are semantic facts and may be compared with current facts only when the operator has independently approved #53 processing for that exact low-sensitivity namespace. Duplicate, refinement, low-confidence, and review-only classifications still create normal unlinked memories; automatic supersession is separately gated and disabled by default. Agents must not treat a probabilistic revision as deletion: closed predecessors remain available to direct/list recall and to `memory_search` with a strict offset-aware `valid_at` instant. Do not try to reopen an interval by rewriting or re-storing a historical row.
+
 ## Forget Guidelines
 
 Use `memory_forget` only when a stored fact is wrong, sensitive, or explicitly requested to be removed. Prefer exact `ids`; filter-only deletion requires `confirm: true` and should be narrowed carefully. Never assume `write` authorizes deletion—the agent's key needs a separately granted `delete` permission. Selectors combine with AND, `before` is strict, and tags use AND containment.
