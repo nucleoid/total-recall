@@ -81,6 +81,7 @@ export async function listAgents(auth: AuthContext, scope: DbScope): Promise<any
        MAX(m.created_at) AS last_memory_at
      FROM agents a
      LEFT JOIN memories m ON m.agent_id = a.id
+       AND m.deleted_at IS NULL
        AND (($4::boolean AND m.client_id = a.api_key_id::text) OR (NOT $4::boolean AND m.client_id = $1))
        AND m.namespace = ANY($2)
        AND ${accessLevelSql('m.access_level', '$3')}

@@ -84,6 +84,7 @@ export async function hybridSearch(
           1 - (embedding <=> ${pVec}::vector) AS vec_score
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+          AND m.deleted_at IS NULL
           AND ${vectorAvailable ? `embedding IS NOT NULL
           AND embedding_provider = ${pProvider}
           AND embedding_model = ${pModel}
@@ -97,6 +98,7 @@ export async function hybridSearch(
           NULL::double precision AS vec_score
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+          AND m.deleted_at IS NULL
           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
           AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
         LIMIT 20
@@ -111,6 +113,7 @@ export async function hybridSearch(
           ts_rank_cd(to_tsvector('english', content), plainto_tsquery(${pQuery})) AS text_score
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+          AND m.deleted_at IS NULL
           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
       ),
       scored AS MATERIALIZED (
@@ -135,7 +138,7 @@ export async function hybridSearch(
     if (res.rows.length > 0) {
       const ids = res.rows.map((r: any) => r.id);
       await client.query(
-        `UPDATE memories SET accessed_at = NOW(), access_count = access_count + 1, last_boosted_at = NOW() WHERE id = ANY($1)`,
+        `UPDATE memories SET accessed_at = NOW(), access_count = access_count + 1, last_boosted_at = NOW() WHERE id = ANY($1) AND deleted_at IS NULL`,
         [ids]
       );
     }

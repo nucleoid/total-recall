@@ -115,7 +115,8 @@ export async function memoryStore(
          agent_id = EXCLUDED.agent_id,
          session_id = EXCLUDED.session_id,
          updated_at = NOW()
-       WHERE memories.namespace = ANY($15::text[])
+       WHERE memories.deleted_at IS NULL
+         AND memories.namespace = ANY($15::text[])
          AND EXCLUDED.namespace = ANY($15::text[])
        RETURNING id, namespace`,
       [...values, sourceKey, auth.namespaces]

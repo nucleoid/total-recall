@@ -15,6 +15,7 @@ export interface Memory {
   updated_at: Date;
   accessed_at: Date;
   access_count: number;
+  deleted_at?: Date | null;
 }
 
 export interface ApiKey {
@@ -78,6 +79,13 @@ export interface ForgetParams {
   namespace?: string;
   before?: string;
   tags?: string[];
+  confirm?: boolean;
+  reason?: string;
+}
+
+export interface ForgetResult {
+  forgotten: string[];
+  count: number;
 }
 
 export interface StatsParams {

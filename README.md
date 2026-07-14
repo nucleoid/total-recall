@@ -33,7 +33,7 @@ Treat the formerly committed application-role password as compromised. Use one c
 6. Verify RLS namespace isolation and application connectivity with the runtime app role.
 7. Remove the old secret only after verification. If credential rollback is needed, perform another controlled rotation rather than restoring the compromised password.
 
-This rotation changes only the PostgreSQL app-role password. Total Recall API keys remain unchanged, so it causes no API-key reauthentication or token replacement. After migration 020, `total_recall_app` holds live DELETE capability on `memories`, constrained by namespace RLS, ahead of the #51 consumer; this issue exposes no deletion tool or endpoint and #51 owns that lifecycle. There is no memory backfill or reindex, and no data is deleted by this rollout. The additive policy migration remains safe if application code is rolled back.
+This rotation changes only the PostgreSQL app-role password. Total Recall API keys remain unchanged, so it causes no API-key reauthentication or token replacement. Migration 020 grants the RLS-scoped database delete capability used by the memory lifecycle; migration 024 adds tombstones. Existing rows need no backfill or reindex (`deleted_at IS NULL` means active).
 
 ## Architecture
 
@@ -68,6 +68,7 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  • memory_recall            │
         │  • memory_list              │
         │  • memory_list_namespaces   │
+        │  • memory_forget            │
         │  • memory_stats             │
         │  • agent_register           │
         │  • agent_list               │
@@ -76,6 +77,7 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  • POST /api/search         │
         │  • POST /api/store          │
         │  • POST /api/store-document │
+        │  • DELETE /api/memories     │
         │  • GET  /api/stats          │
         │  • GET  /api/agents         │
         │  • POST /api/agents         │
@@ -216,6 +218,11 @@ Browse/paginate memories with optional filters (no vector search).
 ### `memory_list_namespaces`
 List available namespaces and their memory counts.
 
+### `memory_forget`
+Soft-delete memories by `ids`, `namespace`, strict `before` (`created_at < before`), and/or `tags` (AND containment). Selectors combine with AND. At least one selector is required; every request without `ids` must include `"confirm": true`. A request is capped at 100 IDs and 100 authorized matches. The API key needs the explicit `delete` permission—`write` does not imply deletion. Results contain only newly tombstoned authorized IDs; missing and inaccessible IDs look identical.
+
+Tombstones disappear from all ordinary recall, search, list, count, access-boost, and maintenance operations. Document chunks can be forgotten independently; the original document ingestion count is immutable, and document recall reports not-found once no active chunks remain. A `source_key` retry cannot restore a tombstone. Deletion reasons are bounded and stored on the tombstone but are never copied to audit/log output.
+
 ### `memory_stats`
 Admin-only statistics: total memories, breakdown by namespace and source, document count, date range.
 
@@ -279,6 +286,7 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | POST | `/api/search` | Hybrid semantic + keyword search |
 | POST | `/api/store` | Store a single memory |
 | POST | `/api/store-document` | Store a chunked document |
+| DELETE | `/api/memories` | Soft-delete matching memories (explicit `delete` permission) |
 | GET | `/api/stats` | Memory statistics (admin) |
 | GET | `/api/agents` | List registered agents for the key |
 | POST | `/api/agents` | Register/update an agent |
@@ -288,6 +296,20 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | POST | `/api/media/events` | Upsert media events (used by connectors) |
 | GET | `/api/media/events` | List structured media events with filters |
 | POST | `/api/media/rollup` | Trigger pending events → summary memories |
+
+### Tombstone purge operations
+
+Hard purge is manual, preview-first, and fixed at a 30-day retention window. Configure an owner/BYPASSRLS maintenance URL and an explicit complete namespace inventory; no automatic purge schedule is shipped:
+
+```bash
+PURGE_NAMESPACES='["shared","work"]' MAINTENANCE_DATABASE_URL='postgresql://...' \
+  npm run purge:deleted -- --preview purge-preview.json
+# Independently review and preserve the preview, then:
+PURGE_NAMESPACES='["shared","work"]' MAINTENANCE_DATABASE_URL='postgresql://...' \
+  npm run purge:deleted -- --apply purge-preview.json
+```
+
+Each preview captures at most 10,000 rows in deterministic retention order; apply that page and generate a new preview file until no candidates remain. Apply rejects missing/stale previews, candidate drift, an empty or incomplete namespace inventory, and concurrent runs. It commits deterministic bounded batches and writes one content-free `memory.purge` audit row before each hard delete in the same transaction. Tombstones referenced by media events are reported and retained, preventing an `ON DELETE SET NULL` link from making forgotten rollups eligible for re-ingestion. A blocked or partial run exits nonzero. Before apply, stop relevant writers, verify a restorable backup, and review the opaque IDs/fingerprints. Before 30 days, recovery requires a separate explicit audited restoration procedure; after purge, recovery is backup-only. Never roll back to a binary that ignores `deleted_at`.
 
 ### Media summary calendar time zone
 

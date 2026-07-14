@@ -14,6 +14,8 @@ import { recallSchema, memoryRecall } from './recall.js';
 import { listNamespacesSchema, memoryListNamespaces } from './list-namespaces.js';
 import { listSchema, memoryList } from './list.js';
 import { statsSchema, memoryStats } from './stats.js';
+import { forgetSchema, memoryForget } from './forget.js';
+import { MAX_DELETION_REASON_CHARS, MAX_FORGET_IDS } from '../memory-lifecycle.js';
 import { mediaSearchSchema, mediaSearch } from './media-search.js';
 import { upsertAgent, listAgents } from '../agents.js';
 import {
@@ -155,6 +157,22 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'memory_forget',
+    description: 'Soft-delete matching memories. Selectors combine with AND. Filter-only requests require confirm: true. Requires the explicit delete permission.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        ids: { type: 'array', minItems: 1, maxItems: MAX_FORGET_IDS, uniqueItems: true, items: { type: 'string', format: 'uuid' }, description: 'Memory UUIDs' },
+        namespace: { type: 'string', minLength: 1, maxLength: 512, description: 'Namespace selector' },
+        before: { type: 'string', format: 'date-time', description: 'Strict created_at boundary (created_at < before)' },
+        tags: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string', minLength: 1, maxLength: 256 }, description: 'Tags selector (AND)' },
+        confirm: { type: 'boolean', description: 'Must be true when ids is omitted' },
+        reason: { type: 'string', minLength: 1, maxLength: MAX_DELETION_REASON_CHARS, description: 'Optional private deletion reason; never copied into audit output' },
+      },
+    },
+  },
+  {
     name: 'memory_stats',
     description: 'Get statistics about the memory store (admin-only).',
     inputSchema: {
@@ -260,6 +278,11 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
           const params = statsSchema.parse(args);
           const result = await memoryStats(params, auth);
           return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        }
+        case 'memory_forget': {
+          const params = forgetSchema.parse(args);
+          const result = await memoryForget(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'media_search': {
           const params = mediaSearchSchema.parse(args);

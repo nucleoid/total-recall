@@ -1,4 +1,4 @@
-import { queryScoped, type DbScope } from './db.js';
+import { queryScoped, type DbScope, type ScopedClient } from './db.js';
 import type { AuthContext } from './types.js';
 
 export async function logAudit(params: {
@@ -10,22 +10,24 @@ export async function logAudit(params: {
   resultCount?: number;
   agentId?: string;
   sessionId?: string;
-}, scope: DbScope): Promise<void> {
-  await queryScoped(
-    scope,
-    `INSERT INTO audit_log (client_id, action, namespace, memory_id, query_text, result_count, agent_id, session_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [
-      params.clientId,
-      params.action,
-      params.namespace ?? null,
-      params.memoryId ?? null,
-      params.queryText ?? null,
-      params.resultCount ?? null,
-      params.agentId ?? null,
-      params.sessionId ?? null,
-    ]
-  );
+}, scope: DbScope, client?: ScopedClient): Promise<void> {
+  const sql = `INSERT INTO audit_log (client_id, action, namespace, memory_id, query_text, result_count, agent_id, session_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`;
+  const values = [
+    params.clientId,
+    params.action,
+    params.namespace ?? null,
+    params.memoryId ?? null,
+    params.queryText ?? null,
+    params.resultCount ?? null,
+    params.agentId ?? null,
+    params.sessionId ?? null,
+  ];
+  if (client) {
+    await client.query(sql, values);
+  } else {
+    await queryScoped(scope, sql, values);
+  }
 }
 
 export async function listAudit(

@@ -107,8 +107,18 @@ List memories with filters (no vector search).
 - limit?: number (default 20)
 - offset?: number
 
-### memory_forget (planned; not currently registered)
-Issue #51 owns the public deletion lifecycle, tombstones, retention, purge behavior, and document invariants. Migration 020 supplies only an RLS-scoped table capability; this tool is not exposed by issue #49.
+### memory_forget
+Soft-delete authorized active memories. Requires the explicit `delete` API-key permission; `write` does not imply `delete`.
+- ids?: UUID[] (1–100, unique after normalization)
+- namespace?: string
+- before?: offset-aware ISO date-time (strict `created_at < before`; future values rejected)
+- tags?: nonempty string[] (AND containment)
+- confirm?: boolean (must be `true` whenever `ids` is absent)
+- reason?: string (1–512 characters; never emitted in audit/log output)
+
+At least one selector is required and selectors combine with AND. A transaction locks at most 101 authorized matches and rejects more than 100 without mutation. It returns only newly tombstoned IDs and a count; inaccessible and absent IDs are indistinguishable. Tombstones are excluded from all ordinary reads, counts, search/access updates, and maintenance writes. Source-key upserts cannot restore them. Each newly forgotten row receives one content-free `memory.forget` audit row atomically.
+
+Hard purge has a fixed 30-day retention window and is a separately invoked, preview-first maintenance command. It uses an explicit namespace inventory, deterministic bounded batches, a session advisory lock, state fingerprints, and per-row `memory.purge` audit. Referenced tombstones are retained and reported. No automatic purge schedule is enabled.
 
 ### memory_stats
 Get usage statistics.

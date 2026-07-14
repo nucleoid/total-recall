@@ -197,6 +197,7 @@ async function findExistingDocument(
      LEFT JOIN memories m
        ON m.document_id = d.id
       AND m.client_id = $1
+      AND m.deleted_at IS NULL
      WHERE d.client_id = $1::uuid
        AND d.namespace = $2
        AND d.idempotency_key = $3

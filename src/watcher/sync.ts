@@ -45,11 +45,14 @@ ON CONFLICT (source_key) DO UPDATE SET
   metadata = EXCLUDED.metadata,
   agent_id = EXCLUDED.agent_id,
   updated_at = NOW()
+WHERE memories.deleted_at IS NULL
+RETURNING id
 `;
 
 const DELETE_STALE_SQL = `
 DELETE FROM memories
 WHERE client_id = 'file-sync'
+  AND deleted_at IS NULL
   AND metadata->>'file' = $1
   AND (source_key IS NULL OR NOT (source_key = ANY($2::text[])))
 `;
@@ -57,6 +60,7 @@ WHERE client_id = 'file-sync'
 const DELETE_FILE_SQL = `
 DELETE FROM memories
 WHERE client_id = 'file-sync'
+  AND deleted_at IS NULL
   AND metadata->>'file' = $1
 `;
 
@@ -126,8 +130,9 @@ export async function reconcilePreparedFile(
   client: ScopedClient,
   input: FileSyncInput
 ): Promise<void> {
+  let tombstonedConflicts = 0;
   for (const chunk of input.chunks) {
-    await client.query(UPSERT_SQL, [
+    const result = await client.query(UPSERT_SQL, [
       chunk.content,
       chunk.vectorStr,
       input.source,
@@ -138,6 +143,10 @@ export async function reconcilePreparedFile(
       input.agentId,
       ...embeddingDescriptorParams(),
     ]);
+    if (result.command === 'INSERT' && result.rowCount === 0) tombstonedConflicts++;
+  }
+  if (tombstonedConflicts > 0) {
+    console.warn(`[watcher] Skipped ${tombstonedConflicts} tombstoned source-key conflict(s)`);
   }
 
   await client.query(DELETE_STALE_SQL, [
