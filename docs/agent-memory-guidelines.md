@@ -173,3 +173,13 @@ The three layers provide defense in depth:
 - **Non-chat sessions** (e.g., Claude Code, Cursor) don't have persistent logs that a sweep can review. These rely entirely on in-session discipline.
 - **LLM extraction quality** in sweeps depends on the model used. Haiku is fast and cheap but may miss nuance. Consider Sonnet for important channels.
 - **Duplicate detection** relies on Total Recall's built-in deduplication (cosine similarity > 0.92). In practice, near-duplicates occasionally slip through — this is acceptable.
+
+## Consolidated memories
+
+The optional operator-run sleep cycle may replace a complete-link group of near-duplicate semantic
+memories with one generated canonical while retaining every original as provenance. Agents should
+normally see only the canonical. Direct recall of a known original can return
+`consolidated_into_id` and `consolidated_at`; treat that link as explanatory history, not as a cue to
+store or update the hidden original. Do not attempt to clear links or delete provenance. Corrections
+belong in a new semantic memory/update workflow; visibility restoration is an owner-audited
+`deconsolidate` operation.

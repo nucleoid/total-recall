@@ -905,3 +905,26 @@ rebuild is required, but plan for provider cost and substantial WAL/index/IO loa
 Rollback cannot reconstruct compounded scores or infer prior custom bases. Keep the
 added column and corrected function on application rollback and roll forward. Old code is unsafe
 after any repair because it will resume compounding the effective score.
+
+## Nightly memory consolidation
+
+Migration 027 adds restrictive, provenance-preserving consolidation links, immutable membership
+history, bounded run state, and owner-key checkpoints. Linked originals are hidden from ordinary
+search/list/count/access/decay/re-embedding paths; direct ID recall still returns
+`consolidated_into_id` and `consolidated_at`. Active canonicals remain ordinary memories for decay
+and future re-embedding. `ON DELETE RESTRICT` and historical memberships prevent purge from
+destroying provenance.
+
+No consolidation is enabled implicitly. `npm run consolidate -- --namespace <one> --selection-only`
+is credential-free and content-free. Generation requires an owner-only strict #54 policy with a
+separately approved provider/model, all privacy/retention/training terms, exactly one normal-only
+namespace, dedicated credential reference, unexpired generation approval, bounded invocation
+budget, and external monthly control. Apply additionally requires an unexpired write approval and
+a dedicated API key with `read,write,delete,consolidate`, exact namespace scope, and
+`max_access_level=normal`. Another feature's approval or `GEMINI_API_KEY` never enables it.
+
+The command is bounded and externally scheduled; this repository installs no timer, MCP tool, or
+REST operation. Every reader/writer/maintenance process must be upgraded before the first active
+link. Rollback stops scheduling and approvals but retains migration 027 and link-aware code;
+visibility restoration uses only the exact audited `npm run deconsolidate` manifest workflow.
+See [docs/consolidation-rollout-runbook.md](docs/consolidation-rollout-runbook.md).

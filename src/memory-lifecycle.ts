@@ -39,6 +39,7 @@ export type NormalizedForgetParams = z.infer<typeof forgetSchema>;
 interface ForgetRow {
   id: string;
   namespace: string;
+  consolidated_into_id?: string | null;
 }
 
 /** Soft-delete authorized active memories and their audit records atomically. */
@@ -73,7 +74,7 @@ export async function forgetMemories(
     if (params.tags) conditions.push(`m.tags @> ${parameter(params.tags, '::text[]')}`);
 
     const selected = await client.query<ForgetRow>(
-      `SELECT m.id, m.namespace
+      `SELECT m.id, m.namespace, m.consolidated_into_id
        FROM memories m
        WHERE ${conditions.join(' AND ')}
        ORDER BY m.id
@@ -85,6 +86,13 @@ export async function forgetMemories(
     if (selected.rows.length === 0) return { forgotten: [], count: 0 };
 
     const ids = selected.rows.map(row => row.id);
+    // A canonical may still disclose a forgotten member's claim. Tombstone it
+    // in the same transaction, while deliberately keeping all provenance links.
+    const canonicalIds = [...new Set(selected.rows
+      .map(row => row.consolidated_into_id)
+      .filter((id): id is string => !!id))];
+    const mutationIds = [...new Set([...ids, ...canonicalIds])].sort();
+    if (mutationIds.length > MAX_FORGET_ROWS) throw new ForgetLimitError(MAX_FORGET_ROWS);
     const updated = await client.query<ForgetRow>(
       `UPDATE memories
        SET deleted_at = statement_timestamp(),
@@ -92,13 +100,12 @@ export async function forgetMemories(
            deletion_reason = $3
        WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL
        RETURNING id, namespace`,
-      [ids, auth.keyId, params.reason ?? null],
+      [mutationIds, auth.keyId, params.reason ?? null],
     );
 
     const byId = new Map(updated.rows.map(row => [row.id, row]));
     const forgotten = ids.filter(id => byId.has(id));
-    for (const id of forgotten) {
-      const row = byId.get(id)!;
+    for (const row of updated.rows) {
       await logAudit({
         clientId: auth.keyId,
         action: 'memory.forget',

@@ -30,6 +30,8 @@
     "start:watcher": "node dist/watcher.js",
     "preseed:chatgpt": "tsx scripts/preseed-chatgpt.ts",
     "decay:update": "tsx scripts/decay-update.ts",
+    "consolidate": "tsx scripts/consolidate-memories.ts",
+    "deconsolidate": "tsx scripts/deconsolidate-memories.ts",
     "purge:deleted": "tsx scripts/purge-deleted.ts",
     "repair:relevance-scores": "tsx scripts/repair-relevance-scores.ts",
     "repair:last-boosted-at": "tsx scripts/repair-last-boosted-at.ts",

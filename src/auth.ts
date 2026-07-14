@@ -48,9 +48,21 @@ export async function validateKey(apiKey: string): Promise<AuthContext | null> {
      RETURNING id, name, namespaces, permissions, max_access_level`,
     [hash]
   );
-  if (res.rows.length === 0) return null;
-  const row = res.rows[0];
-  if (!isAccessLevel(row.max_access_level)) return null;
+  return authContextFromRow(res.rows[0]);
+}
+
+/** Authenticate a no-mutation maintenance preview without updating last_used_at. */
+export async function validateKeyReadOnly(apiKey: string): Promise<AuthContext | null> {
+  const res = await queryUnscoped(
+    `SELECT id, name, namespaces, permissions, max_access_level
+     FROM api_keys WHERE key_hash = $1 AND enabled = true`,
+    [hashKey(apiKey)],
+  );
+  return authContextFromRow(res.rows[0]);
+}
+
+function authContextFromRow(row: any): AuthContext | null {
+  if (!row || !isAccessLevel(row.max_access_level)) return null;
   return {
     keyId: row.id,
     name: row.name,

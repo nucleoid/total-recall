@@ -290,3 +290,25 @@ requires explicit `--memory-timestamp`; run time is never substituted. Claude us
 7. Vector candidates require the exact stored provider/model/dimensions descriptor; unknown or unsupported rows are text-only
 8. Preseed and re-embedding atomically write vectors with the canonical descriptor, never metadata-only relabel uncertain rows
 9. Migration completion requires zero scoped active legacy/unknown rows before operators disable legacy querying
+
+## Consolidation contract
+
+- Migration 027 adds `memories.consolidated_into_id`/`consolidated_at` with restrictive deletion,
+  plus temporal `memory_consolidation_memberships`, owner-scoped runs, and durable checkpoints.
+- Initial eligibility is exactly normal, active/current/unlinked `memory_kind=semantic` rows in one
+  authorized namespace, with no document/source key and the exact current embedding descriptor.
+- Candidate groups are deterministic complete-link clusters at cosine `>= 0.92`, size 2–20. A
+  mutually compatible 21st row makes the group oversized and skipped rather than fragmented.
+- A successful apply inserts one `memory_kind=consolidation` canonical and links every original in
+  the same transaction. Originals are never rewritten or deleted. Generated output cannot set IDs,
+  tags, metadata, access, provenance, or lifecycle fields.
+- Current ordinary reads hide active linked originals; direct ID recall exposes linkage. Temporal
+  reads hide originals only during half-open membership intervals. Privacy tombstones always win.
+- Ordinary updates/source-key writers and maintenance mutations refuse active linked originals;
+  canonicals continue normal decay and re-embedding. Forgetting a member also tombstones its
+  canonical, while provenance remains linked and purge-blocking.
+- `npm run consolidate` is an externally scheduled bounded CLI. Selection-only performs no writes,
+  provider imports, or content reads. Dry-run writes only an explicit owner-only preview. Apply is
+  fail-closed behind independent #54 generation and write approvals.
+- `npm run deconsolidate` is the only supported restoration path. Exact manifest apply closes
+  memberships, clears links, tombstones the obsolete canonical, and audits atomically.

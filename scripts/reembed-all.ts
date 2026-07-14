@@ -127,6 +127,7 @@ async function selectBatch(
       SELECT id, content, namespace, updated_at::text AS updated_at, revision
       FROM public.memories
       WHERE deleted_at IS NULL
+        AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
         AND (cardinality($1::text[]) = 0 OR namespace = ANY($1))
         AND ${eligiblePredicate(6, 2, 3, 4)}
         AND ($5::uuid IS NULL OR id > $5::uuid)
@@ -159,6 +160,7 @@ async function updateEmbedding(
         updated_at = NOW()
     WHERE id = $5::uuid
       AND deleted_at IS NULL
+      AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
       AND updated_at = $6::timestamptz
       AND content = $7
       AND revision = $8
@@ -191,6 +193,7 @@ export async function verifyEmbeddingMigrationComplete(
       )::text AS legacy_count
     FROM public.memories
     WHERE deleted_at IS NULL
+      AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
       AND (cardinality($1::text[]) = 0 OR namespace = ANY($1))
   `, [namespaces, profile.provider, profile.model, profile.dimensions]);
   return result.rows[0] ?? { unknown_count: '0', legacy_count: '0' };

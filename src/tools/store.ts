@@ -173,13 +173,14 @@ export async function memoryStore(
     .update(params.idempotency_key)
     .digest('hex');
   const sourceKey = `discord-safe:v1:${digest}`;
-  type KeyedStoreSchema = 'belief' | 'supersession' | 'legacy';
+  type KeyedStoreSchema = 'consolidation' | 'belief' | 'supersession' | 'legacy';
   const executeKeyedStore = (schema: KeyedStoreSchema) => withScopedClient(dbScopeFromAuth(auth), async (client) => {
-      const beliefAware = schema === 'belief';
+      const beliefAware = schema === 'consolidation' || schema === 'belief';
       const columns = beliefAware ? ', memory_kind, valid_from' : '';
       const insertedValues = beliefAware ? ", 'semantic', statement_timestamp()" : '';
       const kindUpdate = beliefAware ? '\n           memory_kind = EXCLUDED.memory_kind,' : '';
       const currentGuard = schema !== 'legacy' ? '\n           AND memories.superseded_at IS NULL' : '';
+      const consolidationGuard = schema === 'consolidation' ? '\n           AND memories.consolidated_into_id IS NULL' : '';
       const upsert = await client.query(
         `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key${columns})
          VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14${insertedValues})
@@ -198,7 +199,7 @@ export async function memoryStore(
            agent_id = EXCLUDED.agent_id,
            session_id = EXCLUDED.session_id,${kindUpdate}
            updated_at = NOW()
-         WHERE memories.deleted_at IS NULL${currentGuard}
+         WHERE memories.deleted_at IS NULL${currentGuard}${consolidationGuard}
            AND memories.namespace = ANY($15::text[])
            AND EXCLUDED.namespace = ANY($15::text[])
          RETURNING id, namespace`,
@@ -237,16 +238,31 @@ export async function memoryStore(
   let res;
   try {
     try {
-      res = await executeKeyedStore('belief');
+      res = await executeKeyedStore('consolidation');
     } catch (error) {
-      if (!isMissingColumn(error, 'memory_kind')) throw error;
-      try {
-        // #52 already has supersession lifecycle columns. Preserve its guard
-        // while only omitting the not-yet-deployed #53 kind/validity columns.
-        res = await executeKeyedStore('supersession');
-      } catch (supersessionError) {
-        if (!isMissingColumn(supersessionError, 'superseded_at')) throw supersessionError;
-        res = await executeKeyedStore('legacy');
+      if (isMissingColumn(error, 'memory_kind')) {
+        // A pre-#53 database can report memory_kind before reaching the newer
+        // consolidation column in the same statement.
+        try { res = await executeKeyedStore('supersession'); }
+        catch (supersessionError) {
+          if (!isMissingColumn(supersessionError, 'superseded_at')) throw supersessionError;
+          res = await executeKeyedStore('legacy');
+        }
+      } else {
+        if (!isMissingColumn(error, 'consolidated_into_id')) throw error;
+        try {
+          res = await executeKeyedStore('belief');
+        } catch (beliefError) {
+          if (!isMissingColumn(beliefError, 'memory_kind')) throw beliefError;
+          try {
+            // #52 already has supersession lifecycle columns. Preserve its guard
+            // while only omitting the not-yet-deployed #53 kind/validity columns.
+            res = await executeKeyedStore('supersession');
+          } catch (supersessionError) {
+            if (!isMissingColumn(supersessionError, 'superseded_at')) throw supersessionError;
+            res = await executeKeyedStore('legacy');
+          }
+        }
       }
     }
   } catch (error) {
@@ -264,7 +280,7 @@ function isMissingBeliefSchema(error: unknown): boolean {
   return isMissingColumn(error, 'memory_kind');
 }
 
-function isMissingColumn(error: unknown, column: 'memory_kind' | 'superseded_at'): boolean {
+function isMissingColumn(error: unknown, column: 'memory_kind' | 'superseded_at' | 'consolidated_into_id'): boolean {
   return typeof error === 'object' && error !== null &&
     'code' in error && error.code === '42703' &&
     'message' in error && typeof error.message === 'string' && error.message.includes(column);

@@ -1,16 +1,15 @@
 import dotenv from 'dotenv';
+import {
+  ACTIVE_EMBEDDING_DESCRIPTOR,
+  CANONICAL_EMBEDDING_DESCRIPTOR,
+  embeddingDescriptorParams,
+  type EmbeddingDescriptor,
+} from './embedding-descriptor.js';
+
+export { ACTIVE_EMBEDDING_DESCRIPTOR, CANONICAL_EMBEDDING_DESCRIPTOR, embeddingDescriptorParams };
+export type { EmbeddingDescriptor };
 
 dotenv.config();
-
-export const CANONICAL_EMBEDDING_DESCRIPTOR = Object.freeze({
-  provider: 'gemini' as const,
-  model: 'gemini-embedding-2-preview' as const,
-  dimensions: 768 as const,
-});
-
-export const ACTIVE_EMBEDDING_DESCRIPTOR = CANONICAL_EMBEDDING_DESCRIPTOR;
-
-export type EmbeddingDescriptor = typeof CANONICAL_EMBEDDING_DESCRIPTOR;
 
 export interface EmbeddingEnvironment {
   EMBEDDING_PROVIDER?: string;
@@ -43,14 +42,6 @@ export function validateEmbeddingProfile(env: EmbeddingEnvironment): EmbeddingPr
 
 const ACTIVE_EMBEDDING_PROFILE = validateEmbeddingProfile(process.env);
 
-export function embeddingDescriptorParams(): [string, string, number] {
-  return [
-    ACTIVE_EMBEDDING_DESCRIPTOR.provider,
-    ACTIVE_EMBEDDING_DESCRIPTOR.model,
-    ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
-  ];
-}
-
 export function validateEmbeddingVector(values: unknown, context: string): number[] {
   if (!Array.isArray(values)) throw new Error(`${context} embedding response did not contain a vector array`);
   if (values.length !== ACTIVE_EMBEDDING_DESCRIPTOR.dimensions) {
@@ -76,21 +67,25 @@ export function serializeEmbeddingVector(values: number[]): string {
   return `[${validateEmbeddingVector(values, 'serialize').join(',')}]`;
 }
 
-async function requestGemini(path: 'embedContent' | 'batchEmbedContents', body: unknown): Promise<Response> {
+async function requestGemini(
+  path: 'embedContent' | 'batchEmbedContents',
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<Response> {
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${ACTIVE_EMBEDDING_PROFILE.model}:${path}?key=${ACTIVE_EMBEDDING_PROFILE.apiKey}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal },
   );
   if (!response.ok) throw new Error(`Gemini ${path} failed (${response.status}): ${await response.text()}`);
   return response;
 }
 
-export async function embed(text: string): Promise<number[]> {
+export async function embed(text: string, signal?: AbortSignal): Promise<number[]> {
   const response = await requestGemini('embedContent', {
     model: `models/${ACTIVE_EMBEDDING_PROFILE.model}`,
     content: { parts: [{ text }] },
     outputDimensionality: ACTIVE_EMBEDDING_PROFILE.dimensions,
-  });
+  }, signal);
   const data = await response.json() as { embedding?: { values?: unknown } };
   return validateEmbeddingVector(data.embedding?.values, 'Gemini scalar');
 }

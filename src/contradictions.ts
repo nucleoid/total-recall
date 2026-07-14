@@ -452,6 +452,7 @@ export async function findContradictionCandidates(
        AND m.superseded_at IS NULL
        AND m.valid_to IS NULL
        AND m.valid_from <= statement_timestamp()
+       AND m.consolidated_into_id IS NULL
        AND m.embedding IS NOT NULL
        AND m.embedding_provider = $5
        AND m.embedding_model = $6
@@ -670,6 +671,7 @@ export async function commitAutomaticRevision(
          AND m.superseded_at IS NULL
          AND m.valid_to IS NULL
          AND m.valid_from <= statement_timestamp()
+         AND m.consolidated_into_id IS NULL
          AND NOT EXISTS (SELECT 1 FROM memories successor WHERE successor.supersedes_id = m.id)
        FOR UPDATE`,
       [predecessorId, memory.namespace, auth.namespaces],
@@ -690,7 +692,8 @@ export async function commitAutomaticRevision(
        WHERE id = $1::uuid
          AND deleted_at IS NULL
          AND superseded_at IS NULL
-         AND valid_to IS NULL`,
+         AND valid_to IS NULL
+         AND consolidated_into_id IS NULL`,
       [predecessorId, revisionAt],
     );
     if (closed.rowCount !== 1) return null;

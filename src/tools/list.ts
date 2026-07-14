@@ -26,7 +26,7 @@ export async function memoryList(
     return { memories: [], total: 0 };
   }
 
-  const conditions: string[] = ['m.namespace = ANY($1)', 'm.deleted_at IS NULL'];
+  const conditions: string[] = ['m.namespace = ANY($1)', 'm.deleted_at IS NULL', "to_jsonb(m)->>'consolidated_into_id' IS NULL"];
   const values: any[] = [allowedNamespaces];
   let idx = 2;
 
@@ -65,6 +65,8 @@ export async function memoryList(
     `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.document_id,
             m.chunk_index, m.created_at, m.updated_at, m.memory_kind, m.valid_from, m.valid_to,
             m.superseded_at, m.revision,
+            (to_jsonb(m)->>'consolidated_into_id')::uuid AS consolidated_into_id,
+            (to_jsonb(m)->>'consolidated_at')::timestamptz AS consolidated_at,
             (SELECT predecessor.id FROM memories predecessor
              WHERE predecessor.id = m.supersedes_id
                AND predecessor.deleted_at IS NULL

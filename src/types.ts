@@ -25,6 +25,8 @@ export interface Memory {
   superseded_by_id?: string | null;
   is_superseded?: boolean;
   revision?: number;
+  consolidated_into_id?: string | null;
+  consolidated_at?: Date | null;
 }
 
 export interface ApiKey {
