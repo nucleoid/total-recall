@@ -32,7 +32,7 @@ test('repair is dry-run by default, atomically applies matching rows, resumes by
       CREATE TABLE memories (
         id uuid PRIMARY KEY, content text NOT NULL, embedding vector(3), source text NOT NULL,
         namespace text NOT NULL, tags text[] NOT NULL DEFAULT '{}', metadata jsonb NOT NULL DEFAULT '{}',
-        updated_at timestamptz NOT NULL DEFAULT now(), client_id uuid
+        updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz, client_id uuid
       );
       CREATE TABLE media_events (
         id uuid PRIMARY KEY, service text NOT NULL, service_id text, event_type text NOT NULL,
@@ -65,11 +65,15 @@ test('repair is dry-run by default, atomically applies matching rows, resumes by
       INSERT INTO memories (id, content, embedding, source, namespace, client_id) VALUES
         ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1', 'Watched "Arrival" (2016) on 2026-01-02 via plex. Completed.', '[0,0,0]', 'media:plex', 'media', '${CLIENT_ID}'),
         ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2', 'Watched "Dune" (2021) on 2026-01-01 via plex. Completed.', '[0,0,0]', 'media:plex', 'media', '${CLIENT_ID}'),
-        ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3', 'unrelated', '[0,0,0]', 'manual', 'media', '${CLIENT_ID}');
+        ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3', 'unrelated', '[0,0,0]', 'manual', 'media', '${CLIENT_ID}'),
+        ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4', 'tombstoned stale summary', '[0,0,0]', 'media:plex', 'media', '${CLIENT_ID}');
+      UPDATE memories SET deleted_at = '2026-01-01T00:00:00Z'
+       WHERE id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4';
       INSERT INTO media_events (id, service, service_id, event_type, title, year, completed, played_at, client_id, memory_id) VALUES
         ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1', 'plex', '1', 'watch', 'Arrival', 2016, true, '2026-01-02T02:00:00Z', '${CLIENT_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'),
         ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2', 'plex', '2', 'watch', 'Dune', 2021, true, '2026-01-02T03:00:00Z', '${CLIENT_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2'),
-        ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3', 'plex', '3', 'watch', 'Ignored', null, true, '2026-01-02T04:00:00Z', '${CLIENT_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3');
+        ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3', 'plex', '3', 'watch', 'Ignored', null, true, '2026-01-02T04:00:00Z', '${CLIENT_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3'),
+        ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4', 'plex', '4', 'watch', 'Deleted', 2020, true, '2026-01-02T05:00:00Z', '${CLIENT_ID}', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4');
     `);
 
     const appUrl = `postgresql://repair_app:repair_app@127.0.0.1:${port}/postgres`;
@@ -89,6 +93,12 @@ test('repair is dry-run by default, atomically applies matching rows, resumes by
     assert.equal(repaired.rows[0].embedding, '[1,2,3]');
     assert.deepEqual(repaired.rows[0].tags, ['media', 'plex', 'watch', 'unknown', 'completed']);
     assert.equal(repaired.rows[0].metadata.played_at, '2026-01-02T02:00:00.000Z');
+    const tombstone = await client.query<{ content: string; embedding: string; deleted_at: Date }>(
+      `SELECT content, embedding::text, deleted_at FROM memories WHERE id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4'`,
+    );
+    assert.equal(tombstone.rows[0].content, 'tombstoned stale summary');
+    assert.equal(tombstone.rows[0].embedding, '[0,0,0]');
+    assert.ok(tombstone.rows[0].deleted_at);
 
     await client.query(`UPDATE memories SET content = 'Watched "Arrival" (2016) on 2026-01-02 via plex. Completed.', embedding = '[0,0,0]' WHERE id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'`);
     const raced = await repairMediaRollupDates({

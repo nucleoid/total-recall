@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import test from 'node:test';
 
 const migration = (name: string) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8');
@@ -33,16 +33,16 @@ test('the next forward migration idempotently grants namespace-scoped memory DEL
   assert.match(sql, /USING\s*\(\s*namespace\s*=\s*ANY\s*\(\s*app_allowed_namespaces\(\)\s*\)\s*\)/i);
 });
 
-test('DELETE capability does not register a public forget operation', () => {
-  assert.equal(existsSync(new URL('../src/tools/forget.ts', import.meta.url)), false);
-  for (const file of ['../src/index.ts', '../src/server.ts', '../openapi.yaml']) {
-    assert.doesNotMatch(readFileSync(new URL(file, import.meta.url), 'utf8'), /memory_forget|\/api\/forget/i);
-  }
+test('issue 51 consumes the standing DELETE capability without changing migration 020', () => {
+  assert.match(readFileSync(new URL('../src/tools/forget.ts', import.meta.url), 'utf8'), /memoryForget/);
+  assert.match(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf8'), /\/api\/memories/);
+  assert.match(readFileSync(new URL('../openapi.yaml', import.meta.url), 'utf8'), /forgetMemories/);
 });
 
-test('migration checksums are platform-stable and the standing DELETE capability is explicit', () => {
+test('migration checksums are platform-stable and lifecycle migration is additive', () => {
   const attributes = readFileSync(new URL('../.gitattributes', import.meta.url), 'utf8');
-  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const lifecycle = migration('024_memory_lifecycle.sql');
   assert.match(attributes, /^migrations\/\*\.sql text eol=lf$/m);
-  assert.match(readme, /holds (?:a )?live DELETE.*ahead of.*#51/is);
+  assert.match(lifecycle, /ADD COLUMN IF NOT EXISTS deleted_at/i);
+  assert.doesNotMatch(lifecycle, /CREATE\s+POLICY|GRANT\s+DELETE/i);
 });

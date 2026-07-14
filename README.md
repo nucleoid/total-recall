@@ -33,7 +33,7 @@ Treat the formerly committed application-role password as compromised. Use one c
 6. Verify RLS namespace isolation and application connectivity with the runtime app role.
 7. Remove the old secret only after verification. If credential rollback is needed, perform another controlled rotation rather than restoring the compromised password.
 
-This rotation changes only the PostgreSQL app-role password. Total Recall API keys remain unchanged, so it causes no API-key reauthentication or token replacement. After migration 020, `total_recall_app` holds live DELETE capability on `memories`, constrained by namespace RLS, ahead of the #51 consumer; this issue exposes no deletion tool or endpoint and #51 owns that lifecycle. There is no memory backfill or reindex, and no data is deleted by this rollout. The additive policy migration remains safe if application code is rolled back.
+This rotation changes only the PostgreSQL app-role password. Total Recall API keys remain unchanged, so it causes no API-key reauthentication or token replacement. Migration 020 grants the RLS-scoped database delete capability used by the memory lifecycle; migration 024 adds tombstones. No memory backfill or reindex is required (`deleted_at IS NULL` means existing rows are active), but migration 024's two `NOT VALID` constraints must be validated and its two partial indexes built with the separate online finalizer described below.
 
 ## Architecture
 
@@ -68,6 +68,7 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  • memory_recall            │
         │  • memory_list              │
         │  • memory_list_namespaces   │
+        │  • memory_forget            │
         │  • memory_stats             │
         │  • agent_register           │
         │  • agent_list               │
@@ -76,6 +77,7 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  • POST /api/search         │
         │  • POST /api/store          │
         │  • POST /api/store-document │
+        │  • DELETE /api/memories     │
         │  • GET  /api/stats          │
         │  • GET  /api/agents         │
         │  • POST /api/agents         │
@@ -192,7 +194,7 @@ Chunk and store a full document. Content must contain non-whitespace text and is
   "source": "manual"
 }
 ```
-Document chunks are stored with `normal` access unless document classification is added in a later schema/API change. The decoded limit is enforced consistently by the MCP and REST schemas (400 for invalid decoded content). HTTP JSON envelope limits are independent and can reject a request earlier with 413; this change does not raise the server's transport parser limit.
+Document chunks are stored with `normal` access unless document classification is added in a later schema/API change. The decoded limit is enforced consistently by the MCP and REST schemas (400 for invalid decoded content). HTTP JSON envelope limits are independent and can reject a request earlier with 413; this change does not raise the server's transport parser limit. Reusing an idempotency key after any visible chunk of that document has been forgotten returns HTTP 409 with `idempotency_key_tombstoned`; it never restores or replaces the forgotten chunks. Documents and chunks outside the caller's namespace grants remain undisclosed.
 
 ### `memory_search`
 Hybrid semantic + keyword search with filters. Every search is logged as a recall trace with timing data.
@@ -215,6 +217,11 @@ Browse/paginate memories with optional filters (no vector search).
 
 ### `memory_list_namespaces`
 List available namespaces and their memory counts.
+
+### `memory_forget`
+Soft-delete memories by `ids`, `namespace`, strict `before` (`created_at < before`), and/or `tags` (AND containment). Selectors combine with AND. At least one selector is required; every request without `ids` must include `"confirm": true`. A request is capped at 100 IDs and 100 authorized matches. The API key needs the explicit `delete` permission—`write` does not imply deletion. Results contain only newly tombstoned authorized IDs; missing and inaccessible IDs look identical.
+
+Tombstones disappear from all ordinary recall, search, list, count, access-boost, and maintenance operations. Document chunks can be forgotten independently; the original document ingestion count is immutable, and document recall reports not-found once no active chunks remain. A `source_key` retry cannot restore a tombstone. Deletion reasons are bounded and stored on the tombstone but are never copied to audit/log output.
 
 ### `memory_stats`
 Admin-only statistics: total memories, breakdown by namespace and source, document count, date range.
@@ -279,6 +286,7 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | POST | `/api/search` | Hybrid semantic + keyword search |
 | POST | `/api/store` | Store a single memory |
 | POST | `/api/store-document` | Store a chunked document |
+| DELETE | `/api/memories` | Soft-delete matching memories (explicit `delete` permission) |
 | GET | `/api/stats` | Memory statistics (admin) |
 | GET | `/api/agents` | List registered agents for the key |
 | POST | `/api/agents` | Register/update an agent |
@@ -288,6 +296,20 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | POST | `/api/media/events` | Upsert media events (used by connectors) |
 | GET | `/api/media/events` | List structured media events with filters |
 | POST | `/api/media/rollup` | Trigger pending events → summary memories |
+
+### Tombstone purge operations
+
+Hard purge is manual, preview-first, and fixed at a 30-day retention window. Configure an owner/BYPASSRLS maintenance URL and an explicit complete namespace inventory; no automatic purge schedule is shipped:
+
+```bash
+PURGE_NAMESPACES='["shared","work"]' MAINTENANCE_DATABASE_URL='postgresql://...' \
+  npm run purge:deleted -- --preview purge-preview.json
+# Independently review and preserve the preview, then:
+PURGE_NAMESPACES='["shared","work"]' MAINTENANCE_DATABASE_URL='postgresql://...' \
+  npm run purge:deleted -- --apply purge-preview.json
+```
+
+Each preview captures at most 10,000 rows in deterministic retention order; apply that page and generate a new preview file until no candidates remain. Apply rejects missing/stale previews, candidate drift, an empty or incomplete namespace inventory, and concurrent runs. It commits deterministic bounded batches and writes one content-free `memory.purge` audit row before each hard delete in the same transaction. Tombstones referenced by media events are reported and retained, preventing an `ON DELETE SET NULL` link from making forgotten rollups eligible for re-ingestion. A blocked or partial run exits nonzero. Before apply, stop relevant writers, verify a restorable backup, and review the opaque IDs/fingerprints. Before 30 days, recovery requires a separate explicit audited restoration procedure; after purge, recovery is backup-only. For any incident or rollback, disable `memory_forget`/REST deletion and `purge:deleted` first. Never roll back to a binary that ignores `deleted_at`.
 
 ### Media summary calendar time zone
 
@@ -551,6 +573,25 @@ MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm ru
 ```
 
 This command uses `CREATE UNIQUE INDEX CONCURRENTLY` on `(client_id, namespace, idempotency_key)`, repairs an invalid leftover index on retry, and must complete successfully before the new runtime is deployed. The runtime's `ON CONFLICT` clause depends on this index. Stop old document writers during the final cutover, deploy the new runtime only after the command reports `indexValid: true`, then resume writers. Existing rows remain nullable and are not backfilled; retaining the columns/index during rollback is safe.
+
+### Memory lifecycle rollout and rollback
+
+Migration 024 adds nullable tombstone fields and explicitly named deletion-reason CHECK and deleter FK constraints as `NOT VALID`. It does not validate them inside the transaction-wrapped migration, because the earlier `ALTER TABLE` locks persist until commit, and it leaves both potentially long-running partial indexes to a post-migration online finalizer. Roll out deletion support in this order:
+
+1. Keep memory deletion disabled: do not grant/use the API-key `delete` permission, invoke `memory_forget` or the REST DELETE endpoint, or run `purge:deleted`.
+2. Run `npm run migrate` with `MIGRATION_DATABASE_URL` to add the nullable columns and unvalidated constraints, then let the migration transaction commit.
+3. Validate both constraints and build both indexes online with the owner migration connection:
+
+```bash
+MIGRATION_DATABASE_URL=postgresql://<owner-role>@<host>:5432/total_recall npm run finalize:memory-lifecycle
+```
+
+The command runs each `ALTER TABLE ... VALIDATE CONSTRAINT` in a separate autocommit operation, using PostgreSQL's lower-lock validation path only after the migration commits. It then uses `CREATE INDEX CONCURRENTLY`. It verifies exact constraint/index definitions and validity, is safe to retry after partial completion or failed validation, and drops an invalid same-name index left by an interrupted concurrent build. It must report `allValid: true` for `memories_deleted_by_client_id_fkey`, `memories_deletion_reason_length`, `memories_active_namespace_created_idx`, and `memories_deleted_purge_idx`.
+
+4. Deploy and restart **all tombstone-aware processes** before enabling memory deletion: MCP and HTTP servers, watchers, every preseed/import writer, media connectors and rollup workers, decay/re-embedding/repair jobs, and any independently deployed reader or writer that accesses `memories`. Mixed versions are unsafe because an old process can expose, update, or recreate a tombstoned row.
+5. Verify ordinary reads and maintenance exclude `deleted_at IS NOT NULL`, then enable deletion by granting/using `delete` permissions. Keep hard purge manual and wait for the retention window.
+
+Before any rollback or incident response, disable `memory_forget`/REST deletion and `purge:deleted` first and stop their callers. If no tombstones have ever been created, the runtime can be rolled back while retaining the additive columns and indexes. Once tombstones exist, application rollback is **roll-forward-only**: do not deploy any binary or job that is not tombstone-aware, do not clear or drop tombstone fields, and repair by deploying corrected tombstone-aware code. After hard purge, deleted content is recoverable only from a verified backup.
 
 ## Namespace Design
 

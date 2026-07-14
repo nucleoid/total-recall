@@ -9,6 +9,8 @@
   "include": [
     "scripts/migrate.ts",
     "scripts/provision-db.ts",
+    "scripts/memory-lifecycle-finalizer.ts",
+    "scripts/finalize-memory-lifecycle.ts",
     "scripts/preseed-chatgpt.ts",
     "scripts/preseed-gemini.ts",
     "scripts/repair-gemini-source-keys.ts",

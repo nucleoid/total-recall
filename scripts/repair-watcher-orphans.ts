@@ -118,11 +118,14 @@ SELECT m.id, m.namespace, m.metadata->>'file' AS file_path, m.source_key,
 FROM memories m
 LEFT JOIN sync_state s ON s.file_path = m.metadata->>'file'
 WHERE m.client_id = 'file-sync'
+  AND m.deleted_at IS NULL
   AND m.metadata->>'file' IS NOT NULL
   AND m.metadata->>'file' IN (
-    SELECT DISTINCT metadata->>'file'
-    FROM memories
-    WHERE client_id = 'file-sync' AND metadata->>'file' IS NOT NULL
+    SELECT DISTINCT candidate.metadata->>'file'
+    FROM memories candidate
+    WHERE candidate.client_id = 'file-sync'
+      AND candidate.deleted_at IS NULL
+      AND candidate.metadata->>'file' IS NOT NULL
     ORDER BY metadata->>'file'
     LIMIT $1 OFFSET $2
   )
@@ -208,7 +211,9 @@ SELECT m.id, m.namespace, m.metadata->>'file' AS file_path, m.source_key,
        m.updated_at, s.content_hash
 FROM memories m
 LEFT JOIN sync_state s ON s.file_path = m.metadata->>'file'
-WHERE m.client_id = 'file-sync' AND m.metadata->>'file' = $1
+WHERE m.client_id = 'file-sync'
+  AND m.deleted_at IS NULL
+  AND m.metadata->>'file' = $1
 ORDER BY m.id
 FOR UPDATE OF m
 `, [approval.filePath]);
@@ -228,6 +233,7 @@ FOR UPDATE OF m
       }
       const deleted = await client.query(`DELETE FROM memories
 WHERE client_id = 'file-sync'
+  AND deleted_at IS NULL
   AND metadata->>'file' = $1
   AND id = ANY($2::uuid[])`, [approval.filePath, approval.memoryIds]);
       if (deleted.rowCount !== approval.memoryIds.length) throw new Error(`Delete count drift for ${approval.filePath}`);

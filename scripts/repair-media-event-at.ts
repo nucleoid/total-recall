@@ -87,6 +87,7 @@ export async function repairMediaEventAt(
           SELECT id
           FROM public.memories
           WHERE namespace = 'media'
+            AND deleted_at IS NULL
             AND event_at IS NULL
             AND metadata->>'played_at' IS NOT NULL
             AND metadata->>'played_at' ~ $2
@@ -99,6 +100,7 @@ export async function repairMediaEventAt(
         SET event_at = (memories.metadata->>'played_at')::timestamptz
         FROM candidates
         WHERE memories.id = candidates.id
+          AND memories.deleted_at IS NULL
         RETURNING memories.id
         `,
         [limit, ISO_TIMESTAMPTZ_PATTERN]
@@ -162,6 +164,7 @@ async function countRepairable(client: pg.Client): Promise<number> {
     SELECT COUNT(*)::text AS count
     FROM public.memories
     WHERE namespace = 'media'
+      AND deleted_at IS NULL
       AND event_at IS NULL
       AND metadata->>'played_at' IS NOT NULL
       AND metadata->>'played_at' ~ $1
@@ -175,6 +178,7 @@ async function countMalformed(client: pg.Client): Promise<number> {
     SELECT COUNT(*)::text AS count
     FROM public.memories
     WHERE namespace = 'media'
+      AND deleted_at IS NULL
       AND event_at IS NULL
       AND metadata->>'played_at' IS NOT NULL
       AND (
@@ -197,6 +201,7 @@ async function loadMalformedSamples(
            metadata->>'played_at' AS "playedAt"
     FROM public.memories
     WHERE namespace = 'media'
+      AND deleted_at IS NULL
       AND event_at IS NULL
       AND metadata->>'played_at' IS NOT NULL
       AND (

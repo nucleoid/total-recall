@@ -358,7 +358,8 @@ test('last_boosted_at repair is resumable, bounded, and preserves non-null value
       });
       await owner.query(`
         ALTER TABLE memories
-          ADD COLUMN IF NOT EXISTS last_boosted_at TIMESTAMPTZ
+          ADD COLUMN IF NOT EXISTS last_boosted_at TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
       `);
       await insertMemory(owner, {
         content: 'preserve non-null repair row',
@@ -370,6 +371,12 @@ test('last_boosted_at repair is resumable, bounded, and preserves non-null value
         SET last_boosted_at = '2025-01-01T00:00:00Z'
         WHERE content = 'preserve non-null repair row'
       `);
+      await insertMemory(owner, {
+        content: 'tombstoned repair row',
+        accessedAt: '2024-04-05T06:07:08Z',
+        createdAt: '2024-04-01T00:00:00Z',
+      });
+      await owner.query(`UPDATE memories SET deleted_at = NOW() WHERE content = 'tombstoned repair row'`);
     } finally {
       await owner.end();
     }
@@ -395,6 +402,7 @@ test('last_boosted_at repair is resumable, bounded, and preserves non-null value
     await assertLastBoostedAt('repair row one', '2024-01-02T03:04:05.000Z');
     await assertLastBoostedAt('repair row two', '2024-02-03T04:05:06.000Z');
     await assertLastBoostedAt('preserve non-null repair row', '2025-01-01T00:00:00.000Z');
+    await assertLastBoostedAt('tombstoned repair row', null);
   });
 });
 

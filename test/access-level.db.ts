@@ -113,6 +113,7 @@ async function setup(): Promise<Record<string, string>> {
       agent_id UUID REFERENCES agents(id),
       document_id UUID,
       chunk_index INT,
+      deleted_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       accessed_at TIMESTAMPTZ DEFAULT NOW(),

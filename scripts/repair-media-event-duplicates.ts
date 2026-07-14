@@ -152,7 +152,9 @@ async function loadGroups(
       `SELECT id::text, (to_jsonb(m) - ARRAY[
          'embedding', 'accessed_at', 'access_count', 'last_boosted_at', 'relevance_score', 'decay_rate', 'updated_at'
        ]::text[])::text AS snapshot
-       FROM public.memories m WHERE id = ANY($1::uuid[]) ORDER BY id`, [memoryIds]
+       FROM public.memories m
+       WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL
+       ORDER BY id`, [memoryIds]
     )).rows.map(row => ({ id: row.id, fingerprint: hash(row.snapshot) }));
     const events = boundedRows.map(row => ({ id: row.id, fingerprint: hash(row.snapshot) }));
     const seed = JSON.parse(eventRows[0].snapshot) as Record<string, unknown>;
@@ -186,7 +188,7 @@ async function applyApprovals(client: pg.Client, options: RepairMediaEventDuplic
       if (retained && existing.rows.every(row => row.id === approval.retainedEventId)) {
         const memoryOk = approval.retainedMemoryId === retained.memory_id;
         const deletedMemoryIds = approval.memories.filter(row => row.action === 'delete').map(row => row.id);
-        const leftovers = deletedMemoryIds.length ? await client.query(`SELECT 1 FROM public.memories WHERE id=ANY($1::uuid[])`, [deletedMemoryIds]) : { rowCount: 0 };
+        const leftovers = deletedMemoryIds.length ? await client.query(`SELECT 1 FROM public.memories WHERE id=ANY($1::uuid[]) AND deleted_at IS NULL`, [deletedMemoryIds]) : { rowCount: 0 };
         if (memoryOk && leftovers.rowCount === 0) {
           outcomes.push({ groupFingerprint: approval.groupFingerprint, status: 'already-reconciled' });
           continue;
@@ -209,14 +211,20 @@ async function applyApprovals(client: pg.Client, options: RepairMediaEventDuplic
         const external = await client.query(`SELECT 1 FROM public.media_events WHERE memory_id=ANY($1::uuid[]) AND NOT (id=ANY($2::uuid[])) LIMIT 1`, [deleteMemoryIds, approval.events.map(row => row.id)]);
         if (external.rowCount) throw new Error('Approved memory is linked from an unapproved event');
       }
-      await client.query(`UPDATE public.media_events SET memory_id=$1::uuid WHERE id=$2::uuid`, [approval.retainedMemoryId, approval.retainedEventId]);
+      const relinked = await client.query(`UPDATE public.media_events
+        SET memory_id=$1::uuid
+        WHERE id=$2::uuid
+          AND ($1::uuid IS NULL OR EXISTS (
+            SELECT 1 FROM public.memories m WHERE m.id=$1::uuid AND m.deleted_at IS NULL
+          ))`, [approval.retainedMemoryId, approval.retainedEventId]);
+      if (relinked.rowCount !== 1) throw new Error('Retained memory was deleted or changed during apply');
       if (expectedDeletedEvents.length) {
         const removed = await client.query(`DELETE FROM public.media_events WHERE id=ANY($1::uuid[]) RETURNING id`, [expectedDeletedEvents]);
         if (removed.rowCount !== expectedDeletedEvents.length) throw new Error('Exact approved event delete set changed during apply');
         deletedEvents += removed.rowCount ?? 0;
       }
       if (deleteMemoryIds.length) {
-        const removed = await client.query(`DELETE FROM public.memories WHERE id=ANY($1::uuid[]) RETURNING id`, [deleteMemoryIds]);
+        const removed = await client.query(`DELETE FROM public.memories WHERE id=ANY($1::uuid[]) AND deleted_at IS NULL RETURNING id`, [deleteMemoryIds]);
         if (removed.rowCount !== deleteMemoryIds.length) throw new Error('Exact approved memory delete set changed during apply');
         deletedMemories += removed.rowCount ?? 0;
       }

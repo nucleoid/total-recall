@@ -66,6 +66,13 @@ test(
           createdAt: '2026-01-03T12:00:00Z',
         });
         await insertMemory(owner, {
+          content: 'tombstoned historical media',
+          namespace: 'media',
+          source: 'media:event-at-tombstoned',
+          metadata: { played_at: '2022-03-04T05:06:07.000Z' },
+          createdAt: '2026-01-03T18:00:00Z',
+        });
+        await insertMemory(owner, {
           content: 'non-media with played_at',
           namespace: 'shared',
           source: 'event-at-non-media',
@@ -77,6 +84,13 @@ test(
       }
 
       await applyMigration('015_memory_event_time.sql');
+      const lifecycle = await ownerClient();
+      try {
+        await lifecycle.query(`ALTER TABLE memories ADD COLUMN deleted_at TIMESTAMPTZ`);
+        await lifecycle.query(`UPDATE memories SET deleted_at = NOW() WHERE content = 'tombstoned historical media'`);
+      } finally {
+        await lifecycle.end();
+      }
       await assertEventAt('valid historical media one', null);
       await assertEventAt('valid historical media two', null);
       await assertIndexAbsent();
@@ -126,6 +140,7 @@ test(
       await assertEventAt('valid historical media two', '2021-02-03T04:05:06.000Z');
       await assertEventAt('malformed historical media', null);
       await assertEventAt('special literal historical media', null);
+      await assertEventAt('tombstoned historical media', null);
       await assertEventAt('non-media with played_at', null);
     });
   }

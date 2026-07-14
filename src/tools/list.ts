@@ -26,7 +26,7 @@ export async function memoryList(
     return { memories: [], total: 0 };
   }
 
-  const conditions: string[] = ['namespace = ANY($1)'];
+  const conditions: string[] = ['namespace = ANY($1)', 'deleted_at IS NULL'];
   const values: any[] = [allowedNamespaces];
   let idx = 2;
 

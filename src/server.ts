@@ -17,6 +17,8 @@ import {
   storeDocumentSchema,
 } from './tools/store-document.js';
 import { memoryStats } from './tools/stats.js';
+import { memoryForget } from './tools/forget.js';
+import { isPublicApiError } from './errors.js';
 import { mediaSearch, mediaSearchSchema } from './tools/media-search.js';
 import { upsertAgent, listAgents } from './agents.js';
 import { listTraces } from './traces.js';
@@ -384,6 +386,8 @@ function sendApiError(res: express.Response, label: string, err: any): void {
     res.status(400).json({ error: 'Invalid request', details: err.errors });
   } else if (typeof err.message === 'string' && err.message.startsWith('Invalid ')) {
     res.status(400).json({ error: err.message });
+  } else if (isPublicApiError(err)) {
+    res.status(err.statusCode).json({ error: err.message, code: err.code });
   } else if (isStoreDocumentConflictError(err)) {
     res.status(409).json({ error: err.message });
   } else if (permissionDenied(err)) {
@@ -467,6 +471,17 @@ app.post('/api/store-document', async (req, res) => {
     res.json({ id: result.document_id, chunks: result.chunks_stored });
   } catch (err: any) {
     sendApiError(res, '/api/store-document', err);
+  }
+});
+
+app.delete('/api/memories', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const result = await memoryForget(req.body, auth);
+    res.json(result);
+  } catch (err: any) {
+    sendApiError(res, '/api/memories DELETE', err);
   }
 });
 

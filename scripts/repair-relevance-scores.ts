@@ -74,7 +74,8 @@ export function validateApprovalManifest(value: ApprovalManifest): ApprovalManif
 const CANDIDATE_SQL = `
   SELECT id, namespace, relevance_score, decay_rate, accessed_at, access_count, updated_at
   FROM public.memories
-  WHERE relevance_base_score IS NULL
+  WHERE deleted_at IS NULL
+    AND relevance_base_score IS NULL
   ORDER BY id`;
 
 export async function previewRelevanceRepair(connectionString: string): Promise<RepairCandidate[]> {
@@ -110,7 +111,8 @@ export async function applyRelevanceRepair(connectionString: string, raw: Approv
       // when every referenced row already has its approved base.
       if (manifest.approvals.length > 0) {
         const existing = await client.query<{ id: string; relevance_base_score: number }>(
-          `SELECT id, relevance_base_score FROM public.memories WHERE id = ANY($1::uuid[])`,
+          `SELECT id, relevance_base_score FROM public.memories
+           WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
           [manifest.approvals.map(a => a.id)]
         );
         const expected = new Map(manifest.approvals.map(a => [a.id, a.baseScore!]));
@@ -137,7 +139,7 @@ export async function applyRelevanceRepair(connectionString: string, raw: Approv
          SET relevance_base_score = $2,
              relevance_score = public.calculate_relevance($2, decay_rate, accessed_at, access_count),
              updated_at = NOW()
-         WHERE id = $1`,
+         WHERE id = $1 AND deleted_at IS NULL`,
         [row.id, approval.baseScore]
       );
     }

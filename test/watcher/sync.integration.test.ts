@@ -22,6 +22,7 @@ class TransactionClient {
   releaseArgs: unknown[] | undefined;
   committed = new Map<string, string>();
   committedHash: string | null = 'old-hash';
+  tombstonedKeys = new Set<string>();
   failMutation: 'second-upsert' | 'delete' | 'hash-write' | null = null;
   private staged = new Map<string, string>();
   private stagedHash: string | null = null;
@@ -31,13 +32,20 @@ class TransactionClient {
 
   async query<T extends pg.QueryResultRow = pg.QueryResultRow>(text: string, params?: unknown[]): Promise<pg.QueryResult<T>> {
     this.calls.push({ text, params });
+    let command = 'SELECT';
+    let rowCount = 0;
     if (text === 'BEGIN') {
       this.staged = new Map(this.committed);
       this.stagedHash = this.committedHash;
     } else if (text.includes('INSERT INTO memories')) {
       this.upserts++;
       if (this.failMutation === 'second-upsert' && this.upserts === 2) throw new Error('second upsert failed');
-      this.staged.set(params?.[6] as string, params?.[0] as string);
+      command = 'INSERT';
+      const sourceKey = params?.[6] as string;
+      if (!this.tombstonedKeys.has(sourceKey)) {
+        this.staged.set(sourceKey, params?.[0] as string);
+        rowCount = 1;
+      }
     } else if (text.includes('DELETE FROM memories')) {
       if (this.failMutation === 'delete') throw new Error('delete failed');
       const [relPath, desiredKeys] = params as [string, string[] | undefined];
@@ -56,7 +64,7 @@ class TransactionClient {
       this.committed = new Map(this.staged);
       this.committedHash = this.stagedHash;
     }
-    return { command: 'SELECT', rowCount: 0, oid: 0, fields: [], rows: [] };
+    return { command, rowCount, oid: 0, fields: [], rows: [] };
   }
 
   release(err?: Error): void { this.releaseArgs = err ? [err] : []; }
@@ -178,6 +186,24 @@ test('chunk embeddings are prepared serially before opening the transaction', as
     'start:third', 'end:third',
   ]);
   assert.deepEqual(chunks.map(({ vectorStr }) => vectorStr), ['[5]', '[6]', '[5]']);
+});
+
+test('tombstoned watcher conflicts are not resurrected and produce one bounded summary warning', async t => {
+  const client = new TransactionClient(150);
+  client.tombstonedKeys.add('key-1');
+  setPoolForTesting(new SequencedPool([client]) as unknown as pg.Pool);
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (message?: unknown) => { warnings.push(String(message)); };
+  t.after(() => { console.warn = originalWarn; });
+
+  await commitPreparedFile(input());
+
+  assert.equal(client.committed.has('key-1'), false);
+  assert.equal(client.committed.get('key-2'), 'second');
+  assert.deepEqual(warnings, ['[watcher] Skipped 1 tombstoned source-key conflict(s)']);
+  const upsert = client.calls.find(({ text }) => text.includes('INSERT INTO memories'))?.text ?? '';
+  assert.match(upsert, /WHERE memories\.deleted_at IS NULL[\s\S]*RETURNING id/);
 });
 
 test('upsert, stale-delete, and hash-write failures roll back the complete prior snapshot', async () => {

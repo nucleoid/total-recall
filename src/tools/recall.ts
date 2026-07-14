@@ -22,7 +22,7 @@ export async function memoryRecall(
     const res = await queryScoped(
       dbScopeFromAuth(auth),
       `SELECT id, content, source, namespace, tags, metadata, access_level, created_at, updated_at, document_id, chunk_index
-       FROM memories WHERE id = $1 AND namespace = ANY($2) AND ${accessLevelSql('access_level', '$3')}`,
+       FROM memories WHERE id = $1 AND deleted_at IS NULL AND namespace = ANY($2) AND ${accessLevelSql('access_level', '$3')}`,
       [params.id, namespaces, auth.maxAccessLevel]
     );
     if (res.rows.length === 0) throw new Error('Memory not found or access denied');
@@ -32,7 +32,7 @@ export async function memoryRecall(
   const res = await queryScoped(
     dbScopeFromAuth(auth),
     `SELECT id, content, source, namespace, tags, metadata, access_level, created_at, updated_at, document_id, chunk_index
-     FROM memories WHERE document_id = $1 AND namespace = ANY($2) AND ${accessLevelSql('access_level', '$3')}
+     FROM memories WHERE document_id = $1 AND deleted_at IS NULL AND namespace = ANY($2) AND ${accessLevelSql('access_level', '$3')}
      ORDER BY chunk_index ASC`,
     [params.document_id, namespaces, auth.maxAccessLevel]
   );

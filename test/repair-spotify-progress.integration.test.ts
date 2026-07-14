@@ -104,6 +104,24 @@ test('apply requires backup and exact approvals, rejects drift, and preserves un
   });
 });
 
+test('tombstoned linked memories remain byte-for-byte unchanged while the approved event repair proceeds', async () => {
+  await withDatabase(async ({ ownerUrl, owner }) => {
+    const preview = await repairSpotifyProgress({ connectionString: ownerUrl, maxRows: 20 });
+    const approval = preview.candidates.find((candidate) => candidate.id === MATCH_ID)!;
+    await owner.query(`UPDATE memories SET deleted_at = NOW() WHERE id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'`);
+    const before = await owner.query(`SELECT row_to_json(m)::text AS row FROM memories m WHERE id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'`);
+
+    const applied = await repairSpotifyProgress({
+      connectionString: ownerUrl, apply: true, confirmBackup: true, approvals: [approval],
+    });
+    assert.equal(applied.updatedEvents, 1);
+    assert.equal(applied.updatedMemories, 0);
+    assert.equal(applied.outcomes[0].memory, 'missing-or-unrelated');
+    const after = await owner.query(`SELECT row_to_json(m)::text AS row FROM memories m WHERE id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'`);
+    assert.deepEqual(after.rows, before.rows);
+  });
+});
+
 test('guard cases stay untouched, missing or unrelated rollups are safe, relinks drift, and reruns are idempotent', async () => {
   await withDatabase(async ({ ownerUrl, owner }) => {
     const preview = await repairSpotifyProgress({ connectionString: ownerUrl, maxRows: 20 });
@@ -179,7 +197,7 @@ async function withDatabase(run: (fixture: Fixture) => Promise<void>): Promise<v
       CREATE TABLE memories (
         id uuid PRIMARY KEY, source text NOT NULL, namespace text NOT NULL, tags text[] NOT NULL,
         metadata jsonb NOT NULL, content text NOT NULL, embedding text NOT NULL,
-        client_id text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()
+        client_id text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz
       );
       CREATE TABLE media_events (
         id uuid PRIMARY KEY, service text NOT NULL, duration_ms int, played_ms int, completed boolean,
@@ -226,7 +244,7 @@ async function withDatabase(run: (fixture: Fixture) => Promise<void>): Promise<v
 
 async function snapshot(client: pg.Client): Promise<unknown> {
   const events = await client.query('SELECT * FROM media_events ORDER BY id');
-  const memories = await client.query('SELECT id, source, namespace, tags, metadata, content, embedding, client_id, updated_at FROM memories ORDER BY id');
+  const memories = await client.query('SELECT id, source, namespace, tags, metadata, content, embedding, client_id, updated_at, deleted_at FROM memories ORDER BY id');
   return { events: events.rows, memories: memories.rows };
 }
 

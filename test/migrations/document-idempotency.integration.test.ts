@@ -5,10 +5,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import pg from 'pg';
+import request from 'supertest';
 import { setPoolForTesting, shutdown } from '../../src/db.js';
 import type { AuthContext } from '../../src/types.js';
 import { createDocumentIdempotencyIndex } from '../../scripts/document-idempotency-index.js';
 import { provisionDatabase } from '../../scripts/provision-db.js';
+import { TombstonedSourceKeyConflictError } from '../../src/errors.js';
 
 const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const migrationsDir = join(repoRoot, 'migrations');
@@ -37,7 +39,7 @@ test.after(async () => {
 test('real PostgreSQL enforces document idempotency migration, RLS, concurrency, CHECK, rollback, and completeness', async (t) => {
   await ensureDatabase();
   await resetDatabase();
-  await applyMigrationsThrough('023_embedding_identity');
+  await applyMigrationsThrough('024_memory_lifecycle');
   await seedApiKeys();
 
   await t.test('CHECK accepts only the canonical versioned lowercase SHA-256 format', async () => {
@@ -86,7 +88,7 @@ test('real PostgreSQL enforces document idempotency migration, RLS, concurrency,
   const { memoryStoreDocument, StoreDocumentConflictError } = await import('../../src/tools/store-document.js');
   const { memoryStore, storeSchema } = await import('../../src/tools/store.js');
 
-  await t.test('memory keyed reuse moves authorized namespaces and normalizes hidden RLS conflicts', async () => {
+  await t.test('memory keyed reuse moves authorized namespaces, reports visible tombstones, and normalizes hidden RLS conflicts', async () => {
     const elevatedAuth = { ...auth(KEY_A), maxAccessLevel: 'secret' as const };
     const first = await memoryStore(storeSchema.parse({
       content: 'before move', namespace: 'alpha', access_level: 'normal', idempotency_key: 'memory-move',
@@ -108,15 +110,42 @@ test('real PostgreSQL enforces document idempotency migration, RLS, concurrency,
         { namespace: 'beta', access_level: 'sensitive' }
       );
 
-      await memoryStore(storeSchema.parse({
-        content: 'hidden original', namespace: 'beta', idempotency_key: 'memory-hidden',
+      const deleted = await memoryStore(storeSchema.parse({
+        content: 'forgotten original', namespace: 'alpha', idempotency_key: 'memory-deleted',
       }), elevatedAuth);
+      await owner.query(
+        `UPDATE memories
+         SET deleted_at = NOW(), deletion_reason = 'test tombstone'
+         WHERE id = $1`,
+        [deleted.id]
+      );
       await assert.rejects(
         () => memoryStore(storeSchema.parse({
-          content: 'probe', namespace: 'alpha', idempotency_key: 'memory-hidden',
-        }), { ...elevatedAuth, namespaces: ['alpha'] }),
-        (error: unknown) => error instanceof Error && error.message === 'Access denied to existing idempotent memory'
+          content: 'must not resurrect', namespace: 'alpha', idempotency_key: 'memory-deleted',
+        }), elevatedAuth),
+        (error: unknown) => error instanceof TombstonedSourceKeyConflictError &&
+          error.statusCode === 409 && error.code === 'idempotency_key_tombstoned'
       );
+      const stillDeleted = await owner.query<{ content: string; deleted_at: Date | null; deletion_reason: string | null }>(
+        'SELECT content, deleted_at, deletion_reason FROM memories WHERE id = $1',
+        [deleted.id]
+      );
+      assert.equal(stillDeleted.rows[0].content, 'forgotten original');
+      assert.ok(stillDeleted.rows[0].deleted_at instanceof Date);
+      assert.equal(stillDeleted.rows[0].deletion_reason, 'test tombstone');
+
+      const hidden = await memoryStore(storeSchema.parse({
+        content: 'hidden original', namespace: 'beta', idempotency_key: 'memory-hidden',
+      }), elevatedAuth);
+      const probeHidden = () => memoryStore(storeSchema.parse({
+        content: 'probe', namespace: 'alpha', idempotency_key: 'memory-hidden',
+      }), { ...elevatedAuth, namespaces: ['alpha'] });
+      const remainsUndisclosed = (error: unknown) => error instanceof Error &&
+        !(error instanceof TombstonedSourceKeyConflictError) &&
+        error.message === 'Access denied to existing idempotent memory';
+      await assert.rejects(probeHidden, remainsUndisclosed);
+      await owner.query('UPDATE memories SET deleted_at = NOW() WHERE id = $1', [hidden.id]);
+      await assert.rejects(probeHidden, remainsUndisclosed);
     } finally {
       await owner.end();
     }
@@ -147,6 +176,63 @@ test('real PostgreSQL enforces document idempotency migration, RLS, concurrency,
       await app.query('ROLLBACK').catch(() => undefined);
       await app.end();
     }
+  });
+
+  await t.test('document retries report visible tombstoned chunks as typed 409 without leaking across namespaces', async t => {
+    const params = {
+      title: 'forgotten document',
+      content: `first ${'x'.repeat(2100)}\n\nsecond ${'y'.repeat(2100)}`,
+      namespace: 'alpha',
+      tags: [],
+      source: 'test',
+      idempotency_key: 'document-tombstone',
+    };
+    const stored = await memoryStoreDocument(params, auth(KEY_A));
+    const owner = await ownerClient();
+    try {
+      await owner.query(
+        `UPDATE memories SET deleted_at = NOW(), deletion_reason = 'forgotten chunk'
+         WHERE document_id = $1 AND chunk_index = 0`,
+        [stored.document_id]
+      );
+    } finally {
+      await owner.end();
+    }
+
+    await assert.rejects(
+      () => memoryStoreDocument(params, auth(KEY_A)),
+      (error: unknown) => error instanceof TombstonedSourceKeyConflictError &&
+        error.statusCode === 409 && error.code === 'idempotency_key_tombstoned'
+    );
+
+    const { createApp, setServerTestOverrides } = await import('../../src/server.js');
+    setServerTestOverrides({ validateKey: async () => auth(KEY_A) });
+    t.after(() => setServerTestOverrides({}));
+    const response = await request(createApp())
+      .post('/api/store-document')
+      .set('Authorization', 'Bearer tr_test')
+      .send(params);
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, {
+      error: 'Idempotency key refers to a deleted memory',
+      code: 'idempotency_key_tombstoned',
+    });
+
+    const hidden = await memoryStoreDocument(
+      { ...params, namespace: 'beta', idempotency_key: 'hidden-document-tombstone' },
+      auth(KEY_A)
+    );
+    const ownerAgain = await ownerClient();
+    try {
+      await ownerAgain.query('UPDATE memories SET deleted_at = NOW() WHERE document_id = $1', [hidden.document_id]);
+    } finally {
+      await ownerAgain.end();
+    }
+    const sameKeyAllowedNamespace = await memoryStoreDocument(
+      { ...params, namespace: 'alpha', idempotency_key: 'hidden-document-tombstone' },
+      auth(KEY_A, ['alpha'])
+    );
+    assert.notEqual(sameKeyAllowedNamespace.document_id, hidden.document_id);
   });
 
   await t.test('real concurrent identical retries converge through the partial-index ON CONFLICT path', async () => {

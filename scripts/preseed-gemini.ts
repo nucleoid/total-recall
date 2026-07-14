@@ -131,7 +131,7 @@ export function parseGeminiHtml(htmlContent: string): ParseSummary {
 export interface GeminiQueryClient { query(text: string, values?: unknown[]): Promise<unknown> }
 export interface ImportSummary extends ParseSummary { imported: number; exitCode: 0 | 1 }
 
-async function commitBatch(rows: GeminiConversation[], client: GeminiQueryClient, embedder: BatchEmbedder): Promise<void> {
+async function commitBatch(rows: GeminiConversation[], client: GeminiQueryClient, embedder: BatchEmbedder): Promise<number> {
   const unique = [...new Map(rows.map(row => [row.sourceKey, row])).values()];
   const prepared = await prepareCanonicalEmbeddingBatch(unique.map(row => row.content), embedder);
   const values: unknown[] = [];
@@ -152,13 +152,19 @@ async function commitBatch(rows: GeminiConversation[], client: GeminiQueryClient
     );
     return `(gen_random_uuid(), $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, '${CLIENT_ID}', $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11})`;
   });
-  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at, embedding_provider, embedding_model, embedding_dimensions)\nVALUES ${tuples.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, embedding_provider = EXCLUDED.embedding_provider, embedding_model = EXCLUDED.embedding_model, embedding_dimensions = EXCLUDED.embedding_dimensions, created_at = EXCLUDED.created_at, updated_at = NOW()`;
+  const sql = `INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, created_at, embedding_provider, embedding_model, embedding_dimensions)\nVALUES ${tuples.join(',\n')}\nON CONFLICT (source_key) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, embedding_provider = EXCLUDED.embedding_provider, embedding_model = EXCLUDED.embedding_model, embedding_dimensions = EXCLUDED.embedding_dimensions, created_at = EXCLUDED.created_at, updated_at = NOW() WHERE memories.deleted_at IS NULL RETURNING id`;
   let began = false;
   try {
     await client.query('BEGIN'); began = true;
     await client.query("SELECT set_config('app.current_namespace', 'personal', true)");
-    await client.query(sql, values);
+    const result = await client.query(sql, values);
     await client.query('COMMIT');
+    const writeResult = result as { command?: string; rowCount?: number };
+    const written = writeResult.command === 'INSERT' && typeof writeResult.rowCount === 'number'
+      ? writeResult.rowCount
+      : unique.length;
+    if (written < unique.length) console.warn(`[preseed-gemini] Skipped ${unique.length - written} tombstoned source-key conflict(s)`);
+    return written;
   } catch (error) {
     if (began) try { await client.query('ROLLBACK'); } catch { /* preserve original error */ }
     throw error;
@@ -172,8 +178,7 @@ export async function importGeminiHtml(html: string, client: GeminiQueryClient, 
   if (unique.length > 0) {
     for (let index = 0; index < unique.length; index += BATCH_SIZE) {
       const batch = unique.slice(index, index + BATCH_SIZE);
-      await commitBatch(batch, client, embedder);
-      imported += new Set(batch.map(row => row.sourceKey)).size;
+      imported += await commitBatch(batch, client, embedder);
     }
   }
   return { ...parsed, imported, exitCode: parsed.unsupportedTimestamps > 0 ? 1 : 0 };

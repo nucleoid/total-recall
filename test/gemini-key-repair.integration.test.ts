@@ -95,6 +95,10 @@ test('approved ordinary rekeys preserve IDs/content/metadata and rerun is idempo
   const client = new MemoryClient(rows);
   const result = await applyGeminiKeyRepair(client, manifestFor(rows));
   assert.deepEqual(result, { rekeyed: ['1'], deleted: [], retained: [] });
+  assert.ok(client.calls.filter(call => /SELECT[\s\S]+FROM memories/.test(call.sql))
+    .every(call => /deleted_at IS NULL/i.test(call.sql)));
+  assert.ok(client.calls.filter(call => /^UPDATE|^DELETE/.test(call.sql))
+    .every(call => /deleted_at IS NULL/i.test(call.sql)));
   assert.equal(rows[0].id, original.id);
   assert.equal(rows[0].content, original.content);
   assert.deepEqual(rows[0].metadata, original.metadata);
@@ -139,7 +143,10 @@ test('a pre-existing v2 duplicate is deleted before the retained legacy row is r
   const client = new MemoryClient(rows);
   await applyGeminiKeyRepair(client, { version: 1, backupVerified: true, approvals });
   const writes = client.calls.map(call => call.sql).filter(sql => /^UPDATE|^DELETE/.test(sql));
-  assert.deepEqual(writes, ['DELETE FROM memories WHERE id = $1', 'UPDATE memories SET source_key = $1 WHERE id = $2']);
+  assert.deepEqual(writes, [
+    'DELETE FROM memories WHERE id = $1 AND deleted_at IS NULL',
+    'UPDATE memories SET source_key = $1 WHERE id = $2 AND deleted_at IS NULL',
+  ]);
   assert.deepEqual(rows.map(current => current.id), ['a']);
   assert.equal(rows[0].source_key, target);
 });

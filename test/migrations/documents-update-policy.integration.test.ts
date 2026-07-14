@@ -114,6 +114,7 @@ test('documents UPDATE policy and chunk-count repair work on clean and upgraded 
 
     const owner = await connect(ownerUrl!);
     try {
+      await owner.query('ALTER TABLE memories ADD COLUMN deleted_at TIMESTAMPTZ');
       await owner.query('UPDATE documents SET client_id = $1', [KEY_A]);
       const underCounted = await owner.query<{ id: string }>(
         `SELECT id FROM documents WHERE title = 'under counted'`
@@ -124,6 +125,16 @@ test('documents UPDATE policy and chunk-count repair work on clean and upgraded 
                 ('foreign namespace', 'test', 'beta', $3, $2, 101)`,
         [KEY_B, underCounted.rows[0].id, KEY_A]
       );
+      await owner.query(`
+        UPDATE memories
+        SET deleted_at = NOW()
+        WHERE id = (
+          SELECT m.id FROM memories m
+          JOIN documents d ON d.id = m.document_id
+          WHERE d.title = 'correct nonzero' AND m.client_id = d.client_id::text
+          ORDER BY m.id LIMIT 1
+        )
+      `);
     } finally {
       await owner.end();
     }
@@ -179,6 +190,7 @@ test('documents UPDATE policy and chunk-count repair work on clean and upgraded 
         ORDER BY d.title
       `);
       assert.deepEqual(counts.rows, [
+        // Immutable ingestion cardinality includes the tombstoned physical chunk.
         { title: 'correct nonzero', chunk_count: 2, actual_count: 2 },
         { title: 'no chunks', chunk_count: 0, actual_count: 0 },
         { title: 'over counted', chunk_count: 1, actual_count: 1 },

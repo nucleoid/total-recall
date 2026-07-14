@@ -187,7 +187,8 @@ async function applyApprovals(
            SET metadata = metadata - 'played_ms' - 'completed',
                tags = ARRAY(SELECT tag FROM unnest(tags) AS tag WHERE tag <> 'completed'),
                updated_at = NOW()
-           WHERE id = $1::uuid AND namespace = 'media' AND client_id = $2
+           WHERE id = $1::uuid AND deleted_at IS NULL
+             AND namespace = 'media' AND client_id = $2
              AND source = 'media:spotify'
              AND ((metadata ? 'played_ms') OR (metadata ? 'completed') OR 'completed' = ANY(tags))`,
           [row.memory_id, approval.clientId],
@@ -197,8 +198,8 @@ async function applyApprovals(
           memory = 'updated';
         } else {
           const linked = await client.query(
-            `SELECT 1 FROM memories WHERE id = $1::uuid AND namespace = 'media'
-             AND client_id = $2 AND source = 'media:spotify'`,
+            `SELECT 1 FROM memories WHERE id = $1::uuid AND deleted_at IS NULL
+             AND namespace = 'media' AND client_id = $2 AND source = 'media:spotify'`,
             [row.memory_id, approval.clientId],
           );
           memory = linked.rowCount === 1 ? 'unchanged' : 'missing-or-unrelated';

@@ -60,8 +60,9 @@ test('an RLS-limited app role fails closed during preflight', async () => {
   await assert.rejects(prepareAllRowMaintenance(client as never), /all-row maintenance preflight failed/i);
 });
 
-test('namespace inventory treats unusual and future names as data', async () => {
-  const client = { async query() { return { rows: [
+test('namespace inventory treats unusual and future names as active data', async () => {
+  let inventorySql = '';
+  const client = { async query(sql: string) { inventorySql = sql; return { rows: [
     { namespace: 'media', count: '2' },
     { namespace: 'future, odd', count: '1' },
   ] }; } };
@@ -69,6 +70,7 @@ test('namespace inventory treats unusual and future names as data', async () => 
     { namespace: 'media', count: 2 },
     { namespace: 'future, odd', count: 1 },
   ]);
+  assert.match(inventorySql, /WHERE deleted_at IS NULL/i);
 });
 
 test('connection failures still close the dedicated maintenance client', async () => {

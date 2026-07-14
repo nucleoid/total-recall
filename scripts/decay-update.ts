@@ -23,13 +23,14 @@ export async function updateDecayWithClient(client: QueryClient): Promise<DecayS
   }>(`
     WITH maintenance AS MATERIALIZED (
       SELECT NOT EXISTS (
-        SELECT 1 FROM public.memories WHERE relevance_base_score IS NULL
+        SELECT 1 FROM public.memories WHERE deleted_at IS NULL AND relevance_base_score IS NULL
       ) AS ready
     ), updated AS (
       UPDATE public.memories
       SET relevance_score = public.calculate_relevance(relevance_base_score, decay_rate, accessed_at, access_count),
           updated_at = NOW()
       WHERE (SELECT ready FROM maintenance)
+        AND deleted_at IS NULL
       RETURNING namespace, relevance_score
     )
     SELECT maintenance.ready AS maintenance_ready, updated.namespace, updated.relevance_score

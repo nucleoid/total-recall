@@ -112,6 +112,12 @@ than losing context.
 - **Self-check before session ends** — mentally review: did I store the key takeaways?
 ```
 
+## Forget Guidelines
+
+Use `memory_forget` only when a stored fact is wrong, sensitive, or explicitly requested to be removed. Prefer exact `ids`; filter-only deletion requires `confirm: true` and should be narrowed carefully. Never assume `write` authorizes deletion—the agent's key needs a separately granted `delete` permission. Selectors combine with AND, `before` is strict, and tags use AND containment.
+
+A successful forget is a tombstone, not immediate hard deletion. Do not retry `memory_store` with the same source/idempotency key to restore it; restoration is a separate operator-controlled audited operation. Ordinary recall will no longer return forgotten chunks. If every chunk of a document is forgotten, treat document recall as not-found.
+
 ## Automated Sweep (Safety Net)
 
 In-session discipline will never be 100%. For chat platforms where message history persists (Discord, Slack, etc.), you can run a periodic sweep that re-reads recent conversations and extracts anything worth storing.
