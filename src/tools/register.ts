@@ -15,6 +15,7 @@ import { listNamespacesSchema, memoryListNamespaces } from './list-namespaces.js
 import { listSchema, memoryList } from './list.js';
 import { statsSchema, memoryStats } from './stats.js';
 import { forgetSchema, memoryForget } from './forget.js';
+import { updateSchema, memoryUpdate } from './update.js';
 import { MAX_DELETION_REASON_CHARS, MAX_FORGET_IDS } from '../memory-lifecycle.js';
 import { mediaSearchSchema, mediaSearch } from './media-search.js';
 import { upsertAgent, listAgents } from '../agents.js';
@@ -73,6 +74,28 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ['content'],
+    },
+  },
+  {
+    name: 'memory_update',
+    description: 'Patch an active current memory. Tags and metadata replace their complete values. Optionally link it as the sole durable successor of another current memory.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', format: 'uuid', description: 'Active current memory UUID to patch' },
+        content: { type: 'string', minLength: 1, maxLength: MEMORY_CONTENT_MAX_CHARS, description: 'Replacement nonblank content; changed content is re-embedded' },
+        tags: { type: 'array', maxItems: TAG_MAX_COUNT, items: { type: 'string', maxLength: TAG_MAX_CHARS }, description: 'Complete replacement tag list' },
+        metadata: { type: 'object', description: `Complete replacement metadata object (maximum ${METADATA_MAX_BYTES} serialized JSON bytes)` },
+        supersedes: { type: 'string', format: 'uuid', description: 'Current predecessor UUID; creates an immutable one-to-one history link' },
+      },
+      required: ['id'],
+      anyOf: [
+        { required: ['content'] },
+        { required: ['tags'] },
+        { required: ['metadata'] },
+        { required: ['supersedes'] },
+      ],
     },
   },
   {
@@ -247,6 +270,11 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
         case 'memory_store': {
           const params = storeSchema.parse(args);
           const result = await memoryStore(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
+        case 'memory_update': {
+          const params = updateSchema.parse(args);
+          const result = await memoryUpdate(params, auth);
           return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'memory_store_document': {

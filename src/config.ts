@@ -27,3 +27,19 @@ export function parseHnswEfSearch(raw: string | undefined): number {
 export function hnswEfSearchFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   return parseHnswEfSearch(env.HNSW_EF_SEARCH);
 }
+
+export const SUPERSEDED_SCORE_FACTOR_DEFAULT = 0.25;
+
+export function parseSupersededScoreFactor(raw: string | undefined): number {
+  const trimmed = raw?.trim() ?? '';
+  if (trimmed === '') return SUPERSEDED_SCORE_FACTOR_DEFAULT;
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || value <= 0 || value > 1) {
+    throw new Error(`SUPERSEDED_SCORE_FACTOR must be a number greater than 0 and at most 1; got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+export function supersededScoreFactorFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return parseSupersededScoreFactor(env.SUPERSEDED_SCORE_FACTOR);
+}

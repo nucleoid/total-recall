@@ -21,8 +21,14 @@ export async function memoryRecall(
   if (params.id) {
     const res = await queryScoped(
       dbScopeFromAuth(auth),
-      `SELECT id, content, source, namespace, tags, metadata, access_level, created_at, updated_at, document_id, chunk_index
-       FROM memories WHERE id = $1 AND deleted_at IS NULL AND namespace = ANY($2) AND ${accessLevelSql('access_level', '$3')}`,
+      `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.access_level, m.created_at, m.updated_at,
+         m.document_id, m.chunk_index, m.supersedes_id, m.superseded_at, m.revision,
+         (m.superseded_at IS NOT NULL) AS is_superseded,
+         (SELECT successor.id FROM memories successor
+          WHERE successor.supersedes_id = m.id AND successor.deleted_at IS NULL
+            AND ${accessLevelSql('successor.access_level', '$3')}
+          LIMIT 1) AS superseded_by_id
+       FROM memories m WHERE m.id = $1 AND m.deleted_at IS NULL AND m.namespace = ANY($2) AND ${accessLevelSql('m.access_level', '$3')}`,
       [params.id, namespaces, auth.maxAccessLevel]
     );
     if (res.rows.length === 0) throw new Error('Memory not found or access denied');
@@ -31,9 +37,15 @@ export async function memoryRecall(
 
   const res = await queryScoped(
     dbScopeFromAuth(auth),
-    `SELECT id, content, source, namespace, tags, metadata, access_level, created_at, updated_at, document_id, chunk_index
-     FROM memories WHERE document_id = $1 AND deleted_at IS NULL AND namespace = ANY($2) AND ${accessLevelSql('access_level', '$3')}
-     ORDER BY chunk_index ASC`,
+    `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.access_level, m.created_at, m.updated_at,
+       m.document_id, m.chunk_index, m.supersedes_id, m.superseded_at, m.revision,
+       (m.superseded_at IS NOT NULL) AS is_superseded,
+       (SELECT successor.id FROM memories successor
+        WHERE successor.supersedes_id = m.id AND successor.deleted_at IS NULL
+          AND ${accessLevelSql('successor.access_level', '$3')}
+        LIMIT 1) AS superseded_by_id
+     FROM memories m WHERE m.document_id = $1 AND m.deleted_at IS NULL AND m.namespace = ANY($2) AND ${accessLevelSql('m.access_level', '$3')}
+     ORDER BY m.chunk_index ASC`,
     [params.document_id, namespaces, auth.maxAccessLevel]
   );
   if (res.rows.length === 0) throw new Error('Document not found or access denied');

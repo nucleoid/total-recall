@@ -79,6 +79,17 @@ Store a memory with automatic embedding.
 
 The API key's `max_access_level` must be greater than or equal to the requested `access_level`. Reads compare ranks as `normal < sensitive < secret`; rows above the key ceiling are excluded from search, recall, list, namespace counts, stats, and agent memory counts before pagination or aggregation. Null legacy memory values are treated as `normal`; unknown legacy labels fail closed and are not visible to any key.
 
+### memory_update
+Patch an active current memory. Requires `write`, a UUID `id`, and at least one supplied patch field.
+- content?: nonblank string (maximum 100,000 characters; re-embedded only when changed)
+- tags?: string[] (complete replacement, including `[]`)
+- metadata?: Record<string, any> (complete replacement, including `{}`)
+- supersedes?: UUID (immutable predecessor link)
+
+Omitted fields are unchanged and unknown/null fields are rejected. Namespace, source, access level, provenance, document/source identity, creation/deletion state, and lifecycle links are immutable. Both sides of a supersession must be authorized, active/current, distinct, and in the same namespace; each predecessor has at most one successor ever. One transaction locks IDs in UUID order, closes the predecessor and links the successor at one database timestamp, and writes content-free `memory.update` and `belief.supersede` audits. Changed content is embedded before locking and committed only if the trigger-owned `revision` still matches.
+
+Historical active rows remain listable and directly recallable. Results expose `supersedes_id`, visible active `superseded_by_id`, `superseded_at`, `is_superseded`, and `revision`. Search builds separate bounded current/historical vector and text candidates, then multiplies historical final scores by validated `SUPERSEDED_SCORE_FACTOR` in `(0,1]` (default `0.25`) before ordering and limiting. Eligibility thresholds are unchanged. Source-key writers cannot rewrite superseded rows, forgetting/purging a successor does not clear its predecessor marker, and the `ON DELETE RESTRICT` link blocks predecessor purge while referenced.
+
 ### memory_store_document
 Store a nonblank document of at most **1 MiB decoded UTF-8**. Chunking prefers markdown heading and paragraph boundaries, then hard-splits on Unicode code-point boundaries. It is lossless and every embedding chunk is at most **2,000 UTF-8 bytes**. MCP and REST use the same decoded-content schema; an HTTP transport may independently reject an oversized JSON envelope before schema validation.
 - title: string (required)
@@ -231,6 +242,10 @@ Schema migrations use only owner-capable `MIGRATION_DATABASE_URL`; runtime servi
 Deletion remains disabled while operators run `npm run migrate`. Migration 024 adds the explicitly named deletion-reason CHECK and deleter FK as `NOT VALID` and does not validate either inside the transaction-wrapped migration, where earlier `ALTER TABLE` locks persist until commit. After migration commit, operators run `npm run finalize:memory-lifecycle` with the owner connection. The finalizer verifies definitions and validity, validates each constraint in a separate autocommit `ALTER TABLE ... VALIDATE CONSTRAINT` using PostgreSQL's lower-lock path, then builds both partial indexes concurrently. Failed validations, partial completion, and invalid interrupted-index leftovers are safely verified and retried through the same command; both constraints and both indexes must report valid. Operators must then deploy and restart all tombstone-aware processes—servers, watchers, importers, connectors/rollups, and maintenance readers/writers—before enabling memory deletion through `delete` permissions or invoking forget. Mixed tombstone-aware and unaware processes are unsupported.
 
 Disable forget/REST deletion and purge first during incident response or rollback. Before any tombstone is created, retaining the additive fields/indexes permits an application rollback. Once tombstones exist, rollback is **roll-forward-only**: every process must remain tombstone-aware, tombstone fields must remain intact, and fixes deploy forward. Hard-purged content is recoverable only from a verified backup.
+
+### Memory supersession rollout and rollback
+
+After migration 024 is complete, migration 025 adds revision/supersession fields, the trigger, durable unique link, and restrictive self-FK. Deploy all supersession-aware readers and source-key writers before enabling `memory_update` or creating links. Rollback disables the tool but retains the schema, demotion behavior, and existing history. After the first link, old readers and clearing/dropping lifecycle fields are unsafe.
 
 Migration `009_api_key_access_ceiling.sql` backfills existing `api_keys.max_access_level` values to `secret` to preserve upgraded installations, then sets the default for newly created keys to `normal`. Use `--max-access-level sensitive` or `--max-access-level secret` only for clients that should read and write higher-classification memories.
 

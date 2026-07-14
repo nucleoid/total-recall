@@ -197,7 +197,7 @@ async function withDatabase(run: (fixture: Fixture) => Promise<void>): Promise<v
       CREATE TABLE memories (
         id uuid PRIMARY KEY, source text NOT NULL, namespace text NOT NULL, tags text[] NOT NULL,
         metadata jsonb NOT NULL, content text NOT NULL, embedding text NOT NULL,
-        client_id text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz
+        client_id text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz, superseded_at timestamptz
       );
       CREATE TABLE media_events (
         id uuid PRIMARY KEY, service text NOT NULL, duration_ms int, played_ms int, completed boolean,

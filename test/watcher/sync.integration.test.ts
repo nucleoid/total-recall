@@ -188,7 +188,7 @@ test('chunk embeddings are prepared serially before opening the transaction', as
   assert.deepEqual(chunks.map(({ vectorStr }) => vectorStr), ['[5]', '[6]', '[5]']);
 });
 
-test('tombstoned watcher conflicts are not resurrected and produce one bounded summary warning', async t => {
+test('tombstoned or superseded watcher conflicts are not rewritten and produce one bounded summary warning', async t => {
   const client = new TransactionClient(150);
   client.tombstonedKeys.add('key-1');
   setPoolForTesting(new SequencedPool([client]) as unknown as pg.Pool);
@@ -201,9 +201,9 @@ test('tombstoned watcher conflicts are not resurrected and produce one bounded s
 
   assert.equal(client.committed.has('key-1'), false);
   assert.equal(client.committed.get('key-2'), 'second');
-  assert.deepEqual(warnings, ['[watcher] Skipped 1 tombstoned source-key conflict(s)']);
+  assert.deepEqual(warnings, ['[watcher] Skipped 1 tombstoned or superseded source-key conflict(s)']);
   const upsert = client.calls.find(({ text }) => text.includes('INSERT INTO memories'))?.text ?? '';
-  assert.match(upsert, /WHERE memories\.deleted_at IS NULL[\s\S]*RETURNING id/);
+  assert.match(upsert, /WHERE memories\.deleted_at IS NULL[\s\S]*memories\.superseded_at IS NULL[\s\S]*RETURNING id/);
 });
 
 test('upsert, stale-delete, and hash-write failures roll back the complete prior snapshot', async () => {

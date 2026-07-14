@@ -187,7 +187,7 @@ async function applyApprovals(
            SET metadata = metadata - 'played_ms' - 'completed',
                tags = ARRAY(SELECT tag FROM unnest(tags) AS tag WHERE tag <> 'completed'),
                updated_at = NOW()
-           WHERE id = $1::uuid AND deleted_at IS NULL
+           WHERE id = $1::uuid AND deleted_at IS NULL AND superseded_at IS NULL
              AND namespace = 'media' AND client_id = $2
              AND source = 'media:spotify'
              AND ((metadata ? 'played_ms') OR (metadata ? 'completed') OR 'completed' = ANY(tags))`,
@@ -198,7 +198,7 @@ async function applyApprovals(
           memory = 'updated';
         } else {
           const linked = await client.query(
-            `SELECT 1 FROM memories WHERE id = $1::uuid AND deleted_at IS NULL
+            `SELECT 1 FROM memories WHERE id = $1::uuid AND deleted_at IS NULL AND superseded_at IS NULL
              AND namespace = 'media' AND client_id = $2 AND source = 'media:spotify'`,
             [row.memory_id, approval.clientId],
           );

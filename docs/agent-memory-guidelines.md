@@ -112,6 +112,10 @@ than losing context.
 - **Self-check before session ends** — mentally review: did I store the key takeaways?
 ```
 
+## Update and Supersession Guidelines
+
+Use `memory_update` for corrections to the same current fact and for facts that change over time. Supply only fields that should change; `tags` and `metadata` replace their complete values rather than merging. When a new stored fact replaces an older one, call `memory_update` on the new current memory with `supersedes` set to the older memory ID. Do not overwrite the old row: the immutable link preserves history while demoting it in ordinary search. A historical row may still appear in direct recall/list results with `is_superseded: true`; treat the linked successor as current. Supersession cannot be undone implicitly by forgetting or purging the successor.
+
 ## Forget Guidelines
 
 Use `memory_forget` only when a stored fact is wrong, sensitive, or explicitly requested to be removed. Prefer exact `ids`; filter-only deletion requires `confirm: true` and should be narrowed carefully. Never assume `write` authorizes deletion—the agent's key needs a separately granted `delete` permission. Selectors combine with AND, `before` is strict, and tags use AND containment.

@@ -1,12 +1,13 @@
 import { withScopedClient, type DbScope } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR, embed, serializeEmbeddingVector } from './embedding.js';
 import { accessLevelSql } from './auth.js';
-import { hnswEfSearchFromEnv } from './config.js';
+import { hnswEfSearchFromEnv, supersededScoreFactorFromEnv } from './config.js';
 import type { AccessLevel, SearchParams, SearchResult } from './types.js';
 import dotenv from 'dotenv';
 dotenv.config();
 
 const EF_SEARCH = hnswEfSearchFromEnv();
+const SUPERSEDED_SCORE_FACTOR = supersededScoreFactorFromEnv();
 
 // Legacy vector queries are allowed only for truthfully labelled legacy rows.
 // No legacy profile is configured after the verified Gemini-only cutover.
@@ -46,6 +47,7 @@ export async function hybridSearch(
     const pProvider = p(ACTIVE_EMBEDDING_DESCRIPTOR.provider);
     const pModel = p(ACTIVE_EMBEDDING_DESCRIPTOR.model);
     const pDimensions = p(ACTIVE_EMBEDDING_DESCRIPTOR.dimensions);
+    const pSupersededFactor = p(SUPERSEDED_SCORE_FACTOR);
     const accessWhere = `AND ${accessLevelSql('m.access_level', pMaxAccessLevel)}`;
 
     const conditions: string[] = [];
@@ -79,29 +81,54 @@ export async function hybridSearch(
 
     const sql = `
       WITH vector_results AS (
-        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
-          updated_at, accessed_at, access_count, access_level, client_id,
+        (SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
+          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id, superseded_at, revision,
           1 - (embedding <=> ${pVec}::vector) AS vec_score
-        FROM memories m
-        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
-          AND m.deleted_at IS NULL
-          AND ${vectorAvailable ? `embedding IS NOT NULL
-          AND embedding_provider = ${pProvider}
-          AND embedding_model = ${pModel}
-          AND embedding_dimensions = ${pDimensions}` : 'FALSE'}
-        ORDER BY embedding <=> ${pVec}::vector
-        LIMIT 50
+         FROM memories m
+         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+           AND m.deleted_at IS NULL AND m.superseded_at IS NULL
+           AND ${vectorAvailable ? `embedding IS NOT NULL
+           AND embedding_provider = ${pProvider}
+           AND embedding_model = ${pModel}
+           AND embedding_dimensions = ${pDimensions}` : 'FALSE'}
+         ORDER BY embedding <=> ${pVec}::vector, id
+         LIMIT 50)
+        UNION ALL
+        (SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
+          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id, superseded_at, revision,
+          1 - (embedding <=> ${pVec}::vector) AS vec_score
+         FROM memories m
+         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+           AND m.deleted_at IS NULL AND m.superseded_at IS NOT NULL
+           AND ${vectorAvailable ? `embedding IS NOT NULL
+           AND embedding_provider = ${pProvider}
+           AND embedding_model = ${pModel}
+           AND embedding_dimensions = ${pDimensions}` : 'FALSE'}
+         ORDER BY embedding <=> ${pVec}::vector, id
+         LIMIT 50)
       ),
       text_only_results AS (
-        SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
-          updated_at, accessed_at, access_count, access_level, client_id,
+        (SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
+          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id, superseded_at, revision,
           NULL::double precision AS vec_score
-        FROM memories m
-        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
-          AND m.deleted_at IS NULL
-          AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
-          AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
-        LIMIT 20
+         FROM memories m
+         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+           AND m.deleted_at IS NULL AND m.superseded_at IS NULL
+           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
+           AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
+         ORDER BY ts_rank_cd(to_tsvector('english', content), plainto_tsquery(${pQuery})) DESC, id
+         LIMIT 20)
+        UNION ALL
+        (SELECT id, content, metadata, tags, source, namespace, created_at, event_at, relevance_score, relevance_base_score, decay_rate,
+          updated_at, accessed_at, access_count, access_level, client_id, supersedes_id, superseded_at, revision,
+          NULL::double precision AS vec_score
+         FROM memories m
+         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+           AND m.deleted_at IS NULL AND m.superseded_at IS NOT NULL
+           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
+           AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
+         ORDER BY ts_rank_cd(to_tsvector('english', content), plainto_tsquery(${pQuery})) DESC, id
+         LIMIT 20)
       ),
       combined AS (
         SELECT * FROM vector_results
@@ -124,12 +151,22 @@ export async function hybridSearch(
         FROM combined c
         LEFT JOIN text_scores t ON c.id = t.id
         WHERE COALESCE(c.vec_score, 0) >= ${pThreshold} OR t.text_score > 0
+      ),
+      ranked AS (
+        SELECT s.*,
+          (COALESCE(s.vec_score, 0) * 0.3 + s.text_score * 0.7 + CASE WHEN s.text_score > 0 THEN 2.0 ELSE 0 END)
+            * LEAST(s.relevance, 2.0)
+            * CASE WHEN s.superseded_at IS NOT NULL THEN ${pSupersededFactor}::double precision ELSE 1.0 END AS final_score
+        FROM scored s
       )
-      SELECT s.*,
-        (COALESCE(s.vec_score, 0) * 0.3 + s.text_score * 0.7 + CASE WHEN s.text_score > 0 THEN 2.0 ELSE 0 END)
-          * LEAST(s.relevance, 2.0) AS final_score
-      FROM scored s
-      ORDER BY final_score DESC
+      SELECT r.*,
+        (r.superseded_at IS NOT NULL) AS is_superseded,
+        (SELECT successor.id FROM memories successor
+         WHERE successor.supersedes_id = r.id AND successor.deleted_at IS NULL
+           AND ${accessLevelSql('successor.access_level', pMaxAccessLevel)}
+         LIMIT 1) AS superseded_by_id
+      FROM ranked r
+      ORDER BY final_score DESC, id
       LIMIT ${pLimit};
     `;
 

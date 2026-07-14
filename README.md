@@ -64,6 +64,7 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  MCP Tools:                 │
         │  • memory_store             │
         │  • memory_store_document    │
+        │  • memory_update            │
         │  • memory_search            │
         │  • memory_recall            │
         │  • memory_list              │
@@ -108,6 +109,9 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  │ document_id UUID FK │    │
         │  │ chunk_index INT     │    │
         │  │ source_key  TEXT UQ │    │
+        │  │ supersedes_id UUID  │    │
+        │  │ superseded_at TS    │    │
+        │  │ revision    INT     │    │
         │  │ created_at  TS      │    │
         │  │ updated_at  TS      │    │
         │  │ accessed_at TS      │    │
@@ -182,6 +186,20 @@ Store a single memory/fact with metadata. Optionally track which agent stored it
 ```
 
 `access_level` defaults to `normal` and may be `normal`, `sensitive`, or `secret`. The caller's API key must have a `max_access_level` at least as high as the memory being stored.
+
+### `memory_update`
+Patch an active current memory by UUID. At least one of `content`, `tags`, `metadata`, or `supersedes` is required; omitted fields are unchanged, while supplied tags and metadata replace the complete value (including `[]` and `{}`). Content must be nonblank and is re-embedded only when changed. Provenance, namespace, source, access level, document identity, creation/deletion state, and existing lifecycle links are immutable.
+
+```json
+{
+  "id": "<new-current-memory-uuid>",
+  "content": "User lives in Austin",
+  "tags": ["profile", "location"],
+  "supersedes": "<old-location-memory-uuid>"
+}
+```
+
+A supersession atomically closes the predecessor and creates one immutable successor link. Both rows must be active/current, distinct, visible, and in the same namespace. Historical rows remain available through list and direct recall with `supersedes_id`, `superseded_by_id`, `superseded_at`, `is_superseded`, and `revision`, but ordinary search demotes them by `SUPERSEDED_SCORE_FACTOR` (default `0.25`) before final ordering and limiting. Forgetting or purging a successor never reopens its predecessor; the predecessor marker is durable, and its purge is blocked while a successor still references it.
 
 ### `memory_store_document`
 Chunk and store a full document. Content must contain non-whitespace text and is limited to **1 MiB of decoded UTF-8**. Chunking prefers markdown headings and paragraph boundaries, then splits on Unicode code-point boundaries so every embedding chunk is at most **2,000 UTF-8 bytes** without dropping or changing source text. Chunks share a `document_id` for full-document retrieval.
@@ -592,6 +610,10 @@ The command runs each `ALTER TABLE ... VALIDATE CONSTRAINT` in a separate autoco
 5. Verify ordinary reads and maintenance exclude `deleted_at IS NOT NULL`, then enable deletion by granting/using `delete` permissions. Keep hard purge manual and wait for the retention window.
 
 Before any rollback or incident response, disable `memory_forget`/REST deletion and `purge:deleted` first and stop their callers. If no tombstones have ever been created, the runtime can be rolled back while retaining the additive columns and indexes. Once tombstones exist, application rollback is **roll-forward-only**: do not deploy any binary or job that is not tombstone-aware, do not clear or drop tombstone fields, and repair by deploying corrected tombstone-aware code. After hard purge, deleted content is recoverable only from a verified backup.
+
+### Memory supersession rollout and rollback
+
+Apply migration 025 only after the memory lifecycle migration, then deploy and restart every search/list/recall replica and every source-key writer before enabling `memory_update` or creating the first supersession link. Tune `SUPERSEDED_SCORE_FACTOR` only within `(0,1]`; `0.25` is the default. Rollback disables `memory_update` while retaining the columns, trigger, indexes, links, durable predecessor markers, and supersession-aware readers. Once links exist, never deploy an old reader that ranks historical rows as current and never drop or clear populated lifecycle fields.
 
 ## Namespace Design
 

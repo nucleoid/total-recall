@@ -69,7 +69,8 @@ async function createFixture(): Promise<Fixture> {
           embedding_model text,
           embedding_dimensions integer,
           updated_at timestamptz NOT NULL DEFAULT NOW(),
-          deleted_at timestamptz
+          deleted_at timestamptz,
+          revision integer NOT NULL DEFAULT 0
         )
       `);
       await client.query(`
