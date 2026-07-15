@@ -10,6 +10,7 @@
     "test": "node --test --test-concurrency=1 --import ./test/setup-embedding-env.mjs --import tsx \"test/**/*.test.ts\" && npm run test:python && npm run test:daily-sync && npm run test:access-level:db",
     "test:daily-sync": "node scripts/run-daily-sync-tests.mjs",
     "test:integration": "node --import ./test/setup-embedding-env.mjs --import tsx --test test/*.integration.test.ts",
+    "test:contract": "node --test --test-concurrency=1 --import ./test/setup-embedding-env.mjs --import tsx test/openapi-contract.test.ts test/openapi-http.integration.test.ts",
     "test:watcher": "node --test --test-concurrency=1 --import ./test/setup-embedding-env.mjs --import tsx \"test/watcher/**/*.test.ts\"",
     "test:access-level": "node --import ./test/setup-embedding-env.mjs --import tsx test/access-level.integration.test.ts",
     "test:access-level:db": "node --import ./test/setup-embedding-env.mjs --import tsx test/access-level.db.ts",
@@ -75,11 +76,15 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@apidevtools/swagger-parser": "^12.1.0",
     "@types/node": "^22.13.0",
     "@types/pg": "^8.11.11",
     "@types/supertest": "^7.2.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "supertest": "^7.2.2",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "yaml": "^2.9.0"
   }
 }

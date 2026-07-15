@@ -51,6 +51,7 @@ DO NOT STORE:
    - Auth Type: **Bearer**
    - Paste the API key: `tr_b5cf64d5c886fc31962fba1034fa02a9658c4d206a96eb88a13ec931cd298dfe`
 3. In the **Schema** box, paste the contents of `openapi.yaml` from this repo (or import from URL if hosted)
+4. After any schema update, re-import it and click **Publish/Update**. Existing GPTs keep their cached action schema until republished.
 
 ### OpenAPI Schema
 
@@ -74,6 +75,6 @@ In **Configure** → **Additional Settings**:
 ## Troubleshooting
 
 - **401 errors**: Check that the API key is set correctly in Actions auth
-- **403 errors**: The API key may not have access to the requested namespace
+- **403 errors**: The API key may lack the requested namespace, access level, or permission. Stats, agents, traces, audit, media event administration/ingestion, and rollup require a deliberately granted `admin` permission; ordinary Custom GPT keys should normally use search/store actions only.
 - **Timeout errors**: The server may be cold-starting; retry after a few seconds
 - **No results**: Try broader search terms or check namespace access

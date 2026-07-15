@@ -16,7 +16,7 @@ Size the maintenance window against the current `media_events` row count because
 
 Do not weaken the tenant-local uniqueness constraint as a compatibility workaround. The tenant-local key is required so one tenant cannot suppress another tenant's legitimate media event.
 
-`POST /api/media/events` now requires the existing `write` permission. Confirm all keys that perform REST or connector media ingest have `write` before stopping writers; no new permission type is introduced.
+At the migration-021 rollout, `POST /api/media/events` required the existing `write` permission. The later #50 REST contract hardening additionally requires explicit `admin` for HTTP ingestion; follow [`050-openapi-admin.md`](050-openapi-admin.md). In-process connector jobs remain scoped to their existing `media` namespace and `write` permission.
 
 REST `played_at` validation now rejects malformed timestamps before SQL. Offset-less REST timestamps are preserved for compatibility by treating them as UTC before persistence.
 
