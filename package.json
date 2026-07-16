@@ -71,6 +71,7 @@
     "ytmusic:sync": "tsx scripts/ytmusic-sync.ts",
     "plex:auth": "tsx scripts/plex-auth.ts",
     "plex:sync": "tsx scripts/plex-sync.ts",
+    "browser:sync": "tsx scripts/browser-history-sync.ts",
     "preflight:media-keys": "tsx scripts/preflight-media-keys.ts",
     "test:plex": "node --test --import tsx test/connectors/plex-connector.test.ts",
     "test:python": "tsx scripts/run-python-tests.ts"
@@ -86,6 +87,7 @@
     "glob": "^13.0.6",
     "pg": "^8.13.1",
     "stream-json": "^3.5.0",
+    "tldts": "^7.0.17",
     "zod": "^3.24.2"
   },
   "devDependencies": {

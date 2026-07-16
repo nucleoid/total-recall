@@ -3,6 +3,7 @@ import { upsertAgent } from '../agents.js';
 import type { AuthContext } from '../types.js';
 
 const MEDIA_NAMESPACE = 'media';
+const ACTIVITY_NAMESPACE = 'activity';
 
 type ConnectorKeyRow = {
   id: string;
@@ -50,6 +51,21 @@ async function loadConnectorKey(keyName: string): Promise<ConnectorKeyRow> {
   return keyRow.rows[0];
 }
 
+export async function preflightConnectorKey(
+  keyName: string,
+  namespace: string,
+  permission: string = 'write',
+): Promise<AuthContext> {
+  const auth = authFromKeyRow(await loadConnectorKey(keyName));
+  if (!auth.namespaces.includes(namespace)) {
+    throw new Error(`api_key "${keyName}" must include the ${namespace} namespace for connector jobs.`);
+  }
+  if (!auth.permissions.includes(permission)) {
+    throw new Error(`api_key "${keyName}" must include ${permission} permission for connector jobs.`);
+  }
+  return auth;
+}
+
 export async function preflightMediaConnectorKeys(keyNames = mediaConnectorKeyNames()): Promise<AuthContext[]> {
   if (keyNames.length === 0) {
     throw new Error('At least one media connector api_key name is required.');
@@ -94,4 +110,30 @@ export async function resolveConnectorAttribution(service: string): Promise<{
   }, scope);
 
   return { apiKeyId, agentId: agent.id, scope, auth };
+}
+
+/** Resolve least-privilege ownership for private activity connectors. Dry-run
+ * deliberately performs no agent registration or other mutation. */
+export async function resolveActivityConnectorAttribution(
+  service: string,
+  dryRun = false,
+): Promise<{
+  apiKeyId: string;
+  agentId?: string;
+  scope: DbScope;
+  auth: AuthContext;
+}> {
+  const keyName = (process.env.ACTIVITY_CONNECTOR_API_KEY_NAME ?? '').trim();
+  if (!keyName) throw new Error('ACTIVITY_CONNECTOR_API_KEY_NAME is required for activity connector jobs.');
+  const auth = await preflightConnectorKey(keyName, ACTIVITY_NAMESPACE, 'write');
+  const scope = { keyId: auth.keyId, namespaces: auth.namespaces };
+  if (dryRun) return { apiKeyId: auth.keyId, scope, auth };
+
+  const agent = await upsertAgent({
+    name: `${service}-connector`,
+    type: 'system',
+    runtime: 'cron',
+    api_key_id: auth.keyId,
+  }, scope);
+  return { apiKeyId: auth.keyId, agentId: agent.id, scope, auth };
 }

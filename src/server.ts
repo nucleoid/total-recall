@@ -29,6 +29,13 @@ import { registerAgent, listAgents } from './agents.js';
 import { getTrace, listTraces } from './traces.js';
 import { listAudit } from './audit.js';
 import { getMediaStats, parsePublicMediaEventBatch, toTrustedRestMediaEvents, upsertMediaEvents, listMediaEvents } from './media.js';
+import {
+  activityListQuerySchema,
+  listActivityEvents,
+  parsePublicActivityEventBatch,
+  toTrustedActivityEvents,
+  upsertActivityEvents,
+} from './activity.js';
 import { getMemory, getMemorySummaries, listMemories } from './memories.js';
 import { rollupPendingEvents } from './rollup.js';
 import { JSON_BODY_LIMIT_BYTES, validateMetadataInRequest } from './http-limits.js';
@@ -761,6 +768,34 @@ registerRestRoute(app, 'get', '/api/audit', async (req, res) => {
     res.json({ audit: result });
   } catch (err: any) {
     sendApiError(res, '/api/audit', err);
+  }
+});
+
+// === Private structured activity endpoints ===
+
+registerRestRoute(app, 'post', '/api/activity/events', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'write');
+    const events = parsePublicActivityEventBatch(req.body);
+    const trusted = toTrustedActivityEvents(events, auth);
+    res.json(await upsertActivityEvents(trusted, dbScopeFromAuth(auth)));
+  } catch (err: any) {
+    sendApiError(res, '/api/activity/events', err);
+  }
+});
+
+registerRestRoute(app, 'get', '/api/activity/events', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'read');
+    const params = activityListQuerySchema.parse(req.query);
+    const events = await listActivityEvents(auth, dbScopeFromAuth(auth), params.namespace, params);
+    res.json({ events });
+  } catch (err: any) {
+    sendApiError(res, '/api/activity/events GET', err);
   }
 });
 

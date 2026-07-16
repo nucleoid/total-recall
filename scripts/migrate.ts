@@ -103,6 +103,7 @@ async function currentRole(client: pg.Client): Promise<CurrentRole> {
 }
 
 const MIGRATION_OWNED_TABLES = [
+  'activity_events',
   'agents',
   'api_keys',
   'api_key_daily_usage',

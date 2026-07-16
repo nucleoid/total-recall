@@ -28,6 +28,7 @@ export function toMediaEvent(item: PlexHistoryItem, server: { name: string; clie
   const playedAt = new Date(item.viewedAt * 1000).toISOString();
   const base = {
     service: 'plex',
+    source_id: server.clientIdentifier,
     service_id: `${server.clientIdentifier}:${item.ratingKey}`,
     event_type: 'watch',
     title: item.title,

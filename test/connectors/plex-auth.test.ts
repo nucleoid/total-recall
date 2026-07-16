@@ -44,16 +44,24 @@ test('404 is terminal with no sleep and pinFlow does not persist credentials', {
   const originalFetch = globalThis.fetch;
   let fetchCount = 0;
   let insertCount = 0;
+  const credentialQuery = async (sql: string) => {
+    if (sql.includes('set_config') || ['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return { rows: [] };
+    if (sql.includes('SELECT data FROM connector_credentials')) return { rows: [] };
+    if (sql.includes('INSERT INTO connector_credentials')) {
+      insertCount += 1;
+      return { rows: [] };
+    }
+    throw new Error(`Unexpected SQL: ${sql}`);
+  };
   const fakePool = {
     on: () => undefined,
     query: async (sql: string) => {
-      if (sql.includes('SELECT data FROM connector_credentials')) return { rows: [] };
-      if (sql.includes('INSERT INTO connector_credentials')) {
-        insertCount += 1;
-        return { rows: [] };
+      if (sql.includes('SELECT id, namespaces, permissions FROM api_keys')) {
+        return { rows: [{ id: 'key-1', namespaces: ['media'], permissions: ['write'] }] };
       }
       throw new Error(`Unexpected SQL: ${sql}`);
     },
+    connect: async () => ({ query: credentialQuery, release: () => undefined }),
   };
 
   setPoolForTesting(fakePool as never);
@@ -93,16 +101,24 @@ test('pinFlow persists the exact token after an unclaimed response', { concurren
   const originalFetch = globalThis.fetch;
   let pollCount = 0;
   let stored: Record<string, unknown> | null = null;
+  const credentialQuery = async (sql: string, params?: unknown[]) => {
+    if (sql.includes('set_config') || ['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return { rows: [] };
+    if (sql.includes('SELECT data FROM connector_credentials')) return { rows: [] };
+    if (sql.includes('INSERT INTO connector_credentials')) {
+      stored = JSON.parse(String(params?.[4])) as Record<string, unknown>;
+      return { rows: [] };
+    }
+    throw new Error(`Unexpected SQL: ${sql}`);
+  };
   setPoolForTesting({
     on: () => undefined,
-    query: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('SELECT data FROM connector_credentials')) return { rows: [] };
-      if (sql.includes('INSERT INTO connector_credentials')) {
-        stored = JSON.parse(String(params?.[1])) as Record<string, unknown>;
-        return { rows: [] };
+    query: async (sql: string) => {
+      if (sql.includes('SELECT id, namespaces, permissions FROM api_keys')) {
+        return { rows: [{ id: 'key-1', namespaces: ['media'], permissions: ['write'] }] };
       }
       throw new Error(`Unexpected SQL: ${sql}`);
     },
+    connect: async () => ({ query: credentialQuery, release: () => undefined }),
   } as never);
   globalThis.fetch = (async (_input, init) => {
     if (init?.method === 'POST') {

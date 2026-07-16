@@ -6,13 +6,13 @@ import {
   type SyncResult,
 } from '../base.js';
 import {
-  getSyncState,
   mutateConnectorSyncStateWithClient,
   upsertMediaEventsWithClient,
   type ConnectorSyncState,
   type MediaEventInput,
 } from '../../media.js';
 import { withScopedClient } from '../../db.js';
+import { lockConnectorState } from '../state.js';
 import { loadCreds, plexHeaders } from './auth.js';
 import { getAccount, listServers, pickReachableUri, type PlexResource } from './discovery.js';
 import { toMediaEvent, type PlexHistoryItem } from './transform.js';
@@ -366,45 +366,31 @@ export class PlexConnector extends BaseConnector {
     let skipped = 0;
 
     try {
-      const state = await getSyncState(this.service);
-      const sinceByServer = parsePlexCursorMetadata(state?.metadata, (message) => warnings.push(message));
-
-      const creds = await loadCreds();
-      const account = await getAccount(creds);
-      const servers = await listServers(creds);
-
-      if (servers.length === 0) {
-        throw new Error('No accessible Plex servers found for this account.');
-      }
-
-      const fetchResult = await fetchHistoryForServers({
-        servers,
-        creds,
-        account,
-        since: null,
-        sinceByServer,
-        throwOnServerErrors: false,
-      });
-      errors.push(...fetchResult.errors);
-
-      if (fetchResult.successfulServers.length === 0 && fetchResult.errors.length > 0) {
-        return {
-          service: this.service,
-          events_ingested: 0,
-          events_skipped: 0,
-          warnings,
-          errors,
-          duration_ms: Date.now() - start,
-        };
-      }
-
-      const valid = filterValidMediaEventDates(fetchResult.events);
-      errors.push(...valid.errors);
-      skipped += valid.skipped;
-
-      const enriched = trustConnectorMediaEvents(valid.events, ctx);
-
       await withScopedClient(ctx.scope, async (client) => {
+        const state = await lockConnectorState(client, ctx.scope, this.service, 'default', 'media');
+        const sinceByServer = parsePlexCursorMetadata(state.metadata, (message) => warnings.push(message));
+        const creds = await loadCreds();
+        const account = await getAccount(creds);
+        const servers = await listServers(creds);
+        if (servers.length === 0) throw new Error('No accessible Plex servers found for this account.');
+
+        const fetchResult = await fetchHistoryForServers({
+          servers,
+          creds,
+          account,
+          since: null,
+          sinceByServer,
+          throwOnServerErrors: false,
+        });
+        errors.push(...fetchResult.errors);
+        if (fetchResult.successfulServers.length === 0 && fetchResult.errors.length > 0) {
+          throw new Error('No Plex source completed successfully');
+        }
+
+        const valid = filterValidMediaEventDates(fetchResult.events);
+        errors.push(...valid.errors);
+        skipped += valid.skipped;
+        const enriched = trustConnectorMediaEvents(valid.events, ctx);
         const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
         ingested = result.inserted;
         skipped += result.skipped;
