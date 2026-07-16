@@ -2,7 +2,7 @@ export interface Capabilities {
   name: string;
   namespaces: string[];
   max_access_level: 'normal' | 'sensitive' | 'secret';
-  capabilities: { read: boolean; write: boolean; delete: boolean; admin: boolean };
+  capabilities: { read: boolean; write: boolean; delete: boolean; admin: boolean; export: boolean; import: boolean };
 }
 
 export interface MemoryRecord {

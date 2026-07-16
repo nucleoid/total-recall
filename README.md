@@ -110,11 +110,12 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  │ namespace   TEXT    │    │
         │  │ tags        TEXT[]  │    │
         │  │ metadata    JSONB   │    │
+        │  │ client_id   TEXT    │    │
         │  │ agent_id    UUID FK │    │
         │  │ session_id  TEXT    │    │
         │  │ document_id UUID FK │    │
         │  │ chunk_index INT     │    │
-        │  │ source_key  TEXT UQ │    │
+        │  │ source_key  TEXT    │    │
         │  │ supersedes_id UUID  │    │
         │  │ superseded_at TS    │    │
         │  │ revision    INT     │    │
@@ -196,6 +197,23 @@ Store a single memory/fact with metadata. Optionally track which agent stored it
 Ordinary stores semantically deduplicate by default. At cosine similarity `>= MEMORY_DEDUPE_THRESHOLD` (default `0.95`), the best active memory in the same namespace, access level, and embedding model is returned and boosted instead of inserting another row. Its content, metadata, and provenance are preserved; access count/timestamps are updated and tags are unioned. Document chunks and source-key/idempotent stores are excluded. Send `"dedupe": false` when similar content is intentionally distinct. Results always include `id`, `namespace`, `created`, `deduplicated`, and nullable `expires_at`; a dedupe hit also includes `similarity`.
 
 For ephemeral scratch state, pass `"ttl": <seconds>` (a positive integer up to 2147483647). PostgreSQL computes `expires_at` once from statement time. Expiring stores default to `dedupe:false`, and `ttl` with `dedupe:true` is rejected; exact idempotency-key retries remain supported. At `expires_at` the row is logically absent from reads, search, counts, graph/reflection inputs, updates, and access boosts even before cleanup. `ttl` is available in any authorized namespace, but `working` is recommended and must be explicitly added to the API key namespace ACL. `memory_store_document` does not accept TTL.
+
+### Memory-only export and import feed (V1)
+
+Migration 034 adds an instance UUID and changes source-key identity from global to tenant-local `(client_id, source_key)`. Stop watcher, preseed, consolidation, distillation, and transfer writers while applying that migration; old and new source-key writers must not overlap.
+
+V1 is a versioned UTF-8 JSONL **memory-only feed, not a faithful backup**. The first line is a manifest and later lines are typed memory records. It intentionally omits vectors, document records and topology, local client/agent/document UUIDs, deletion tombstones, supersession relationships, and retrieval/relevance counters. Null local source keys are exported as deterministic keys derived from the source instance and memory UUID without changing the source row. Import matches only `(destination key, source_key)`, never similarity-merges, re-embeds every insert with the destination profile, skips exact replays, and reports divergent matches as conflicts without overwrite. V1 does not synchronize deletions.
+
+Use a dedicated credential with explicit `export` and/or `import` permission and the smallest namespace/access-level ACL:
+
+```bash
+npm run create-key -- --name transfer --namespaces shared,work --permissions export,import --max-access-level normal
+npm run memory:export -- --output local.memory-export.jsonl
+npm run memory:import -- --input local.memory-export.jsonl --dry-run
+npm run memory:import -- --input local.memory-export.jsonl --checkpoint local.memory-import-result.json
+```
+
+The REST routes stream `application/x-ndjson`; import also accepts gzip and commits batches of at most 100. Export uses stable keyset traversal but is not a point-in-time snapshot, so concurrent source writes may appear or be omitted. A failed later batch does not roll back earlier batches. The response/checkpoint reports the last committed line and record; resume with `--resume-line <line>`. Export files contain plaintext memory content and metadata and are created mode `0600`; existing output files are not overwritten. Normal rows are exported by default. `--include-sensitive` requires the explicit `--acknowledge-plaintext-sensitive` flag and a key whose access ceiling permits sensitive/secret rows. Back up the destination with a real database backup before import.
 
 ```bash
 npm run create-key -- --name scratch-agent --namespaces shared,working --permissions read,write
@@ -337,6 +355,8 @@ All `/api/*` endpoints require `Authorization: Bearer tr_<key>`. `/health` is pu
 | POST | `/api/search` | Hybrid semantic + keyword search |
 | POST | `/api/store` | Store a single memory |
 | POST | `/api/store-document` | Store a chunked document |
+| GET | `/api/transfer/export` | Stream the V1 memory-only JSONL feed (`export`) |
+| POST | `/api/transfer/import` | Preflight/import the V1 JSONL feed (`import`) |
 | DELETE | `/api/memories` | Soft-delete matching memories (explicit `delete` permission) |
 | GET | `/api/stats` | Memory statistics (admin) |
 | GET | `/api/agents` | List registered agents and counts (`admin` + `read`) |

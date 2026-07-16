@@ -30,6 +30,8 @@ test('health is public while every documented API operation requires bearer auth
     ['post', '/api/search'],
     ['post', '/api/store'],
     ['post', '/api/store-document'],
+    ['get', '/api/transfer/export'],
+    ['post', '/api/transfer/import'],
     ['delete', '/api/memories'],
     ['get', '/api/stats'],
     ['get', '/api/agents'],
@@ -69,6 +71,37 @@ test('global observability and media administration require explicit admin permi
     assert.equal(response.status, 403, `${method.toUpperCase()} ${path}`);
     assert.match(response.body.error, /admin/);
   }
+});
+
+test('transfer routes require their dedicated permissions before processing feeds', async () => {
+  setServerTestOverrides({ validateKey: async () => auth(['read', 'write']) });
+  const deniedExport = await request(app).get('/api/transfer/export').set('Authorization', token);
+  assert.equal(deniedExport.status, 403);
+  assert.match(deniedExport.body.error, /export/);
+
+  const deniedImport = await request(app).post('/api/transfer/import')
+    .set('Authorization', token)
+    .set('Content-Type', 'application/x-ndjson')
+    .send('{}\n');
+  assert.equal(deniedImport.status, 403);
+  assert.match(deniedImport.body.error, /import/);
+});
+
+test('manifest-only transfer import validates as an empty committed feed', async () => {
+  setServerTestOverrides({ validateKey: async () => auth(['import']) });
+  const manifest = {
+    type: 'manifest', format: 'total-recall-memory-feed', version: { major: 1, minor: 0 },
+    source_instance_id: '11111111-1111-4111-8111-111111111111',
+    exported_at: '2026-07-17T00:00:00.000Z',
+  };
+  const response = await request(app).post('/api/transfer/import')
+    .set('Authorization', token)
+    .set('Content-Type', 'application/x-ndjson')
+    .send(`${JSON.stringify(manifest)}\n`);
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.inserted, 0);
+  assert.equal(response.body.last_committed_line, 1);
+  assert.equal(response.body.last_committed_record, 0);
 });
 
 test('shared Zod contracts reject invalid bodies and query coercions as 400', async () => {

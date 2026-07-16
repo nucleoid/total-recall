@@ -109,7 +109,7 @@ test('embeds a deduplicated batch before one atomic transaction and uses transac
 
   assert.equal(committed, 2);
   assert.deepEqual(events, ['embed:replacement|other', 'BEGIN', "SELECT set_config('app.current_namespace', 'personal', true)", 'insert', 'COMMIT']);
-  assert.match(queries[2].text, /INSERT INTO memories[\s\S]*VALUES[\s\S]*ON CONFLICT \(source_key\)/);
+  assert.match(queries[2].text, /INSERT INTO memories[\s\S]*VALUES[\s\S]*ON CONFLICT \(client_id, source_key\)/);
   assert.equal(queries[2].values?.length, 22);
   assert.equal(queries[2].values?.[0], 'replacement');
   assert.equal(queries[2].values?.[6], 'same');

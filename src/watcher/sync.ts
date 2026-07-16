@@ -37,7 +37,7 @@ export interface FileSyncInput {
 const UPSERT_SQL = `
 INSERT INTO memories (id, content, embedding, source, namespace, tags, metadata, client_id, source_key, agent_id, embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from)
 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'file-sync', $7, $8, $9, $10, $11, 'synced', statement_timestamp())
-ON CONFLICT (source_key) DO UPDATE SET
+ON CONFLICT (client_id, source_key) DO UPDATE SET
   content = EXCLUDED.content,
   embedding = EXCLUDED.embedding,
   embedding_provider = EXCLUDED.embedding_provider,

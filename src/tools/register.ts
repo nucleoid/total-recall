@@ -16,6 +16,8 @@ import { listSchema, memoryList } from './list.js';
 import { statsSchema, memoryStats } from './stats.js';
 import { forgetSchema, memoryForget } from './forget.js';
 import { updateSchema, memoryUpdate } from './update.js';
+import { memoryExport, memoryExportSchema } from './export.js';
+import { memoryImport, memoryImportSchema } from './import.js';
 import { MAX_DELETION_REASON_CHARS, MAX_FORGET_IDS } from '../memory-lifecycle.js';
 import { mediaSearchSchema, mediaSearch } from './media-search.js';
 import { graphSchema, memoryGraph } from './graph.js';
@@ -271,6 +273,35 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'memory_export',
+    description: 'Return one bounded page of the versioned V1 memory-only transfer feed. This is not a faithful backup: vectors, documents, topology, counters, and local foreign keys are not transferred. Sensitive/secret rows require include_sensitive=true.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        namespaces: { type: 'array', maxItems: 100, items: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS } },
+        include_sensitive: { type: 'boolean', default: false },
+        acknowledge_plaintext_sensitive: { type: 'boolean', default: false, description: 'Required when include_sensitive is true; confirms records are returned as plaintext.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 },
+        cursor: { type: 'string', minLength: 1, maxLength: 4096 },
+      },
+    },
+  },
+  {
+    name: 'memory_import',
+    description: 'Preflight or commit one bounded V1 memory-feed batch. Destination embeddings are always generated locally; divergent source-key matches are reported as conflicts and never overwritten.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        manifest: { type: 'object', description: 'The V1 manifest record returned by memory_export' },
+        records: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'object' } },
+        dry_run: { type: 'boolean', default: false },
+      },
+      required: ['manifest', 'records'],
+    },
+  },
+  {
     name: 'memory_stats',
     description: 'Get statistics about the memory store (admin-only).',
     inputSchema: {
@@ -432,6 +463,16 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
           const params = listNamespacesSchema.parse(args);
           const result = await memoryListNamespaces(params, auth);
           return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        }
+        case 'memory_export': {
+          const params = memoryExportSchema.parse(args);
+          const result = await memoryExport(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
+        case 'memory_import': {
+          const params = memoryImportSchema.parse(args);
+          const result = await memoryImport(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'memory_stats': {
           const params = statsSchema.parse(args);

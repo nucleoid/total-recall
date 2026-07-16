@@ -113,6 +113,7 @@ const MIGRATION_OWNED_TABLES = [
   'documents',
   'entities',
   'entity_enrichment_queue',
+  'instance_settings',
   'media_events',
   'memories',
   'memory_consolidation_checkpoints',
