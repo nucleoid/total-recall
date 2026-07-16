@@ -14,7 +14,9 @@ export async function memoryStats(
 
   const ns = auth.namespaces;
   const scope = dbScopeFromAuth(auth);
-  const accessWhere = `deleted_at IS NULL AND to_jsonb(memories)->>'consolidated_into_id' IS NULL AND ${accessLevelSql('access_level', '$2')}`;
+  const accessWhere = `deleted_at IS NULL
+    AND (expires_at IS NULL OR expires_at > statement_timestamp())
+    AND to_jsonb(memories)->>'consolidated_into_id' IS NULL AND ${accessLevelSql('access_level', '$2')}`;
   const values = [ns, auth.maxAccessLevel];
 
   const [totalRes, byNsRes, bySrcRes, docsRes, oldestRes, newestRes] = await Promise.all([

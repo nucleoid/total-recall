@@ -87,6 +87,7 @@ export async function inventoryNamespaces(client: QueryClient): Promise<Namespac
     SELECT namespace, count(*)::text AS count
     FROM public.memories
     WHERE deleted_at IS NULL
+      AND (expires_at IS NULL OR expires_at > statement_timestamp())
     GROUP BY namespace
     ORDER BY namespace
   `);

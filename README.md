@@ -193,7 +193,14 @@ Store a single memory/fact with metadata. Optionally track which agent stored it
 
 `access_level` defaults to `normal` and may be `normal`, `sensitive`, or `secret`. The caller's API key must have a `max_access_level` at least as high as the memory being stored.
 
-Ordinary stores semantically deduplicate by default. At cosine similarity `>= MEMORY_DEDUPE_THRESHOLD` (default `0.95`), the best active memory in the same namespace, access level, and embedding model is returned and boosted instead of inserting another row. Its content, metadata, and provenance are preserved; access count/timestamps are updated and tags are unioned. Document chunks and source-key/idempotent stores are excluded. Send `"dedupe": false` when similar content is intentionally distinct. Results always include `id`, `namespace`, `created`, and `deduplicated`; a dedupe hit also includes `similarity`.
+Ordinary stores semantically deduplicate by default. At cosine similarity `>= MEMORY_DEDUPE_THRESHOLD` (default `0.95`), the best active memory in the same namespace, access level, and embedding model is returned and boosted instead of inserting another row. Its content, metadata, and provenance are preserved; access count/timestamps are updated and tags are unioned. Document chunks and source-key/idempotent stores are excluded. Send `"dedupe": false` when similar content is intentionally distinct. Results always include `id`, `namespace`, `created`, `deduplicated`, and nullable `expires_at`; a dedupe hit also includes `similarity`.
+
+For ephemeral scratch state, pass `"ttl": <seconds>` (a positive integer up to 2147483647). PostgreSQL computes `expires_at` once from statement time. Expiring stores default to `dedupe:false`, and `ttl` with `dedupe:true` is rejected; exact idempotency-key retries remain supported. At `expires_at` the row is logically absent from reads, search, counts, graph/reflection inputs, updates, and access boosts even before cleanup. `ttl` is available in any authorized namespace, but `working` is recommended and must be explicitly added to the API key namespace ACL. `memory_store_document` does not accept TTL.
+
+```bash
+npm run create-key -- --name scratch-agent --namespaces shared,working --permissions read,write
+# Then store task state through MCP/REST with namespace=working and ttl=3600.
+```
 
 ### `memory_update`
 Patch an active current memory by UUID. At least one of `content`, `tags`, `metadata`, or `supersedes` is required; omitted fields are unchanged, while supplied tags and metadata replace the complete value (including `[]` and `{}`). Content must be nonblank and is re-embedded only when changed. Provenance, namespace, source, access level, document identity, creation/deletion state, and existing lifecycle links are immutable.
@@ -673,6 +680,12 @@ The finalizer runs each `ALTER TABLE ... VALIDATE CONSTRAINT` as a separate auto
 
 During rollback or incident response, disable `memory_update` and stop link creation first. Before any link exists, the runtime can be rolled back while retaining the additive schema. Once links exist, rollback is roll-forward-only: retain the columns, trigger, indexes, links, durable predecessor markers, and supersession-aware readers; never deploy an old reader that ranks historical rows as current and never drop or clear populated lifecycle fields.
 
+## TTL maintenance rollout
+
+Migration 032 adds nullable `memories.expires_at`, its partial purge index, and cascade behavior for content-free evidence/lineage links. Existing rows remain permanent. Keep `npm run decay:update` (or `npm run maintenance`) scheduled: it hard-deletes expired rows in overlap-safe batches before decay and emits one aggregate `ttl_purge` audit event per nonempty batch. `TTL_PURGE_BATCH_SIZE` defaults to 1000 (range 1–100000). The command requires the existing owner/BYPASSRLS maintenance connection and exits nonzero on purge or decay failure.
+
+Deploy migration 032 before TTL-aware servers and grant `working` only to keys that need scratch state. Do not roll application code back while future-expiry rows remain: old readers do not enforce logical expiry. Stop TTL writes and purge those rows first.
+
 ## Namespace Design
 
 | Namespace | Contents | Access |
@@ -683,6 +696,7 @@ During rollback or incident response, disable `memory_update` and stop link crea
 | `financial` | Staking, retirement, sensitive | Home agents, restricted |
 | `shared` | General knowledge, non-sensitive | All agents |
 | `media` | Viewing/listening history rollups from connectors | Home agents |
+| `working` | Expiring task/scratch state stored with `ttl` | Explicitly granted agents only |
 
 Media rollups have exactly one kind tag: `music`, `tv`, `movie`, or `unknown`. Classification uses trusted Plex type metadata first, canonical artist/show/episode fields next, and Spotify/YouTube Music play semantics after that; generic events are `unknown` rather than assumed movies. Existing linked rollups can be inspected and optionally repaired without re-embedding content:
 

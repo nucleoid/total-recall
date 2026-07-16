@@ -30,6 +30,7 @@ export interface Memory {
   consolidated_at?: Date | null;
   origin_namespace?: string | null;
   insight_content_hash?: string | null;
+  expires_at?: Date | null;
 }
 
 export interface ApiKey {
@@ -64,6 +65,8 @@ export interface StoreParams {
   session_id?: string;
   idempotency_key?: string;
   dedupe?: boolean;
+  /** Positive integer lifetime in seconds. */
+  ttl?: number;
 }
 
 export interface StoreResult {
@@ -73,6 +76,7 @@ export interface StoreResult {
   deduplicated: boolean;
   similarity?: number;
   idempotency_key_honored?: true;
+  expires_at: Date | null;
 }
 
 export interface UpdateParams {

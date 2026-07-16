@@ -65,7 +65,9 @@ paths:
         By default, an active near-duplicate in the same namespace, access level,
         and embedding space is boosted and returned instead of inserting a row.
         Document chunks and source-key stores are excluded. Send dedupe=false to
-        force insertion.
+        force insertion. Optional ttl is a positive integer lifetime in seconds;
+        expiring writes bypass semantic deduplication and are logically absent at
+        expires_at even if physical purge has not run yet.
       requestBody:
         required: true
         content:
@@ -704,10 +706,15 @@ components:
         dedupe:
           type: boolean
           default: true
-          description: Set false to force insertion despite a near semantic match.
+          description: Set false to force insertion despite a near semantic match. Cannot be true when ttl is present.
+        ttl:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: Lifetime in seconds, computed from PostgreSQL statement time. Omitted means no expiry.
     StoreResponse:
       type: object
-      required: [id, namespace, created, deduplicated]
+      required: [id, namespace, created, deduplicated, expires_at]
       properties:
         id:
           type: string
@@ -726,6 +733,10 @@ components:
         idempotency_key_honored:
           type: boolean
           const: true
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: Database-computed logical expiry, or null for permanent memory.
     StoreDocumentRequest:
       type: object
       required: [title, content]
@@ -844,6 +855,7 @@ components:
         - client_id
         - memory_kind
         - event_at
+        - expires_at
         - relevance_score
         - relevance_base_score
         - decay_rate
@@ -879,6 +891,9 @@ components:
           type: string
           format: date-time
         event_at:
+          type: [string, "null"]
+          format: date-time
+        expires_at:
           type: [string, "null"]
           format: date-time
         relevance_score:

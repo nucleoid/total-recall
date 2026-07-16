@@ -8,7 +8,13 @@ import type { AuthContext, ForgetResult } from './types.js';
 export const MAX_FORGET_IDS = 100;
 export const MAX_FORGET_ROWS = 100;
 export const MAX_DELETION_REASON_CHARS = 512;
-export const ACTIVE_MEMORY_PREDICATE = 'deleted_at IS NULL';
+export const ACTIVE_MEMORY_PREDICATE = "deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())";
+
+/** SQL visibility predicate for a memory alias. Expiry is half-open at expires_at. */
+export function activeMemoryPredicate(alias?: string): string {
+  const prefix = alias ? `${alias}.` : '';
+  return `${prefix}deleted_at IS NULL AND (${prefix}expires_at IS NULL OR ${prefix}expires_at > statement_timestamp())`;
+}
 
 const uuid = z.string().uuid().transform(value => value.toLowerCase());
 
@@ -59,7 +65,7 @@ export async function forgetMemories(
   return withScopedClient(dbScopeFromAuth(auth), async client => {
     const values: unknown[] = [auth.namespaces, auth.maxAccessLevel];
     const conditions = [
-      'm.deleted_at IS NULL',
+      activeMemoryPredicate('m'),
       'm.namespace = ANY($1::text[])',
       accessLevelSql('m.access_level', '$2'),
     ];
@@ -98,7 +104,9 @@ export async function forgetMemories(
        SET deleted_at = statement_timestamp(),
            deleted_by_client_id = $2::uuid,
            deletion_reason = $3
-       WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL
+       WHERE id = ANY($1::uuid[])
+         AND deleted_at IS NULL
+         AND (expires_at IS NULL OR expires_at > statement_timestamp())
        RETURNING id, namespace`,
       [mutationIds, auth.keyId, params.reason ?? null],
     );

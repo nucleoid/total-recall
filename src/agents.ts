@@ -82,6 +82,7 @@ export async function listAgents(auth: AuthContext, scope: DbScope): Promise<any
      FROM agents a
      LEFT JOIN memories m ON m.agent_id = a.id
        AND m.deleted_at IS NULL
+       AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
        AND to_jsonb(m)->>'consolidated_into_id' IS NULL
        AND (($4::boolean AND m.client_id = a.api_key_id::text) OR (NOT $4::boolean AND m.client_id = $1))
        AND m.namespace = ANY($2)

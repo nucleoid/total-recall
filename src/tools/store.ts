@@ -23,7 +23,9 @@ import {
   metadataSchema,
 } from '../http-limits.js';
 
-export const storeSchema = z.object({
+export const MAX_MEMORY_TTL_SECONDS = 2_147_483_647;
+
+const storeInputSchema = z.object({
   content: z.string().min(1).max(MEMORY_CONTENT_MAX_CHARS),
   namespace: z.string().min(1).max(TEXT_FIELD_MAX_CHARS).default('shared'),
   source: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
@@ -36,8 +38,24 @@ export const storeSchema = z.object({
   agent_runtime: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
   session_id: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
   idempotency_key: z.string().min(1).max(512).optional(),
-  dedupe: z.boolean().default(true),
+  dedupe: z.boolean().optional(),
+  ttl: z.number().int().min(1).max(MAX_MEMORY_TTL_SECONDS).optional(),
+}).superRefine((value, ctx) => {
+  if (value.ttl !== undefined && value.dedupe === true) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['dedupe'],
+      message: 'dedupe:true cannot be combined with ttl; expiring stores must remain distinct',
+    });
+  }
 });
+
+export const storeSchema = storeInputSchema.transform(value => ({
+  ...value,
+  // Expiring writes bypass semantic dedupe. Exact idempotency/source-key
+  // identity remains available and has explicit expiry replacement semantics.
+  dedupe: value.dedupe ?? value.ttl === undefined,
+}));
 
 export function parseMemoryDedupeThreshold(value: string | undefined): number {
   if (value === undefined) return 0.95;
@@ -66,6 +84,14 @@ export async function memoryStore(
   runtime: MemoryStoreRuntimeOptions = {},
 ): Promise<StoreResult> {
   checkPermission(auth, 'write');
+  if (params.ttl !== undefined && (
+    !Number.isSafeInteger(params.ttl) || params.ttl < 1 || params.ttl > MAX_MEMORY_TTL_SECONDS
+  )) {
+    throw new Error(`ttl must be an integer between 1 and ${MAX_MEMORY_TTL_SECONDS} seconds`);
+  }
+  if (params.ttl !== undefined && params.dedupe === true) {
+    throw new Error('dedupe:true cannot be combined with ttl');
+  }
 
   const ns = params.namespace;
   const allowed = filterNamespaces([ns], auth.namespaces);
@@ -109,6 +135,7 @@ export async function memoryStore(
     agentId,
     params.session_id ?? null,
     ...embeddingDescriptorParams(),
+    params.ttl ?? null,
   ];
 
   const semanticMemory: SemanticMemoryInsert = {
@@ -126,7 +153,7 @@ export async function memoryStore(
   const reviseBelief = runtime.reviseBelief ?? maybeReviseBelief;
   // Retry-safe/idempotent writes are updates to an existing observation, not a
   // new belief event. They never query candidates or disclose text to #53.
-  const contradictionPolicy = params.idempotency_key
+  const contradictionPolicy = params.idempotency_key || params.ttl !== undefined
     ? undefined
     : (runtime.contradictionPolicy ?? contradictionPolicyFromEnv());
 
@@ -136,7 +163,7 @@ export async function memoryStore(
       allowMutation: true,
       metric: runtime.contradictionMetric,
     });
-    if (revised) return { ...revised, created: true, deduplicated: false };
+    if (revised) return { ...revised, created: true, deduplicated: false, expires_at: null };
   }
 
   const scheduleShadowAfterCommit = (storedId: string): void => {
@@ -154,7 +181,7 @@ export async function memoryStore(
 
   if (!params.idempotency_key) {
     const result = await withScopedClient(dbScopeFromAuth(auth), async (client): Promise<StoreResult> => {
-      if (params.dedupe !== false) {
+      if (params.ttl === undefined && params.dedupe !== false) {
         // Serialize semantic identity decisions within the security boundary. The
         // embedding is deliberately computed before this short-lived lock.
         await client.query(
@@ -175,6 +202,7 @@ export async function memoryStore(
              AND m.source_key IS NULL
              AND m.document_id IS NULL
              AND m.deleted_at IS NULL
+             AND m.expires_at IS NULL
              AND m.superseded_at IS NULL
              AND m.valid_to IS NULL
              AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
@@ -191,7 +219,7 @@ export async function memoryStore(
         const match = candidate.rows[0];
         const similarity = match?.similarity == null ? Number.NaN : Number(match.similarity);
         if (match && Number.isFinite(similarity) && similarity >= MEMORY_DEDUPE_THRESHOLD) {
-          const boosted = await client.query<{ id: string; namespace: string }>(
+          const boosted = await client.query<{ id: string; namespace: string; expires_at: Date | null }>(
             `UPDATE memories
              SET access_count = COALESCE(access_count, 0) + 1,
                  accessed_at = statement_timestamp(),
@@ -206,10 +234,11 @@ export async function memoryStore(
                  updated_at = statement_timestamp()
              WHERE id = $1::uuid
                AND deleted_at IS NULL
+               AND (expires_at IS NULL OR expires_at > statement_timestamp())
                AND superseded_at IS NULL
                AND valid_to IS NULL
                AND consolidated_into_id IS NULL
-             RETURNING id, namespace`,
+             RETURNING id, namespace, expires_at`,
             [match.id, params.tags],
           );
           if (boosted.rows.length !== 1) {
@@ -217,6 +246,7 @@ export async function memoryStore(
           }
           return {
             ...boosted.rows[0],
+            expires_at: boosted.rows[0].expires_at ?? null,
             created: false,
             deduplicated: true,
             similarity,
@@ -224,13 +254,14 @@ export async function memoryStore(
         }
       }
 
-      const inserted = await client.query<{ id: string; namespace: string }>(
-        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from)
-         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'semantic', statement_timestamp())
-         RETURNING id, namespace`,
+      const inserted = await client.query<{ id: string; namespace: string; expires_at: Date | null }>(
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from, expires_at)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'semantic', statement_timestamp(),
+           CASE WHEN $14::bigint IS NULL THEN NULL ELSE statement_timestamp() + $14::double precision * interval '1 second' END)
+         RETURNING id, namespace, expires_at`,
         values,
       );
-      return { ...inserted.rows[0], created: true, deduplicated: false };
+      return { ...inserted.rows[0], expires_at: inserted.rows[0].expires_at ?? null, created: true, deduplicated: false };
     });
     if (result.created) scheduleShadowAfterCommit(result.id);
     return result;
@@ -251,8 +282,9 @@ export async function memoryStore(
       const currentGuard = schema !== 'legacy' ? '\n           AND memories.superseded_at IS NULL' : '';
       const consolidationGuard = schema === 'consolidation' ? '\n           AND memories.consolidated_into_id IS NULL' : '';
       const upsert = await client.query(
-        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key${columns})
-         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14${insertedValues})
+        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key${columns}, expires_at)
+         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15${insertedValues},
+           CASE WHEN $14::bigint IS NULL THEN NULL ELSE statement_timestamp() + $14::double precision * interval '1 second' END)
          ON CONFLICT (source_key) DO UPDATE SET
            content = EXCLUDED.content,
            embedding = EXCLUDED.embedding,
@@ -266,12 +298,13 @@ export async function memoryStore(
            access_level = EXCLUDED.access_level,
            client_id = EXCLUDED.client_id,
            agent_id = EXCLUDED.agent_id,
-           session_id = EXCLUDED.session_id,${kindUpdate}
+           session_id = EXCLUDED.session_id,
+           expires_at = EXCLUDED.expires_at,${kindUpdate}
            updated_at = NOW()
          WHERE memories.deleted_at IS NULL${currentGuard}${consolidationGuard}
-           AND memories.namespace = ANY($15::text[])
-           AND EXCLUDED.namespace = ANY($15::text[])
-         RETURNING id, namespace, (xmax = 0) AS created`,
+           AND memories.namespace = ANY($16::text[])
+           AND EXCLUDED.namespace = ANY($16::text[])
+         RETURNING id, namespace, expires_at, (xmax = 0) AS created`,
         [...values, sourceKey, auth.namespaces]
       );
       if (upsert.rows.length > 0) return upsert;
@@ -342,13 +375,14 @@ export async function memoryStore(
     }
     throw error;
   }
-  const stored = res.rows[0] as { id: string; namespace: string; created?: boolean };
+  const stored = res.rows[0] as { id: string; namespace: string; expires_at: Date | null; created?: boolean };
   return {
     id: stored.id,
     namespace: stored.namespace,
     created: stored.created ?? true,
     deduplicated: false,
     idempotency_key_honored: true,
+    expires_at: stored.expires_at ?? null,
   };
 }
 

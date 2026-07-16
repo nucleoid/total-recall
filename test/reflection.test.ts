@@ -115,7 +115,7 @@ test('dry-run materializes a bounded estimate without provider calls or database
         id, revision: 0, access_level: 'normal', created_at: '2026-07-01T00:00:00Z',
         accessed_at: '2026-07-01T00:00:00Z', access_count: index,
       })) };
-      if (text === 'SELECT content FROM memories WHERE id = $1::uuid') {
+      if (text.includes('SELECT content FROM memories WHERE id = $1::uuid')) {
         return { rows: [{ content: content.get(params?.[0] as string) }] };
       }
       return { rows: [], rowCount: 0 };

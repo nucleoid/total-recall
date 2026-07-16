@@ -53,10 +53,11 @@ function updateResultColumns(validitySchema: boolean): string {
   return `m.id, m.content, m.source, m.namespace, m.tags, m.metadata,
   m.access_level, m.created_at, m.updated_at, m.document_id, m.chunk_index,
   ${validityColumns}
-  m.superseded_at, m.revision,
+  m.superseded_at, m.revision, m.expires_at,
   (SELECT predecessor.id FROM memories predecessor
    WHERE predecessor.id = m.supersedes_id
      AND predecessor.deleted_at IS NULL
+     AND (predecessor.expires_at IS NULL OR predecessor.expires_at > statement_timestamp())
      AND predecessor.namespace = m.namespace
      AND predecessor.namespace = ANY($2::text[])
      AND ${accessLevelSql('predecessor.access_level', '$3')}
@@ -75,6 +76,7 @@ async function readCurrentTarget(id: string, auth: AuthContext): Promise<UpdateR
      FROM memories m
      WHERE m.id = $1::uuid
        AND m.deleted_at IS NULL
+       AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
        AND m.superseded_at IS NULL
        AND to_jsonb(m)->>'consolidated_into_id' IS NULL
        AND to_jsonb(m)->>'memory_kind' IS DISTINCT FROM 'consolidation'
@@ -135,6 +137,7 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
          FROM memories m
          WHERE m.id = ANY($1::uuid[])
            AND m.deleted_at IS NULL
+           AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
            AND m.superseded_at IS NULL
            AND to_jsonb(m)->>'consolidated_into_id' IS NULL
            AND to_jsonb(m)->>'memory_kind' IS DISTINCT FROM 'consolidation'
@@ -155,6 +158,9 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
       }
       if (predecessor && predecessor.namespace !== target.namespace) {
         throw new MemoryConflictError('Successor and predecessor must be in the same namespace');
+      }
+      if (predecessor && (predecessor.expires_at != null || target.expires_at != null)) {
+        throw new MemoryConflictError('An expiring memory cannot participate in durable supersession history');
       }
       if (params.supersedes && target.supersedes_id !== null) {
         throw new MemoryConflictError('The memory already has an immutable predecessor link');
@@ -216,7 +222,10 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
         assignments.push(`updated_at = ${parameter(timestamp)}::timestamptz`);
         values.push(target.id);
         await client.query(
-          `UPDATE memories SET ${assignments.join(', ')} WHERE id = $${values.length}::uuid AND to_jsonb(memories)->>'consolidated_into_id' IS NULL AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'`,
+          `UPDATE memories SET ${assignments.join(', ')} WHERE id = $${values.length}::uuid
+             AND (expires_at IS NULL OR expires_at > statement_timestamp())
+             AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
+             AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'`,
           values,
         );
       }
@@ -225,7 +234,9 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
         const validityClosure = validitySchema ? ', valid_to = $1::timestamptz' : '';
         const closed = await client.query(
           `UPDATE memories SET superseded_at = $1::timestamptz${validityClosure}, updated_at = $1::timestamptz
-           WHERE id = $2::uuid AND superseded_at IS NULL AND to_jsonb(memories)->>'consolidated_into_id' IS NULL AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'`,
+           WHERE id = $2::uuid AND superseded_at IS NULL
+             AND expires_at IS NULL
+             AND to_jsonb(memories)->>'consolidated_into_id' IS NULL AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'`,
           [timestamp, predecessor.id],
         );
         if (closed.rowCount !== 1) {
@@ -255,6 +266,7 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
            (SELECT successor.id FROM memories successor
             WHERE successor.supersedes_id = m.id
               AND successor.deleted_at IS NULL
+              AND (successor.expires_at IS NULL OR successor.expires_at > statement_timestamp())
               AND successor.namespace = m.namespace
               AND successor.namespace = ANY($2::text[])
               AND ${accessLevelSql('successor.access_level', '$3')}
@@ -262,6 +274,7 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
          FROM memories m
          WHERE m.id = $1::uuid
            AND m.deleted_at IS NULL
+           AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
            AND m.namespace = ANY($2::text[])
            AND ${accessLevelSql('m.access_level', '$3')}`,
         [target.id, auth.namespaces, auth.maxAccessLevel],
