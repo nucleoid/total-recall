@@ -1,15 +1,33 @@
 openapi: 3.1.0
 info:
   title: Total Recall Memory API
-  description: >-
-    Store and search memories with semantic search. Used by AI assistants to maintain long-term memory.
-    JSON request bodies are limited to 8 MiB and must use identity Content-Encoding. Memory content is
-    limited to 100,000 JavaScript characters; document content to 1048576 UTF-8 bytes; per-request metadata to
-    65536 serialized JSON bytes, depth 16, and 1000 keys total across the metadata value; tags to 100 tags and 256 JavaScript characters per tag.
   version: 1.0.0
+  description: >-
+    Authenticated REST API for memory storage, hybrid search, provenance,
+    observability, and media ingestion. JSON bodies are limited to 8 MiB and
+    only identity Content-Encoding is accepted. Memory content is limited to
+    100,000 JavaScript characters; document content to 1048576 UTF-8 bytes and
+    each embedding chunk to 2,000 UTF-8 bytes. Per-request metadata is limited
+    to 65536 serialized JSON bytes, depth 16, and 1000 keys. Requests accept at
+    most 100 tags and 256 JavaScript characters per tag. Administrative
+    operations require an API key with the explicit admin permission.
 servers:
   - url: https://recall.stakewatch.dev
+security:
+  - bearerAuth: []
 paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Check service health
+      security: []
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
   /api/search:
     post:
       operationId: searchMemories
@@ -19,180 +37,100 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [query]
-              properties:
-                query:
-                  type: string
-                  description: Search query text
-                limit:
-                  type: integer
-                  default: 10
-                  minimum: 1
-                  maximum: 50
-                namespaces:
-                  type: array
-                  items:
-                    type: string
-                  description: Filter to specific namespaces
-                valid_at:
-                  type: string
-                  format: date-time
-                  description: Offset-aware ISO-8601 instant for historical belief validity using [valid_from, valid_to). Available after validity finalization.
+              $ref: "#/components/schemas/SearchRequest"
       responses:
         "200":
-          description: Search results
+          description: Search results, ordered by final_score descending
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  results:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Memory"
-        "401":
-          description: Unauthorized
-        "403":
-          description: Forbidden
+                $ref: "#/components/schemas/SearchResponse"
         "400":
-          description: Invalid search request; malformed JSON returns `{code: "invalid_json"}`.
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
           $ref: "#/components/responses/UnsupportedContentEncoding"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /api/store:
     post:
       operationId: storeMemory
-      summary: Store a new memory
+      summary: Store a memory
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [content, namespace]
-              properties:
-                content:
-                  type: string
-                  description: Memory content text; maximum 100,000 JavaScript characters (UTF-16 code units).
-                namespace:
-                  type: string
-                  description: "Namespace to store in (e.g. work, shared); maximum 512 JavaScript characters."
-                tags:
-                  type: array
-                  maxItems: 100
-                  description: Maximum 100 tags.
-                  items:
-                    type: string
-                    description: Maximum 256 JavaScript characters per tag.
-                metadata:
-                  type: object
-                  description: Per-request maximum 65536 serialized JSON bytes, depth 16, and 1000 keys total across the metadata value.
-                  additionalProperties: true
-                source:
-                  type: string
-                  description: Source identifier (defaults to key name)
-                idempotency_key:
-                  type: string
-                  minLength: 1
-                  maxLength: 512
-                  description: Optional retry key scoped only to the authenticated API key. Reusing it updates the same memory while preserving created_at; callers authorized for both namespaces may move it and may update its access level.
+              $ref: "#/components/schemas/StoreRequest"
       responses:
         "200":
           description: Memory stored
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: string
-                  created:
-                    type: boolean
-                  idempotency_key_honored:
-                    type: boolean
-                    description: Present and true only when an idempotency_key was supplied and honored. Keyed callers should require this acknowledgement before checkpointing.
-        "401":
-          description: Unauthorized
-        "403":
-          description: Forbidden
+                $ref: "#/components/schemas/StoreResponse"
         "400":
           $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/TombstonedIdempotencyKey"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
           $ref: "#/components/responses/UnsupportedContentEncoding"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /api/store-document:
     post:
       operationId: storeDocument
-      summary: Store a full document (auto-chunked for search)
+      summary: Store and automatically chunk a document
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [title, content, namespace]
-              properties:
-                title:
-                  type: string
-                  description: Maximum 512 JavaScript characters.
-                content:
-                  type: string
-                  description: Nonblank document content. The authoritative limit is 1 MiB (1048576 decoded UTF-8 bytes, not characters); content is preserved losslessly in embedding chunks of at most 2,000 UTF-8 bytes.
-                namespace:
-                  type: string
-                  description: Maximum 512 JavaScript characters.
-                tags:
-                  type: array
-                  maxItems: 100
-                  description: Maximum 100 tags.
-                  items:
-                    type: string
-                    description: Maximum 256 JavaScript characters per tag.
-                metadata:
-                  type: object
-                  description: Per-request maximum 65536 serialized JSON bytes, depth 16, and 1000 keys total across the metadata value; applied to stored chunks.
-                  additionalProperties: true
-                source:
-                  type: string
-                idempotency_key:
-                  type: string
-                  description: Optional retry key scoped to the authenticated API key and namespace. Reusing it with a different or incomplete document returns 409. If any visible chunk of the completed document was tombstoned, retry returns the stable idempotency_key_tombstoned 409 and never restores chunks.
+              $ref: "#/components/schemas/StoreDocumentRequest"
       responses:
         "200":
           description: Document stored
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: string
-                  chunks:
-                    type: integer
+                $ref: "#/components/schemas/StoreDocumentResponse"
         "400":
-          description: Invalid request, including blank content or decoded UTF-8 content over 1 MiB; malformed JSON and metadata envelope failures use the documented stable codes.
-          $ref: "#/components/responses/InvalidRequest"
+          description: Invalid request, including blank content or decoded UTF-8 document content over 1 MiB.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
-          description: Unauthorized
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: Forbidden
+          $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/DocumentIdempotencyConflict"
         "413":
-          description: JSON transport envelope exceeds the independently configured HTTP parser limit.
+          description: JSON transport envelope exceeds the 8 MiB parser limit.
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
           $ref: "#/components/responses/UnsupportedContentEncoding"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /api/memories:
     delete:
       operationId: forgetMemories
       summary: Soft-delete matching memories
-      description: Selectors combine with AND. At least one selector is required. Requests without ids require confirm=true. Requires the explicit delete permission; write does not imply delete.
+      description: >-
+        Selectors combine with AND. At least one selector is required. Requests
+        without ids require confirm=true. Requires the delete permission.
       requestBody:
         required: true
         content:
@@ -201,25 +139,263 @@ paths:
               $ref: "#/components/schemas/ForgetRequest"
       responses:
         "200":
-          description: Newly tombstoned authorized memories. Missing and inaccessible IDs are omitted identically.
+          description: Newly tombstoned authorized memories
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ForgetResult"
+                $ref: "#/components/schemas/ForgetResponse"
         "400":
-          description: Invalid, unconfirmed, empty, or over-broad request
+          $ref: "#/components/responses/InvalidRequest"
         "401":
-          description: Unauthorized
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: Missing delete permission or namespace access
+          $ref: "#/components/responses/Forbidden"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
           $ref: "#/components/responses/UnsupportedContentEncoding"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/stats:
+    get:
+      operationId: getMemoryStats
+      summary: Return global memory statistics
+      description: Requires admin and read permissions.
+      responses:
+        "200":
+          description: Memory statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/agents:
+    get:
+      operationId: listAgents
+      summary: List registered agents and their memory counts
+      description: Requires admin and read permissions.
+      responses:
+        "200":
+          description: Registered agents
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agents]
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Agent"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      operationId: registerAgent
+      summary: Register or update an agent
+      description: Requires admin and write permissions. Ownership is always attributed to the authenticated key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentRegistration"
+      responses:
+        "200":
+          description: Registered agent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentBase"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedContentEncoding"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/traces:
+    get:
+      operationId: listRecallTraces
+      summary: List recall traces
+      description: Requires admin and read permissions.
+      parameters:
+        - $ref: "#/components/parameters/TraceLimit"
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/AgentId"
+        - name: session_id
+          in: query
+          schema:
+            type: string
+            maxLength: 512
+      responses:
+        "200":
+          description: Recall traces
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [traces]
+                properties:
+                  traces:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RecallTrace"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/audit:
+    get:
+      operationId: listAuditLog
+      summary: List audit records
+      description: Requires admin and read permissions. PostgreSQL bigint ids are serialized as decimal strings.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - $ref: "#/components/parameters/Offset"
+        - name: action
+          in: query
+          schema:
+            type: string
+            maxLength: 512
+        - $ref: "#/components/parameters/AgentId"
+      responses:
+        "200":
+          description: Audit records
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [audit]
+                properties:
+                  audit:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AuditRecord"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/media/search:
+    post:
+      operationId: searchMedia
+      summary: Search rolled-up media memories by event semantics
+      description: >-
+        played_after and played_before filter structured media event played_at,
+        inclusively. A date-only played_before includes that entire UTC day.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MediaSearchRequest"
+      responses:
+        "200":
+          description: Media search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedContentEncoding"
+        "500":
+          $ref: "#/components/responses/InternalError"
   /api/media/events:
+    get:
+      operationId: listMediaEvents
+      summary: List structured media events
+      description: Requires admin and read permissions. Date comparisons are inclusive.
+      parameters:
+        - name: service
+          in: query
+          schema:
+            type: string
+            maxLength: 512
+        - name: event_type
+          in: query
+          schema:
+            type: string
+            maxLength: 512
+        - name: played_after
+          in: query
+          description: Inclusive lower played_at bound.
+          schema:
+            type: string
+            format: date-time
+        - name: played_before
+          in: query
+          description: Inclusive upper played_at bound.
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 50
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Media events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MediaEvent"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
     post:
       operationId: ingestMediaEvents
-      summary: Ingest media playback or viewing events
+      summary: Ingest structured media events
+      description: Requires admin and write permissions. Client and agent ownership fields supplied by callers are ignored.
       requestBody:
         required: true
         content:
@@ -232,62 +408,94 @@ paths:
                   type: array
                   maxItems: 500
                   items:
-                    type: object
-                    required: [service, event_type, title, played_at]
-                    properties:
-                      service:
-                        type: string
-                      service_id:
-                        type: string
-                      event_type:
-                        type: string
-                      title:
-                        type: string
-                      artist:
-                        type: string
-                      album:
-                        type: string
-                      show:
-                        type: string
-                      season:
-                        type: integer
-                      episode:
-                        type: integer
-                      year:
-                        type: integer
-                      genres:
-                        type: array
-                        items:
-                          type: string
-                      duration_ms:
-                        type: integer
-                      played_ms:
-                        type: integer
-                      completed:
-                        type: boolean
-                      played_at:
-                        type: string
-                        format: date-time
-                      metadata:
-                        type: object
-                        additionalProperties: true
+                    $ref: "#/components/schemas/MediaEventInput"
       responses:
         "200":
-          description: Media events ingested
+          description: Batch upsert result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaUpsertResult"
         "400":
-          description: Invalid media event request; malformed JSON returns `{code: "invalid_json"}`.
+          $ref: "#/components/responses/InvalidRequest"
         "401":
-          description: Unauthorized
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: Forbidden
+          $ref: "#/components/responses/Forbidden"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
           $ref: "#/components/responses/UnsupportedContentEncoding"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/media/rollup:
+    post:
+      operationId: rollupMediaEvents
+      summary: Roll pending media events into searchable memories
+      description: Requires admin and write permissions plus access to the media namespace.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                batch_size:
+                  type: integer
+                  minimum: 1
+                  maximum: 500
+                  default: 50
+      responses:
+        "200":
+          description: Rollup result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaRollupResult"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedContentEncoding"
+        "500":
+          $ref: "#/components/responses/InternalError"
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Total Recall API key (tr_...)
+  parameters:
+    TraceLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Offset:
+      name: offset
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 10000
+        default: 0
+    AgentId:
+      name: agent_id
+      in: query
+      schema:
+        type: string
+        format: uuid
   responses:
     InvalidRequest:
-      description: Malformed JSON returns `{code: "invalid_json"}`; metadata envelope violations on memory, document, and agent requests return `{code: "invalid_metadata"}`; decoded schema violations use the validation-error shape.
+      description: Invalid JSON, per-request metadata envelope, query parameter, or request body
       content:
         application/json:
           schema:
@@ -298,35 +506,43 @@ components:
                   code:
                     type: string
                     enum: [invalid_json, invalid_metadata]
-              - type: object
-                required: [error]
-                properties:
-                  error:
-                    type: string
-                  details:
-                    type: array
-                    items:
-                      type: object
-                      additionalProperties: true
-    PayloadTooLarge:
-      description: Encoded JSON exceeds 8 MiB; returns `{code: "payload_too_large"}`.
-    UnsupportedContentEncoding:
-      description: Non-identity Content-Encoding; returns `{code: "unsupported_content_encoding"}`.
-    TombstonedIdempotencyKey:
-      description: The supplied idempotency key resolves to a deleted memory visible to the authenticated caller. Deleted memories are never restored implicitly.
+              - $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or malformed bearer API key
       content:
         application/json:
           schema:
-            type: object
-            required: [error, code]
-            properties:
-              error:
-                type: string
-              code:
-                type: string
-                enum: [idempotency_key_tombstoned]
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Invalid key, missing permission, or denied namespace/access level
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TombstonedIdempotencyKey:
+      description: The idempotency key resolves to a tombstoned or superseded memory and is never restored implicitly.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - type: object
+                required: [error, code]
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum: [idempotency_key_tombstoned]
+              - type: object
+                required: [error, code]
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum: [source_key_superseded]
     DocumentIdempotencyConflict:
-      description: The key identifies a different request or incomplete write, or a visible completed document has one or more tombstoned chunks. The tombstone case returns the stable idempotency_key_tombstoned code and never restores chunks; inaccessible rows remain undisclosed.
+      description: The key identifies a different or incomplete document, or a completed document with tombstoned chunks.
       content:
         application/json:
           schema:
@@ -337,12 +553,202 @@ components:
                 type: string
               code:
                 type: string
-                description: Present for the stable visible-tombstone conflict.
                 enum: [idempotency_key_tombstoned]
+    PayloadTooLarge:
+      description: Encoded JSON exceeds the 8 MiB transport envelope; returns code payload_too_large.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedContentEncoding:
+      description: Content-Encoding is not identity; returns code unsupported_content_encoding.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
   schemas:
+    JsonObject:
+      type: object
+      additionalProperties: true
+    Error:
+      type: object
+      anyOf:
+        - required: [error]
+        - required: [code]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+        details:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    Health:
+      type: object
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          const: ok
+        version:
+          type: string
+    SearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 100000
+        namespaces:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            minLength: 1
+            maxLength: 512
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+        threshold:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.3
+        tags:
+          $ref: "#/components/schemas/SearchTags"
+        source:
+          type: string
+          minLength: 1
+          maxLength: 512
+        after:
+          type: string
+          format: date-time
+          description: Inclusive created_at lower bound.
+        before:
+          type: string
+          format: date-time
+          description: Inclusive created_at upper bound.
+        valid_at:
+          type: string
+          format: date-time
+          description: Historical validity instant using [valid_from, valid_to).
+        agent_name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        session_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+    StoreRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          description: Maximum 100,000 JavaScript characters (UTF-16 code units).
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 512
+          default: shared
+        source:
+          type: string
+          maxLength: 512
+          description: Defaults to the authenticated key name.
+        tags:
+          $ref: "#/components/schemas/Tags"
+        metadata:
+          $ref: "#/components/schemas/JsonObject"
+        access_level:
+          type: string
+          enum: [normal, sensitive, secret]
+          default: normal
+        agent_name:
+          type: string
+          maxLength: 512
+        agent_type:
+          type: string
+          maxLength: 512
+        agent_model:
+          type: string
+          maxLength: 512
+        agent_runtime:
+          type: string
+          maxLength: 512
+        session_id:
+          type: string
+          maxLength: 512
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 512
+    StoreResponse:
+      type: object
+      required: [id, created]
+      properties:
+        id:
+          type: string
+          format: uuid
+        created:
+          type: boolean
+          const: true
+        idempotency_key_honored:
+          type: boolean
+          const: true
+    StoreDocumentRequest:
+      type: object
+      required: [title, content]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 512
+        content:
+          type: string
+          minLength: 1
+          description: Nonblank; maximum 1048576 decoded UTF-8 bytes.
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 512
+          default: shared
+        tags:
+          $ref: "#/components/schemas/Tags"
+        source:
+          type: string
+          maxLength: 512
+          default: manual
+        metadata:
+          $ref: "#/components/schemas/JsonObject"
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 200
+    StoreDocumentResponse:
+      type: object
+      required: [id, chunks]
+      properties:
+        id:
+          type: string
+          format: uuid
+        chunks:
+          type: integer
+          minimum: 1
     ForgetRequest:
       type: object
-      additionalProperties: false
       properties:
         ids:
           type: array
@@ -359,23 +765,16 @@ components:
         before:
           type: string
           format: date-time
-          description: Strict boundary; only created_at values less than this instant match.
+          description: Strict created_at upper bound.
         tags:
-          type: array
-          minItems: 1
-          maxItems: 100
-          items:
-            type: string
-            minLength: 1
-            maxLength: 256
+          $ref: "#/components/schemas/Tags"
         confirm:
           type: boolean
-          description: Must be true whenever ids is omitted.
         reason:
           type: string
           minLength: 1
           maxLength: 512
-    ForgetResult:
+    ForgetResponse:
       type: object
       required: [forgotten, count]
       properties:
@@ -387,24 +786,102 @@ components:
         count:
           type: integer
           minimum: 0
+    Tags:
+      type: array
+      maxItems: 100
+      items:
+        type: string
+        maxLength: 256
+    SearchTags:
+      type: array
+      maxItems: 100
+      items:
+        type: string
+        minLength: 1
+        maxLength: 256
+    SearchResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Memory"
+    SearchResult:
+      $ref: "#/components/schemas/Memory"
     Memory:
       type: object
+      required:
+        - id
+        - content
+        - metadata
+        - tags
+        - source
+        - namespace
+        - created_at
+        - updated_at
+        - accessed_at
+        - access_count
+        - access_level
+        - client_id
+        - memory_kind
+        - event_at
+        - relevance_score
+        - relevance_base_score
+        - decay_rate
+        - valid_from
+        - valid_to
+        - supersedes_id
+        - superseded_at
+        - superseded_by_id
+        - is_superseded
+        - revision
+        - vec_score
+        - text_score
+        - base_score
+        - relevance
+        - final_score
       properties:
         id:
           type: string
+          format: uuid
         content:
           type: string
-        namespace:
-          type: string
+        metadata:
+          $ref: "#/components/schemas/JsonObject"
         tags:
           type: array
           items:
             type: string
         source:
           type: string
+        namespace:
+          type: string
         created_at:
           type: string
           format: date-time
+        event_at:
+          type: [string, "null"]
+          format: date-time
+        relevance_score:
+          type: [number, "null"]
+        relevance_base_score:
+          type: [number, "null"]
+        decay_rate:
+          type: [number, "null"]
+        updated_at:
+          type: string
+          format: date-time
+        accessed_at:
+          type: string
+          format: date-time
+        access_count:
+          type: integer
+        access_level:
+          type: string
+          enum: [normal, sensitive, secret]
+        client_id:
+          type: string
         memory_kind:
           type: string
           enum: [unspecified, semantic, document_chunk, synced, media_rollup, consolidation]
@@ -420,13 +897,352 @@ components:
         superseded_at:
           type: [string, "null"]
           format: date-time
+        superseded_by_id:
+          type: [string, "null"]
+          format: uuid
         is_superseded:
           type: boolean
+        revision:
+          type: integer
+        vec_score:
+          type: [number, "null"]
+        text_score:
+          type: number
+        base_score:
+          type: number
+        relevance:
+          type: number
         final_score:
           type: number
-  securitySchemes:
-    bearerAuth:
-      type: http
-      scheme: bearer
-security:
-  - bearerAuth: []
+    Stats:
+      type: object
+      required: [total_memories, by_namespace, by_source, total_documents, oldest_memory, newest_memory]
+      properties:
+        total_memories:
+          type: integer
+          minimum: 0
+        by_namespace:
+          type: array
+          items:
+            type: object
+            required: [namespace, count]
+            properties:
+              namespace:
+                type: string
+              count:
+                type: integer
+                minimum: 0
+        by_source:
+          type: array
+          items:
+            type: object
+            required: [source, count]
+            properties:
+              source:
+                type: string
+              count:
+                type: integer
+                minimum: 0
+        total_documents:
+          type: integer
+          minimum: 0
+        oldest_memory:
+          type: [string, "null"]
+          format: date-time
+        newest_memory:
+          type: [string, "null"]
+          format: date-time
+    AgentRegistration:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        type:
+          type: string
+          minLength: 1
+          maxLength: 512
+          default: llm
+        model:
+          type: string
+          minLength: 1
+          maxLength: 512
+        runtime:
+          type: string
+          minLength: 1
+          maxLength: 512
+        parent_agent_name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        metadata:
+          $ref: "#/components/schemas/JsonObject"
+    AgentBase:
+      type: object
+      required: [id, name, type, model, runtime, parent_agent_id, api_key_id, metadata, first_seen_at, last_seen_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          type: string
+        model:
+          type: [string, "null"]
+        runtime:
+          type: [string, "null"]
+        parent_agent_id:
+          type: [string, "null"]
+          format: uuid
+        api_key_id:
+          type: [string, "null"]
+          format: uuid
+        metadata:
+          $ref: "#/components/schemas/JsonObject"
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+    Agent:
+      allOf:
+        - $ref: "#/components/schemas/AgentBase"
+        - type: object
+          required: [memory_count, last_memory_at]
+          properties:
+            memory_count:
+              type: integer
+              minimum: 0
+            last_memory_at:
+              type: [string, "null"]
+              format: date-time
+    RecallTrace:
+      type: object
+      required: [id, session_id, agent_id, client_id, query_text, memory_ids, result_count, scores, duration_ms, created_at, agent_name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        session_id:
+          type: [string, "null"]
+        agent_id:
+          type: [string, "null"]
+          format: uuid
+        client_id:
+          type: [string, "null"]
+        query_text:
+          type: string
+        memory_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        result_count:
+          type: integer
+        scores:
+          type: array
+          items: {}
+        duration_ms:
+          type: [integer, "null"]
+        created_at:
+          type: string
+          format: date-time
+        agent_name:
+          type: [string, "null"]
+    AuditRecord:
+      type: object
+      required: [id, client_id, action, namespace, memory_id, query_text, result_count, created_at, agent_id, session_id, agent_name]
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9]+$"
+        client_id:
+          type: string
+        action:
+          type: string
+        namespace:
+          type: [string, "null"]
+        memory_id:
+          type: [string, "null"]
+          format: uuid
+        query_text:
+          type: [string, "null"]
+        result_count:
+          type: [integer, "null"]
+        created_at:
+          type: string
+          format: date-time
+        agent_id:
+          type: [string, "null"]
+          format: uuid
+        session_id:
+          type: [string, "null"]
+        agent_name:
+          type: [string, "null"]
+    MediaSearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 100000
+        services:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            minLength: 1
+            maxLength: 512
+        event_types:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            minLength: 1
+            maxLength: 512
+        played_after:
+          $ref: "#/components/schemas/MediaDateBound"
+        played_before:
+          $ref: "#/components/schemas/MediaDateBound"
+        tags:
+          $ref: "#/components/schemas/SearchTags"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+        threshold:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.3
+        agent_name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        session_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+    MediaDateBound:
+      oneOf:
+        - type: string
+          format: date
+        - type: string
+          format: date-time
+    MediaEventInput:
+      type: object
+      required: [service, event_type, title, played_at]
+      properties:
+        service:
+          type: string
+          minLength: 1
+          maxLength: 128
+        service_id:
+          type: [string, "null"]
+          maxLength: 512
+        event_type:
+          type: string
+          minLength: 1
+          maxLength: 128
+        title:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        artist:
+          type: [string, "null"]
+          maxLength: 4096
+        album:
+          type: [string, "null"]
+          maxLength: 4096
+        show:
+          type: [string, "null"]
+          maxLength: 4096
+        season:
+          $ref: "#/components/schemas/NullableInt32"
+        episode:
+          $ref: "#/components/schemas/NullableInt32"
+        year:
+          $ref: "#/components/schemas/NullableInt32"
+        genres:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+        duration_ms:
+          $ref: "#/components/schemas/NullableInt32"
+        played_ms:
+          $ref: "#/components/schemas/NullableInt32"
+        completed:
+          type: [boolean, "null"]
+        played_at:
+          type: string
+          description: Timestamp accepted by PostgreSQL; missing offsets are interpreted as UTC.
+        metadata:
+          type: object
+          description: Maximum 16384 serialized JSON characters.
+          additionalProperties: true
+    NullableInt32:
+      type: [integer, "null"]
+      minimum: -2147483648
+      maximum: 2147483647
+    MediaEvent:
+      allOf:
+        - $ref: "#/components/schemas/MediaEventInput"
+        - type: object
+          required: [id, service_id, artist, album, show, season, episode, year, genres, duration_ms, played_ms, completed, metadata, client_id, agent_id, memory_id, created_at]
+          properties:
+            id:
+              type: string
+              format: uuid
+            played_at:
+              type: string
+              format: date-time
+            client_id:
+              type: [string, "null"]
+              format: uuid
+            agent_id:
+              type: [string, "null"]
+              format: uuid
+            memory_id:
+              type: [string, "null"]
+              format: uuid
+            created_at:
+              type: string
+              format: date-time
+    MediaUpsertResult:
+      type: object
+      required: [inserted, skipped, ids]
+      properties:
+        inserted:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+    MediaRollupResult:
+      type: object
+      required: [rolled, failed, errors]
+      properties:
+        rolled:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        errors:
+          type: array
+          items:
+            type: string

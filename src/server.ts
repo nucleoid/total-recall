@@ -27,6 +27,12 @@ import { listAudit } from './audit.js';
 import { parsePublicMediaEventBatch, toTrustedRestMediaEvents, upsertMediaEvents, listMediaEvents } from './media.js';
 import { rollupPendingEvents } from './rollup.js';
 import { JSON_BODY_LIMIT_BYTES, validateMetadataInRequest } from './http-limits.js';
+import {
+  auditQuerySchema,
+  mediaEventsQuerySchema,
+  mediaRollupSchema,
+  tracesQuerySchema,
+} from './http-schemas.js';
 
 dotenv.config();
 
@@ -45,6 +51,24 @@ const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9
 
 type ValidateKey = typeof validateKey;
 type RegisterTools = typeof registerTools;
+export type RestMethod = 'get' | 'post' | 'delete';
+
+const restRouteInventory = new Set<string>();
+
+function registerRestRoute(
+  app: express.Express,
+  method: RestMethod,
+  path: string,
+  ...handlers: express.RequestHandler[]
+): void {
+  restRouteInventory.add(`${method.toUpperCase()} ${path}`);
+  app[method](path, ...handlers);
+}
+
+/** Registration-derived method/path inventory used by the OpenAPI parity test. */
+export function getRestRouteInventory(): string[] {
+  return [...restRouteInventory].sort();
+}
 
 let keyValidator: ValidateKey = validateKey;
 let toolRegistrar: RegisterTools = registerTools;
@@ -241,7 +265,7 @@ app.use((req, res, next) => {
 });
 
 // Health check
-app.get('/health', (_req, res) => {
+registerRestRoute(app, 'get', '/health', (_req, res) => {
   res.json({ status: 'ok', version: '1.0.0' });
 });
 
@@ -400,43 +424,7 @@ function sendApiError(res: express.Response, label: string, err: any): void {
   }
 }
 
-function parseBoundedInteger(raw: unknown, fallback: number, min: number, max: number, name: string): number {
-  if (raw === undefined) return fallback;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < min || value > max) {
-    throw new Error(`Invalid ${name}`);
-  }
-  return value;
-}
-
-function parseUuid(raw: unknown, name: string): string | undefined {
-  if (raw === undefined) return undefined;
-  const value = String(raw);
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
-    throw new Error(`Invalid ${name}`);
-  }
-  return value;
-}
-
-function parseDateFilter(raw: unknown, name: string): string | undefined {
-  if (raw === undefined) return undefined;
-  const value = String(raw);
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) {
-    throw new Error(`Invalid ${name}`);
-  }
-  return value;
-}
-
-function parseSingleString(raw: unknown, name: string): string | undefined {
-  if (raw === undefined) return undefined;
-  if (Array.isArray(raw) || typeof raw !== 'string') {
-    throw new Error(`Invalid ${name}`);
-  }
-  return raw;
-}
-
-app.post('/api/search', async (req, res) => {
+registerRestRoute(app, 'post', '/api/search', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
@@ -448,7 +436,7 @@ app.post('/api/search', async (req, res) => {
   }
 });
 
-app.post('/api/store', async (req, res) => {
+registerRestRoute(app, 'post', '/api/store', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
@@ -464,7 +452,7 @@ app.post('/api/store', async (req, res) => {
   }
 });
 
-app.post('/api/store-document', async (req, res) => {
+registerRestRoute(app, 'post', '/api/store-document', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
@@ -476,7 +464,7 @@ app.post('/api/store-document', async (req, res) => {
   }
 });
 
-app.delete('/api/memories', async (req, res) => {
+registerRestRoute(app, 'delete', '/api/memories', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
@@ -487,10 +475,11 @@ app.delete('/api/memories', async (req, res) => {
   }
 });
 
-app.get('/api/stats', async (req, res) => {
+registerRestRoute(app, 'get', '/api/stats', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
+    checkPermission(auth, 'admin');
     const result = await memoryStats({}, auth);
     res.json(result);
   } catch (err: any) {
@@ -498,10 +487,11 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-app.get('/api/agents', async (req, res) => {
+registerRestRoute(app, 'get', '/api/agents', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
+    checkPermission(auth, 'admin');
     checkPermission(auth, 'read');
     const result = await listAgents(auth, dbScopeFromAuth(auth));
     res.json({ agents: result });
@@ -510,12 +500,13 @@ app.get('/api/agents', async (req, res) => {
   }
 });
 
-app.post('/api/agents', async (req, res) => {
+registerRestRoute(app, 'post', '/api/agents', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
     checkPermission(auth, 'write');
     const params = agentRegisterSchema.parse(req.body);
+    checkPermission(auth, 'admin');
     const result = await upsertAgent({
       ...params,
       api_key_id: auth.keyId,
@@ -526,32 +517,40 @@ app.post('/api/agents', async (req, res) => {
   }
 });
 
-app.get('/api/traces', async (req, res) => {
+registerRestRoute(app, 'get', '/api/traces', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
+    checkPermission(auth, 'admin');
     checkPermission(auth, 'read');
-    const limit = parseBoundedInteger(req.query.limit, 20, 1, 100, 'limit');
-    const offset = parseBoundedInteger(req.query.offset, 0, 0, 10_000, 'offset');
-    const agentId = parseUuid(req.query.agent_id, 'agent_id');
-    const sessionId = parseSingleString(req.query.session_id, 'session_id');
-    const result = await listTraces(auth, dbScopeFromAuth(auth), limit, offset, agentId, sessionId);
+    const params = tracesQuerySchema.parse(req.query);
+    const result = await listTraces(
+      auth,
+      dbScopeFromAuth(auth),
+      params.limit,
+      params.offset,
+      params.agent_id,
+      params.session_id
+    );
     res.json({ traces: result });
   } catch (err: any) {
     sendApiError(res, '/api/traces', err);
   }
 });
 
-app.get('/api/audit', async (req, res) => {
+registerRestRoute(app, 'get', '/api/audit', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
+    checkPermission(auth, 'admin');
     checkPermission(auth, 'read');
-    const limit = parseBoundedInteger(req.query.limit, 50, 1, 200, 'limit');
-    const offset = parseBoundedInteger(req.query.offset, 0, 0, 10_000, 'offset');
-    const action = parseSingleString(req.query.action, 'action');
-    const agentId = parseUuid(req.query.agent_id, 'agent_id');
-    const result = await listAudit(auth, dbScopeFromAuth(auth), { limit, offset, action, agentId });
+    const params = auditQuerySchema.parse(req.query);
+    const result = await listAudit(auth, dbScopeFromAuth(auth), {
+      limit: params.limit,
+      offset: params.offset,
+      action: params.action,
+      agentId: params.agent_id,
+    });
     res.json({ audit: result });
   } catch (err: any) {
     sendApiError(res, '/api/audit', err);
@@ -560,7 +559,7 @@ app.get('/api/audit', async (req, res) => {
 
 // === Media endpoints ===
 
-app.post('/api/media/search', async (req, res) => {
+registerRestRoute(app, 'post', '/api/media/search', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
@@ -572,10 +571,11 @@ app.post('/api/media/search', async (req, res) => {
   }
 });
 
-app.post('/api/media/events', async (req, res) => {
+registerRestRoute(app, 'post', '/api/media/events', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
+    checkPermission(auth, 'admin');
     checkPermission(auth, 'write');
     const events = parsePublicMediaEventBatch(req.body);
     const enriched = toTrustedRestMediaEvents(events, auth);
@@ -586,33 +586,28 @@ app.post('/api/media/events', async (req, res) => {
   }
 });
 
-app.get('/api/media/events', async (req, res) => {
+registerRestRoute(app, 'get', '/api/media/events', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
+    checkPermission(auth, 'admin');
     checkPermission(auth, 'read');
-    const limit = parseBoundedInteger(req.query.limit, 50, 1, 500, 'limit');
-    const offset = parseBoundedInteger(req.query.offset, 0, 0, 10_000, 'offset');
-    const events = await listMediaEvents(auth, dbScopeFromAuth(auth), {
-      service: parseSingleString(req.query.service, 'service'),
-      event_type: parseSingleString(req.query.event_type, 'event_type'),
-      played_after: parseDateFilter(req.query.played_after, 'played_after'),
-      played_before: parseDateFilter(req.query.played_before, 'played_before'),
-      limit,
-      offset,
-    });
+    const params = mediaEventsQuerySchema.parse(req.query);
+    const events = await listMediaEvents(auth, dbScopeFromAuth(auth), params);
     res.json({ events });
   } catch (err: any) {
     sendApiError(res, '/api/media/events GET', err);
   }
 });
 
-app.post('/api/media/rollup', async (req, res) => {
+registerRestRoute(app, 'post', '/api/media/rollup', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
     if (!auth) return;
-    const batchSize = parseBoundedInteger(req.body?.batch_size, 50, 1, 500, 'batch_size');
-    const result = await rollupPendingEvents(auth, dbScopeFromAuth(auth), batchSize);
+    checkPermission(auth, 'admin');
+    checkPermission(auth, 'write');
+    const params = mediaRollupSchema.parse(req.body);
+    const result = await rollupPendingEvents(auth, dbScopeFromAuth(auth), params.batch_size);
     res.json(result);
   } catch (err: any) {
     sendApiError(res, '/api/media/rollup', err);

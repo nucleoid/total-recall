@@ -5,6 +5,12 @@ import type { AuthContext, SearchParams, SearchResult } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
 import { logTrace } from '../traces.js';
+import {
+  MEMORY_CONTENT_MAX_CHARS,
+  TAG_MAX_CHARS,
+  TAG_MAX_COUNT,
+  TEXT_FIELD_MAX_CHARS,
+} from '../http-limits.js';
 
 const MEDIA_NAMESPACE = 'media';
 const ISO_DATE_TIME_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -15,17 +21,19 @@ type NormalizedPlayedBound = {
   exclusive: boolean;
 };
 
+const boundedText = z.string().trim().min(1).max(TEXT_FIELD_MAX_CHARS);
+
 export const mediaSearchSchema = z.object({
-  query: z.string().min(1),
-  services: z.array(z.string()).optional(),
-  event_types: z.array(z.string()).optional(),
-  played_after: z.string().optional(),
-  played_before: z.string().optional(),
-  tags: z.array(z.string()).optional(),
-  limit: z.number().min(1).max(50).default(10),
+  query: z.string().min(1).max(MEMORY_CONTENT_MAX_CHARS),
+  services: z.array(boundedText).max(TAG_MAX_COUNT).optional(),
+  event_types: z.array(boundedText).max(TAG_MAX_COUNT).optional(),
+  played_after: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  played_before: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  tags: z.array(z.string().trim().min(1).max(TAG_MAX_CHARS)).max(TAG_MAX_COUNT).optional(),
+  limit: z.number().int().min(1).max(50).default(10),
   threshold: z.number().min(0).max(1).default(0.3),
-  agent_name: z.string().optional(),
-  session_id: z.string().optional(),
+  agent_name: boundedText.optional(),
+  session_id: boundedText.optional(),
 });
 
 export type MediaSearchParams = z.infer<typeof mediaSearchSchema>;

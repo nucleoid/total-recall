@@ -294,11 +294,11 @@ Every search operation is automatically logged as a recall trace, enabling full 
 GET /api/traces?limit=20&offset=0&agent_id=<uuid>&session_id=<string>
 ```
 
-Agent and trace listing endpoints are scoped to the authenticated API key. Shared namespaces do not expose another key's provenance rows.
+Agent and trace listing endpoints are scoped to the authenticated API key at the database layer. The REST observability endpoints additionally require the explicit `admin` permission so ordinary keys cannot enumerate administrative data.
 
 ## REST API
 
-All endpoints require authentication via `Authorization: Bearer tr_<key>`.
+All `/api/*` endpoints require `Authorization: Bearer tr_<key>`. `/health` is public. Global observability and media-administration routes require the explicit `admin` permission; `admin` is never granted implicitly.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -308,14 +308,16 @@ All endpoints require authentication via `Authorization: Bearer tr_<key>`.
 | POST | `/api/store-document` | Store a chunked document |
 | DELETE | `/api/memories` | Soft-delete matching memories (explicit `delete` permission) |
 | GET | `/api/stats` | Memory statistics (admin) |
-| GET | `/api/agents` | List registered agents for the key |
-| POST | `/api/agents` | Register/update an agent |
-| GET | `/api/traces` | Paginated recall traces for the key |
-| GET | `/api/audit` | Paginated audit log |
-| POST | `/api/media/search` | Vector search over media (viewing/listening) history |
-| POST | `/api/media/events` | Upsert media events (used by connectors) |
-| GET | `/api/media/events` | List structured media events with filters |
-| POST | `/api/media/rollup` | Trigger pending events → summary memories |
+| GET | `/api/agents` | List registered agents and counts (`admin` + `read`) |
+| POST | `/api/agents` | Register/update an agent (`admin` + `write`) |
+| GET | `/api/traces` | Paginated recall traces (`admin` + `read`) |
+| GET | `/api/audit` | Paginated audit log (`admin` + `read`) |
+| POST | `/api/media/search` | Vector search over authorized media history (`read`) |
+| POST | `/api/media/events` | Upsert media events (`admin` + `write`) |
+| GET | `/api/media/events` | List structured media events (`admin` + `read`) |
+| POST | `/api/media/rollup` | Trigger pending events → summary memories (`admin` + `write`) |
+
+`openapi.yaml` is the Custom GPT action contract. Run `npm run test:contract` after changing REST registration, request schemas, or response shapes; the contract suite validates OpenAPI 3.1 and enforces exact method/path parity with runtime registration. See [the admin rollout runbook](docs/rollouts/050-openapi-admin.md) before deploying the tightened administrative routes.
 
 ### Tombstone purge operations
 

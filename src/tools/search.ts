@@ -5,19 +5,36 @@ import type { AuthContext, SearchResult } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
 import { logTrace } from '../traces.js';
+import {
+  MEMORY_CONTENT_MAX_CHARS,
+  TAG_MAX_CHARS,
+  TAG_MAX_COUNT,
+  TEXT_FIELD_MAX_CHARS,
+} from '../http-limits.js';
+
+const boundedText = z.string().min(1).max(TEXT_FIELD_MAX_CHARS);
+const offsetDateTime = z.string().datetime({ offset: true });
 
 export const searchSchema = z.object({
-  query: z.string().min(1),
-  namespaces: z.array(z.string()).optional(),
-  limit: z.number().min(1).max(50).default(10),
+  query: z.string().min(1).max(MEMORY_CONTENT_MAX_CHARS),
+  namespaces: z.array(boundedText).max(TAG_MAX_COUNT).optional(),
+  limit: z.number().int().min(1).max(50).default(10),
   threshold: z.number().min(0).max(1).default(0.3),
-  tags: z.array(z.string()).optional(),
-  source: z.string().optional(),
-  after: z.string().optional(),
-  before: z.string().optional(),
-  valid_at: z.string().datetime({ offset: true }).optional(),
-  agent_name: z.string().optional(),
-  session_id: z.string().optional(),
+  tags: z.array(z.string().min(1).max(TAG_MAX_CHARS)).max(TAG_MAX_COUNT).optional(),
+  source: boundedText.optional(),
+  after: offsetDateTime.optional(),
+  before: offsetDateTime.optional(),
+  valid_at: offsetDateTime.optional(),
+  agent_name: boundedText.optional(),
+  session_id: boundedText.optional(),
+}).superRefine((value, ctx) => {
+  if (value.after && value.before && Date.parse(value.after) > Date.parse(value.before)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['before'],
+      message: 'before must be after or equal to after',
+    });
+  }
 });
 
 export async function memorySearch(

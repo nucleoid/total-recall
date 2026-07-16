@@ -33,10 +33,10 @@ import {
 
 export const agentRegisterSchema = z.object({
   name: z.string().min(1).max(TEXT_FIELD_MAX_CHARS),
-  type: z.string().max(TEXT_FIELD_MAX_CHARS).default('llm'),
-  model: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
-  runtime: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
-  parent_agent_name: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
+  type: z.string().min(1).max(TEXT_FIELD_MAX_CHARS).default('llm'),
+  model: z.string().min(1).max(TEXT_FIELD_MAX_CHARS).optional(),
+  runtime: z.string().min(1).max(TEXT_FIELD_MAX_CHARS).optional(),
+  parent_agent_name: z.string().min(1).max(TEXT_FIELD_MAX_CHARS).optional(),
   metadata: metadataSchema.default({}),
 });
 

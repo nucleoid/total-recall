@@ -3,20 +3,14 @@ import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { accessLevelSql, checkPermission } from '../auth.js';
 
-const ALL_NAMESPACES = ['personal', 'work', 'projects', 'financial', 'shared'];
-
 export const statsSchema = z.object({});
 
 export async function memoryStats(
   _params: z.infer<typeof statsSchema>,
   auth: AuthContext
 ) {
+  checkPermission(auth, 'admin');
   checkPermission(auth, 'read');
-
-  const hasAll = ALL_NAMESPACES.every((ns) => auth.namespaces.includes(ns));
-  if (!hasAll) {
-    throw new Error('memory_stats is admin-only');
-  }
 
   const ns = auth.namespaces;
   const scope = dbScopeFromAuth(auth);
