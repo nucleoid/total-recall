@@ -1,9 +1,10 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
 import { build } from 'esbuild';
 
 const root = resolve(import.meta.dirname, '..');
 const outdir = resolve(root, 'dist', 'dashboard');
+await rm(outdir, { recursive: true, force: true });
 const result = await build({
   absWorkingDir: root,
   entryPoints: ['dashboard/app.ts'],
@@ -15,7 +16,7 @@ const result = await build({
   platform: 'browser',
   target: ['es2022'],
   minify: true,
-  sourcemap: 'external',
+  sourcemap: false,
   metafile: true,
   write: true,
 });

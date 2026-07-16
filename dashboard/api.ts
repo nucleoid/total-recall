@@ -8,6 +8,10 @@ export class ApiError extends Error {
   }
 }
 
+export function toApiDateTime(value: string): string {
+  return new Date(value).toISOString();
+}
+
 export function restoreKey(): string {
   apiKey = sessionStorage.getItem(TAB_KEY) ?? '';
   rememberForTab = apiKey.length > 0;

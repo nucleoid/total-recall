@@ -752,6 +752,9 @@ app.use('/dashboard', dashboardSecurity, express.static(dashboardDirectory, {
       : 'no-cache');
   },
 }));
+app.get(/^\/dashboard\/assets(?:\/.*)?$/, dashboardSecurity, (_req, res) => {
+  res.status(404).type('text/plain').send('Not Found');
+});
 app.get(/^\/dashboard(?:\/.*)?$/, dashboardSecurity, (_req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.sendFile('index.html', { root: dashboardDirectory });

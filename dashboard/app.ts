@@ -1,5 +1,5 @@
 import './styles.css';
-import { api, ApiError, clearKey, hasKey, isRemembered, restoreKey, setKey } from './api.js';
+import { api, ApiError, clearKey, hasKey, isRemembered, restoreKey, setKey, toApiDateTime } from './api.js';
 import type { Capabilities, MediaStats, MemoryRecord, PagedMemories, TraceRecord } from './types.js';
 
 type View = 'overview' | 'memories' | 'search' | 'traces' | 'media' | 'agents' | 'audit';
@@ -239,7 +239,10 @@ function memoryFilters(): HTMLFormElement {
   for (const value of ['created_at', 'updated_at', 'accessed_at', 'access_count', 'relevance']) { const option = el('option', value); option.value = value; sort.append(option); }
   sortLabel.append(sort); form.append(sortLabel);
   const submit = el('button', 'Apply filters'); submit.type = 'submit'; form.append(submit);
-  form.addEventListener('submit', (event) => { event.preventDefault(); void loadMemoryResults(form); });
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    void loadMemoryResults(form).catch(fail);
+  });
   return form;
 }
 
@@ -247,7 +250,8 @@ async function loadMemoryResults(form: HTMLFormElement): Promise<void> {
   activeController?.abort(); activeController = new AbortController();
   const params = new URLSearchParams();
   for (const [name, value] of new FormData(form)) {
-    if (typeof value === 'string' && value) params.append(name, value.endsWith('T00:00') ? `${value}:00Z` : value);
+    if (typeof value !== 'string' || !value) continue;
+    params.append(name, name === 'created_after' || name === 'created_before' ? toApiDateTime(value) : value);
   }
   const result = await api<PagedMemories>(`/api/memories?${params}`, { signal: activeController.signal });
   const list = document.querySelector<HTMLElement>('#memory-results')!;
