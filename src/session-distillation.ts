@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
 import { logAudit } from './audit.js';
 import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
-import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from './embedding.js';
+import { embedWithProfile, embeddingDescriptorParams, serializeEmbeddingVector } from './embedding.js';
 import { generateBounded, type GenerationProvider } from './generation.js';
 import { resolveAgent } from './agents.js';
 import { chunkDocumentContent, MAX_DOCUMENT_CONTENT_BYTES } from './tools/store-document.js';
@@ -189,7 +189,7 @@ export async function memoryStoreSession(input: StoreSessionParams, auth: AuthCo
   );
   const chunks = chunkDocumentContent(params.transcript);
   const vectors: string[] = [];
-  for (const chunk of chunks) vectors.push(serializeEmbeddingVector(await embed(chunk)));
+  for (const chunk of chunks) vectors.push(serializeEmbeddingVector((await embedWithProfile(chunk)).vector));
 
   return withScopedClient(dbScopeFromAuth(auth), async client => {
     const document = await client.query<{ id: string }>(`
@@ -591,7 +591,7 @@ export async function markSessionDistillationFailed(
 
 export async function embedDistilledFacts(facts: readonly DistilledFact[], signal?: AbortSignal): Promise<string[]> {
   const vectors: string[] = [];
-  for (const fact of facts) vectors.push(serializeEmbeddingVector(await embed(fact.content, signal)));
+  for (const fact of facts) vectors.push(serializeEmbeddingVector((await embedWithProfile(fact.content, undefined, signal)).vector));
   return vectors;
 }
 

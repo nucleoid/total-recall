@@ -1,5 +1,12 @@
 import { getPoolGeneration, withScopedClient, type DbScope, type ScopedClient } from './db.js';
-import { ACTIVE_EMBEDDING_DESCRIPTOR, embed, serializeEmbeddingVector } from './embedding.js';
+import {
+  ACTIVE_EMBEDDING_PROFILE,
+  EMBEDDING_PROFILES,
+  embedWithProfile,
+  embeddingIdentity,
+  serializeEmbeddingVector,
+  type EmbeddingProfile,
+} from './embedding.js';
 import { accessLevelSql } from './auth.js';
 import {
   hnswEfSearchFromEnv,
@@ -17,9 +24,11 @@ const SUPERSEDED_SCORE_FACTOR = SUPERSEDED_SEARCH_DEMOTION_ENABLED
   : 1;
 const SEARCH_SCHEMA_CAPABILITY_TTL_MS = boundedSchemaTtl(process.env.SEARCH_SCHEMA_CAPABILITY_TTL_MS);
 
-// Legacy vector queries are allowed only for truthfully labelled legacy rows.
-// No legacy profile is configured after the verified Gemini-only cutover.
-export const LEGACY_EMBEDDING_PROFILES: readonly never[] = Object.freeze([]);
+// A truthfully labelled legacy row is required: providers are queried only after an eligible row
+// has been proven inside the caller's scoped transaction.
+export const LEGACY_EMBEDDING_PROFILES = Object.freeze(
+  EMBEDDING_PROFILES.filter(profile => profile.name !== ACTIVE_EMBEDDING_PROFILE.name),
+);
 
 type SearchSchemaCapabilities = {
   belief_schema: boolean;
@@ -136,20 +145,68 @@ function boundedSchemaTtl(raw: string | undefined): number {
   return Number.isSafeInteger(value) && value >= 1 && value <= 300_000 ? value : 30_000;
 }
 
+async function hasEligibleRowsForProfile(
+  client: ScopedClient,
+  profile: EmbeddingProfile,
+  params: SearchParams,
+  namespaces: string[],
+  maxAccessLevel: AccessLevel,
+  capabilities: SearchSchemaCapabilities,
+): Promise<boolean> {
+  const values: unknown[] = [namespaces, maxAccessLevel, profile.provider, profile.model, profile.dimensions];
+  const p = (value: unknown) => { values.push(value); return `$${values.length}`; };
+  const conditions = [
+    'm.namespace = ANY($1)',
+    accessLevelSql('m.access_level', '$2'),
+    'm.embedding IS NOT NULL',
+    'm.embedding_provider = $3',
+    'm.embedding_model = $4',
+    'm.embedding_dimensions = $5',
+    'm.deleted_at IS NULL',
+    '(m.expires_at IS NULL OR m.expires_at > statement_timestamp())',
+  ];
+  if (capabilities.consolidation_schema && !params.valid_at) conditions.push('m.consolidated_into_id IS NULL');
+  if (params.tags?.length) conditions.push(`m.tags @> ${p(params.tags)}`);
+  if (params.source) conditions.push(`m.source = ${p(params.source)}`);
+  if (params.after) conditions.push(`m.created_at >= ${p(params.after)}::timestamptz`);
+  if (params.before) conditions.push(`m.created_at <= ${p(params.before)}::timestamptz`);
+  if (params.valid_at) {
+    const validAt = p(params.valid_at);
+    conditions.push(`m.valid_from <= ${validAt}::timestamptz`);
+    conditions.push(`(m.valid_to IS NULL OR ${validAt}::timestamptz < m.valid_to)`);
+    if (capabilities.consolidation_schema) conditions.push(`NOT EXISTS (
+      SELECT 1 FROM memory_consolidation_memberships cm
+      WHERE cm.member_id = m.id
+        AND cm.consolidated_at <= ${validAt}::timestamptz
+        AND (cm.deconsolidated_at IS NULL OR ${validAt}::timestamptz < cm.deconsolidated_at)
+    )`);
+  }
+  if (params.mediaFilters?.services?.length) conditions.push(`m.metadata->>'service' = ANY(${p(params.mediaFilters.services)}::text[])`);
+  if (params.mediaFilters?.eventTypes?.length) conditions.push(`m.metadata->>'event_type' = ANY(${p(params.mediaFilters.eventTypes)}::text[])`);
+  if (params.mediaFilters?.eventAfter) conditions.push(`m.event_at >= ${p(params.mediaFilters.eventAfter)}::timestamptz`);
+  if (params.mediaFilters?.eventBefore) {
+    conditions.push(`m.event_at ${params.mediaFilters.eventBeforeExclusive ? '<' : '<='} ${p(params.mediaFilters.eventBefore)}::timestamptz`);
+  }
+  const result = await client.query<{ eligible: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM memories m WHERE ${conditions.join(' AND ')} LIMIT 1) AS eligible`,
+    values,
+  );
+  return result.rows[0]?.eligible === true;
+}
+
 export async function hybridSearch(
   params: SearchParams,
   namespaces: string[],
   scope: DbScope,
   maxAccessLevel: AccessLevel
 ): Promise<SearchResult[]> {
-  let vecStr: string | null = null;
-  let vectorAvailable = true;
+  // queryVectors supersedes the old single vectorAvailable flag.
+  const queryVectors: Array<{ profile: EmbeddingProfile; vector: string }> = [];
   try {
-    const embedding = await embed(params.query);
-    vecStr = serializeEmbeddingVector(embedding);
+    const result = await embedWithProfile(params.query, ACTIVE_EMBEDDING_PROFILE);
+    queryVectors.push({ profile: ACTIVE_EMBEDDING_PROFILE, vector: serializeEmbeddingVector(result.vector) });
   } catch (error) {
-    vectorAvailable = false;
-    console.warn('[search] Embedding provider unavailable; using text-only search fallback');
+    console.warn('[search] Current embedding profile unavailable; using text-only search fallback');
   }
   const limit = Math.min(params.limit ?? 10, 50);
   const threshold = params.threshold ?? 0.3;
@@ -165,19 +222,32 @@ export async function hybridSearch(
       throw new Error('Invalid valid_at: temporal search is unavailable until memory validity finalization completes');
     }
 
+    // Canonicalize aliases that describe the same space. A legacy provider is
+    // never called merely because credentials exist: at least one fully labelled,
+    // filtered, visible row must be present.
+    const queriedIdentities = new Set([embeddingIdentity(ACTIVE_EMBEDDING_PROFILE)]);
+    for (const profile of LEGACY_EMBEDDING_PROFILES) {
+      const identity = embeddingIdentity(profile);
+      if (queriedIdentities.has(identity)) continue;
+      if (!await hasEligibleRowsForProfile(client, profile, params, namespaces, maxAccessLevel, capabilities)) continue;
+      queriedIdentities.add(identity);
+      try {
+        const result = await embedWithProfile(params.query, profile);
+        queryVectors.push({ profile, vector: serializeEmbeddingVector(result.vector) });
+      } catch (error) {
+        console.warn(`[search] Legacy embedding profile ${profile.name} (${profile.provider}/${profile.model}/${profile.dimensions}) unavailable; continuing without that vector space`);
+      }
+    }
+
     const values: unknown[] = [];
     let idx = 0;
     const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
 
-    const pVec = p(vecStr);
     const pNs = p(namespaces);
     const pQuery = p(params.query);
     const pLimit = p(limit);
     const pThreshold = p(threshold);
     const pMaxAccessLevel = p(maxAccessLevel);
-    const pProvider = vectorAvailable ? p(ACTIVE_EMBEDDING_DESCRIPTOR.provider) : null;
-    const pModel = vectorAvailable ? p(ACTIVE_EMBEDDING_DESCRIPTOR.model) : null;
-    const pDimensions = vectorAvailable ? p(ACTIVE_EMBEDDING_DESCRIPTOR.dimensions) : null;
     const pValidAt = params.valid_at ? p(params.valid_at) : null;
     const shouldDemoteSuperseded = capabilities.supersession_schema &&
       SUPERSEDED_SEARCH_DEMOTION_ENABLED && !params.valid_at;
@@ -229,28 +299,36 @@ export async function hybridSearch(
     const revisionColumn = capabilities.revision_schema ? 'm.revision' : '0::integer AS revision';
     const selectedColumns = `id, content, metadata, tags, source, namespace, created_at, event_at, expires_at,
       relevance_score, relevance_base_score, decay_rate, updated_at, accessed_at, access_count,
-      access_level, client_id, ${beliefColumns}, ${supersessionColumns}, ${revisionColumn}`;
+      access_level, client_id, embedding_provider, embedding_model, embedding_dimensions,
+      ${beliefColumns}, ${supersessionColumns}, ${revisionColumn}`;
 
     const lifecyclePredicates = capabilities.supersession_schema
       ? ['m.superseded_at IS NULL', 'm.superseded_at IS NOT NULL']
       : ['TRUE'];
-    const vectorPredicate = vectorAvailable ? `embedding IS NOT NULL
-      AND embedding_provider = ${pProvider}
-      AND embedding_model = ${pModel}
-      AND embedding_dimensions = ${pDimensions}` : 'FALSE';
-
-    const vectorBranches = lifecyclePredicates.map(lifecycle => `
-      (SELECT ${selectedColumns},
-        1 - (embedding <=> ${pVec}::vector) AS vec_score
-       FROM memories m
-       WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
-         AND m.deleted_at IS NULL
-         AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
-         AND ${lifecycle}
-         ${consolidationVisibility}
-         AND ${vectorPredicate}
-       ORDER BY embedding <=> ${pVec}::vector, id
-       LIMIT 50)`).join('\nUNION ALL\n');
+    const vectorBranches = queryVectors.flatMap(({ profile, vector }) => {
+      const pVec = p(vector);
+      const pProvider = p(profile.provider);
+      const pModel = p(profile.model);
+      const pDimensions = p(profile.dimensions);
+      const vectorPredicate = `embedding IS NOT NULL
+        AND embedding_provider = ${pProvider}
+        AND embedding_model = ${pModel}
+        AND embedding_dimensions = ${pDimensions}`;
+      return lifecyclePredicates.map(lifecycle => `
+        (SELECT ${selectedColumns},
+          1 - (embedding <=> ${pVec}::vector) AS vec_score
+         FROM memories m
+         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+           AND m.deleted_at IS NULL
+           AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+           AND ${lifecycle}
+           ${consolidationVisibility}
+           AND ${vectorPredicate}
+         ORDER BY embedding <=> ${pVec}::vector, id
+         LIMIT 50)`);
+    }).join('\nUNION ALL\n') || `
+      (SELECT ${selectedColumns}, NULL::double precision AS vec_score
+       FROM memories m WHERE FALSE)`;
 
     const textBranches = lifecyclePredicates.map(lifecycle => `
       (SELECT ${selectedColumns}, NULL::double precision AS vec_score
@@ -329,8 +407,9 @@ export async function hybridSearch(
       )
       SELECT r.id, r.content, r.metadata, r.tags, r.source, r.namespace, r.created_at, r.event_at, r.expires_at,
         r.relevance_score, r.relevance_base_score, r.decay_rate, r.updated_at, r.accessed_at,
-        r.access_count, r.access_level, r.client_id, r.memory_kind, r.valid_from, r.valid_to,
-        r.superseded_at, r.revision, r.vec_score, r.text_score, r.base_score, r.relevance, r.final_score,
+        r.access_count, r.access_level, r.client_id, r.embedding_provider, r.embedding_model,
+        r.embedding_dimensions, r.memory_kind, r.valid_from, r.valid_to, r.superseded_at,
+        r.revision, r.vec_score, r.text_score, r.base_score, r.relevance, r.final_score,
         ${predecessorSelect} AS supersedes_id,
         (r.superseded_at IS NOT NULL) AS is_superseded,
         ${successorSelect} AS superseded_by_id

@@ -885,6 +885,13 @@ components:
             type: string
         source:
           type: string
+        embedding_provider:
+          type: [string, "null"]
+          description: Provider of the stored vector; null means vector identity is unknown and search treats it as text-only.
+        embedding_model:
+          type: [string, "null"]
+        embedding_dimensions:
+          type: [integer, "null"]
         namespace:
           type: string
         created_at:

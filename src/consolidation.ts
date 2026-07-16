@@ -563,9 +563,10 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
             vector = serializeCanonicalVector(await options.embedCanonical(generated.canonical_content!, controller.signal));
           } else {
             const embeddingModule = await import('./embedding.js');
-            vector = embeddingModule.serializeEmbeddingVector(
-              await embeddingModule.embed(generated.canonical_content!, controller.signal),
+            const embedding = await embeddingModule.embedWithProfile(
+              generated.canonical_content!, embeddingModule.ACTIVE_EMBEDDING_PROFILE, controller.signal,
             );
+            vector = embeddingModule.serializeEmbeddingVector(embedding.vector);
           }
         } finally {
           controller.close();

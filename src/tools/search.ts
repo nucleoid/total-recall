@@ -76,7 +76,15 @@ export async function memorySearch(
     queryText: params.query,
     memoryIds: results.map((r) => r.id),
     resultCount: results.length,
-    scores: results.map((r) => ({ id: r.id, vec: r.vec_score, text: r.text_score, final: r.final_score })),
+    scores: results.map((r) => ({
+      id: r.id,
+      vec: r.vec_score,
+      text: r.text_score,
+      final: r.final_score,
+      embedding: r.embedding_provider && r.embedding_model && r.embedding_dimensions
+        ? { provider: r.embedding_provider, model: r.embedding_model, dimensions: r.embedding_dimensions }
+        : null,
+    })),
     durationMs,
   }, dbScopeFromAuth(auth)).catch((err) => console.error('[total-recall] trace log error:', err.message));
 

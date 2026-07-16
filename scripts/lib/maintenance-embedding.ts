@@ -53,6 +53,7 @@ export function createMaintenanceEmbedder(
     const response = await request(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(30_000),
       body: JSON.stringify({
         requests: texts.map(text => ({
           model: `models/${profile.model}`,

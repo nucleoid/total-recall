@@ -158,11 +158,13 @@ Automatic supersession defaults off independently of classification. It addition
 Rollout is #52 migration 025/readers/writers → migration 026 and kind-aware writers with every #53/search-ranking gate off → bounded validity backfill (standalone rows from `created_at`, linked successors from predecessor `superseded_at`) → owner finalizer (concurrent unique/index builds plus deferred validation) → temporal readers → optional superseded-row demotion → independently approved conservative budget model and bounded shadow classification → reviewed metrics → per-environment mutation approval. Rollback disables mutation and drains requests, disables classification and drains up to its timeout, disables demotion, then disables `valid_at`; it retains all additive lifecycle state and never reopens history. A pre-#52 reader is forbidden once any supersession link exists.
 
 ## Embedding Pipeline
-- Gemini API: `embedContent` / `batchEmbedContents`
-- Model: `gemini-embedding-2-preview`, output dimensionality 768
-- Explicit provider/model/dimensions validation; no credential-driven fallback
-- Scalar and batch response cardinality, dimension, and finite-number validation
-- Vector and complete descriptor are written atomically
+- `EMBEDDING_CURRENT_PROFILE` explicitly selects a named entry in `EMBEDDING_PROFILES_JSON`; entries reference credential/URL environment variables rather than containing secrets
+- The write/current-query target is Gemini `gemini-embedding-2-preview`, output dimensionality 768; all configured spaces must match physical `VECTOR(768)`
+- No provider is inferred and there is no credential-driven fallback
+- `EmbeddingResult` carries vector/provider/model/dimensions together; scalar and batch response count, dimension, finite-number, and timeout checks precede atomic writes
+- Mixed-aware search proves eligible labelled rows before a legacy call, embeds once per distinct supported identity, queries each vector space separately, unions one full-text candidate set (including unknown rows), and globally orders the unchanged final score
+- A legacy outage degrades to remaining vector spaces plus text; unknown or unsupported rows never receive a cosine score
+- `embedding:status` gates retirement at zero active unknown/legacy rows; `embedding:label` requires scoped evidence and cannot stamp the current target; resumable `reembed` performs the fresh target-vector replacement
 
 ## Hybrid Search Query
 ```sql

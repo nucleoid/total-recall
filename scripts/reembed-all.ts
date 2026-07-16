@@ -5,6 +5,7 @@ import {
   validateMaintenanceEmbeddingProfile,
   type MaintenanceEmbeddingProfile,
 } from './lib/maintenance-embedding.js';
+import { resolveConfiguredTarget } from './lib/embedding-target.js';
 import {
   inventoryNamespaces,
   withMaintenanceClient,
@@ -41,6 +42,7 @@ export interface ReembedOptions {
   model?: string;
   namespaces?: string[];
   fullRepair?: boolean;
+  dryRun?: boolean;
   maxErrors?: number;
   onProgress?: (progress: ReembedProgress) => void;
 }
@@ -127,6 +129,8 @@ async function selectBatch(
       SELECT id, content, namespace, updated_at::text AS updated_at, revision
       FROM public.memories
       WHERE deleted_at IS NULL
+        AND (expires_at IS NULL OR expires_at > statement_timestamp())
+        AND to_jsonb(memories)->>'superseded_at' IS NULL
         AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
         AND (cardinality($1::text[]) = 0 OR namespace = ANY($1))
         AND ${eligiblePredicate(6, 2, 3, 4)}
@@ -160,6 +164,8 @@ async function updateEmbedding(
         updated_at = NOW()
     WHERE id = $5::uuid
       AND deleted_at IS NULL
+      AND (expires_at IS NULL OR expires_at > statement_timestamp())
+      AND to_jsonb(memories)->>'superseded_at' IS NULL
       AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
       AND updated_at = $6::timestamptz
       AND content = $7
@@ -193,6 +199,8 @@ export async function verifyEmbeddingMigrationComplete(
       )::text AS legacy_count
     FROM public.memories
     WHERE deleted_at IS NULL
+      AND (expires_at IS NULL OR expires_at > statement_timestamp())
+      AND to_jsonb(memories)->>'superseded_at' IS NULL
       AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
       AND (cardinality($1::text[]) = 0 OR namespace = ANY($1))
   `, [namespaces, profile.provider, profile.model, profile.dimensions]);
@@ -252,6 +260,11 @@ export async function reembedWithClient(
     lastId = batch.at(-1)!.id;
     selected += batch.length;
     for (const row of batch) increment(selectedByNamespace, row.namespace);
+
+    if (options.dryRun) {
+      options.onProgress?.({ processed: selected, selected, succeeded: 0, failed: 0 });
+      continue;
+    }
 
     let embeddings: number[][] | undefined;
     let batchFailure: ReembedError['category'] | undefined;
@@ -334,19 +347,80 @@ function booleanEnvironment(name: string, fallback = false): boolean {
   throw new Error(`${name} must be true or false`);
 }
 
+export interface ReembedArguments {
+  target?: string;
+  batchSize?: number;
+  delayMs?: number;
+  namespaces: string[];
+  maxErrors?: number;
+  dryRun: boolean;
+  fullRepair?: boolean;
+}
+
+export function parseReembedArguments(argv: string[]): ReembedArguments {
+  const result: ReembedArguments = { namespaces: [], dryRun: false };
+  const required = (name: string, raw: string | undefined) => {
+    if (!raw?.trim()) throw new Error(`${name} requires a nonblank value`);
+    return raw;
+  };
+  const integer = (name: string, raw: string | undefined, minimum: number) => {
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${name} must be an integer >= ${minimum}`);
+    return value;
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--target') result.target = required(arg, argv[++i]);
+    else if (arg === '--batch-size') result.batchSize = integer(arg, argv[++i], 1);
+    else if (arg === '--delay-ms') result.delayMs = integer(arg, argv[++i], 0);
+    else if (arg === '--namespace') result.namespaces.push(...required(arg, argv[++i]).split(',').map(value => value.trim()).filter(Boolean));
+    else if (arg === '--max-errors') result.maxErrors = integer(arg, argv[++i], 0);
+    else if (arg === '--dry-run') result.dryRun = true;
+    else if (arg === '--full-repair') result.fullRepair = true;
+    else throw new Error(`Unknown argument ${arg}`);
+  }
+  result.namespaces = [...new Set(result.namespaces)].sort();
+  return result;
+}
+
+function maintenanceEnvironment(env: NodeJS.ProcessEnv, targetName: string): NodeJS.ProcessEnv {
+  if (!env.EMBEDDING_PROFILES_JSON) return env;
+  const profiles = JSON.parse(env.EMBEDDING_PROFILES_JSON) as Record<string, { apiKeyEnv?: string }>;
+  const keyName = profiles[targetName]?.apiKeyEnv;
+  if (!keyName || !env[keyName]) throw new Error(`Target profile ${targetName} has no configured Gemini credential reference`);
+  return {
+    ...env,
+    EMBEDDING_PROVIDER: 'gemini',
+    EMBEDDING_MODEL: 'gemini-embedding-2-preview',
+    EMBEDDING_DIMENSIONS: '768',
+    GEMINI_API_KEY: env[keyName],
+  };
+}
+
 async function main(): Promise<void> {
-  const profile = validateMaintenanceEmbeddingProfile(process.env);
-  const embedder = createMaintenanceEmbedder(profile);
-  const namespaces = (process.env.REEMBED_NAMESPACES ?? '').split(',').map(value => value.trim()).filter(Boolean);
+  const args = parseReembedArguments(process.argv.slice(2));
+  const target = resolveConfiguredTarget(process.env, args.target);
+  const current = resolveConfiguredTarget(process.env);
+  if (target.name !== current.name || target.provider !== 'gemini' || target.model !== 'gemini-embedding-2-preview' || target.dimensions !== 768) {
+    throw new Error('--target must resolve to the approved current Gemini production profile');
+  }
+  const profile = args.dryRun
+    ? { provider: 'gemini' as const, model: 'gemini-embedding-2-preview' as const, dimensions: 768 as const, apiKey: '' }
+    : validateMaintenanceEmbeddingProfile(maintenanceEnvironment(process.env, target.name));
+  const embedder = args.dryRun
+    ? async (_texts: string[]) => { throw new Error('dry-run must not call the embedding provider'); }
+    : createMaintenanceEmbedder(profile);
+  const namespaces = args.namespaces.length ? args.namespaces : (process.env.REEMBED_NAMESPACES ?? '').split(',').map(value => value.trim()).filter(Boolean);
   const { summary } = await runReembedAgainstEnvironment(process.env, embedder, {
     provider: profile.provider,
     model: profile.model,
     dimensions: profile.dimensions,
     namespaces,
-    fullRepair: booleanEnvironment('REEMBED_FULL_REPAIR'),
-    batchSize: integerEnvironment('REEMBED_BATCH_SIZE', 10, 1),
-    delayMs: integerEnvironment('REEMBED_DELAY_MS', 50, 0),
-    maxErrors: integerEnvironment('REEMBED_MAX_ERRORS', 0, 0),
+    dryRun: args.dryRun,
+    fullRepair: args.fullRepair ?? booleanEnvironment('REEMBED_FULL_REPAIR'),
+    batchSize: args.batchSize ?? integerEnvironment('REEMBED_BATCH_SIZE', 10, 1),
+    delayMs: args.delayMs ?? integerEnvironment('REEMBED_DELAY_MS', 50, 0),
+    maxErrors: args.maxErrors ?? integerEnvironment('REEMBED_MAX_ERRORS', 0, 0),
     onIdentity: (identity, source) => {
       console.log('[reembed] Maintenance database', { ...identity, source });
       console.log('[reembed] All-row capability preflight passed; provider work starts now.');
@@ -364,7 +438,7 @@ async function main(): Promise<void> {
     verification: summary.verification,
   });
   if (summary.errors.length > 0) console.log('[reembed] Sanitized errors', summary.errors);
-  if (summary.failed > 0 || Number(summary.verification.unknown_count) !== 0 || Number(summary.verification.legacy_count) !== 0) {
+  if (!args.dryRun && (summary.failed > 0 || Number(summary.verification.unknown_count) !== 0 || Number(summary.verification.legacy_count) !== 0)) {
     process.exitCode = 1;
   }
 }

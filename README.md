@@ -908,23 +908,36 @@ not grant `BYPASSRLS` to the service role or place maintenance credentials in lo
 service environments. The separately approval-gated relevance repair retains its #34
 migration-owner fallback.
 
-Every live store/search/rollup/watcher and preseed process now requires the exact profile
-`EMBEDDING_PROVIDER=gemini`, a nonblank `GEMINI_API_KEY`,
-`EMBEDDING_MODEL=gemini-embedding-2-preview`, and `EMBEDDING_DIMENSIONS=768`. Dotenv never
-overrides shell or service values. Missing or mismatched configuration fails before serving;
-a failed Gemini request never falls back to another vector space. Every vector write stores the
-provider, model, and dimensions in the same SQL statement. Search compares only rows with the
-complete active descriptor; unknown and unsupported rows remain text-only and eligible for text search with no
-fabricated cosine score.
+Every live store/search/rollup/watcher and preseed process uses `EMBEDDING_CURRENT_PROFILE` to
+select an entry in `EMBEDDING_PROFILES_JSON`. The current entry must be exactly Gemini
+`gemini-embedding-2-preview` at 768 dimensions and references `GEMINI_API_KEY` through
+`apiKeyEnv`; secrets are never placed in JSON. Temporary legacy entries may explicitly reference
+a Gemini key or Ollama URL environment variable. The older `EMBEDDING_PROVIDER=gemini`,
+`EMBEDDING_MODEL=gemini-embedding-2-preview`, and `EMBEDDING_DIMENSIONS=768` contract remains
+upgrade-only compatibility when neither named setting exists. Compatibility validation requires
+`GEMINI_API_KEY`, `EMBEDDING_MODEL`, and `EMBEDDING_DIMENSIONS` together. Dotenv never overrides shell or
+service values. Missing or mismatched configuration fails before serving; there is no implicit
+fallback. Every vector write stores provider, model, and dimensions atomically.
+
+During migration search inventories visible, filtered identities first, embeds the query once per
+supported identity with eligible rows, and runs separate bounded cosine candidate branches. One
+full-text branch includes unknown/unsupported rows. A failed legacy provider logs its descriptor
+and does not remove current/text results. Raw cosine, text, relevance, final score, and complete
+stored identity are retained; vectors from different identities are never directly compared. Unknown rows remain text-only until freshly re-embedded.
 
 For rollout, take a verified restorable backup, apply additive migration
 `023_embedding_identity.sql`, audit configuration for the exact profile in every service and operator shell, and
 deploy all identity-aware readers/writers before mixed writes begin. Existing descriptors remain
-NULL because historical provenance cannot be inferred. Run `npm run reembed` with an owner or
-`BYPASSRLS` maintenance connection. Optional controls are `REEMBED_NAMESPACES` (comma-separated;
-empty means all, including `media`), `REEMBED_BATCH_SIZE`, `REEMBED_DELAY_MS`,
-`REEMBED_MAX_ERRORS` (hard provider/response/database errors only), and
-`REEMBED_FULL_REPAIR=true` for deliberate repair of already-labelled rows. Batches preserve the
+NULL because historical provenance cannot be inferred. Use `npm run embedding:status` to inventory namespace/identity groups. The command
+`npm run embedding:label -- --profile <legacy> --namespace <scope> --evidence <proof> --dry-run`
+labels only a proven legacy
+space; mutation additionally requires `--confirm "LABEL EMBEDDINGS"`. `--unknown` corrects false
+labels. Labelling as the current target is forbidden: uncertain rows must receive a fresh vector.
+
+Run `npm run reembed -- --target <current> --batch-size 10 --delay-ms 50 --max-errors 0 --dry-run`
+with an owner or `BYPASSRLS` maintenance connection, then omit `--dry-run`. `--namespace` may be
+repeated (empty means all, including `media`); the equivalent `REEMBED_*` environment controls
+remain supported. Batches preserve the
 exact PostgreSQL concurrency token, advance a stable UUID cursor, and atomically commit each new
 Gemini vector with its descriptor. Concurrent row changes are reported but do not consume the hard
 error budget; the final nonzero exit requests another pass. Interrupted or failed runs are safe to
@@ -933,8 +946,9 @@ restart; no command metadata-only relabels uncertain rows.
 Pause scheduled decay while the #34 relevance migration/repair is in progress. Run
 `npm run decay:update` only after every historical relevance base is classified; it updates
 and reports every namespace, including `media` and future names. Re-embedding exits nonzero when
-rows fail or scoped verification reports nonzero `unknown_count` or `legacy_count`. Retry failures
-and rerun until both counts are zero for the same namespace scope. Only then disable and remove
+rows fail or scoped verification reports nonzero `unknown_count` or `legacy_count`. Re-embedding
+skips deleted, expired, superseded, and consolidated members. Retry failures and rerun status until
+`retirement_ready` is true (both counts zero) for the same namespace scope. Only then disable and remove
 legacy query profiles and credentials. PostgreSQL maintains HNSW on updates, so no manual index
 rebuild is required, but plan for provider cost and substantial WAL/index/IO load.
 
