@@ -11,7 +11,7 @@ import {
   resolveWorkspaceRoot,
 } from './watcher/paths.js';
 import { queryUnscoped, shutdown } from './db.js';
-import { embed } from './embedding.js';
+import { embedWithProfile } from './embedding.js';
 import {
   commitIfCurrent,
   commitPreparedFile,
@@ -92,7 +92,7 @@ async function processFile(filePath: string, work: PathWork): Promise<void> {
   if (storedHash === hash) return;
 
   const chunks = chunkMarkdown(content, spec.source, relPath);
-  const preparedChunks = await prepareChunks(chunks, embed);
+  const preparedChunks = await prepareChunks(chunks, embedWithProfile);
 
   const committed = await commitIfCurrent({
     filePath: absolutePath,

@@ -2,7 +2,8 @@ import crypto from 'node:crypto';
 import type { ScopedClient } from '../db.js';
 import { withScopedClient } from '../db.js';
 import type { PathWork } from './queue.js';
-import { embeddingDescriptorParams } from '../embedding.js';
+import { ACTIVE_EMBEDDING_PROFILE, type EmbeddingResult } from '../embedding.js';
+// ACTIVE_EMBEDDING_PROFILE is the runtime form of ACTIVE_EMBEDDING_DESCRIPTOR.
 
 export const WATCHER_FINGERPRINT_VERSION = 'watcher:v2:';
 
@@ -19,6 +20,9 @@ export interface SyncChunk {
 
 export interface PreparedSyncChunk extends SyncChunk {
   vectorStr: string;
+  embeddingProvider?: string;
+  embeddingModel?: string;
+  embeddingDimensions?: number;
 }
 
 export interface FileSyncInput {
@@ -80,12 +84,21 @@ SET content_hash = $2, last_synced = NOW()
 
 export async function prepareChunks(
   chunks: SyncChunk[],
-  embedChunk: (content: string) => Promise<number[]>
+  embedChunk: (content: string) => Promise<number[] | EmbeddingResult>
 ): Promise<PreparedSyncChunk[]> {
   const prepared: PreparedSyncChunk[] = [];
   for (const chunk of chunks) {
-    const embedding = await embedChunk(chunk.content.slice(0, 8000));
-    prepared.push({ ...chunk, vectorStr: `[${embedding.join(',')}]` });
+    const result = await embedChunk(chunk.content.slice(0, 8000));
+    const embedding = Array.isArray(result)
+      ? { vector: result, ...ACTIVE_EMBEDDING_PROFILE }
+      : result;
+    prepared.push({
+      ...chunk,
+      vectorStr: `[${embedding.vector.join(',')}]`,
+      embeddingProvider: embedding.provider,
+      embeddingModel: embedding.model,
+      embeddingDimensions: embedding.dimensions,
+    });
   }
   return prepared;
 }
@@ -146,7 +159,9 @@ export async function reconcilePreparedFile(
       JSON.stringify(chunk.metadata),
       chunk.sourceKey,
       input.agentId,
-      ...embeddingDescriptorParams(),
+      chunk.embeddingProvider ?? ACTIVE_EMBEDDING_PROFILE.provider,
+      chunk.embeddingModel ?? ACTIVE_EMBEDDING_PROFILE.model,
+      chunk.embeddingDimensions ?? ACTIVE_EMBEDDING_PROFILE.dimensions,
     ]);
     if (result.command === 'INSERT' && result.rowCount === 0) tombstonedConflicts++;
   }

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type pg from 'pg';
 import { dbScopeFromAuth, withScopedClient } from '../db.js';
-import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
+import { embedWithProfile, serializeEmbeddingVector, type EmbeddingResult } from '../embedding.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { TombstonedSourceKeyConflictError } from '../errors.js';
@@ -270,10 +270,11 @@ export async function memoryStoreDocument(
     }
   }
 
-  const embeddings: number[][] = [];
+  // EmbeddingResult carries vector and ACTIVE_EMBEDDING_DESCRIPTOR together.
+  const embeddings: EmbeddingResult[] = [];
   for (let i = 0; i < chunks.length; i++) {
-    const embedding = await embed(chunks[i]);
-    validateEmbedding(embedding, i);
+    const embedding = await embedWithProfile(chunks[i]);
+    validateEmbedding(embedding.vector, i);
     embeddings.push(embedding);
   }
 
@@ -302,7 +303,7 @@ export async function memoryStoreDocument(
     const id = docRes.rows[0].id as string;
 
     for (let i = 0; i < chunks.length; i++) {
-      const vecStr = serializeEmbeddingVector(embeddings[i]);
+      const vecStr = serializeEmbeddingVector(embeddings[i].vector);
 
       const beliefColumns = beliefAware ? ', memory_kind, valid_from' : '';
       const beliefValues = beliefAware ? ", 'document_chunk', statement_timestamp()" : '';
@@ -320,7 +321,9 @@ export async function memoryStoreDocument(
           auth.keyId,
           id,
           i,
-          ...embeddingDescriptorParams(),
+          embeddings[i].provider,
+          embeddings[i].model,
+          embeddings[i].dimensions,
         ]
       );
     }

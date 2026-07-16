@@ -385,7 +385,8 @@ export async function runReflection(options: RunReflectionOptions): Promise<RunR
       if (options.embedInsight) vectors.push(serializeVector(await options.embedInsight(insight.content, options.signal)));
       else {
         const embedding = await import('./embedding.js');
-        vectors.push(embedding.serializeEmbeddingVector(await embedding.embed(insight.content, options.signal)));
+        const result = await embedding.embedWithProfile(insight.content, embedding.ACTIVE_EMBEDDING_PROFILE, options.signal);
+        vectors.push(embedding.serializeEmbeddingVector(result.vector));
       }
     }
     const agentId = await resolveAgent('memory-reflection', 'system', options.policy.generation.model,

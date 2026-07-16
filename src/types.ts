@@ -5,6 +5,9 @@ export interface Memory {
   id: string;
   content: string;
   embedding?: number[];
+  embedding_provider?: string | null;
+  embedding_model?: string | null;
+  embedding_dimensions?: number | null;
   source: string;
   namespace: string;
   tags: string[];

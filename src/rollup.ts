@@ -1,5 +1,5 @@
 import { withScopedClient, type DbScope } from './db.js';
-import { embed, embeddingDescriptorParams } from './embedding.js';
+import { embedWithProfile, serializeEmbeddingVector } from './embedding.js';
 import { getRollupPendingEvents, linkEventToMemoryWithClient, type MediaEvent } from './media.js';
 import { checkPermission } from './auth.js';
 import type { AuthContext } from './types.js';
@@ -39,8 +39,9 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
       const tags = buildTags(event);
       const metadata = buildMetadata(event);
 
-      const vec = await embed(summary);
-      const vecStr = `[${vec.join(',')}]`;
+      // EmbeddingResult keeps ACTIVE_EMBEDDING_DESCRIPTOR and vector together.
+      const embedding = await embedWithProfile(summary);
+      const vecStr = serializeEmbeddingVector(embedding.vector);
 
       await withScopedClient(
         { namespaces: [MEDIA_NAMESPACE], keyId: auth.keyId },
@@ -59,7 +60,9 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
               event.played_at,
               event.client_id,
               event.agent_id,
-              ...embeddingDescriptorParams(),
+              embedding.provider,
+              embedding.model,
+              embedding.dimensions,
             ]
           );
 

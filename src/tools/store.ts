@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { dbScopeFromAuth, withScopedClient } from '../db.js';
-import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
+import { embedWithProfile, serializeEmbeddingVector } from '../embedding.js';
 import type { AuthContext, StoreResult } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
@@ -119,8 +119,10 @@ export async function memoryStore(
     dbScopeFromAuth(auth)
   );
 
-  const embedding = await embed(params.content);
-  const vecStr = serializeEmbeddingVector(embedding);
+  // EmbeddingResult atomically carries the ACTIVE_EMBEDDING_DESCRIPTOR identity.
+  const embedding = await embedWithProfile(params.content);
+  const vecStr = serializeEmbeddingVector(embedding.vector);
+  const descriptor: [string, string, number] = [embedding.provider, embedding.model, embedding.dimensions];
 
   const source = params.source || auth.name;
   const values = [
@@ -134,7 +136,7 @@ export async function memoryStore(
     auth.keyId,
     agentId,
     params.session_id ?? null,
-    ...embeddingDescriptorParams(),
+    ...descriptor,
     params.ttl ?? null,
   ];
 
@@ -214,7 +216,7 @@ export async function memoryStore(
                     m.id ASC
            LIMIT 1
            FOR UPDATE`,
-          [vecStr, ns, params.access_level, ...embeddingDescriptorParams()],
+          [vecStr, ns, params.access_level, ...descriptor],
         );
         const match = candidate.rows[0];
         const similarity = match?.similarity == null ? Number.NaN : Number(match.similarity);

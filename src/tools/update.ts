@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { accessLevelSql } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { dbScopeFromAuth, queryScoped, withScopedClient, type ScopedClient } from '../db.js';
-import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
+import { embedWithProfile, serializeEmbeddingVector } from '../embedding.js';
 import { AuthorizationError, MemoryConflictError, MemoryNotFoundError } from '../errors.js';
 import {
   MEMORY_CONTENT_MAX_CHARS,
@@ -124,8 +124,9 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
   if (params.content !== undefined) {
     initial = await readCurrentTarget(params.id, auth);
     if (params.content !== initial.content) {
-      vector = serializeEmbeddingVector(await embed(params.content));
-      descriptor = embeddingDescriptorParams();
+      const embedding = await embedWithProfile(params.content);
+      vector = serializeEmbeddingVector(embedding.vector);
+      descriptor = [embedding.provider, embedding.model, embedding.dimensions];
     }
   }
 
