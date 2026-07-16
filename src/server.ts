@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -19,18 +21,22 @@ import {
 } from './tools/store-document.js';
 import { memoryStats } from './tools/stats.js';
 import { memoryForget } from './tools/forget.js';
+import { memoryUpdate } from './tools/update.js';
 import { isPublicApiError } from './errors.js';
 import { mediaSearch, mediaSearchSchema } from './tools/media-search.js';
 import { upsertAgent, listAgents } from './agents.js';
-import { listTraces } from './traces.js';
+import { getTrace, listTraces } from './traces.js';
 import { listAudit } from './audit.js';
-import { parsePublicMediaEventBatch, toTrustedRestMediaEvents, upsertMediaEvents, listMediaEvents } from './media.js';
+import { getMediaStats, parsePublicMediaEventBatch, toTrustedRestMediaEvents, upsertMediaEvents, listMediaEvents } from './media.js';
+import { getMemory, getMemorySummaries, listMemories } from './memories.js';
 import { rollupPendingEvents } from './rollup.js';
 import { JSON_BODY_LIMIT_BYTES, validateMetadataInRequest } from './http-limits.js';
 import {
   auditQuerySchema,
   mediaEventsQuerySchema,
   mediaRollupSchema,
+  mediaStatsQuerySchema,
+  memoriesQuerySchema,
   tracesQuerySchema,
 } from './http-schemas.js';
 
@@ -51,7 +57,7 @@ const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9
 
 type ValidateKey = typeof validateKey;
 type RegisterTools = typeof registerTools;
-export type RestMethod = 'get' | 'post' | 'delete';
+export type RestMethod = 'get' | 'post' | 'patch' | 'delete';
 
 const restRouteInventory = new Set<string>();
 
@@ -61,7 +67,8 @@ function registerRestRoute(
   path: string,
   ...handlers: express.RequestHandler[]
 ): void {
-  restRouteInventory.add(`${method.toUpperCase()} ${path}`);
+  const documentedPath = path.replace(/:([A-Za-z0-9_]+)/g, '{$1}');
+  restRouteInventory.add(`${method.toUpperCase()} ${documentedPath}`);
   app[method](path, ...handlers);
 }
 
@@ -175,7 +182,7 @@ async function authenticateMcpRequest(
     if (responseType === 'json') {
       sendPostUnauthorized(res);
     } else {
-      res.status(401).send('Unauthorized');
+      res.status(401).type('text/plain').send('Unauthorized');
     }
     return null;
   }
@@ -397,6 +404,13 @@ async function authenticateRequest(req: express.Request, res: express.Response):
   return auth;
 }
 
+function parseUuidParam(value: string | string[]): string {
+  if (Array.isArray(value) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new Error('Invalid id: expected UUID');
+  }
+  return value.toLowerCase();
+}
+
 function permissionDenied(err: any): boolean {
   const message = err?.message ?? '';
   return (
@@ -423,6 +437,23 @@ function sendApiError(res: express.Response, label: string, err: any): void {
     res.status(500).json({ error: err.message || 'Internal server error' });
   }
 }
+
+registerRestRoute(app, 'get', '/api/capabilities', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    res.json({
+      name: auth.name,
+      namespaces: auth.namespaces,
+      max_access_level: auth.maxAccessLevel,
+      capabilities: Object.fromEntries(
+        ['read', 'write', 'delete', 'admin'].map((permission) => [permission, auth.permissions.includes(permission)])
+      ),
+    });
+  } catch (err: any) {
+    sendApiError(res, '/api/capabilities', err);
+  }
+});
 
 registerRestRoute(app, 'post', '/api/search', async (req, res) => {
   try {
@@ -465,6 +496,58 @@ registerRestRoute(app, 'post', '/api/store-document', async (req, res) => {
     res.json({ id: result.document_id, chunks: result.chunks_stored });
   } catch (err: any) {
     sendApiError(res, '/api/store-document', err);
+  }
+});
+
+registerRestRoute(app, 'get', '/api/memories', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const params = memoriesQuerySchema.parse(req.query);
+    res.json(await listMemories(auth, params));
+  } catch (err: any) {
+    sendApiError(res, '/api/memories GET', err);
+  }
+});
+
+registerRestRoute(app, 'get', '/api/memories/:id', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const memory = await getMemory(auth, parseUuidParam(req.params.id));
+    if (!memory) {
+      res.status(404).json({ error: 'Memory not found' });
+      return;
+    }
+    res.json({ memory });
+  } catch (err: any) {
+    sendApiError(res, '/api/memories/:id GET', err);
+  }
+});
+
+registerRestRoute(app, 'patch', '/api/memories/:id', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    const id = parseUuidParam(req.params.id);
+    const ifMatch = req.headers['if-match'];
+    if (ifMatch === undefined) {
+      res.status(428).json({ error: 'If-Match with the memory updated_at value is required' });
+      return;
+    }
+    if (Array.isArray(ifMatch)) {
+      res.status(400).json({ error: 'Invalid If-Match precondition' });
+      return;
+    }
+    const match = /^"([^"\r\n]+)"$/.exec(ifMatch);
+    if (!match || !Number.isFinite(Date.parse(match[1]))) {
+      res.status(400).json({ error: 'Invalid If-Match precondition' });
+      return;
+    }
+    const memory = await memoryUpdate({ ...req.body, id }, auth, match[1]);
+    res.json({ memory });
+  } catch (err: any) {
+    sendApiError(res, '/api/memories/:id PATCH', err);
   }
 });
 
@@ -542,6 +625,24 @@ registerRestRoute(app, 'get', '/api/traces', async (req, res) => {
   }
 });
 
+registerRestRoute(app, 'get', '/api/traces/:id', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'admin');
+    checkPermission(auth, 'read');
+    const trace = await getTrace(auth, parseUuidParam(req.params.id), dbScopeFromAuth(auth));
+    if (!trace) {
+      res.status(404).json({ error: 'Trace not found' });
+      return;
+    }
+    const memories = await getMemorySummaries(auth, trace.memory_ids ?? []);
+    res.json({ trace, memories });
+  } catch (err: any) {
+    sendApiError(res, '/api/traces/:id', err);
+  }
+});
+
 registerRestRoute(app, 'get', '/api/audit', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
@@ -604,6 +705,19 @@ registerRestRoute(app, 'get', '/api/media/events', async (req, res) => {
   }
 });
 
+registerRestRoute(app, 'get', '/api/media/stats', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'admin');
+    checkPermission(auth, 'read');
+    const params = mediaStatsQuerySchema.parse(req.query);
+    res.json(await getMediaStats(auth, dbScopeFromAuth(auth), params));
+  } catch (err: any) {
+    sendApiError(res, '/api/media/stats', err);
+  }
+});
+
 registerRestRoute(app, 'post', '/api/media/rollup', async (req, res) => {
   try {
     const auth = await authenticateRequest(req, res);
@@ -616,6 +730,34 @@ registerRestRoute(app, 'post', '/api/media/rollup', async (req, res) => {
   } catch (err: any) {
     sendApiError(res, '/api/media/rollup', err);
   }
+});
+
+const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+const builtDashboardDirectory = resolve(process.cwd(), 'dist', 'dashboard');
+const dashboardDirectory = existsSync(resolve(builtDashboardDirectory, 'index.html'))
+  ? builtDashboardDirectory
+  : resolve(moduleDirectory, 'dashboard');
+const dashboardSecurity: express.RequestHandler = (_req, res, next) => {
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+};
+app.use('/dashboard', dashboardSecurity, express.static(dashboardDirectory, {
+  index: false,
+  setHeaders: (res, filePath) => {
+    res.setHeader('Cache-Control', filePath.includes(`${resolve(dashboardDirectory, 'assets')}`)
+      ? 'public, max-age=31536000, immutable'
+      : 'no-cache');
+  },
+}));
+app.get(/^\/dashboard\/assets(?:\/.*)?$/, dashboardSecurity, (_req, res) => {
+  res.status(404).type('text/plain').send('Not Found');
+});
+app.get(/^\/dashboard(?:\/.*)?$/, dashboardSecurity, (_req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.sendFile('index.html', { root: dashboardDirectory });
 });
 
 app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {

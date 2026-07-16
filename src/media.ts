@@ -471,6 +471,72 @@ export async function listMediaEvents(auth: AuthContext, scope: DbScope, filters
   return res.rows;
 }
 
+export interface MediaStatsFilters {
+  service?: string;
+  played_after?: string;
+  played_before?: string;
+  limit?: number;
+}
+
+export interface MediaStats {
+  total_events: number;
+  listening_duration_ms: number;
+  plays_by_service: Array<{ service: string; count: number; duration_ms: number }>;
+  top_artists: Array<{ artist: string; plays: number; duration_ms: number }>;
+  top_albums: Array<{ album: string; artist: string | null; plays: number; duration_ms: number }>;
+  top_tracks: Array<{ title: string; artist: string | null; plays: number; duration_ms: number }>;
+  daily: Array<{ date: string; count: number; duration_ms: number }>;
+}
+
+/** Aggregate key-owned media history. The REST route restricts this global observability view to admins. */
+export async function getMediaStats(auth: AuthContext, scope: DbScope, filters: MediaStatsFilters = {}): Promise<MediaStats> {
+  const isAdmin = auth.permissions.includes('admin');
+  const values: unknown[] = [auth.keyId, isAdmin];
+  const conditions = ['($2::boolean OR client_id = $1::uuid)'];
+  const parameter = (value: unknown) => { values.push(value); return `$${values.length}`; };
+  if (filters.service) conditions.push(`service = ${parameter(filters.service)}`);
+  if (filters.played_after) conditions.push(`played_at >= ${parameter(filters.played_after)}::timestamptz`);
+  if (filters.played_before) conditions.push(`played_at <= ${parameter(filters.played_before)}::timestamptz`);
+  const limit = parameter(filters.limit ?? 10);
+  const duration = 'COALESCE(played_ms, CASE WHEN completed IS TRUE THEN duration_ms ELSE 0 END, 0)';
+
+  const result = await queryScoped<{ stats: MediaStats }>(
+    { ...scope, isAdmin },
+    `WITH filtered AS (
+       SELECT *, ${duration}::bigint AS listen_ms
+       FROM media_events WHERE ${conditions.join(' AND ')}
+     ), services AS (
+       SELECT service, COUNT(*)::int AS count, COALESCE(SUM(listen_ms), 0)::bigint AS duration_ms
+       FROM filtered GROUP BY service ORDER BY count DESC, service
+     ), artists AS (
+       SELECT artist, COUNT(*)::int AS plays, COALESCE(SUM(listen_ms), 0)::bigint AS duration_ms
+       FROM filtered WHERE artist IS NOT NULL GROUP BY artist ORDER BY plays DESC, artist LIMIT ${limit}
+     ), albums AS (
+       SELECT album, artist, COUNT(*)::int AS plays, COALESCE(SUM(listen_ms), 0)::bigint AS duration_ms
+       FROM filtered WHERE artist IS NOT NULL AND album IS NOT NULL
+       GROUP BY album, artist ORDER BY plays DESC, album, artist LIMIT ${limit}
+     ), tracks AS (
+       SELECT title, artist, COUNT(*)::int AS plays, COALESCE(SUM(listen_ms), 0)::bigint AS duration_ms
+       FROM filtered WHERE artist IS NOT NULL GROUP BY title, artist ORDER BY plays DESC, title, artist LIMIT ${limit}
+     ), days AS (
+       SELECT (played_at AT TIME ZONE 'UTC')::date::text AS date, COUNT(*)::int AS count,
+              COALESCE(SUM(listen_ms), 0)::bigint AS duration_ms
+       FROM filtered GROUP BY (played_at AT TIME ZONE 'UTC')::date ORDER BY (played_at AT TIME ZONE 'UTC')::date
+     )
+     SELECT jsonb_build_object(
+       'total_events', (SELECT COUNT(*)::int FROM filtered),
+       'listening_duration_ms', (SELECT COALESCE(SUM(listen_ms), 0)::bigint FROM filtered),
+       'plays_by_service', COALESCE((SELECT jsonb_agg(to_jsonb(services)) FROM services), '[]'::jsonb),
+       'top_artists', COALESCE((SELECT jsonb_agg(to_jsonb(artists)) FROM artists), '[]'::jsonb),
+       'top_albums', COALESCE((SELECT jsonb_agg(to_jsonb(albums)) FROM albums), '[]'::jsonb),
+       'top_tracks', COALESCE((SELECT jsonb_agg(to_jsonb(tracks)) FROM tracks), '[]'::jsonb),
+       'daily', COALESCE((SELECT jsonb_agg(to_jsonb(days)) FROM days), '[]'::jsonb)
+     ) AS stats`,
+    values
+  );
+  return result.rows[0].stats;
+}
+
 export async function getRollupPendingEvents(auth: AuthContext, scope: DbScope, limit = 50): Promise<MediaEvent[]> {
   const res = await queryScoped<MediaEvent>(
     scope,

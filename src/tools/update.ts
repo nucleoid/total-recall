@@ -109,7 +109,7 @@ async function assertNoCycle(client: ScopedClient, targetId: string, predecessor
 }
 
 /** Patch an active current memory and optionally close the predecessor it supersedes. */
-export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<Memory> {
+export async function memoryUpdate(input: unknown, auth: AuthContext, expectedUpdatedAt?: string): Promise<Memory> {
   const params = updateSchema.parse(input);
   if (!auth.permissions.includes('write')) {
     throw new AuthorizationError("Permission denied: requires 'write'");
@@ -154,6 +154,10 @@ export async function memoryUpdate(input: unknown, auth: AuthContext): Promise<M
       const predecessor = params.supersedes ? rows.get(params.supersedes) : undefined;
       if (params.supersedes && !predecessor) notFound();
 
+      if (expectedUpdatedAt !== undefined &&
+          new Date(target.updated_at).getTime() !== new Date(expectedUpdatedAt).getTime()) {
+        throw new MemoryConflictError('Memory changed since the dashboard loaded it');
+      }
       if (initial && target.revision !== initial.revision) {
         throw new MemoryConflictError('Memory changed while its embedding was being prepared');
       }

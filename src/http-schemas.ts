@@ -16,6 +16,51 @@ function boundedInteger(defaultValue: number, min: number, max: number, name: st
   );
 }
 
+const sortField = z.enum(['created_at', 'updated_at', 'accessed_at', 'access_count', 'relevance']);
+const direction = z.enum(['asc', 'desc']);
+const activeStatus = z.enum(['active', 'superseded', 'expired', 'all']);
+const accessLevel = z.enum(['normal', 'sensitive', 'secret']);
+
+export const memoriesQuerySchema = z.object({
+  namespace: boundedText.optional(),
+  source: boundedText.optional(),
+  tag: z.union([boundedText, z.array(boundedText)]).optional().transform((value) =>
+    value === undefined ? undefined : Array.isArray(value) ? value : [value]
+  ),
+  agent_id: uuid.optional(),
+  access_level: accessLevel.optional(),
+  created_after: offsetDateTime.optional(),
+  created_before: offsetDateTime.optional(),
+  active: activeStatus.default('active'),
+  sort: sortField.default('created_at'),
+  direction: direction.default('desc'),
+  limit: boundedInteger(50, 1, 200, 'limit'),
+  offset: boundedInteger(0, 0, 10_000, 'offset'),
+}).transform(({ tag, ...value }) => tag === undefined ? value : { ...value, tags: tag }).superRefine((value, ctx) => {
+  if (value.created_after && value.created_before && Date.parse(value.created_after) > Date.parse(value.created_before)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['created_before'],
+      message: 'created_before must be after or equal to created_after',
+    });
+  }
+});
+
+export const mediaStatsQuerySchema = z.object({
+  service: boundedText.optional(),
+  played_after: offsetDateTime.optional(),
+  played_before: offsetDateTime.optional(),
+  limit: boundedInteger(10, 1, 50, 'limit').optional(),
+}).superRefine((value, ctx) => {
+  if (value.played_after && value.played_before && Date.parse(value.played_after) > Date.parse(value.played_before)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['played_before'],
+      message: 'played_before must be after or equal to played_after',
+    });
+  }
+});
+
 export const tracesQuerySchema = z.object({
   limit: boundedInteger(20, 1, 100, 'limit'),
   offset: boundedInteger(0, 0, 10_000, 'offset'),

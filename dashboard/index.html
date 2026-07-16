@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Total Recall Dashboard</title>
+  <link rel="stylesheet" href="__APP_CSS__">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <section id="auth-gate" class="auth-gate" aria-labelledby="auth-title">
+    <form id="auth-form" class="auth-card">
+      <p class="eyebrow">Total Recall</p>
+      <h1 id="auth-title">Open your memory dashboard</h1>
+      <p>Enter an existing API key. It stays in memory unless you choose to remember it for this tab.</p>
+      <label>API key
+        <input id="api-key" name="api-key" type="password" autocomplete="off" spellcheck="false" required>
+      </label>
+      <label class="checkbox"><input id="remember-key" type="checkbox"> Remember for this tab</label>
+      <button type="submit">Connect</button>
+      <p class="fine-print">Keys are never placed in URLs, cookies, page markup, or persistent browser storage.</p>
+    </form>
+  </section>
+
+  <div id="dashboard" class="shell" hidden>
+    <header class="topbar">
+      <div><p class="eyebrow">Total Recall</p><h1>Memory operations</h1></div>
+      <div class="identity"><span id="identity"></span><button id="logout" type="button">Log out</button></div>
+    </header>
+    <nav id="primary-nav" class="nav" aria-label="Dashboard"></nav>
+    <main id="main-content" tabindex="-1"></main>
+  </div>
+
+  <dialog id="memory-dialog" aria-labelledby="memory-dialog-title">
+    <h2 id="memory-dialog-title"></h2>
+    <div class="dialog-body"></div>
+    <div class="dialog-actions"></div>
+  </dialog>
+  <div id="live-region" class="sr-only" role="status" aria-live="polite"></div>
+  <script type="module" src="__APP_JS__"></script>
+</body>
+</html>
