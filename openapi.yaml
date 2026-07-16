@@ -28,6 +28,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Health"
+  /api/capabilities:
+    get:
+      operationId: getCapabilities
+      summary: Describe the authenticated key's dashboard capabilities
+      responses:
+        "200":
+          description: Non-secret key capabilities
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Capabilities"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /api/search:
     post:
       operationId: searchMemories
@@ -132,6 +147,37 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
   /api/memories:
+    get:
+      operationId: listMemories
+      summary: Browse accessible memories
+      description: Returns only namespaces and access levels authorized for the key. Tombstones are never returned.
+      parameters:
+        - { name: namespace, in: query, schema: { type: string, maxLength: 512 } }
+        - { name: source, in: query, schema: { type: string, maxLength: 512 } }
+        - name: tag
+          in: query
+          schema: { type: array, items: { type: string, maxLength: 512 } }
+          style: form
+          explode: true
+        - $ref: "#/components/parameters/AgentId"
+        - { name: access_level, in: query, schema: { type: string, enum: [normal, sensitive, secret] } }
+        - { name: created_after, in: query, schema: { type: string, format: date-time } }
+        - { name: created_before, in: query, schema: { type: string, format: date-time } }
+        - { name: active, in: query, schema: { type: string, enum: [active, superseded, expired, all], default: active } }
+        - { name: sort, in: query, schema: { type: string, enum: [created_at, updated_at, accessed_at, access_count, relevance], default: created_at } }
+        - { name: direction, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Accessible memory page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MemoryPage" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
     delete:
       operationId: forgetMemories
       summary: Soft-delete matching memories
@@ -163,6 +209,56 @@ paths:
           $ref: "#/components/responses/UnsupportedContentEncoding"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/memories/{id}:
+    parameters:
+      - $ref: "#/components/parameters/MemoryId"
+    get:
+      operationId: getMemory
+      summary: Get one active accessible memory
+      responses:
+        "200":
+          description: Memory detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [memory]
+                properties: { memory: { $ref: "#/components/schemas/MemoryRecord" } }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: updateMemory
+      summary: Update an active memory and regenerate its embedding when content changes
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          description: Quoted updated_at value from the memory representation.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MemoryPatch" }
+      responses:
+        "200":
+          description: Updated memory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [memory]
+                properties: { memory: { $ref: "#/components/schemas/MemoryRecord" } }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "428":
+          description: If-Match is required
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
   /api/stats:
     get:
       operationId: getMemoryStats
@@ -269,6 +365,23 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/traces/{id}:
+    get:
+      operationId: getRecallTrace
+      summary: Inspect recorded retrieval score evidence
+      description: Requires admin and read permissions. Inaccessible or inactive memory IDs are omitted from summaries.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Recall trace and accessible memory summaries
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TraceDetail" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/audit:
     get:
       operationId: listAuditLog
@@ -435,6 +548,24 @@ paths:
           $ref: "#/components/responses/UnsupportedContentEncoding"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/media/stats:
+    get:
+      operationId: getMediaStats
+      summary: Aggregate listening statistics
+      description: Requires admin and read permissions. Date comparisons are inclusive and daily buckets use UTC.
+      parameters:
+        - { name: service, in: query, schema: { type: string, maxLength: 512 } }
+        - { name: played_after, in: query, schema: { type: string, format: date-time } }
+        - { name: played_before, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 10 } }
+      responses:
+        "200":
+          description: Filtered media aggregates
+          content: { application/json: { schema: { $ref: "#/components/schemas/MediaStats" } } }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /api/media/rollup:
     post:
       operationId: rollupMediaEvents
@@ -494,6 +625,13 @@ components:
         minimum: 0
         maximum: 10000
         default: 0
+    MemoryId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     AgentId:
       name: agent_id
       in: query
@@ -514,6 +652,18 @@ components:
                     type: string
                     enum: [invalid_json, invalid_metadata]
               - $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found or inaccessible
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Resource changed or conflicts with current history
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     Unauthorized:
       description: Missing or malformed bearer API key
       content:
@@ -815,6 +965,84 @@ components:
         count:
           type: integer
           minimum: 0
+    Capabilities:
+      type: object
+      required: [name, namespaces, max_access_level, capabilities]
+      properties:
+        name: { type: string }
+        namespaces: { type: array, items: { type: string } }
+        max_access_level: { type: string, enum: [normal, sensitive, secret] }
+        capabilities:
+          type: object
+          required: [read, write, delete, admin]
+          properties:
+            read: { type: boolean }
+            write: { type: boolean }
+            delete: { type: boolean }
+            admin: { type: boolean }
+    MemoryRecord:
+      type: object
+      required: [id, content, source, namespace, tags, metadata, access_level, client_id, created_at, updated_at, accessed_at, access_count]
+      properties:
+        id: { type: string, format: uuid }
+        content: { type: string }
+        source: { type: string }
+        namespace: { type: string }
+        tags: { $ref: "#/components/schemas/Tags" }
+        metadata: { $ref: "#/components/schemas/JsonObject" }
+        access_level: { type: string, enum: [normal, sensitive, secret] }
+        client_id: { type: string }
+        agent_id: { type: [string, "null"], format: uuid }
+        session_id: { type: [string, "null"] }
+        document_id: { type: [string, "null"], format: uuid }
+        chunk_index: { type: [integer, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        accessed_at: { type: string, format: date-time }
+        access_count: { type: integer }
+        relevance_score: { type: [number, "null"] }
+        memory_kind: { type: [string, "null"] }
+        valid_from: { type: [string, "null"], format: date-time }
+        valid_to: { type: [string, "null"], format: date-time }
+        supersedes_id: { type: [string, "null"], format: uuid }
+        superseded_at: { type: [string, "null"], format: date-time }
+        revision: { type: [integer, "null"] }
+        expires_at: { type: [string, "null"], format: date-time }
+        consolidated_into_id: { type: [string, "null"], format: uuid }
+    MemoryPage:
+      type: object
+      required: [memories, total, limit, offset]
+      properties:
+        memories: { type: array, items: { $ref: "#/components/schemas/MemoryRecord" } }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 200 }
+        offset: { type: integer, minimum: 0 }
+    MemoryPatch:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        content: { type: string, minLength: 1, maxLength: 100000 }
+        tags: { $ref: "#/components/schemas/Tags" }
+        metadata: { $ref: "#/components/schemas/JsonObject" }
+        supersedes: { type: string, format: uuid }
+    MemorySummary:
+      type: object
+      required: [id, content, namespace, source, tags, access_level, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        content: { type: string }
+        namespace: { type: string }
+        source: { type: string }
+        tags: { $ref: "#/components/schemas/Tags" }
+        access_level: { type: string, enum: [normal, sensitive, secret] }
+        created_at: { type: string, format: date-time }
+    TraceDetail:
+      type: object
+      required: [trace, memories]
+      properties:
+        trace: { $ref: "#/components/schemas/RecallTrace" }
+        memories: { type: array, items: { $ref: "#/components/schemas/MemorySummary" } }
     Tags:
       type: array
       maxItems: 100
@@ -1272,6 +1500,59 @@ components:
           items:
             type: string
             format: uuid
+    MediaStats:
+      type: object
+      required: [total_events, listening_duration_ms, plays_by_service, top_artists, top_albums, top_tracks, daily]
+      properties:
+        total_events: { type: integer, minimum: 0 }
+        listening_duration_ms: { type: integer, minimum: 0 }
+        plays_by_service:
+          type: array
+          items:
+            type: object
+            required: [service, count, duration_ms]
+            properties:
+              service: { type: string }
+              count: { type: integer, minimum: 0 }
+              duration_ms: { type: integer, minimum: 0 }
+        top_artists:
+          type: array
+          items:
+            type: object
+            required: [artist, plays, duration_ms]
+            properties:
+              artist: { type: string }
+              plays: { type: integer, minimum: 0 }
+              duration_ms: { type: integer, minimum: 0 }
+        top_albums:
+          type: array
+          items:
+            type: object
+            required: [album, artist, plays, duration_ms]
+            properties:
+              album: { type: string }
+              artist: { type: [string, "null"] }
+              plays: { type: integer, minimum: 0 }
+              duration_ms: { type: integer, minimum: 0 }
+        top_tracks:
+          type: array
+          items:
+            type: object
+            required: [title, artist, plays, duration_ms]
+            properties:
+              title: { type: string }
+              artist: { type: [string, "null"] }
+              plays: { type: integer, minimum: 0 }
+              duration_ms: { type: integer, minimum: 0 }
+        daily:
+          type: array
+          items:
+            type: object
+            required: [date, count, duration_ms]
+            properties:
+              date: { type: string, format: date }
+              count: { type: integer, minimum: 0 }
+              duration_ms: { type: integer, minimum: 0 }
     MediaRollupResult:
       type: object
       required: [rolled, failed, errors]

@@ -330,6 +330,10 @@ All `/api/*` endpoints require `Authorization: Bearer tr_<key>`. `/health` is pu
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
+| GET | `/api/capabilities` | Authenticated key capabilities without secret/key ID |
+| GET | `/api/memories` | Filtered, sorted, paginated accessible memories |
+| GET | `/api/memories/{id}` | Active accessible memory detail |
+| PATCH | `/api/memories/{id}` | Optimistic-concurrency memory update (`write`) |
 | POST | `/api/search` | Hybrid semantic + keyword search |
 | POST | `/api/store` | Store a single memory |
 | POST | `/api/store-document` | Store a chunked document |
@@ -338,11 +342,15 @@ All `/api/*` endpoints require `Authorization: Bearer tr_<key>`. `/health` is pu
 | GET | `/api/agents` | List registered agents and counts (`admin` + `read`) |
 | POST | `/api/agents` | Register/update an agent (`admin` + `write`) |
 | GET | `/api/traces` | Paginated recall traces (`admin` + `read`) |
+| GET | `/api/traces/{id}` | Trace score evidence and accessible memory summaries (`admin` + `read`) |
 | GET | `/api/audit` | Paginated audit log (`admin` + `read`) |
 | POST | `/api/media/search` | Vector search over authorized media history (`read`) |
 | POST | `/api/media/events` | Upsert media events (`admin` + `write`) |
 | GET | `/api/media/events` | List structured media events (`admin` + `read`) |
+| GET | `/api/media/stats` | Listening aggregates (`admin` + `read`) |
 | POST | `/api/media/rollup` | Trigger pending events → summary memories (`admin` + `write`) |
+
+The same HTTP process serves a standalone same-origin dashboard at `/dashboard/`; see [Dashboard setup and security](docs/dashboard.md). It is independent of the external Cortex dashboard. `npm run build` emits both server and hashed dashboard assets.
 
 `openapi.yaml` is the Custom GPT action contract. Run `npm run test:contract` after changing REST registration, request schemas, or response shapes; the contract suite validates OpenAPI 3.1 and enforces exact method/path parity with runtime registration. See [the admin rollout runbook](docs/rollouts/050-openapi-admin.md) before deploying the tightened administrative routes.
 

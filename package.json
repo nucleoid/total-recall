@@ -4,7 +4,9 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "npm run build:server && npm run build:dashboard",
+    "build:server": "tsc",
+    "build:dashboard": "tsx scripts/build-dashboard.ts",
     "pretest": "npm run build",
     "typecheck:scripts": "tsc --project tsconfig.scripts.json",
     "test": "node --test --test-concurrency=1 --import ./test/setup-embedding-env.mjs --import tsx \"test/**/*.test.ts\" && npm run test:python && npm run test:daily-sync && npm run test:access-level:db",
@@ -90,6 +92,7 @@
     "@types/supertest": "^7.2.0",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
+    "esbuild": "^0.25.12",
     "supertest": "^7.2.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
