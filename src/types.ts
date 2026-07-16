@@ -1,5 +1,5 @@
 export type AccessLevel = 'normal' | 'sensitive' | 'secret';
-export type MemoryKind = 'unspecified' | 'semantic' | 'document_chunk' | 'synced' | 'media_rollup' | 'consolidation';
+export type MemoryKind = 'unspecified' | 'semantic' | 'document_chunk' | 'episode_chunk' | 'synced' | 'media_rollup' | 'consolidation';
 
 export interface Memory {
   id: string;

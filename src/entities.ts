@@ -70,7 +70,7 @@ export async function loadEntityJobContent(
     JOIN memories m ON m.id = q.memory_id AND m.namespace = q.namespace
     WHERE q.memory_id = $1::uuid AND q.namespace = $2 AND q.status = 'processing'
       AND q.source_revision = $3 AND q.source_content_hash = $4
-      AND q.source_access_level = 'normal'
+      AND q.source_access_level = 'normal' AND m.memory_kind <> 'episode_chunk'
       AND m.entity_source_revision = q.source_revision AND md5(m.content) = q.source_content_hash
       AND COALESCE(m.access_level, 'normal') = q.source_access_level
       AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
@@ -150,7 +150,7 @@ async function lockFreshEntityJob(client: ScopedClient, job: EntityEnrichmentJob
   eligible: boolean;
 } | null> {
   const result = await client.query<{ eligible: boolean }>(`
-    SELECT (COALESCE(m.access_level, 'normal') = 'normal'
+    SELECT (COALESCE(m.access_level, 'normal') = 'normal' AND m.memory_kind <> 'episode_chunk'
       AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
       AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
       AND m.consolidated_into_id IS NULL) AS eligible
@@ -324,7 +324,7 @@ async function graphIndexingStatus(client: ScopedClient, namespaces: string[]): 
     FROM memories m
     LEFT JOIN entity_enrichment_queue q ON q.memory_id = m.id AND q.namespace = m.namespace
     WHERE m.namespace = ANY($1::text[]) AND COALESCE(m.access_level, 'normal') = 'normal'
-      AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
+      AND m.memory_kind <> 'episode_chunk' AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
       AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
       AND m.consolidated_into_id IS NULL
   `, [namespaces]);
@@ -358,8 +358,8 @@ export async function previewEntityBackfill(client: ScopedClient, namespace: str
   const result = await client.query<{ rows: string; input_bytes: string }>(`
     SELECT count(*)::text AS rows, COALESCE(sum(octet_length(m.content)), 0)::text AS input_bytes
     FROM memories m LEFT JOIN entity_enrichment_queue q ON q.memory_id = m.id
-    WHERE m.namespace = $1 AND m.access_level = 'normal' AND m.deleted_at IS NULL
-      AND m.superseded_at IS NULL AND m.valid_to IS NULL
+    WHERE m.namespace = $1 AND m.access_level = 'normal' AND m.memory_kind <> 'episode_chunk'
+      AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
       AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
       AND m.consolidated_into_id IS NULL AND q.memory_id IS NULL
   `, [namespace]);
@@ -380,8 +380,8 @@ export async function enqueueEntityBackfill(
              COALESCE(m.updated_at, statement_timestamp()) AS updated_at,
              md5(m.content) AS content_hash, m.access_level, m.created_at
       FROM memories m LEFT JOIN entity_enrichment_queue q ON q.memory_id = m.id
-      WHERE m.namespace = $1 AND m.access_level = 'normal' AND m.deleted_at IS NULL
-        AND m.superseded_at IS NULL AND m.valid_to IS NULL
+      WHERE m.namespace = $1 AND m.access_level = 'normal' AND m.memory_kind <> 'episode_chunk'
+        AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
         AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
         AND m.consolidated_into_id IS NULL AND q.memory_id IS NULL
       ORDER BY m.created_at, m.id LIMIT $2

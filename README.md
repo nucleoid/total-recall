@@ -64,6 +64,8 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  MCP Tools:                 │
         │  • memory_store             │
         │  • memory_store_document    │
+        │  • memory_store_session     │
+        │  • memory_session_status    │
         │  • memory_update            │
         │  • memory_search            │
         │  • memory_graph             │
@@ -217,6 +219,9 @@ Chunk and store a full document. Content must contain non-whitespace text and is
 }
 ```
 Document chunks are stored with `normal` access unless document classification is added in a later schema/API change. The decoded limit is enforced consistently by the MCP and REST schemas (400 for invalid decoded content). HTTP JSON envelope limits are independent and can reject a request earlier with 413; this change does not raise the server's transport parser limit. Reusing an idempotency key after any visible chunk of that document has been forgotten returns HTTP 409 with `idempotency_key_tombstoned`; it never restores or replaces the forgotten chunks. Documents and chunks outside the caller's namespace grants remain undisclosed.
+
+### `memory_store_session` / `memory_session_status`
+Store a bounded full transcript as an episodic document and atomically enqueue asynchronous durable-fact distillation. A caller-provided `session_id` makes identical retries converge and changed requests conflict. Status is owner-only and content-free. Generation is fail-closed and requires a separate #57 provider/model, transcript terms, one-namespace `normal` scope, and cost-budget approval; storing an episode alone never calls a provider. See [`docs/session-distillation.md`](docs/session-distillation.md).
 
 ### `memory_search`
 Hybrid semantic + keyword search with filters. Every search is logged as a recall trace with timing data.

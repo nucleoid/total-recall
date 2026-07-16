@@ -112,6 +112,8 @@ than losing context.
 - **Self-check before session ends** — mentally review: did I store the key takeaways?
 ```
 
+The only raw-transcript exception is an intentional `memory_store_session` call. Use it only when the caller explicitly wants episodic retention, select the correct namespace and access level, and provide a stable `session_id` for retries. Storing an episode does not imply consent to send it to a model: automatic distillation remains disabled unless the operator has separately approved #57's complete-transcript provider/model, privacy terms, exact one-namespace `normal` scope, and cost budget. Never place a transcript in ordinary memory metadata, tags, logs, or status output.
+
 ## Update, Supersession, and Belief Revision Guidelines
 
 Use `memory_update` for corrections to the same current fact and for facts that change over time. Supply only fields that should change; `tags` and `metadata` replace their complete values rather than merging. When a new stored fact replaces an older one, call `memory_update` on the new current memory with `supersedes` set to the older memory ID. Do not overwrite the old row: the immutable link preserves history. A historical row may still appear in direct recall/list results with `is_superseded: true`; treat a visible linked successor as current. Linked IDs are intentionally null when the linked row is deleted, outside the requested namespace, or above the caller's access-level ceiling; never infer that a null link reopens a durable historical fact. Supersession cannot be undone implicitly by forgetting or purging the successor.
