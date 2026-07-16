@@ -10,6 +10,7 @@
     "scripts/migrate.ts",
     "scripts/provision-db.ts",
     "scripts/consolidate-memories.ts",
+    "scripts/reflect.ts",
     "scripts/deconsolidate-memories.ts",
     "scripts/entity-enrich.ts",
     "scripts/entity-backfill.ts",

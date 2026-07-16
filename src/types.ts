@@ -1,5 +1,5 @@
 export type AccessLevel = 'normal' | 'sensitive' | 'secret';
-export type MemoryKind = 'unspecified' | 'semantic' | 'document_chunk' | 'episode_chunk' | 'synced' | 'media_rollup' | 'consolidation';
+export type MemoryKind = 'unspecified' | 'semantic' | 'document_chunk' | 'episode_chunk' | 'synced' | 'media_rollup' | 'consolidation' | 'insight';
 
 export interface Memory {
   id: string;
@@ -28,6 +28,8 @@ export interface Memory {
   entity_source_revision?: number;
   consolidated_into_id?: string | null;
   consolidated_at?: Date | null;
+  origin_namespace?: string | null;
+  insight_content_hash?: string | null;
 }
 
 export interface ApiKey {

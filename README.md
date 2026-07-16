@@ -948,3 +948,14 @@ REST operation. Every reader/writer/maintenance process must be upgraded before 
 link. Rollback stops scheduling and approvals but retains migration 027 and link-aware code;
 visibility restoration uses only the exact audited `npm run deconsolidate` manifest workflow.
 See [docs/consolidation-rollout-runbook.md](docs/consolidation-rollout-runbook.md).
+
+## Weekly reflection
+
+Migration 031 adds an origin-aware `insights` namespace, restrictive evidence links, and
+idempotent run generations. Reflection remains disabled until an exact normal-only source scope,
+provider/model and terms, and per-run/monthly budget are independently approved. It requires a
+dedicated key scoped to the source plus `insights` with exactly `read,reflection`; it grants no
+ordinary source writes. Run a call-free, write-free estimate with
+`npm run reflect -- --namespace <one> --dry-run`, then externally schedule the normal command for
+the last completed ISO week. No MCP/HTTP trigger or in-process scheduler is installed. See
+[docs/reflection-rollout-runbook.md](docs/reflection-rollout-runbook.md).
