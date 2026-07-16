@@ -127,18 +127,22 @@ CREATE INDEX IF NOT EXISTS activity_events_source_idx
 -- Legacy rows remain nullable only to permit a non-destructive upgrade. New
 -- app-role writes are constrained by RLS to a real current key.
 ALTER TABLE public.connector_credentials
+  ADD COLUMN IF NOT EXISTS id uuid NOT NULL DEFAULT gen_random_uuid(),
   ADD COLUMN IF NOT EXISTS source_id text NOT NULL DEFAULT 'default',
   ADD COLUMN IF NOT EXISTS namespace text NOT NULL DEFAULT 'media',
   ADD COLUMN IF NOT EXISTS client_id uuid REFERENCES public.api_keys(id);
 ALTER TABLE public.connector_credentials DROP CONSTRAINT IF EXISTS connector_credentials_pkey;
+ALTER TABLE public.connector_credentials ADD CONSTRAINT connector_credentials_pkey PRIMARY KEY (id);
 CREATE UNIQUE INDEX IF NOT EXISTS connector_credentials_owner_source_uidx
   ON public.connector_credentials (client_id, namespace, service, source_id) NULLS NOT DISTINCT;
 
 ALTER TABLE public.connector_sync_state
+  ADD COLUMN IF NOT EXISTS id uuid NOT NULL DEFAULT gen_random_uuid(),
   ADD COLUMN IF NOT EXISTS source_id text NOT NULL DEFAULT 'default',
   ADD COLUMN IF NOT EXISTS namespace text NOT NULL DEFAULT 'media',
   ADD COLUMN IF NOT EXISTS client_id uuid REFERENCES public.api_keys(id);
 ALTER TABLE public.connector_sync_state DROP CONSTRAINT IF EXISTS connector_sync_state_pkey;
+ALTER TABLE public.connector_sync_state ADD CONSTRAINT connector_sync_state_pkey PRIMARY KEY (id);
 CREATE UNIQUE INDEX IF NOT EXISTS connector_sync_state_owner_source_uidx
   ON public.connector_sync_state (client_id, namespace, service, source_id) NULLS NOT DISTINCT;
 

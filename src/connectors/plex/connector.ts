@@ -1,7 +1,9 @@
 import {
   BaseConnector,
+  assertStateUnchanged,
   filterValidMediaEventDates,
   trustConnectorMediaEvents,
+  withConnectorSessionLock,
   type ConnectorContext,
   type SyncResult,
 } from '../base.js';
@@ -11,8 +13,8 @@ import {
   type ConnectorSyncState,
   type MediaEventInput,
 } from '../../media.js';
-import { withScopedClient } from '../../db.js';
-import { lockConnectorState } from '../state.js';
+import { withScopedTransactionOnClient } from '../../db.js';
+import { lockConnectorState, readConnectorStateRowWithClient } from '../state.js';
 import { loadCreds, plexHeaders } from './auth.js';
 import { getAccount, listServers, pickReachableUri, type PlexResource } from './discovery.js';
 import { toMediaEvent, type PlexHistoryItem } from './transform.js';
@@ -366,9 +368,11 @@ export class PlexConnector extends BaseConnector {
     let skipped = 0;
 
     try {
-      await withScopedClient(ctx.scope, async (client) => {
-        const state = await lockConnectorState(client, ctx.scope, this.service, 'default', 'media');
-        const sinceByServer = parsePlexCursorMetadata(state.metadata, (message) => warnings.push(message));
+      await withConnectorSessionLock(ctx.scope, this.service, 'default', 'media', async (client) => {
+        const before = await withScopedTransactionOnClient(client, ctx.scope, (scoped) =>
+          readConnectorStateRowWithClient(scoped, ctx.scope, this.service, 'default', 'media')
+        );
+        const sinceByServer = parsePlexCursorMetadata(before?.metadata, (message) => warnings.push(message));
         const creds = await loadCreds();
         const account = await getAccount(creds);
         const servers = await listServers(creds);
@@ -391,14 +395,17 @@ export class PlexConnector extends BaseConnector {
         errors.push(...valid.errors);
         skipped += valid.skipped;
         const enriched = trustConnectorMediaEvents(valid.events, ctx);
-        const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
-        ingested = result.inserted;
-        skipped += result.skipped;
-
-        await mutateConnectorSyncStateWithClient(client, this.service, (current: ConnectorSyncState) => ({
-          last_sync_at: new Date(),
-          metadata: mergePlexCursorMetadata(current.metadata, fetchResult.cursorCandidates),
-        }));
+        await withScopedTransactionOnClient(client, ctx.scope, async (scoped) => {
+          const state = await lockConnectorState(scoped, ctx.scope, this.service, 'default', 'media');
+          assertStateUnchanged(before, state, this.service, 'default');
+          const result = await upsertMediaEventsWithClient(scoped, enriched, ctx.scope);
+          ingested = result.inserted;
+          skipped += result.skipped;
+          await mutateConnectorSyncStateWithClient(scoped, this.service, (current: ConnectorSyncState) => ({
+            last_sync_at: new Date(),
+            metadata: mergePlexCursorMetadata(current.metadata, fetchResult.cursorCandidates),
+          }));
+        });
       });
     } catch (err: any) {
       errors.push(err?.message ?? String(err));

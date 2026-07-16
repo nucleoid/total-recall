@@ -13,6 +13,39 @@ export interface ConnectorStateRow {
   updated_at: Date;
 }
 
+export async function acquireConnectorSourceLock(
+  client: ScopedClient,
+  scope: DbScope,
+  service: string,
+  sourceId: string,
+  namespace: string,
+): Promise<void> {
+  assertIdentity(service, sourceId, namespace);
+  const result = await client.query<{ acquired: boolean }>(
+    `SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired`,
+    [lockIdentity(scope, service, sourceId, namespace)],
+  );
+  if (result.rows[0]?.acquired !== true) {
+    throw new Error(`Connector source is already syncing: ${service}/${sourceId}`);
+  }
+}
+
+export async function releaseConnectorSourceLock(
+  client: ScopedClient,
+  scope: DbScope,
+  service: string,
+  sourceId: string,
+  namespace: string,
+): Promise<void> {
+  const result = await client.query<{ released: boolean }>(
+    `SELECT pg_advisory_unlock(hashtextextended($1, 0)) AS released`,
+    [lockIdentity(scope, service, sourceId, namespace)],
+  );
+  if (result.rows[0]?.released !== true) {
+    throw new Error(`Connector source lock was not held: ${service}/${sourceId}`);
+  }
+}
+
 export async function lockConnectorState(
   client: ScopedClient,
   scope: DbScope,
@@ -29,7 +62,7 @@ export async function lockConnectorState(
   // the same cursor while this page is in flight.
   const lock = await client.query<{ acquired: boolean }>(
     `SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired`,
-    [`connector:${scope.keyId}:${namespace}:${service}:${sourceId}`],
+    [lockIdentity(scope, service, sourceId, namespace)],
   );
   if (lock.rows[0]?.acquired !== true) {
     throw new Error(`Connector source is already syncing: ${service}/${sourceId}`);
@@ -52,6 +85,22 @@ export async function lockConnectorState(
   return result.rows[0];
 }
 
+export async function readConnectorStateRowWithClient(
+  client: Pick<ScopedClient, 'query'>,
+  scope: DbScope,
+  service: string,
+  sourceId: string,
+  namespace: string,
+): Promise<ConnectorStateRow | null> {
+  assertIdentity(service, sourceId, namespace);
+  const result = await client.query<ConnectorStateRow>(
+    `SELECT * FROM connector_sync_state
+     WHERE client_id = $1 AND namespace = $2 AND service = $3 AND source_id = $4`,
+    [scope.keyId, namespace, service, sourceId],
+  );
+  return result.rows[0] ?? null;
+}
+
 export async function readConnectorStateWithClient(
   client: Pick<ScopedClient, 'query'>,
   scope: DbScope,
@@ -60,12 +109,7 @@ export async function readConnectorStateWithClient(
   namespace: string,
 ): Promise<ConnectorStoredState> {
   assertIdentity(service, sourceId, namespace);
-  const result = await client.query<ConnectorStateRow>(
-    `SELECT * FROM connector_sync_state
-     WHERE client_id = $1 AND namespace = $2 AND service = $3 AND source_id = $4`,
-    [scope.keyId, namespace, service, sourceId],
-  );
-  const row = result.rows[0];
+  const row = await readConnectorStateRowWithClient(client, scope, service, sourceId, namespace);
   return {
     cursor: row?.cursor ?? null,
     lastEventAt: row?.last_event_at ?? null,
@@ -100,6 +144,10 @@ export async function advanceConnectorState(
     ],
   );
   if (result.rowCount !== 1) throw new Error(`Unable to advance connector state for ${service}/${sourceId}`);
+}
+
+function lockIdentity(scope: DbScope, service: string, sourceId: string, namespace: string): string {
+  return `connector:${scope.keyId}:${namespace}:${service}:${sourceId}`;
 }
 
 function assertIdentity(service: string, sourceId: string, namespace: string): void {

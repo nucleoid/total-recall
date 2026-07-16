@@ -1,6 +1,6 @@
 # Migration 035 activity connector foundation rollout
 
-Migration 035 replaces media identity with owner/service/source/event identity, adds the separate `activity_events` domain, and enables owner-plus-namespace RLS for connector credentials and state.
+Migration 035 replaces media identity with owner/service/source/event identity, adds the separate `activity_events` domain, and enables owner-plus-namespace RLS for connector credentials and state. This intentionally removes the previous admin cross-key bypass for media event lists and statistics: an admin key now sees only media rows it owns. Inventory any dashboard/report that relied on cross-key media aggregation and move it to explicitly owner-scoped credentials before rollout.
 
 ## Before migration
 
@@ -9,6 +9,7 @@ Migration 035 replaces media identity with owner/service/source/event identity, 
 3. Inventory duplicate candidate groups under `(client_id, service, source_id, event_key)` and confirm Plex rows have trustworthy `metadata.server_id`. Do not delete ambiguous rows.
 4. Inventory each `connector_credentials` and `connector_sync_state` row and independently map it to one API key. The migration intentionally does not guess that ownership.
 5. Confirm the selected keys include `media` or `activity` and the required read/write permissions.
+6. Inventory admin dashboards/reports for cross-key media list/statistics use. The privacy correction to owner-only results is intentional and otherwise appears as silently lower counts.
 
 ## Deploy
 
