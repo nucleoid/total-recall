@@ -566,6 +566,197 @@ export async function getMediaStats(auth: AuthContext, scope: DbScope, filters: 
   return result.rows[0].stats;
 }
 
+export type MediaTasteCategory = 'music' | 'viewing';
+
+export interface MediaTasteWindow {
+  start: Date;
+  end: Date;
+}
+
+export interface MediaTasteAggregateItem {
+  value: string;
+  count: number;
+}
+
+export interface MediaTasteContext {
+  total: number;
+  services: MediaTasteAggregateItem[];
+  entities: MediaTasteAggregateItem[];
+  genres: MediaTasteAggregateItem[];
+}
+
+export interface MediaTasteAggregate {
+  category: MediaTasteCategory;
+  sourceNamespace: string;
+  period: MediaTasteWindow;
+  previousPeriod: MediaTasteWindow;
+  contexts: {
+    period: MediaTasteContext;
+    previous: MediaTasteContext;
+    days30: MediaTasteContext;
+    days90: MediaTasteContext;
+    days365: MediaTasteContext;
+    allTime: MediaTasteContext;
+  };
+  qualityWarnings: string[];
+}
+
+interface MediaTasteAggregateRow {
+  window_name: 'period' | 'previous' | 'days30' | 'days90' | 'days365' | 'allTime';
+  dimension: 'total' | 'service' | 'entity' | 'genre' | 'quality';
+  value: string;
+  event_count: number | string;
+  rank: number | string;
+}
+
+export interface MediaTasteAggregateOptions {
+  category: MediaTasteCategory;
+  sourceNamespace: string;
+  period: MediaTasteWindow;
+  previousPeriod: MediaTasteWindow;
+  topLimit?: number;
+}
+
+const MEDIA_TASTE_TOP_LIMIT_MAX = 20;
+
+/**
+ * Build bounded taste-profile facts from structured rows only. The query never
+ * returns event IDs, timestamps, account/source IDs, metadata, or raw events.
+ */
+export async function getMediaTasteAggregate(
+  client: Pick<ScopedClient, 'query'>,
+  options: MediaTasteAggregateOptions,
+): Promise<MediaTasteAggregate> {
+  const topLimit = options.topLimit ?? 10;
+  if (!Number.isSafeInteger(topLimit) || topLimit < 1 || topLimit > MEDIA_TASTE_TOP_LIMIT_MAX) {
+    throw new Error(`Taste aggregate topLimit must be an integer from 1 to ${MEDIA_TASTE_TOP_LIMIT_MAX}`);
+  }
+  if (!options.sourceNamespace.trim() || options.sourceNamespace.includes(',')) {
+    throw new Error('Taste aggregate requires exactly one source namespace');
+  }
+  if (options.period.start.getTime() >= options.period.end.getTime() ||
+      options.previousPeriod.start.getTime() >= options.previousPeriod.end.getTime() ||
+      options.previousPeriod.end.getTime() !== options.period.start.getTime()) {
+    throw new Error('Taste aggregate periods must be adjacent, nonempty intervals');
+  }
+  const end = options.period.end.getTime();
+  const starts = {
+    days30: new Date(end - 30 * 86_400_000),
+    days90: new Date(end - 90 * 86_400_000),
+    days365: new Date(end - 365 * 86_400_000),
+  };
+  const result = await client.query<MediaTasteAggregateRow>(`
+    WITH eligible AS (
+      SELECT id, service, played_at,
+        CASE WHEN $7 = 'music' THEN NULLIF(btrim(artist), '')
+             ELSE COALESCE(NULLIF(btrim(show), ''), NULLIF(btrim(title), '')) END AS entity,
+        genres,
+        CASE WHEN metadata ? 'played_precision'
+                  AND metadata->>'played_precision' NOT IN ('exact', 'instant') THEN true ELSE false END AS approximate_time
+      FROM media_events
+      WHERE namespace = $1 AND played_at < $3::timestamptz
+        AND CASE WHEN $7 = 'music' THEN (
+          NULLIF(btrim(artist), '') IS NOT NULL OR lower(service) IN ('spotify', 'ytmusic')
+        ) ELSE (
+          NOT (NULLIF(btrim(artist), '') IS NOT NULL OR lower(service) IN ('spotify', 'ytmusic'))
+          AND (
+            NULLIF(btrim(show), '') IS NOT NULL OR season IS NOT NULL OR episode IS NOT NULL
+            OR lower(event_type) IN ('watch', 'watched', 'view', 'viewed', 'complete', 'completed')
+          )
+        ) END
+    ), windows(window_name, window_start, window_end) AS (VALUES
+      ('period', $2::timestamptz, $3::timestamptz),
+      ('previous', $4::timestamptz, $2::timestamptz),
+      ('days30', $5::timestamptz, $3::timestamptz),
+      ('days90', $6::timestamptz, $3::timestamptz),
+      ('days365', $8::timestamptz, $3::timestamptz),
+      ('allTime', NULL::timestamptz, $3::timestamptz)
+    ), scoped AS (
+      SELECT w.window_name, e.* FROM windows w JOIN eligible e
+        ON (w.window_start IS NULL OR e.played_at >= w.window_start) AND e.played_at < w.window_end
+    ), facts AS (
+      SELECT window_name, 'total'::text AS dimension, 'events'::text AS value,
+             count(DISTINCT id)::bigint AS event_count FROM scoped GROUP BY window_name
+      UNION ALL
+      SELECT window_name, 'service', service, count(DISTINCT id)::bigint
+        FROM scoped GROUP BY window_name, service
+      UNION ALL
+      SELECT window_name, 'entity', entity, count(DISTINCT id)::bigint
+        FROM scoped WHERE entity IS NOT NULL GROUP BY window_name, entity
+      UNION ALL
+      SELECT scoped.window_name, 'genre', genre, count(DISTINCT scoped.id)::bigint
+        FROM scoped CROSS JOIN LATERAL unnest(scoped.genres) genre
+        WHERE NULLIF(btrim(genre), '') IS NOT NULL GROUP BY scoped.window_name, genre
+      UNION ALL
+      SELECT window_name, 'quality', 'missing_entity', count(DISTINCT id)::bigint
+        FROM scoped WHERE entity IS NULL GROUP BY window_name
+      UNION ALL
+      SELECT window_name, 'quality', 'approximate_timestamps', count(DISTINCT id)::bigint
+        FROM scoped WHERE approximate_time GROUP BY window_name
+    ), ranked AS (
+      SELECT *, row_number() OVER (
+        PARTITION BY window_name, dimension ORDER BY event_count DESC, value COLLATE "C"
+      ) AS rank FROM facts
+    )
+    SELECT window_name, dimension, value, event_count, rank FROM ranked
+    WHERE dimension IN ('total', 'quality') OR rank <= $9
+    ORDER BY CASE window_name WHEN 'period' THEN 1 WHEN 'previous' THEN 2 WHEN 'days30' THEN 3
+      WHEN 'days90' THEN 4 WHEN 'days365' THEN 5 ELSE 6 END,
+      dimension, rank, value COLLATE "C"
+  `, [
+    options.sourceNamespace,
+    options.period.start.toISOString(),
+    options.period.end.toISOString(),
+    options.previousPeriod.start.toISOString(),
+    starts.days30.toISOString(),
+    starts.days90.toISOString(),
+    options.category,
+    starts.days365.toISOString(),
+    topLimit,
+  ]);
+  return buildMediaTasteAggregate(result.rows, options);
+}
+
+export function buildMediaTasteAggregate(
+  rows: readonly MediaTasteAggregateRow[],
+  options: MediaTasteAggregateOptions,
+): MediaTasteAggregate {
+  const empty = (): MediaTasteContext => ({ total: 0, services: [], entities: [], genres: [] });
+  const contexts: MediaTasteAggregate['contexts'] = {
+    period: empty(), previous: empty(), days30: empty(), days90: empty(), days365: empty(), allTime: empty(),
+  };
+  const key = (name: MediaTasteAggregateRow['window_name']): keyof typeof contexts => name;
+  const warnings = new Set<string>();
+  for (const row of rows) {
+    const count = typeof row.event_count === 'number' ? row.event_count : Number(row.event_count);
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error('Media aggregate returned an invalid count');
+    const context = contexts[key(row.window_name)];
+    if (row.dimension === 'total') context.total = count;
+    else if (row.dimension === 'service') context.services.push({ value: row.value, count });
+    else if (row.dimension === 'entity') context.entities.push({ value: row.value, count });
+    else if (row.dimension === 'genre') context.genres.push({ value: row.value, count });
+    else if (row.window_name === 'period' && count > 0) warnings.add(`${row.value}:${count}`);
+  }
+  if (contexts.period.total > 0 && contexts.period.services.length === 1) warnings.add('single_service');
+  for (const context of Object.values(contexts)) {
+    context.services.sort(compareAggregateItem);
+    context.entities.sort(compareAggregateItem);
+    context.genres.sort(compareAggregateItem);
+  }
+  return {
+    category: options.category,
+    sourceNamespace: options.sourceNamespace,
+    period: options.period,
+    previousPeriod: options.previousPeriod,
+    contexts,
+    qualityWarnings: [...warnings].sort(),
+  };
+}
+
+function compareAggregateItem(left: MediaTasteAggregateItem, right: MediaTasteAggregateItem): number {
+  return right.count - left.count || (left.value < right.value ? -1 : left.value > right.value ? 1 : 0);
+}
+
 export async function getRollupPendingEvents(auth: AuthContext, scope: DbScope, limit = 50): Promise<MediaEvent[]> {
   const res = await queryScoped<MediaEvent>(
     scope,

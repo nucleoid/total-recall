@@ -39,6 +39,7 @@
     "maintenance": "npm run decay:update",
     "consolidate": "tsx scripts/consolidate-memories.ts",
     "reflect": "tsx scripts/reflect.ts",
+    "taste-profile": "tsx scripts/taste-profile.ts",
     "entity:enrich": "tsx scripts/entity-enrich.ts",
     "entity:backfill": "tsx scripts/entity-backfill.ts",
     "session:distill": "tsx scripts/session-distill.ts",

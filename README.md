@@ -405,6 +405,10 @@ npm run media:repair-dates -- --apply --after-played-at <ISO_TIMESTAMP> --after-
 
 Dry-run is the default and performs no embedding or writes. Applying consumes embedding quota and atomically refreshes summary text, vector, tags, and metadata only when the linked event and media memory still match. Back up/review first, stop overlapping rollup or repair workers, and use optional `--service`, `--played-after`, and `--played-before` filters as needed. A provider or row failure aborts immediately, reports one bounded error without summary content, leaves the checkpoint before that row for a retry, and makes the command exit nonzero. A concurrent change likewise stops the scan with the checkpoint before that row; resume from that checkpoint after quiescing overlapping workers. If `skippedConcurrent` is greater than zero, always finish with a final no-cursor reconciliation pass (omit both `--after-*` options) so no concurrently skipped row is permanently passed.
 
+### Monthly media taste profiles
+
+`npm run taste-profile` builds separate music and viewing profiles for the last completed calendar month from bounded structured-event aggregates. It never sends raw events or rollup prose to generation. The default dry-run makes no provider, embedding, or mutation call; `--preview --json` is the explicit human-review boundary, and `--apply` atomically updates/supersedes recallable `derived:media-taste` memories. No provider or approval is inherited from embeddings or another generative feature. See [the taste-profile policy, scheduling, disclosure, and rollback guide](docs/taste-profile.md).
+
 ## Data Sources & Sync Model
 
 ### Automatic (MCP — ongoing)
