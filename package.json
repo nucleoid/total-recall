@@ -32,6 +32,7 @@
     "preseed:chatgpt": "tsx scripts/preseed-chatgpt.ts",
     "decay:update": "tsx scripts/decay-update.ts",
     "consolidate": "tsx scripts/consolidate-memories.ts",
+    "reflect": "tsx scripts/reflect.ts",
     "entity:enrich": "tsx scripts/entity-enrich.ts",
     "entity:backfill": "tsx scripts/entity-backfill.ts",
     "session:distill": "tsx scripts/session-distill.ts",
