@@ -113,6 +113,20 @@ export interface StatsParams {
   namespace?: string;
 }
 
+export interface MemorySubscription {
+  id: string;
+  api_key_id: string;
+  query: string;
+  namespaces: string[];
+  threshold: number;
+  exclude_self: boolean;
+  status: 'active' | 'disabled';
+  created_at: Date;
+  disabled_at: Date | null;
+}
+
+export type WebhookDeliveryStatus = 'pending' | 'processing' | 'retry' | 'delivered' | 'dead' | 'cancelled';
+
 export interface AuthContext {
   keyId: string;
   name: string;

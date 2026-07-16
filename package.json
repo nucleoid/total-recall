@@ -34,6 +34,7 @@
     "consolidate": "tsx scripts/consolidate-memories.ts",
     "entity:enrich": "tsx scripts/entity-enrich.ts",
     "entity:backfill": "tsx scripts/entity-backfill.ts",
+    "webhooks:deliver": "tsx scripts/webhook-delivery.ts",
     "deconsolidate": "tsx scripts/deconsolidate-memories.ts",
     "purge:deleted": "tsx scripts/purge-deleted.ts",
     "repair:relevance-scores": "tsx scripts/repair-relevance-scores.ts",
