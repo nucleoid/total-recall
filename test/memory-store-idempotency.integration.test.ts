@@ -30,6 +30,8 @@ class FakePool {
         return result([]);
       }
       if (sql.startsWith("SELECT set_config('app.")) return result([]);
+      if (/SELECT pg_advisory_xact_lock/i.test(sql)) return result([{}]);
+      if (/SELECT m\.id, m\.namespace,[\s\S]*m\.embedding <=>/i.test(sql)) return result([]);
       if (/INSERT INTO agents/i.test(sql)) return result([{ id: `agent-${params[0]}` }]);
       if (/INSERT INTO memories/i.test(sql)) {
         const keyed = /source_key/i.test(sql);
@@ -68,7 +70,7 @@ class FakePool {
 function result(rows: any[], command = 'MOCK') { return { command, rowCount: rows.length, oid: 0, fields: [], rows }; }
 function sourceKey(auth: AuthContext, key: string) { return `discord-safe:v1:${createHash('sha256').update(`${auth.keyId}\0${key}`).digest('hex')}`; }
 
-test('memory_store keyed retries upsert per API key while unkeyed calls append', async t => {
+test('memory_store keyed retries upsert per API key while dedupe opt-out calls append', async t => {
   const pool = new FakePool();
   setPoolForTesting(pool as unknown as pg.Pool);
   const originalFetch = globalThis.fetch;
@@ -101,7 +103,7 @@ test('memory_store keyed retries upsert per API key while unkeyed calls append',
   assert.equal(pool.rows.length, 2);
   assert.equal(pool.rows[1].source_key, sourceKey(AUTH_B, 'same'));
 
-  const plain = storeSchema.parse({ content: 'append' });
+  const plain = storeSchema.parse({ content: 'append', dedupe: false });
   const unkeyed = await memoryStore(plain, AUTH_A); await memoryStore(plain, AUTH_A);
   assert.equal('idempotency_key_honored' in unkeyed, false);
   assert.equal(pool.rows.length, 4);

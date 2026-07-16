@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { dbScopeFromAuth, queryScoped, withScopedClient } from '../db.js';
+import { dbScopeFromAuth, withScopedClient } from '../db.js';
 import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from '../embedding.js';
-import type { AuthContext } from '../types.js';
+import type { AuthContext, StoreResult } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
 import { SupersededSourceKeyConflictError, TombstonedSourceKeyConflictError } from '../errors.js';
@@ -36,7 +36,21 @@ export const storeSchema = z.object({
   agent_runtime: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
   session_id: z.string().max(TEXT_FIELD_MAX_CHARS).optional(),
   idempotency_key: z.string().min(1).max(512).optional(),
+  dedupe: z.boolean().default(true),
 });
+
+export function parseMemoryDedupeThreshold(value: string | undefined): number {
+  if (value === undefined) return 0.95;
+  if (value.trim() === '') throw new Error('MEMORY_DEDUPE_THRESHOLD must be a number between 0 and 1');
+  const threshold = Number(value);
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new Error('MEMORY_DEDUPE_THRESHOLD must be a number between 0 and 1');
+  }
+  return threshold;
+}
+
+/** Validated once when the store runtime starts. */
+export const MEMORY_DEDUPE_THRESHOLD = parseMemoryDedupeThreshold(process.env.MEMORY_DEDUPE_THRESHOLD);
 
 export interface MemoryStoreRuntimeOptions {
   contradictionPolicy?: ContradictionPolicy;
@@ -50,7 +64,7 @@ export async function memoryStore(
   params: z.infer<typeof storeSchema>,
   auth: AuthContext,
   runtime: MemoryStoreRuntimeOptions = {},
-): Promise<{ id: string; namespace: string; idempotency_key_honored?: true }> {
+): Promise<StoreResult> {
   checkPermission(auth, 'write');
 
   const ns = params.namespace;
@@ -122,7 +136,7 @@ export async function memoryStore(
       allowMutation: true,
       metric: runtime.contradictionMetric,
     });
-    if (revised) return revised;
+    if (revised) return { ...revised, created: true, deduplicated: false };
   }
 
   const scheduleShadowAfterCommit = (storedId: string): void => {
@@ -139,32 +153,87 @@ export async function memoryStore(
   };
 
   if (!params.idempotency_key) {
-    try {
-      const res = await queryScoped(
-        dbScopeFromAuth(auth),
+    const result = await withScopedClient(dbScopeFromAuth(auth), async (client): Promise<StoreResult> => {
+      if (params.dedupe !== false) {
+        // Serialize semantic identity decisions within the security boundary. The
+        // embedding is deliberately computed before this short-lived lock.
+        await client.query(
+          'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+          [`memory-store-dedupe:${JSON.stringify([ns, params.access_level])}`],
+        );
+
+        const candidate = await client.query<{ id: string; namespace: string; similarity: number | string | null }>(
+          `SELECT m.id, m.namespace,
+                  1 - (m.embedding <=> $1::vector) AS similarity
+           FROM memories m
+           WHERE m.namespace = $2
+             AND COALESCE(m.access_level, 'normal') = $3
+             AND m.embedding IS NOT NULL
+             AND m.embedding_provider = $4
+             AND m.embedding_model = $5
+             AND m.embedding_dimensions = $6
+             AND m.source_key IS NULL
+             AND m.document_id IS NULL
+             AND m.deleted_at IS NULL
+             AND m.superseded_at IS NULL
+             AND m.valid_to IS NULL
+             AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
+             AND m.consolidated_into_id IS NULL
+             AND m.memory_kind NOT IN ('document_chunk', 'episode_chunk')
+           ORDER BY m.embedding <=> $1::vector ASC,
+                    calculate_relevance(m.relevance_base_score, m.decay_rate, m.accessed_at, m.access_count) DESC,
+                    m.created_at ASC,
+                    m.id ASC
+           LIMIT 1
+           FOR UPDATE`,
+          [vecStr, ns, params.access_level, ...embeddingDescriptorParams()],
+        );
+        const match = candidate.rows[0];
+        const similarity = match?.similarity == null ? Number.NaN : Number(match.similarity);
+        if (match && Number.isFinite(similarity) && similarity >= MEMORY_DEDUPE_THRESHOLD) {
+          const boosted = await client.query<{ id: string; namespace: string }>(
+            `UPDATE memories
+             SET access_count = COALESCE(access_count, 0) + 1,
+                 accessed_at = statement_timestamp(),
+                 last_boosted_at = statement_timestamp(),
+                 tags = ARRAY(
+                   SELECT value
+                   FROM unnest(COALESCE(memories.tags, ARRAY[]::text[]) || $2::text[])
+                     WITH ORDINALITY AS combined(value, position)
+                   GROUP BY value
+                   ORDER BY MIN(position)
+                 ),
+                 updated_at = statement_timestamp()
+             WHERE id = $1::uuid
+               AND deleted_at IS NULL
+               AND superseded_at IS NULL
+               AND valid_to IS NULL
+               AND consolidated_into_id IS NULL
+             RETURNING id, namespace`,
+            [match.id, params.tags],
+          );
+          if (boosted.rows.length !== 1) {
+            throw new Error('Dedupe candidate changed while the namespace lock was held');
+          }
+          return {
+            ...boosted.rows[0],
+            created: false,
+            deduplicated: true,
+            similarity,
+          };
+        }
+      }
+
+      const inserted = await client.query<{ id: string; namespace: string }>(
         `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from)
          VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'semantic', statement_timestamp())
          RETURNING id, namespace`,
-        values
-      );
-      const stored = res.rows[0];
-      scheduleShadowAfterCommit(stored.id);
-      return stored;
-    } catch (error) {
-      // Preserve the repository's migration-by-migration integration harness.
-      // Production rollout still requires migration 026 before this writer.
-      if (!isMissingBeliefSchema(error)) throw error;
-      const legacy = await queryScoped(
-        dbScopeFromAuth(auth),
-        `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions)
-         VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-         RETURNING id, namespace`,
         values,
       );
-      const stored = legacy.rows[0];
-      scheduleShadowAfterCommit(stored.id);
-      return stored;
-    }
+      return { ...inserted.rows[0], created: true, deduplicated: false };
+    });
+    if (result.created) scheduleShadowAfterCommit(result.id);
+    return result;
   }
 
   const digest = createHash('sha256')
@@ -202,7 +271,7 @@ export async function memoryStore(
          WHERE memories.deleted_at IS NULL${currentGuard}${consolidationGuard}
            AND memories.namespace = ANY($15::text[])
            AND EXCLUDED.namespace = ANY($15::text[])
-         RETURNING id, namespace`,
+         RETURNING id, namespace, (xmax = 0) AS created`,
         [...values, sourceKey, auth.namespaces]
       );
       if (upsert.rows.length > 0) return upsert;
@@ -273,11 +342,14 @@ export async function memoryStore(
     }
     throw error;
   }
-  return { ...res.rows[0], idempotency_key_honored: true };
-}
-
-function isMissingBeliefSchema(error: unknown): boolean {
-  return isMissingColumn(error, 'memory_kind');
+  const stored = res.rows[0] as { id: string; namespace: string; created?: boolean };
+  return {
+    id: stored.id,
+    namespace: stored.namespace,
+    created: stored.created ?? true,
+    deduplicated: false,
+    idempotency_key_honored: true,
+  };
 }
 
 function isMissingColumn(error: unknown, column: 'memory_kind' | 'superseded_at' | 'consolidated_into_id'): boolean {

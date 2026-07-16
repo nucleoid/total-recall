@@ -76,6 +76,9 @@ Store a memory with automatic embedding.
 - tags?: string[]
 - metadata?: Record<string, any>
 - access_level?: 'normal' | 'sensitive' | 'secret'
+- dedupe?: boolean (default `true`)
+
+For ordinary non-source-key stores, the incoming embedding is compared only with active, current, non-document memories in the same namespace, access level, and embedding descriptor. At cosine similarity `>= MEMORY_DEDUPE_THRESHOLD` (default `0.95`), the highest-similarity candidate is reused; calculated relevance, oldest creation time, and UUID break ties. Reuse increments access count, updates access/boost/update timestamps, and unions tags without changing content, metadata, or provenance. Candidate selection and insert/boost share a scoped transaction protected by a namespace/access-level advisory lock. `dedupe:false`, document chunks, and source-key stores bypass this lookup. Results are `{ id, namespace, created, deduplicated, similarity? }`.
 
 The API key's `max_access_level` must be greater than or equal to the requested `access_level`. Reads compare ranks as `normal < sensitive < secret`; rows above the key ceiling are excluded from search, recall, list, namespace counts, stats, and agent memory counts before pagination or aggregation. Null legacy memory values are treated as `normal`; unknown legacy labels fail closed and are not visible to any key.
 

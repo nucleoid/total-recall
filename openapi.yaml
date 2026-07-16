@@ -60,7 +60,12 @@ paths:
   /api/store:
     post:
       operationId: storeMemory
-      summary: Store a memory
+      summary: Store or reuse a near-duplicate memory
+      description: >-
+        By default, an active near-duplicate in the same namespace, access level,
+        and embedding space is boosted and returned instead of inserting a row.
+        Document chunks and source-key stores are excluded. Send dedupe=false to
+        force insertion.
       requestBody:
         required: true
         content:
@@ -695,16 +700,29 @@ components:
           type: string
           minLength: 1
           maxLength: 512
+          description: Source-key upserts bypass semantic deduplication.
+        dedupe:
+          type: boolean
+          default: true
+          description: Set false to force insertion despite a near semantic match.
     StoreResponse:
       type: object
-      required: [id, created]
+      required: [id, namespace, created, deduplicated]
       properties:
         id:
           type: string
           format: uuid
+        namespace:
+          type: string
         created:
           type: boolean
-          const: true
+        deduplicated:
+          type: boolean
+        similarity:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Cosine similarity to the reused canonical memory; present only when deduplicated is true.
         idempotency_key_honored:
           type: boolean
           const: true
