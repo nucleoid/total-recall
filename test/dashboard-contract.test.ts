@@ -5,6 +5,7 @@ import {
   mediaStatsQuerySchema,
   memoriesQuerySchema,
 } from '../src/http-schemas.js';
+import { toApiDateTime } from '../dashboard/api.js';
 
 const id = '00000000-0000-4000-8000-000000000001';
 
@@ -30,6 +31,12 @@ test('memory browsing query contract validates filters, deterministic sorting, a
   assert.throws(() => memoriesQuerySchema.parse({ limit: '201' }));
   assert.throws(() => memoriesQuerySchema.parse({ sort: 'content' }));
   assert.throws(() => memoriesQuerySchema.parse({ created_after: 'later' }));
+});
+
+test('dashboard normalizes every datetime-local value to an offset timestamp', () => {
+  for (const value of ['2026-07-16T00:00', '2026-07-16T13:45']) {
+    assert.equal(toApiDateTime(value), new Date(value).toISOString());
+  }
 });
 
 test('media stats contract validates inclusive date range and service', () => {

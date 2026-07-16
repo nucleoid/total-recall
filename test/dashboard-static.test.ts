@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readdir } from 'node:fs/promises';
 import { afterEach, test } from 'node:test';
 import request from 'supertest';
 import { app, setServerTestOverrides } from '../src/server.js';
@@ -27,6 +28,14 @@ test('dashboard shell and direct routes are public, hardened, and never contain 
     assert.equal(response.headers['x-content-type-options'], 'nosniff');
     assert.equal(response.headers['referrer-policy'], 'no-referrer');
   }
+});
+
+test('missing immutable assets return 404 instead of the SPA shell and production emits no source maps', async () => {
+  const response = await request(app).get('/dashboard/assets/app-stale-hash.js').set('Accept', '*/*');
+  assert.equal(response.status, 404);
+  assert.doesNotMatch(response.type, /html/);
+  const assets = await readdir(new URL('../dist/dashboard/assets/', import.meta.url));
+  assert.equal(assets.some((name) => name.endsWith('.map')), false);
 });
 
 test('dashboard API routes remain authenticated and are not swallowed by the SPA fallback', async () => {
