@@ -20,7 +20,9 @@ test('migration implements prospective bounded same-model normal-only outbox mat
   assert.match(sql, /AFTER INSERT ON public\.memories/);
   assert.match(sql, /COALESCE\(NEW\.access_level, 'normal'\) <> 'normal'/);
   assert.match(sql, /s\.embedding_provider = NEW\.embedding_provider/);
-  assert.match(sql, /ORDER BY similarity DESC, s\.id\s+LIMIT 100/);
+  assert.match(sql, /ORDER BY similarity DESC, s\.id\s+LIMIT 101/);
+  assert.match(sql, /ALTER TABLE public\.memories DISABLE TRIGGER memories_subscription_enqueue/);
+  assert.doesNotMatch(sql, /memory_id UUID[^,\n]*REFERENCES public\.memories/);
   assert.match(sql, /UNIQUE \(subscription_id, memory_id, event_version\)/);
   assert.match(sql, /SECURITY DEFINER\s+SET search_path = public, pg_temp/);
   assert.match(sql, /REVOKE ALL ON FUNCTION public\.enqueue_memory_subscription_webhooks\(\) FROM PUBLIC/);

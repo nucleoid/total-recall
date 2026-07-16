@@ -257,7 +257,7 @@ Admin-only statistics: total memories, breakdown by namespace and source, docume
 
 ### `agent_subscribe` / `agent_list_subscriptions` / `agent_unsubscribe`
 
-Create, inspect, and disable prospective semantic interests that emit signed, ID-only webhooks for matching newly inserted `normal` memories. Creation requires an owner-scoped `idempotency_key`; destinations are public HTTPS/443 only, delivery is at least once, and receivers recall content separately with their own authorized API key. Creation and the worker are disabled by default. See [docs/subscriptions.md](docs/subscriptions.md) for payload verification, SSRF policy, key rotation, operation, and rollback.
+Create, inspect, and disable prospective semantic interests that emit signed, ID-only webhooks for matching newly inserted `normal` memories. Creation requires an owner-scoped `idempotency_key`; destinations are public HTTPS/443 only, delivery is at least once, and receivers recall content separately with their own authorized API key. Creation, the worker, and the database enqueue trigger are disabled by default. See [docs/subscriptions.md](docs/subscriptions.md) for payload verification, SSRF policy, key rotation, operation, and rollback.
 
 ### `agent_register`
 Register or update an AI agent in the provenance system.

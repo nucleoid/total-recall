@@ -7,7 +7,7 @@ Memory subscriptions are prospective semantic interests. A new `normal` memory w
 Creation and delivery have separate fail-closed gates:
 
 ```dotenv
-MEMORY_SUBSCRIPTIONS_ENABLED=true
+MEMORY_SUBSCRIPTION_CREATION_ENABLED=true
 WEBHOOK_DELIVERY_ENABLED=true
 WEBHOOK_ENCRYPTION_KEYS=2026-01:<base64-32-byte-key>,2025-12:<previous-key>
 WEBHOOK_WORKER_API_KEY=tr_dedicated_admin_read_key
@@ -46,9 +46,10 @@ Only public HTTPS destinations on port 443 are accepted. URLs with user-info or 
 
 ## Rollout and rollback
 
-1. Apply migration 029 with creation and delivery disabled.
+1. Apply migration 029. Creation and delivery are disabled, and the migration leaves `memories_subscription_enqueue` disabled as the database-side kill switch.
 2. Configure the encryption key ring and dedicated worker key.
-3. Enable delivery and canary the worker with no subscriptions.
-4. Enable creation for keys restricted to one approved namespace, then widen deliberately.
+3. Enable and canary the worker with no subscriptions.
+4. After measuring insert plans/latency, explicitly run `ALTER TABLE public.memories ENABLE TRIGGER memories_subscription_enqueue` as the database owner.
+5. Enable creation for keys restricted to one approved namespace, then widen deliberately.
 
-There is no backfill or query replay. Rollback by disabling creation, stopping the worker, and disabling the `memories_subscription_enqueue` trigger. Retain encrypted subscriptions, outbox history, and audit rows. Disabling a subscription/key or narrowing an ACL wins before a new connection, but cannot recall an HTTP request already in flight. Content-bearing payloads and private-network destinations require a separate policy and contract review.
+There is no backfill or query replay. Rollback by disabling creation, stopping the worker, and disabling the `memories_subscription_enqueue` trigger. Retain encrypted subscriptions, content-free outbox history, and audit rows. Delivery/truncation rows intentionally do not hold a foreign key to `memories`: hard deletion may remove memory content while retaining only its former opaque ID in notification history. Disabling a subscription/key or narrowing an ACL wins before a new connection, but cannot recall an HTTP request already in flight. Content-bearing payloads and private-network destinations require a separate policy and contract review.

@@ -49,7 +49,7 @@ function configuredRing(): EncryptionKeyRing {
 }
 
 function assertCreationEnabled(): void {
-  if (process.env.MEMORY_SUBSCRIPTIONS_ENABLED !== 'true') {
+  if (process.env.MEMORY_SUBSCRIPTION_CREATION_ENABLED !== 'true') {
     throw new Error('Memory subscription creation is disabled by operator policy');
   }
 }

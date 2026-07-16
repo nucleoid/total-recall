@@ -50,7 +50,9 @@ CREATE TABLE public.webhook_deliveries (
   event_id UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
   subscription_id UUID NOT NULL,
   api_key_id UUID NOT NULL,
-  memory_id UUID NOT NULL REFERENCES public.memories(id) ON DELETE RESTRICT,
+  -- Deliberately not an FK: hard deletion must not be blocked, while this
+  -- content-free delivery audit may retain the former opaque memory ID.
+  memory_id UUID NOT NULL,
   namespace TEXT NOT NULL,
   event_version INTEGER NOT NULL DEFAULT 1 CHECK (event_version = 1),
   similarity DOUBLE PRECISION NOT NULL CHECK (similarity >= -1 AND similarity <= 1),
@@ -71,7 +73,8 @@ CREATE INDEX webhook_deliveries_claim_idx ON public.webhook_deliveries
 CREATE INDEX webhook_deliveries_subscription_idx ON public.webhook_deliveries (subscription_id, created_at DESC);
 
 CREATE TABLE public.subscription_match_truncations (
-  memory_id UUID PRIMARY KEY REFERENCES public.memories(id) ON DELETE RESTRICT,
+  -- Deliberately not an FK for the same hard-deletion compatibility reason.
+  memory_id UUID PRIMARY KEY,
   namespace TEXT NOT NULL,
   match_cap INTEGER NOT NULL DEFAULT 100 CHECK (match_cap = 100),
   created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
@@ -133,8 +136,6 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
-DECLARE
-  enqueued_count INTEGER;
 BEGIN
   IF NEW.embedding IS NULL
      OR NEW.embedding_provider IS NULL
@@ -144,10 +145,11 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  INSERT INTO public.webhook_deliveries
-    (subscription_id, api_key_id, memory_id, namespace, event_version, similarity)
-  SELECT matched.id, matched.api_key_id, NEW.id, NEW.namespace, 1, matched.similarity
-  FROM (
+  -- Materialize at most 101 exact matches once. The first 100 become durable
+  -- deliveries; the extra row records content-free truncation without a second
+  -- cosine scan. Exact matching is intentional until measured volume justifies
+  -- a separately reviewed approximate index.
+  WITH matched AS MATERIALIZED (
     SELECT s.id, s.api_key_id, (1 - (s.query_embedding <=> NEW.embedding))::double precision AS similarity
     FROM public.memory_subscriptions s
     JOIN public.subscription_namespaces sn ON sn.subscription_id = s.id AND sn.api_key_id = s.api_key_id
@@ -163,28 +165,20 @@ BEGIN
       AND s.embedding_dimensions = NEW.embedding_dimensions
       AND (1 - (s.query_embedding <=> NEW.embedding)) >= s.threshold
     ORDER BY similarity DESC, s.id
-    LIMIT 100
-  ) matched
-  ON CONFLICT (subscription_id, memory_id, event_version) DO NOTHING;
-  GET DIAGNOSTICS enqueued_count = ROW_COUNT;
-
-  IF enqueued_count = 100 AND EXISTS (
-    SELECT 1
-    FROM public.memory_subscriptions s
-    JOIN public.subscription_namespaces sn ON sn.subscription_id = s.id AND sn.api_key_id = s.api_key_id
-    JOIN public.api_keys k ON k.id = s.api_key_id
-    WHERE s.status = 'active' AND s.access_level_policy = 'normal' AND sn.namespace = NEW.namespace
-      AND k.enabled = true AND NEW.namespace = ANY(k.namespaces)
-      AND (NOT s.exclude_self OR NEW.client_id <> s.api_key_id::text)
-      AND s.embedding_provider = NEW.embedding_provider AND s.embedding_model = NEW.embedding_model
-      AND s.embedding_dimensions = NEW.embedding_dimensions
-      AND (1 - (s.query_embedding <=> NEW.embedding)) >= s.threshold
-    ORDER BY (1 - (s.query_embedding <=> NEW.embedding)) DESC, s.id
-    OFFSET 100 LIMIT 1
-  ) THEN
-    INSERT INTO public.subscription_match_truncations (memory_id, namespace) VALUES (NEW.id, NEW.namespace)
-    ON CONFLICT (memory_id) DO NOTHING;
-  END IF;
+    LIMIT 101
+  ), enqueued AS (
+    INSERT INTO public.webhook_deliveries
+      (subscription_id, api_key_id, memory_id, namespace, event_version, similarity)
+    SELECT id, api_key_id, NEW.id, NEW.namespace, 1, similarity
+    FROM matched ORDER BY similarity DESC, id LIMIT 100
+    ON CONFLICT (subscription_id, memory_id, event_version) DO NOTHING
+    RETURNING 1
+  )
+  INSERT INTO public.subscription_match_truncations (memory_id, namespace)
+  SELECT NEW.id, NEW.namespace
+  WHERE (SELECT count(*) FROM matched) > 100
+    AND (SELECT count(*) FROM enqueued) >= 0
+  ON CONFLICT (memory_id) DO NOTHING;
   RETURN NEW;
 END;
 $$;
@@ -195,3 +189,6 @@ DROP TRIGGER IF EXISTS memories_subscription_enqueue ON public.memories;
 CREATE TRIGGER memories_subscription_enqueue
 AFTER INSERT ON public.memories
 FOR EACH ROW EXECUTE FUNCTION public.enqueue_memory_subscription_webhooks();
+-- Enqueue is an explicit operator rollout step and a true database-side kill
+-- switch. Creation and delivery environment gates cannot control a DB trigger.
+ALTER TABLE public.memories DISABLE TRIGGER memories_subscription_enqueue;
