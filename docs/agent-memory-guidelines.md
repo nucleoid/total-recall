@@ -174,7 +174,7 @@ The three layers provide defense in depth:
 
 - **Non-chat sessions** (e.g., Claude Code, Cursor) don't have persistent logs that a sweep can review. These rely entirely on in-session discipline.
 - **LLM extraction quality** in sweeps depends on the model used. Haiku is fast and cheap but may miss nuance. Consider Sonnet for important channels.
-- **Duplicate detection** relies on Total Recall's built-in deduplication (cosine similarity > 0.92). In practice, near-duplicates occasionally slip through — this is acceptable.
+- **Duplicate detection** relies on Total Recall's built-in deduplication (cosine similarity at or above `MEMORY_DEDUPE_THRESHOLD`, default `0.95`). It applies only within the same namespace, access level, and embedding model; document/source-key stores are excluded. Use `dedupe:false` only when semantically similar facts must remain distinct. In practice, near-duplicates can still slip through — this is acceptable.
 
 ## Consolidated memories
 

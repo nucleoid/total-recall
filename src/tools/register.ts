@@ -63,9 +63,10 @@ const TOOL_DEFINITIONS = [
   {
     name: 'memory_store',
     description:
-      'Store a memory with automatic embedding generation. ' +
-      'For accurate provenance, pass agent_name identifying the agent storing this memory ' +
-      '(e.g. "openclaw", "cursor-dev"). When omitted, the API key name is used as a fallback.',
+      'Store a memory with automatic embedding generation. Near-duplicates in the same namespace, ' +
+      'access level, and embedding space reuse and boost the canonical memory by default; the result ' +
+      'reports created/deduplicated and similarity. For accurate provenance, pass agent_name identifying ' +
+      'the agent storing this memory (e.g. "openclaw", "cursor-dev"). When omitted, the API key name is used as a fallback.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -87,7 +88,12 @@ const TOOL_DEFINITIONS = [
         session_id: { type: 'string', description: 'Optional session/conversation ID for grouping related operations' },
         idempotency_key: {
           type: 'string',
-          description: 'Optional retry key (1-512 characters), scoped only to the authenticated API key. Reusing it updates the same memory, including authorized namespace and access-level moves; keyed responses acknowledge that the key was honored.',
+          description: 'Optional retry key (1-512 characters), scoped only to the authenticated API key. Reusing it updates the same memory, including authorized namespace and access-level moves; keyed responses acknowledge that the key was honored. Keyed stores bypass semantic deduplication.',
+        },
+        dedupe: {
+          type: 'boolean',
+          default: true,
+          description: 'Set false to force insertion of a semantically similar but distinct memory (default: true).',
         },
       },
       required: ['content'],

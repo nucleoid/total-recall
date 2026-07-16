@@ -103,7 +103,7 @@ test('representative runtime response fixtures satisfy the published schemas', a
   const now = '2026-07-16T00:00:00.000Z';
   const fixtures: Record<string, unknown> = {
     Health: { status: 'ok', version: '1.0.0' },
-    StoreResponse: { id, created: true, idempotency_key_honored: true },
+    StoreResponse: { id, namespace: 'shared', created: true, deduplicated: false, idempotency_key_honored: true },
     StoreDocumentResponse: { id, chunks: 2 },
     ForgetResponse: { forgotten: [id], count: 1 },
     Stats: {

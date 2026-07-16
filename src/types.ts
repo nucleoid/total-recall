@@ -57,7 +57,22 @@ export interface StoreParams {
   tags?: string[];
   metadata?: Record<string, unknown>;
   access_level?: AccessLevel;
+  agent_name?: string;
+  agent_type?: string;
+  agent_model?: string;
+  agent_runtime?: string;
+  session_id?: string;
   idempotency_key?: string;
+  dedupe?: boolean;
+}
+
+export interface StoreResult {
+  id: string;
+  namespace: string;
+  created: boolean;
+  deduplicated: boolean;
+  similarity?: number;
+  idempotency_key_honored?: true;
 }
 
 export interface UpdateParams {

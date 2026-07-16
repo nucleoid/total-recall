@@ -444,7 +444,10 @@ registerRestRoute(app, 'post', '/api/store', async (req, res) => {
     const result = await memoryStore(params, auth);
     res.json({
       id: result.id,
-      created: true,
+      namespace: result.namespace,
+      created: result.created,
+      deduplicated: result.deduplicated,
+      ...(result.similarity !== undefined && { similarity: result.similarity }),
       ...(result.idempotency_key_honored && { idempotency_key_honored: true }),
     });
   } catch (err: any) {

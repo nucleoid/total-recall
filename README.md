@@ -193,6 +193,8 @@ Store a single memory/fact with metadata. Optionally track which agent stored it
 
 `access_level` defaults to `normal` and may be `normal`, `sensitive`, or `secret`. The caller's API key must have a `max_access_level` at least as high as the memory being stored.
 
+Ordinary stores semantically deduplicate by default. At cosine similarity `>= MEMORY_DEDUPE_THRESHOLD` (default `0.95`), the best active memory in the same namespace, access level, and embedding model is returned and boosted instead of inserting another row. Its content, metadata, and provenance are preserved; access count/timestamps are updated and tags are unioned. Document chunks and source-key/idempotent stores are excluded. Send `"dedupe": false` when similar content is intentionally distinct. Results always include `id`, `namespace`, `created`, and `deduplicated`; a dedupe hit also includes `similarity`.
+
 ### `memory_update`
 Patch an active current memory by UUID. At least one of `content`, `tags`, `metadata`, or `supersedes` is required; omitted fields are unchanged, while supplied tags and metadata replace the complete value (including `[]` and `{}`). Content must be nonblank and is re-embedded only when changed. Provenance, namespace, source, access level, document identity, creation/deletion state, and existing lifecycle links are immutable.
 
@@ -487,13 +489,13 @@ Chunker (heading-based for MD, turn-pair for conversations)
     ↓
 Density Filter (skip low-information exchanges)
     ↓
-Deduplicator (skip if >0.92 cosine similarity to existing)
-    ↓
 Namespace Tagger (auto-classify or rule-based)
     ↓
 Canonical embedder (explicit Gemini gemini-embedding-2-preview, 768d)
     ↓
-PostgreSQL + pgvector (upsert)
+Semantic deduplicator (reuse/boost at configurable cosine >=0.95)
+    ↓
+PostgreSQL + pgvector (insert or source-key upsert)
 ```
 
 ## Tech Stack
