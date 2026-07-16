@@ -6,6 +6,7 @@ import { embedWithProfile, serializeEmbeddingVector, type EmbeddingResult } from
 import type { AuthContext } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { TombstonedSourceKeyConflictError } from '../errors.js';
+import { logAudit } from '../audit.js';
 import {
   DOCUMENT_TITLE_MAX_CHARS,
   MEBIBYTE,
@@ -335,6 +336,16 @@ export async function memoryStoreDocument(
     if (countRes.rowCount !== 1) {
       throw new Error('Document chunk count update failed');
     }
+
+    await logAudit({
+      clientId: auth.keyId,
+      action: 'document.store',
+      namespace: ns,
+      resourceType: 'document',
+      resourceId: id,
+      resultCount: chunks.length,
+      details: { chunks: chunks.length },
+    }, dbScopeFromAuth(auth), client);
 
     return { document_id: id, chunks_stored: chunks.length, title: params.title };
   });

@@ -1,6 +1,7 @@
 import { accessLevelSql, checkPermission, filterNamespaces } from './auth.js';
 import { dbScopeFromAuth, queryScoped } from './db.js';
 import type { AuthContext } from './types.js';
+import { logAudit } from './audit.js';
 
 export type MemorySort = 'created_at' | 'updated_at' | 'accessed_at' | 'access_count' | 'relevance';
 export type MemoryActivity = 'active' | 'superseded' | 'expired' | 'all';
@@ -33,7 +34,12 @@ const COLUMNS = `m.id, m.content, m.source, m.namespace, m.tags, m.metadata,
   m.created_at, m.updated_at, m.accessed_at, m.access_count, m.relevance_score,
   m.memory_kind, m.valid_from, m.valid_to, m.supersedes_id, m.superseded_at,
   m.revision, m.expires_at,
-  (to_jsonb(m)->>'consolidated_into_id')::uuid AS consolidated_into_id`;
+  (to_jsonb(m)->>'consolidated_into_id')::uuid AS consolidated_into_id,
+  CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object(
+    'agent_id', a.id, 'agent_name', a.name, 'agent_type', a.type,
+    'agent_model', a.model, 'agent_runtime', a.runtime,
+    'same_key_as_requester', COALESCE(a.api_key_id::text = app_current_key_id(), false)
+  ) END AS provenance`;
 
 function baseConditions(auth: AuthContext, namespaces: string[], includeInactive: boolean): { conditions: string[]; values: unknown[] } {
   const conditions = [
@@ -53,6 +59,7 @@ export async function listMemories(auth: AuthContext, filters: MemoryBrowseFilte
   checkPermission(auth, 'read');
   const namespaces = filterNamespaces(filters.namespace ? [filters.namespace] : undefined, auth.namespaces);
   if (namespaces.length === 0) {
+    await logAudit({ clientId: auth.keyId, action: 'memory.list', resourceType: 'search', resultCount: 0 }, dbScopeFromAuth(auth));
     return { memories: [], total: 0, limit: filters.limit, offset: filters.offset };
   }
 
@@ -81,9 +88,12 @@ export async function listMemories(auth: AuthContext, filters: MemoryBrowseFilte
   const scope = dbScopeFromAuth(auth);
   const [count, rows] = await Promise.all([
     queryScoped<{ total: string }>(scope, `SELECT COUNT(*)::text AS total FROM memories m WHERE ${where}`, countValues),
-    queryScoped(scope, `SELECT ${COLUMNS} FROM memories m WHERE ${where} ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`, values),
+    queryScoped(scope, `SELECT ${COLUMNS} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id WHERE ${where} ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`, values),
   ]);
 
+  await logAudit({
+    clientId: auth.keyId, action: 'memory.list', resourceType: 'search', resultCount: rows.rows.length,
+  }, scope);
   return {
     memories: rows.rows,
     total: Number(count.rows[0]?.total ?? 0),
@@ -97,7 +107,14 @@ export async function getMemory(auth: AuthContext, id: string) {
   const { conditions, values } = baseConditions(auth, auth.namespaces, false);
   values.push(id);
   conditions.push(`m.id = $${values.length}::uuid`);
-  const result = await queryScoped(dbScopeFromAuth(auth), `SELECT ${COLUMNS} FROM memories m WHERE ${conditions.join(' AND ')} LIMIT 1`, values);
+  const scope = dbScopeFromAuth(auth);
+  const result = await queryScoped(scope, `SELECT ${COLUMNS} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id WHERE ${conditions.join(' AND ')} LIMIT 1`, values);
+  if (result.rows[0]) {
+    await logAudit({
+      clientId: auth.keyId, action: 'memory.recall', resourceType: 'memory',
+      resourceId: id, memoryId: id, resultCount: 1,
+    }, scope);
+  }
   return result.rows[0] ?? null;
 }
 

@@ -34,6 +34,7 @@ export interface Memory {
   origin_namespace?: string | null;
   insight_content_hash?: string | null;
   expires_at?: Date | null;
+  provenance?: MemoryProvenance | null;
 }
 
 export interface ApiKey {
@@ -46,6 +47,33 @@ export interface ApiKey {
   created_at: Date;
   last_used_at: Date | null;
   enabled: boolean;
+  expires_at: Date | null;
+  revoked_at: Date | null;
+  rotated_from: string | null;
+  requests_per_minute: number | null;
+  requests_per_day: number | null;
+}
+
+export interface MemoryProvenance {
+  agent_id: string;
+  agent_name: string;
+  agent_type: string;
+  agent_model: string | null;
+  agent_runtime: string | null;
+  same_key_as_requester: boolean;
+}
+
+export interface RateLimitWindow {
+  limit: number;
+  remaining: number;
+  resetAt: Date;
+}
+
+export interface RateLimitResult {
+  allowed: boolean;
+  minute: RateLimitWindow | null;
+  day: RateLimitWindow | null;
+  retryAfterSeconds: number;
 }
 
 export interface SearchResult extends Memory {
@@ -157,6 +185,11 @@ export interface AuthContext {
   namespaces: string[];
   permissions: string[];
   maxAccessLevel: AccessLevel;
+  /** Null/undefined preserves unlimited legacy credentials. */
+  requestsPerMinute?: number | null;
+  /** Null/undefined preserves unlimited legacy credentials. */
+  requestsPerDay?: number | null;
+  expiresAt?: Date | null;
 }
 
 export interface Agent {

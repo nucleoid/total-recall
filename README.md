@@ -788,17 +788,19 @@ Access levels are enforced in addition to namespace ACLs. Each key has `max_acce
 Migration `009_api_key_access_ceiling.sql` preserves existing API key behavior by backfilling existing keys to `secret`, while new keys default to `normal`. Create elevated keys explicitly:
 
 ```bash
-npm run create-key -- --name "trusted-agent" --namespaces "personal,shared" --max-access-level secret
+npm run create-key -- --name "trusted-agent" --namespaces "personal,shared" --max-access-level secret --expires 90d --rpm 60 --daily-quota 10000
 ```
 
 Null legacy memory access levels are normalized to `normal`. Unknown legacy labels are hidden from every key until operators remediate them; the migration adds a `NOT VALID` constraint so new writes must use one of the supported values.
 
-1. **API keys** — unique per client (`tr_` prefix), revocable, SHA256 hashed at rest. MCP tool calls revalidate the key against PostgreSQL, so disabling/deleting a key or changing its namespaces, permissions, or access ceiling takes effect on the next call. A stdio client captures `TOTAL_RECALL_API_KEY` at process startup; replacing that environment secret requires restarting that client, but does not require issuing new credentials when the existing key remains valid. HTTP MCP sessions are bound to the API key that initialized them; another valid key cannot use a captured session ID.
-2. **Namespace ACLs** — each key bound to specific namespaces
-3. **Row-Level Security** — PostgreSQL RLS policies enforce namespace isolation at the database level
-4. **Audit log** — every read/write logged with client ID, agent ID, and timestamp
-5. **Recall traces** — every search operation logged with query, results, and timing
-6. **No open ports** — Cloudflare Tunnel for external, localhost for internal
+1. **API keys** — unique per client (`tr_` prefix), revocable, expirable, SHA256 hashed at rest. MCP tool calls revalidate the key against PostgreSQL, so disablement, revocation, expiry, ACL changes, and rotation take effect without a server restart. HTTP MCP sessions are bound to the API key that initialized them; another valid key cannot use a captured session ID. New keys require minute/day quotas from `API_KEY_DEFAULT_RPM`/`API_KEY_DEFAULT_DAILY_QUOTA` or explicit `--rpm`/`--daily-quota` flags; migrated keys remain unlimited. Rotate with `npm run rotate-key -- --name trusted-agent [--grace 24h]`; the replacement secret is printed once and the old key expires at the grace deadline.
+2. **Durable quotas** — fixed UTC minute and calendar-day counters are atomic in PostgreSQL across processes. Authenticated REST and MCP operations return rate-limit headers and `429`/a stable MCP error when exhausted; `/health` is not charged.
+3. **Namespace ACLs** — each key bound to specific namespaces
+4. **Row-Level Security** — PostgreSQL RLS policies enforce namespace isolation at the database level
+5. **Audit log** — successful core memory/document writes, explicit agent registration, and search/recall/list/stats reads are recorded without content, embeddings, secrets, or credentials. Audit listing is always scoped to the requesting key, including for admins.
+6. **Recall traces** — every search operation logged with query, results, and timing
+7. **Origin signals** — search, recall, and list results include structured agent provenance and `same_key_as_requester`. These fields report origin, not trust; agent labels are client supplied.
+8. **No open ports** — Cloudflare Tunnel for external, localhost for internal
 
 ## Cortex Dashboard
 

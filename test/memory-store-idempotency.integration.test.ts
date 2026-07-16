@@ -33,12 +33,13 @@ class FakePool {
       if (/SELECT pg_advisory_xact_lock/i.test(sql)) return result([{}]);
       if (/SELECT m\.id, m\.namespace,[\s\S]*m\.embedding <=>/i.test(sql)) return result([]);
       if (/INSERT INTO agents/i.test(sql)) return result([{ id: `agent-${params[0]}` }]);
+      if (/INSERT INTO audit_log/i.test(sql)) return result([]);
       if (/INSERT INTO memories/i.test(sql)) {
         const keyed = /source_key/i.test(sql);
-        const sourceKey = keyed ? String(params[13]) : null;
+        const sourceKey = keyed ? String(params[14]) : null;
         let row = sourceKey ? this.rows.find(r => r.source_key === sourceKey) : undefined;
         if (row) {
-          const allowedNamespaces = params[14] as string[] | undefined;
+          const allowedNamespaces = params[15] as string[] | undefined;
           if (allowedNamespaces && !allowedNamespaces.includes(row.namespace)) {
             const error = new Error('duplicate key value violates unique constraint "memories_source_key_key"') as Error & { code: string };
             error.code = '23505';

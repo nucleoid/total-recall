@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { accessLevelSql, checkPermission } from '../auth.js';
+import { logAudit } from '../audit.js';
 
 export const statsSchema = z.object({});
 
@@ -47,6 +48,11 @@ export async function memoryStats(
       values
     ),
   ]);
+
+  await logAudit({
+    clientId: auth.keyId, action: 'memory.stats', resourceType: 'system',
+    resultCount: parseInt(totalRes.rows[0].total, 10),
+  }, scope);
 
   return {
     total_memories: parseInt(totalRes.rows[0].total, 10),

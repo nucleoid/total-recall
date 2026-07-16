@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { accessLevelSql, checkPermission } from '../auth.js';
+import { logAudit } from '../audit.js';
 
 export const recallSchema = z.object({
   id: z.string().uuid().optional(),
@@ -24,6 +25,11 @@ export async function memoryRecall(
       `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.access_level,
               m.created_at, m.updated_at, m.document_id, m.chunk_index, m.memory_kind,
               m.valid_from, m.valid_to, m.superseded_at, m.revision, m.expires_at,
+              CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object(
+                'agent_id', a.id, 'agent_name', a.name, 'agent_type', a.type,
+                'agent_model', a.model, 'agent_runtime', a.runtime,
+                'same_key_as_requester', COALESCE(a.api_key_id::text = $4, false)
+              ) END AS provenance,
               (to_jsonb(m)->>'consolidated_into_id')::uuid AS consolidated_into_id,
               (to_jsonb(m)->>'consolidated_at')::timestamptz AS consolidated_at,
               (SELECT predecessor.id FROM memories predecessor
@@ -43,12 +49,18 @@ export async function memoryRecall(
                  AND successor.namespace = ANY($2)
                  AND ${accessLevelSql('successor.access_level', '$3')}
                LIMIT 1) AS superseded_by_id
-       FROM memories m WHERE m.id = $1 AND m.deleted_at IS NULL
+       FROM memories m
+       LEFT JOIN agents a ON a.id = m.agent_id
+       WHERE m.id = $1 AND m.deleted_at IS NULL
          AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
          AND m.namespace = ANY($2) AND ${accessLevelSql('m.access_level', '$3')}`,
-      [params.id, namespaces, auth.maxAccessLevel]
+      [params.id, namespaces, auth.maxAccessLevel, auth.keyId]
     );
     if (res.rows.length === 0) throw new Error('Memory not found or access denied');
+    await logAudit({
+      clientId: auth.keyId, action: 'memory.recall', resourceType: 'memory',
+      resourceId: params.id, memoryId: params.id, resultCount: 1,
+    }, dbScopeFromAuth(auth));
     return res.rows[0];
   }
 
@@ -57,6 +69,11 @@ export async function memoryRecall(
     `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.access_level,
             m.created_at, m.updated_at, m.document_id, m.chunk_index, m.memory_kind,
             m.valid_from, m.valid_to, m.superseded_at, m.revision, m.expires_at,
+            CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object(
+              'agent_id', a.id, 'agent_name', a.name, 'agent_type', a.type,
+              'agent_model', a.model, 'agent_runtime', a.runtime,
+              'same_key_as_requester', COALESCE(a.api_key_id::text = $4, false)
+            ) END AS provenance,
             (to_jsonb(m)->>'consolidated_into_id')::uuid AS consolidated_into_id,
             (to_jsonb(m)->>'consolidated_at')::timestamptz AS consolidated_at,
             (SELECT predecessor.id FROM memories predecessor
@@ -76,12 +93,18 @@ export async function memoryRecall(
                AND successor.namespace = ANY($2)
                AND ${accessLevelSql('successor.access_level', '$3')}
              LIMIT 1) AS superseded_by_id
-     FROM memories m WHERE m.document_id = $1 AND m.deleted_at IS NULL
+     FROM memories m
+     LEFT JOIN agents a ON a.id = m.agent_id
+     WHERE m.document_id = $1 AND m.deleted_at IS NULL
        AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
        AND to_jsonb(m)->>'consolidated_into_id' IS NULL AND m.namespace = ANY($2) AND ${accessLevelSql('m.access_level', '$3')}
      ORDER BY m.chunk_index ASC`,
-    [params.document_id, namespaces, auth.maxAccessLevel]
+    [params.document_id, namespaces, auth.maxAccessLevel, auth.keyId]
   );
   if (res.rows.length === 0) throw new Error('Document not found or access denied');
+  await logAudit({
+    clientId: auth.keyId, action: 'memory.recall', resourceType: 'document',
+    resourceId: params.document_id, resultCount: res.rows.length,
+  }, dbScopeFromAuth(auth));
   return res.rows;
 }
