@@ -13,7 +13,7 @@ export const TASTE_PROFILE_POLICY_VERSION = 1;
 export const TASTE_PROFILE_PROMPT_VERSION = 1;
 export const TASTE_PROFILE_MAX_INPUT_BYTES = 64 * 1024;
 export const TASTE_PROFILE_MAX_OUTPUT_BYTES = 4 * 1024;
-export const TASTE_PROFILE_MAX_EVIDENCE = 64;
+export const TASTE_PROFILE_MAX_EVIDENCE = 128;
 export const TASTE_PROFILE_MAX_SELECTED_EVIDENCE = 12;
 export const DEFAULT_TASTE_PROFILE_MIN_EVENTS = 10;
 export const DEFAULT_TASTE_PROFILE_TOP_LIMIT = 10;
@@ -64,7 +64,8 @@ export const tasteProfilePolicySchema = z.object({
     trendMinimumShareChange: z.number().finite().min(0.01).max(1).default(0.1),
   }).strict(),
   budget: z.object({
-    maxCallsPerRun: positiveInteger.min(2).max(4),
+    // Exactly two attempts implements the one permitted validation retry.
+    maxCallsPerRun: z.literal(2),
     maxCostUsdPerRun: z.number().finite().positive(),
     maxCostUsdPerMonth: z.number().finite().positive(),
     estimatedRequestCostUsd: nonnegativeFinite,
@@ -390,7 +391,7 @@ export async function runTasteProfile(options: RunTasteProfileOptions): Promise<
   const callCost = estimatedTasteProfileCostMicroUsd(policy, inputBytes);
   if (mode === 'dry-run') return { ...base, status: 'dry-run', estimatedCostMicroUsd: callCost };
 
-  const maximumCalls = Math.min(2, policy.budget.maxCallsPerRun);
+  const maximumCalls = policy.budget.maxCallsPerRun;
   if (maximumCalls < 1 || callCost * maximumCalls > Math.floor(policy.budget.maxCostUsdPerRun * 1_000_000)) {
     throw new Error('Taste-profile per-run budget is insufficient for the bounded validation attempts');
   }

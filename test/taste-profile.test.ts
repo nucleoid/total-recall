@@ -145,6 +145,57 @@ test('preview retries invalid structured output once and never embeds or mutates
   } finally { setPoolForTesting(null); }
 });
 
+test('apply embeds before one atomic agent/update/supersession/audit transaction', async () => {
+  const period = mediaMonthPeriod('2026-06', 'UTC');
+  const calls: Array<{ connection: number; text: string }> = [];
+  let connections = 0;
+  let embeddingDone = false;
+  const agentId = '22222222-2222-4222-8222-222222222222';
+  const priorId = '33333333-3333-4333-8333-333333333333';
+  const profileId = '44444444-4444-4444-8444-444444444444';
+  const client = {
+    query: async (text: string) => {
+      calls.push({ connection: connections, text });
+      if (text.includes('WITH eligible AS')) return { rows: [
+        { window_name: 'period', dimension: 'total', value: 'events', event_count: '20', rank: 1 },
+        { window_name: 'period', dimension: 'entity', value: 'Artist A', event_count: '12', rank: 1 },
+      ] };
+      if (text.includes("SELECT id, metadata->>'aggregate_hash'")) return { rows: [] };
+      if (text.startsWith('INSERT INTO agents')) return { rows: [{ id: agentId }] };
+      if (text.includes('SELECT id, source, metadata')) return { rows: [] };
+      if (text.includes('SELECT id, CASE WHEN')) return { rows: [{ id: priorId, series_order: '2026-05' }] };
+      if (text.includes('statement_timestamp()::text AS now')) return { rows: [{ now: '2026-07-01 00:00:00+00' }] };
+      if (text.includes('UPDATE memories SET superseded_at')) return { rows: [], rowCount: 1 };
+      if (text.includes('INSERT INTO memories')) return { rows: [{ id: profileId }], rowCount: 1 };
+      return { rows: [], rowCount: 1 };
+    },
+    release: () => undefined,
+  };
+  setPoolForTesting({ connect: async () => {
+    connections += 1;
+    if (connections === 3) assert.equal(embeddingDone, true, 'embedding must finish before the write transaction');
+    return client;
+  } } as unknown as pg.Pool);
+  try {
+    const result = await runTasteProfile({
+      auth: { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
+        namespaces: ['media', 'personal'], permissions: ['read', 'write'], maxAccessLevel: 'normal' },
+      category: 'music', period, timeZone: 'UTC', environment: 'test', policy: policy(), mode: 'apply',
+      provider: { name: 'gateway', generate: async () =>
+        '{"profile_style":"focused","evidence_ids":["E002"]}' },
+      embedProfile: async () => { embeddingDone = true; return Array(768).fill(0); },
+    });
+    assert.equal(result.status, 'created');
+    assert.equal(result.memoryId, profileId);
+    assert.equal(result.supersededId, priorId);
+    const mutations = calls.filter(call => /^\s*(?:INSERT|UPDATE|DELETE)\b/i.test(call.text));
+    assert.ok(mutations.length >= 4);
+    assert.ok(mutations.every(call => call.connection === 3), JSON.stringify(mutations));
+    const finalSql = calls.filter(call => call.connection === 3).map(call => call.text).join('\n');
+    assert.match(finalSql, /BEGIN[\s\S]*INSERT INTO agents[\s\S]*UPDATE memories SET superseded_at[\s\S]*INSERT INTO memories[\s\S]*INSERT INTO audit_log[\s\S]*COMMIT/);
+  } finally { setPoolForTesting(null); }
+});
+
 test('taste-profile CLI defaults to provider-free dry-run and keeps modes explicit', () => {
   assert.deepEqual(parseTasteProfileCli([]), { mode: 'dry-run', category: 'all', period: undefined, force: false, json: false });
   assert.deepEqual(parseTasteProfileCli(['--preview', '--category', 'viewing', '--period', '2026-06', '--json']),

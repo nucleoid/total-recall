@@ -59,7 +59,7 @@ Example (replace every value after review):
     "trendMinimumShareChange": 0.1
   },
   "budget": {
-    "maxCallsPerRun": 4,
+    "maxCallsPerRun": 2,
     "maxCostUsdPerRun": 1,
     "maxCostUsdPerMonth": 5,
     "estimatedRequestCostUsd": 0.001,
@@ -105,7 +105,7 @@ npm run taste-profile -- --category all --apply
 
 Supported categories are `music`, `viewing`, and `all`. `--force` is valid for preview/apply only and bypasses the unchanged-aggregate no-op. Apply historical months oldest-to-newest per category so the immutable supersession chain remains chronological; an out-of-order apply fails without mutation. Without `--json`, logs contain only counts, statuses, cost estimates, and quality-warning codes.
 
-Schedule the idempotent apply command once per month with cron or systemd; there is no in-process scheduler. Keep the policy and API key out of command history. Enforce the policy's monthly budget through the referenced scheduler/provider billing control as well as the per-run conservative reservation.
+Schedule the idempotent apply command once per month with cron or systemd; there is no in-process scheduler. Keep the policy and API key out of command history. `maxCostUsdPerMonth` is an approved external ceiling, not an in-database spend ledger: enforce it through the required `monthlyControlReference` scheduler/provider billing control. The process enforces the per-run conservative reservation locally. Exactly two calls are allowed per category run so malformed structured output receives one retry and no more.
 
 ## Storage and failure behavior
 
