@@ -28,6 +28,13 @@ import {
   agentUnsubscribe,
 } from './subscriptions.js';
 import { SUBSCRIPTION_DEFAULT_THRESHOLD, SUBSCRIPTION_MAX_NAMESPACES, SUBSCRIPTION_QUERY_MAX_CHARS } from '../subscriptions.js';
+import {
+  MAX_SESSION_TRANSCRIPT_BYTES,
+  memorySessionStatus,
+  memoryStoreSession,
+  sessionStatusSchema,
+  storeSessionSchema,
+} from '../session-distillation.js';
 import { upsertAgent, listAgents } from '../agents.js';
 import {
   DOCUMENT_TITLE_MAX_CHARS,
@@ -126,6 +133,35 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ['title', 'content'],
+    },
+  },
+  {
+    name: 'memory_store_session',
+    description: 'Atomically store a bounded transcript as an episodic document and enqueue asynchronous durable-fact distillation. Generation remains disabled unless a separate #57 policy and worker are approved.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        transcript: { type: 'string', description: `Nonblank transcript (maximum ${MAX_SESSION_TRANSCRIPT_BYTES} decoded UTF-8 bytes)` },
+        namespace: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS, description: 'Namespace (default: shared)' },
+        access_level: { type: 'string', enum: ['normal', 'sensitive', 'secret'], default: 'normal' },
+        session_id: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS, description: 'Optional caller session identity; identical retries converge and changed requests conflict' },
+        agent_name: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS, description: 'Conversation agent provenance; defaults to the authenticated API key name' },
+        agent_type: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS },
+        agent_model: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS },
+        agent_runtime: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS },
+      },
+      required: ['transcript'],
+    },
+  },
+  {
+    name: 'memory_session_status',
+    description: 'Inspect an owned transcript distillation run without returning transcript or generated fact content.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: { episode_id: { type: 'string', format: 'uuid', description: 'Episode document UUID returned by memory_store_session' } },
+      required: ['episode_id'],
     },
   },
   {
@@ -313,9 +349,15 @@ const TOOL_DEFINITIONS = [
 
 type AuthResolver = () => Promise<AuthContext>;
 
+function sessionToolsEnabled(): boolean {
+  return process.env.MEMORY_SESSION_TOOLS_ENABLED !== 'false';
+}
+
 export function registerTools(server: Server, getAuth: AuthResolver): void {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: TOOL_DEFINITIONS,
+    tools: sessionToolsEnabled()
+      ? TOOL_DEFINITIONS
+      : TOOL_DEFINITIONS.filter(tool => !['memory_store_session', 'memory_session_status'].includes(tool.name)),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -339,6 +381,18 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
         case 'memory_store_document': {
           const params = storeDocumentSchema.parse(args);
           const result = await memoryStoreDocument(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
+        case 'memory_store_session': {
+          if (!sessionToolsEnabled()) throw new Error('Session ingestion tools are disabled by operator policy');
+          const params = storeSessionSchema.parse(args);
+          const result = await memoryStoreSession(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
+        case 'memory_session_status': {
+          if (!sessionToolsEnabled()) throw new Error('Session ingestion tools are disabled by operator policy');
+          const params = sessionStatusSchema.parse(args);
+          const result = await memorySessionStatus(params, auth);
           return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'memory_search': {

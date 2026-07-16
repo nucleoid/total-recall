@@ -118,6 +118,8 @@ const MIGRATION_OWNED_TABLES = [
   'memory_consolidation_runs',
   'memory_entities',
   'memory_subscriptions',
+  'memory_session_derivations',
+  'memory_session_distillation_runs',
   'subscription_namespaces',
   'subscription_match_truncations',
   'webhook_deliveries',
