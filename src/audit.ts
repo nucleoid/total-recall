@@ -16,7 +16,10 @@ export async function logAudit(params: {
   details?: Record<string, string | number | boolean | null>;
 }, scope: DbScope, client?: ScopedClient): Promise<void> {
   const details = params.details ?? {};
-  const allowedDetailKeys = new Set(['created', 'deduplicated', 'idempotent', 'chunks']);
+  const allowedDetailKeys = new Set([
+    'created', 'deduplicated', 'idempotent', 'chunks',
+    'inserted', 'updated', 'skipped', 'conflicted', 'denied', 'failed', 'exported',
+  ]);
   const unapprovedDetailKey = Object.keys(details).find(key => !allowedDetailKeys.has(key));
   if (unapprovedDetailKey) throw new Error(`Unapproved audit detail key: ${unapprovedDetailKey}`);
   const sql = `INSERT INTO audit_log

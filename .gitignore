@@ -1,6 +1,11 @@
 node_modules/
 .env
 imports/
+exports/
+*.memory-export.jsonl
+*.memory-export.jsonl.gz
+*.memory-import.checkpoint
+*.memory-import.result.json
 dist/
 __pycache__/
 *.pyc

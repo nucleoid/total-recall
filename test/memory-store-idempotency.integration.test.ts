@@ -111,7 +111,7 @@ test('memory_store keyed retries upsert per API key while dedupe opt-out calls a
   const memorySql = pool.sql.filter(sql => /INSERT INTO memories/i.test(sql));
   assert.doesNotMatch(memorySql.at(-1)!, /source_key|ON CONFLICT/i);
   const keyedSql = memorySql.find(sql => /ON CONFLICT/i)!;
-  assert.match(keyedSql, /ON CONFLICT \(source_key\) DO UPDATE/i);
+  assert.match(keyedSql, /ON CONFLICT \(client_id, source_key\) WHERE source_key IS NOT NULL DO UPDATE/i);
   assert.match(keyedSql, /memories\.namespace = ANY/i);
   assert.match(keyedSql, /EXCLUDED\.namespace = ANY/i);
   assert.doesNotMatch(keyedSql, /created_at\s*=/i);

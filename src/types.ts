@@ -14,6 +14,7 @@ export interface Memory {
   metadata: Record<string, unknown>;
   access_level: AccessLevel;
   client_id: string;
+  source_key?: string | null;
   created_at: Date;
   event_at?: Date | null;
   updated_at: Date;

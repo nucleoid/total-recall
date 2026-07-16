@@ -59,6 +59,8 @@
     "reembed": "tsx scripts/reembed-all.ts",
     "embedding:status": "tsx scripts/embedding-status.ts",
     "embedding:label": "tsx scripts/label-embeddings.ts",
+    "memory:export": "tsx scripts/memory-export.ts",
+    "memory:import": "tsx scripts/memory-import.ts",
     "spotify:auth": "tsx scripts/spotify-auth.ts",
     "spotify:sync": "tsx scripts/spotify-sync.ts",
     "spotify:repair-progress": "tsx scripts/repair-spotify-progress.ts",

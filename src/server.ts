@@ -27,7 +27,7 @@ import { isPublicApiError } from './errors.js';
 import { mediaSearch, mediaSearchSchema } from './tools/media-search.js';
 import { registerAgent, listAgents } from './agents.js';
 import { getTrace, listTraces } from './traces.js';
-import { listAudit } from './audit.js';
+import { listAudit, logAudit } from './audit.js';
 import { getMediaStats, parsePublicMediaEventBatch, toTrustedRestMediaEvents, upsertMediaEvents, listMediaEvents } from './media.js';
 import { getMemory, getMemorySummaries, listMemories } from './memories.js';
 import { rollupPendingEvents } from './rollup.js';
@@ -40,6 +40,13 @@ import {
   memoriesQuerySchema,
   tracesQuerySchema,
 } from './http-schemas.js';
+import { streamMemoryExport } from './transfer/export.js';
+import { addImportCounts, DEFAULT_IMPORT_BATCH_SIZE, emptyImportCounts, importMemoryBatch } from './transfer/import.js';
+import {
+  parseTransferManifest, parseTransferMemory, TRANSFER_MAX_BATCH_SIZE,
+  TRANSFER_MEDIA_TYPE, TransferFormatError, TransferLimitError, type TransferManifest, type TransferMemoryRecord,
+} from './transfer/format.js';
+import { parseNdjsonRequest } from './transfer/http.js';
 
 dotenv.config();
 
@@ -330,6 +337,124 @@ function metadataContractPayloads(req: express.Request): unknown[] {
 
 export function createApp(): express.Express {
 const app = express();
+
+// Streaming transfer routes must precede express.json() and the identity-only
+// middleware. Import has its own compressed/decompressed byte accounting.
+registerRestRoute(app, 'get', '/api/transfer/export', async (req, res) => {
+  const abort = new AbortController();
+  req.once('aborted', () => abort.abort(new Error('Export request aborted')));
+  res.once('close', () => { if (!res.writableEnded) abort.abort(new Error('Export response closed')); });
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'export');
+    const namespaces = parseTransferNamespaces(req.query.namespaces);
+    if (namespaces?.some(namespace => !auth.namespaces.includes(namespace))) throw new Error('Access denied to requested export namespace');
+    const includeProtected = parseTransferBoolean(req.query.include_protected, false, 'include_protected');
+    const acknowledgePlaintext = parseTransferBoolean(req.query.acknowledge_plaintext, false, 'acknowledge_plaintext');
+    if (includeProtected && !acknowledgePlaintext) {
+      throw new Error('Sensitive/secret export requires acknowledgement that the feed contains plaintext');
+    }
+    res.status(200);
+    res.setHeader('Content-Type', `${TRANSFER_MEDIA_TYPE}; charset=utf-8`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const exported = await streamMemoryExport(res, auth, {
+      namespaces, includeProtected, acknowledgePlaintext,
+    }, abort.signal);
+    await logAudit({
+      clientId: auth.keyId, action: 'memory.export', resourceType: 'system',
+      resultCount: exported, details: { exported },
+    }, dbScopeFromAuth(auth));
+    res.end();
+  } catch (err: any) {
+    if (abort.signal.aborted) return;
+    if (!res.headersSent) sendApiError(res, '/api/transfer/export', err);
+    else safelyEndResponse(res);
+  }
+});
+
+registerRestRoute(app, 'post', '/api/transfer/import', async (req, res) => {
+  const abort = new AbortController();
+  req.once('aborted', () => abort.abort(new Error('Import request aborted')));
+  let nextRecord = 0;
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'import');
+    const contentType = String(req.headers['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase();
+    if (contentType !== TRANSFER_MEDIA_TYPE) {
+      res.status(415).json({ error: `Content-Type must be ${TRANSFER_MEDIA_TYPE}`, code: 'unsupported_media_type' });
+      return;
+    }
+    const contentEncoding = String(req.headers['content-encoding'] ?? 'identity').trim().toLowerCase();
+    if (contentEncoding !== 'identity' && contentEncoding !== 'gzip') {
+      res.status(415).json({ error: 'Content-Encoding must be identity or gzip', code: 'unsupported_content_encoding' });
+      return;
+    }
+    const dryRun = parseTransferBoolean(req.query.dry_run, false, 'dry_run');
+    const resumeAfter = parseTransferInteger(req.query.resume_after, 0, 0, 100_000, 'resume_after');
+    const batchSize = parseTransferInteger(req.query.batch_size, DEFAULT_IMPORT_BATCH_SIZE, 1, TRANSFER_MAX_BATCH_SIZE, 'batch_size');
+    nextRecord = resumeAfter;
+    let manifest: TransferManifest | undefined;
+    let batch: TransferMemoryRecord[] = [];
+    let batchStart = resumeAfter;
+    let recordNumber = 0;
+    const seen = new Set<string>();
+    const counts = emptyImportCounts();
+    let embeddingCalls = 0;
+
+    const commitBatch = async () => {
+      if (!manifest || batch.length === 0) return;
+      const result = await importMemoryBatch(auth, manifest, batch, {
+        dryRun, recordOffset: batchStart, signal: abort.signal,
+      });
+      addImportCounts(counts, result);
+      embeddingCalls += result.embeddingCalls;
+      nextRecord = result.nextRecord;
+      batchStart = nextRecord;
+      batch = [];
+    };
+
+    for await (const parsed of parseNdjsonRequest(req, contentEncoding, abort.signal)) {
+      if (parsed.line === 1) {
+        manifest = parseTransferManifest(parsed.value, parsed.line);
+        continue;
+      }
+      if (!manifest) throw new TransferFormatError('first record must be a manifest', parsed.line);
+      const record = parseTransferMemory(parsed.value, parsed.line);
+      recordNumber += 1;
+      if (seen.has(record.source_key)) throw new TransferFormatError('duplicate source_key', parsed.line);
+      seen.add(record.source_key);
+      if (recordNumber <= resumeAfter) continue;
+      batch.push(record);
+      if (batch.length >= batchSize) await commitBatch();
+    }
+    if (!manifest) throw new TransferFormatError('transfer is empty; manifest required', 1);
+    if (resumeAfter > recordNumber) throw new TransferFormatError('resume_after exceeds transfer record count');
+    await commitBatch();
+    res.json({ ...counts, records: recordNumber, next_record: nextRecord, dry_run: dryRun, embedding_calls: embeddingCalls });
+  } catch (err: any) {
+    if (abort.signal.aborted) return;
+    if (err instanceof TransferLimitError) {
+      res.status(413).json({ error: err.message, code: 'transfer_limit_exceeded', next_record: nextRecord });
+    } else if (err instanceof TransferFormatError || err?.name === 'ZodError' ||
+        ['Z_DATA_ERROR', 'Z_BUF_ERROR', 'ERR_STREAM_PREMATURE_CLOSE'].includes(String(err?.code)) ||
+        String(err?.message).startsWith('Invalid ')) {
+      res.status(400).json({ error: err.message, code: 'invalid_transfer', next_record: nextRecord });
+    } else if (permissionDenied(err)) {
+      sendApiError(res, '/api/transfer/import', err);
+    } else {
+      console.error('[total-recall] /api/transfer/import failed', {
+        name: err instanceof Error ? err.name : 'UnknownError',
+        code: typeof err?.code === 'string' ? err.code : undefined,
+        nextRecord,
+      });
+      res.status(500).json({ error: 'Import failed', code: 'import_failed', next_record: nextRecord });
+    }
+  }
+});
+
 app.use((req, res, next) => {
   const encoding = req.headers['content-encoding'];
   if (encoding !== undefined && String(encoding).trim().toLowerCase() !== 'identity') {
@@ -502,6 +627,33 @@ function parseUuidParam(value: string | string[]): string {
   return value.toLowerCase();
 }
 
+function parseTransferNamespaces(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  const raw = Array.isArray(value) ? value.map(String) : String(value).split(',');
+  const namespaces = raw.map(namespace => namespace.trim());
+  if (!namespaces.length || namespaces.some(namespace => !namespace || namespace.length > 512)) {
+    throw new Error('Invalid namespaces: expected nonempty comma-separated values');
+  }
+  return [...new Set(namespaces)];
+}
+
+function parseTransferBoolean(value: unknown, fallback: boolean, name: string): boolean {
+  if (value === undefined) return fallback;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`Invalid ${name}: expected true or false`);
+}
+
+function parseTransferInteger(value: unknown, fallback: number, minimum: number, maximum: number, name: string): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new Error(`Invalid ${name}: expected an integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`Invalid ${name}: expected ${minimum}..${maximum}`);
+  }
+  return parsed;
+}
+
 function permissionDenied(err: any): boolean {
   const message = err?.message ?? '';
   return (
@@ -538,7 +690,7 @@ registerRestRoute(app, 'get', '/api/capabilities', async (req, res) => {
       namespaces: auth.namespaces,
       max_access_level: auth.maxAccessLevel,
       capabilities: Object.fromEntries(
-        ['read', 'write', 'delete', 'admin'].map((permission) => [permission, auth.permissions.includes(permission)])
+        ['read', 'write', 'delete', 'admin', 'export', 'import'].map((permission) => [permission, auth.permissions.includes(permission)])
       ),
     });
   } catch (err: any) {

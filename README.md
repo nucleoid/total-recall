@@ -349,6 +349,34 @@ All `/api/*` endpoints require `Authorization: Bearer tr_<key>`. `/health` is pu
 | GET | `/api/media/events` | List structured media events (`admin` + `read`) |
 | GET | `/api/media/stats` | Listening aggregates (`admin` + `read`) |
 | POST | `/api/media/rollup` | Trigger pending events → summary memories (`admin` + `write`) |
+| GET | `/api/transfer/export` | Stream a V1 memory-only JSONL feed (explicit `export`) |
+| POST | `/api/transfer/import` | Preflight/import a V1 JSONL feed (explicit `import`) |
+
+### Memory transfer (V1)
+
+V1 is a **memory-only export/import feed, not a faithful backup or bidirectional sync protocol**. It deliberately omits embeddings, raw memory-ID fields and local foreign-key columns, document records and chunk topology, local agent/document relationships, retrieval counters, tombstones, and conflict-resolution clocks. Every inserted memory is re-embedded using the destination's active embedding profile. Matching `source_key` payloads are skipped; divergent payloads are reported as conflicts and are never overwritten or similarity-merged. Deletions do not converge.
+
+Create a least-privilege key with explicit transfer permissions and only the required namespaces:
+
+```bash
+npm run create-key -- --name transfer --namespaces shared,work --permissions export,import
+```
+
+Normal memories are exported by default. Exporting plaintext `sensitive` or `secret` rows requires both `--include-protected` and `--acknowledge-plaintext`, and remains bounded by the key's `max_access_level`. Files are created with restrictive permissions and are gitignored by the standard names:
+
+```bash
+npm run memory:export -- --url https://recall.example --output export.memory-export.jsonl.gz --gzip
+npm run memory:import -- --url https://other.example --input export.memory-export.jsonl.gz --gzip --dry-run
+npm run memory:import -- --url https://other.example --input export.memory-export.jsonl.gz --gzip --checkpoint import.memory-import.checkpoint
+```
+
+Exports use stable `(created_at, id)` traversal but do not hold a repeatable-read transaction, so a V1 feed is not a point-in-time snapshot. Quiesce writers when a consistent feed is required; even then it remains memory-only rather than a faithful backup.
+
+The REST importer accepts `application/x-ndjson` with identity or gzip encoding, validates a required first manifest, commits bounded batches, and reports `next_record`. Resume by replaying the same immutable feed with `--resume-after <next_record>`; source-key identity makes committed batches idempotent. A dry run estimates inserts/conflicts and embedding work without calling the provider or writing. Back up the destination with a real database backup mechanism before import.
+
+The MCP `memory_export` and `memory_import` tools expose only bounded pages/batches; use REST/CLI for large feeds. Export content and metadata are plaintext sensitive data: do not log records, pass server filesystem paths, or treat the feed as encrypted storage.
+
+Migration 034 changes source-key uniqueness from global to `(client_id, source_key)` and is mixed-version incompatible. Stop watcher, preseed, consolidation, session-distillation, and transfer writers; migrate; deploy all updated writers; then resume. Old and new source-key writers must not overlap. Disable/revoke the dedicated transfer key to stop rollout; partially committed feeds are recovered by replaying from the last reported boundary, not by running old and new importers together.
 
 The same HTTP process serves a standalone same-origin dashboard at `/dashboard/`; see [Dashboard setup and security](docs/dashboard.md). It is independent of the external Cortex dashboard. `npm run build` emits both server and hashed dashboard assets.
 

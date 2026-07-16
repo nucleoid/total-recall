@@ -4,8 +4,9 @@ info:
   version: 1.0.0
   description: >-
     Authenticated REST API for memory storage, hybrid search, provenance,
-    observability, and media ingestion. JSON bodies are limited to 8 MiB and
-    only identity Content-Encoding is accepted. Memory content is limited to
+    observability, media ingestion, and memory-only transfer. JSON bodies are
+    limited to 8 MiB and only identity Content-Encoding is accepted, except the
+    bounded transfer importer which also accepts gzip. Memory content is limited to
     100,000 JavaScript characters; document content to 1048576 UTF-8 bytes and
     each embedding chunk to 2,000 UTF-8 bytes. Per-request metadata is limited
     to 65536 serialized JSON bytes, depth 16, and 1000 keys. Requests accept at
@@ -670,6 +671,64 @@ paths:
           $ref: "#/components/responses/UnsupportedContentEncoding"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/transfer/export:
+    get:
+      operationId: exportMemoryFeed
+      summary: Stream the V1 memory-only transfer feed
+      description: >-
+        Requires explicit export permission. This is plaintext JSONL and is not
+        a faithful backup: vectors, document topology, local foreign keys,
+        retrieval counters, and tombstones are omitted. Protected rows require
+        include_protected=true and acknowledge_plaintext=true and remain bounded
+        by the authenticated key's access ceiling.
+      parameters:
+        - { name: namespaces, in: query, schema: { type: string }, description: Comma-separated authorized namespaces. }
+        - { name: include_protected, in: query, schema: { type: boolean, default: false } }
+        - { name: acknowledge_plaintext, in: query, schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: One manifest line followed by zero or more V1 memory lines.
+          content:
+            application/x-ndjson:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/transfer/import:
+    post:
+      operationId: importMemoryFeed
+      summary: Preflight or import the V1 memory-only transfer feed
+      description: >-
+        Requires explicit import permission. The first line is a V1 manifest.
+        Destination vectors are always regenerated. Equal identities are skipped
+        and divergent identities conflict without overwrite. Committed batches
+        are durable; next_record is a safe replay boundary.
+      parameters:
+        - { name: dry_run, in: query, schema: { type: boolean, default: false } }
+        - { name: resume_after, in: query, schema: { type: integer, minimum: 0, maximum: 100000, default: 0 } }
+        - { name: batch_size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema: { type: string }
+      responses:
+        "200":
+          description: Content-free import counts and committed resume boundary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TransferImportResult" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedContentEncoding" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
 components:
   securitySchemes:
     bearerAuth:
@@ -780,13 +839,13 @@ components:
                 type: string
                 enum: [idempotency_key_tombstoned]
     PayloadTooLarge:
-      description: Encoded JSON exceeds the 8 MiB transport envelope; returns code payload_too_large.
+      description: Encoded JSON exceeds 8 MiB, or a transfer exceeds its encoded, decoded, line, or record cap.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
     UnsupportedContentEncoding:
-      description: Content-Encoding is not identity; returns code unsupported_content_encoding.
+      description: Content-Encoding is unsupported; ordinary JSON accepts identity and transfer import accepts identity or gzip.
       content:
         application/json:
           schema:
@@ -837,6 +896,20 @@ components:
           items:
             type: object
             additionalProperties: true
+    TransferImportResult:
+      type: object
+      required: [inserted, updated, skipped, conflicted, denied, failed, records, next_record, dry_run, embedding_calls]
+      properties:
+        inserted: { type: integer, minimum: 0 }
+        updated: { type: integer, minimum: 0 }
+        skipped: { type: integer, minimum: 0 }
+        conflicted: { type: integer, minimum: 0 }
+        denied: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        records: { type: integer, minimum: 0 }
+        next_record: { type: integer, minimum: 0 }
+        dry_run: { type: boolean }
+        embedding_calls: { type: integer, minimum: 0 }
     Health:
       type: object
       required: [status, version]
@@ -1063,12 +1136,14 @@ components:
         max_access_level: { type: string, enum: [normal, sensitive, secret] }
         capabilities:
           type: object
-          required: [read, write, delete, admin]
+          required: [read, write, delete, admin, export, import]
           properties:
             read: { type: boolean }
             write: { type: boolean }
             delete: { type: boolean }
             admin: { type: boolean }
+            export: { type: boolean }
+            import: { type: boolean }
     MemoryRecord:
       type: object
       required: [id, content, source, namespace, tags, metadata, access_level, client_id, created_at, updated_at, accessed_at, access_count]

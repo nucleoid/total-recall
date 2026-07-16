@@ -19,6 +19,9 @@ import { updateSchema, memoryUpdate } from './update.js';
 import { MAX_DELETION_REASON_CHARS, MAX_FORGET_IDS } from '../memory-lifecycle.js';
 import { mediaSearchSchema, mediaSearch } from './media-search.js';
 import { graphSchema, memoryGraph } from './graph.js';
+import { memoryExportPage, memoryExportSchema } from './export.js';
+import { memoryImportBatch, memoryImportSchema } from './import.js';
+import { TRANSFER_MAX_BATCH_SIZE, TRANSFER_MAX_PAGE_SIZE } from '../transfer/format.js';
 import {
   agentSubscribeSchema,
   agentListSubscriptionsSchema,
@@ -60,6 +63,36 @@ export const agentRegisterSchema = z.object({
 const agentListSchema = z.object({});
 
 const TOOL_DEFINITIONS = [
+  {
+    name: 'memory_export',
+    description: 'Return one bounded page of the V1 memory-only transfer feed. This is not a faithful backup: vectors, document topology, local foreign keys, and retrieval counters are excluded. Sensitive/secret plaintext requires explicit acknowledgement.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        namespaces: { type: 'array', maxItems: 100, items: { type: 'string', minLength: 1, maxLength: 512 } },
+        include_protected: { type: 'boolean', default: false },
+        acknowledge_plaintext: { type: 'boolean', default: false },
+        limit: { type: 'integer', minimum: 1, maximum: TRANSFER_MAX_PAGE_SIZE, default: 50 },
+        cursor: { type: 'string', maxLength: 2048 },
+      },
+    },
+  },
+  {
+    name: 'memory_import',
+    description: 'Preflight or commit one bounded V1 transfer batch. Matching divergent content is reported as a conflict and never overwritten; inserted rows are always re-embedded by this destination.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        manifest: { type: 'object', description: 'Required V1 manifest returned by memory_export' },
+        records: { type: 'array', maxItems: TRANSFER_MAX_BATCH_SIZE, items: { type: 'object' } },
+        dry_run: { type: 'boolean', default: false },
+        record_offset: { type: 'integer', minimum: 0, default: 0 },
+      },
+      required: ['manifest', 'records'],
+    },
+  },
   {
     name: 'memory_store',
     description:
@@ -381,6 +414,16 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
       const scope = dbScopeFromAuth(auth);
 
       switch (name) {
+        case 'memory_export': {
+          const params = memoryExportSchema.parse(args);
+          const result = await memoryExportPage(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
+        case 'memory_import': {
+          const params = memoryImportSchema.parse(args);
+          const result = await memoryImportBatch(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
         case 'memory_store': {
           const params = storeSchema.parse(args);
           const result = await memoryStore(params, auth);

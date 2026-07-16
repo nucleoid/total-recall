@@ -812,7 +812,7 @@ async function applyCluster(
       $1, $2::vector, 'memory-consolidation', $3, $4::text[], $5::jsonb, 'normal', $6, $7::uuid,
       $8, $9, $10, $11, 'consolidation', $12::timestamptz, $12::timestamptz
     )
-    ON CONFLICT (source_key) DO NOTHING
+    ON CONFLICT (client_id, source_key) WHERE source_key IS NOT NULL DO NOTHING
     RETURNING id
   `, [
     generated.canonical_content,
@@ -836,8 +836,9 @@ async function applyCluster(
   let canonicalId = inserted.rows[0]?.id;
   if (!canonicalId) {
     const existing = await client.query<{ id: string }>(`
-      SELECT id FROM memories WHERE source_key = $1 AND namespace = $2 AND memory_kind = 'consolidation'
-    `, [sourceKey, options.namespace]);
+      SELECT id FROM memories WHERE source_key = $1 AND client_id = $2::text
+        AND namespace = $3 AND memory_kind = 'consolidation'
+    `, [sourceKey, options.auth.keyId, options.namespace]);
     if (existing.rows.length !== 1) throw new Error('Consolidation source-key conflict');
     canonicalId = existing.rows[0].id;
     const memberships = await client.query<{ member_id: string; member_fingerprint: string }>(`
