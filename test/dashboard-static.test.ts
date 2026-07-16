@@ -47,6 +47,18 @@ test('dashboard API routes remain authenticated and are not swallowed by the SPA
   assert.doesNotMatch(mcp.type, /html/);
 });
 
+test('dashboard edits require a valid optimistic-concurrency precondition before database work', async () => {
+  setServerTestOverrides({ validateKey: async () => ordinary });
+  const path = '/api/memories/00000000-0000-4000-8000-000000000001';
+  const missing = await request(app).patch(path).set('Authorization', token).send({ tags: [] });
+  assert.equal(missing.status, 428);
+  assert.match(missing.body.error, /If-Match/);
+
+  const malformed = await request(app).patch(path).set('Authorization', token).set('If-Match', 'yesterday').send({ tags: [] });
+  assert.equal(malformed.status, 400);
+  assert.match(malformed.body.error, /If-Match/);
+});
+
 test('capabilities are derived from the authenticated key without exposing the key', async () => {
   setServerTestOverrides({ validateKey: async () => ordinary });
   const response = await request(app).get('/api/capabilities').set('Authorization', token);
