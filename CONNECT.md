@@ -290,6 +290,10 @@ Don't announce memory operations — integrate recalled context naturally.
 
 ---
 
+## Proactive memory notifications
+
+Approved agents can use `agent_subscribe` to register a public HTTPS callback for future semantic matches, `agent_list_subscriptions` to inspect redacted destinations and counts, and `agent_unsubscribe` to stop delivery. Treat the one-time signing secret like a credential, verify `X-Total-Recall-Signature` over the exact body, deduplicate by event ID, and call `memory_recall` with the receiver's own key for content. See [docs/subscriptions.md](docs/subscriptions.md); subscription creation is operator-gated and disabled by default.
+
 ## Remote Access (Cloudflare Tunnel)
 
 For tools running on your work laptop (not on the home server):

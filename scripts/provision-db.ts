@@ -119,7 +119,9 @@ export async function provisionDatabase(
                    'memories', 'documents', 'api_keys', 'sync_state',
                    'audit_log', 'agents', 'recall_traces', 'media_events',
                    'memory_consolidation_memberships', 'memory_consolidation_runs',
-                   'memory_consolidation_checkpoints'
+                   'memory_consolidation_checkpoints', 'memory_subscriptions',
+                   'subscription_namespaces', 'subscription_match_truncations',
+                   'webhook_deliveries'
                  )
              ) AS owned_tables
       FROM pg_roles r

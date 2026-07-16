@@ -19,6 +19,15 @@ import { updateSchema, memoryUpdate } from './update.js';
 import { MAX_DELETION_REASON_CHARS, MAX_FORGET_IDS } from '../memory-lifecycle.js';
 import { mediaSearchSchema, mediaSearch } from './media-search.js';
 import { graphSchema, memoryGraph } from './graph.js';
+import {
+  agentSubscribeSchema,
+  agentListSubscriptionsSchema,
+  agentUnsubscribeSchema,
+  agentSubscribe,
+  agentListSubscriptions,
+  agentUnsubscribe,
+} from './subscriptions.js';
+import { SUBSCRIPTION_DEFAULT_THRESHOLD, SUBSCRIPTION_MAX_NAMESPACES, SUBSCRIPTION_QUERY_MAX_CHARS } from '../subscriptions.js';
 import { upsertAgent, listAgents } from '../agents.js';
 import {
   DOCUMENT_TITLE_MAX_CHARS,
@@ -244,6 +253,39 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'agent_subscribe',
+    description: 'Register a durable semantic interest. Matching new normal memories enqueue signed ID-only HTTPS webhook notifications.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string', minLength: 1, maxLength: SUBSCRIPTION_QUERY_MAX_CHARS, description: 'Semantic standing query' },
+        webhook_url: { type: 'string', format: 'uri', maxLength: 4096, description: 'Public HTTPS callback on port 443; private and reserved destinations are rejected' },
+        namespaces: { type: 'array', minItems: 1, maxItems: SUBSCRIPTION_MAX_NAMESPACES, uniqueItems: true, items: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS }, description: 'Namespaces, each of which must remain in the owner key ACL' },
+        threshold: { type: 'number', minimum: 0, maximum: 1, default: SUBSCRIPTION_DEFAULT_THRESHOLD },
+        exclude_self: { type: 'boolean', default: true, description: 'Exclude memories written by this subscription owner API key' },
+        idempotency_key: { type: 'string', minLength: 1, maxLength: 512, description: 'Required owner-scoped retry key' },
+        agent_name: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS, description: 'Optional provenance agent already registered to this API key' },
+      },
+      required: ['query', 'webhook_url', 'idempotency_key'],
+    },
+  },
+  {
+    name: 'agent_list_subscriptions',
+    description: 'List subscriptions owned by this API key with redacted destinations and delivery counts.',
+    inputSchema: { type: 'object' as const, additionalProperties: false, properties: {} },
+  },
+  {
+    name: 'agent_unsubscribe',
+    description: 'Disable an owned subscription and cancel its undelivered notifications while retaining history.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: { id: { type: 'string', format: 'uuid', description: 'Owned subscription UUID' } },
+      required: ['id'],
+    },
+  },
+  {
     name: 'agent_register',
     description: 'Register or update an AI agent for provenance tracking.',
     inputSchema: {
@@ -338,6 +380,21 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
           const params = mediaSearchSchema.parse(args);
           const results = await mediaSearch(params, auth);
           return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+        }
+        case 'agent_subscribe': {
+          const params = agentSubscribeSchema.parse(args);
+          const result = await agentSubscribe(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
+        case 'agent_list_subscriptions': {
+          const params = agentListSubscriptionsSchema.parse(args);
+          const result = await agentListSubscriptions(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        }
+        case 'agent_unsubscribe': {
+          const params = agentUnsubscribeSchema.parse(args);
+          const result = await agentUnsubscribe(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'agent_register': {
           checkPermission(auth, 'write');

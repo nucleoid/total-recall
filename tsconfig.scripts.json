@@ -13,6 +13,7 @@
     "scripts/deconsolidate-memories.ts",
     "scripts/entity-enrich.ts",
     "scripts/entity-backfill.ts",
+    "scripts/webhook-delivery.ts",
     "scripts/memory-lifecycle-finalizer.ts",
     "scripts/finalize-memory-lifecycle.ts",
     "scripts/backfill-memory-validity.ts",
