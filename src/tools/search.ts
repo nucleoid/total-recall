@@ -5,6 +5,7 @@ import type { AuthContext, SearchResult } from '../types.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
 import { logTrace } from '../traces.js';
+import { logAudit } from '../audit.js';
 import {
   MEMORY_CONTENT_MAX_CHARS,
   TAG_MAX_CHARS,
@@ -44,6 +45,7 @@ export async function memorySearch(
   checkPermission(auth, 'read');
   const namespaces = filterNamespaces(params.namespaces, auth.namespaces);
   if (namespaces.length === 0) {
+    await logAudit({ clientId: auth.keyId, action: 'memory.search', resourceType: 'search', resultCount: 0 }, dbScopeFromAuth(auth));
     return [];
   }
 
@@ -87,6 +89,15 @@ export async function memorySearch(
     })),
     durationMs,
   }, dbScopeFromAuth(auth)).catch((err) => console.error('[total-recall] trace log error:', err.message));
+
+  await logAudit({
+    clientId: auth.keyId,
+    action: 'memory.search',
+    resourceType: 'search',
+    resultCount: results.length,
+    agentId,
+    sessionId: params.session_id,
+  }, dbScopeFromAuth(auth));
 
   return results;
 }

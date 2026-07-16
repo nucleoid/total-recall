@@ -51,6 +51,7 @@ class DedupePool {
         if (/UPDATE memories SET access_count/i.test(sql)) {
           return result([{ id: CANDIDATE_ID, namespace: 'shared', expires_at: null }]);
         }
+        if (/INSERT INTO audit_log/i.test(sql)) return result([]);
         if (/INSERT INTO memories/i.test(sql)) {
           return result([{
             id: INSERTED_ID,
@@ -131,6 +132,9 @@ test('memory_store reuses a candidate at the threshold and boosts only safe muta
   assert.match(boost.text, /COALESCE\(memories\.tags/);
   assert.doesNotMatch(boost.text, /content\s*=|metadata\s*=|source\s*=|client_id\s*=|agent_id\s*=/);
   assert.equal(pool.statements.some(statement => /INSERT INTO memories/i.test(statement.text)), false);
+  const audit = pool.statements.find(statement => /INSERT INTO audit_log/i.test(statement.text));
+  assert.ok(audit);
+  assert.deepEqual(audit.params.slice(0, 4), [AUTH.keyId, 'memory.store', 'shared', CANDIDATE_ID]);
   assert.equal(pool.statements.at(-1)?.text, 'COMMIT');
 });
 

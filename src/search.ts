@@ -299,7 +299,7 @@ export async function hybridSearch(
     const revisionColumn = capabilities.revision_schema ? 'm.revision' : '0::integer AS revision';
     const selectedColumns = `id, content, metadata, tags, source, namespace, created_at, event_at, expires_at,
       relevance_score, relevance_base_score, decay_rate, updated_at, accessed_at, access_count,
-      access_level, client_id, embedding_provider, embedding_model, embedding_dimensions,
+      access_level, client_id, agent_id, embedding_provider, embedding_model, embedding_dimensions,
       ${beliefColumns}, ${supersessionColumns}, ${revisionColumn}`;
 
     const lifecyclePredicates = capabilities.supersession_schema
@@ -367,6 +367,7 @@ export async function hybridSearch(
          LIMIT 1)`
       : 'NULL::uuid';
 
+    const pRequesterKeyId = p(scope.keyId);
     const sql = `
       WITH vector_results AS (
         ${vectorBranches}
@@ -412,9 +413,18 @@ export async function hybridSearch(
         r.revision, r.vec_score, r.text_score, r.base_score, r.relevance, r.final_score,
         ${predecessorSelect} AS supersedes_id,
         (r.superseded_at IS NOT NULL) AS is_superseded,
-        ${successorSelect} AS superseded_by_id
+        ${successorSelect} AS superseded_by_id,
+        CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object(
+          'agent_id', a.id,
+          'agent_name', a.name,
+          'agent_type', a.type,
+          'agent_model', a.model,
+          'agent_runtime', a.runtime,
+          'same_key_as_requester', COALESCE(a.api_key_id::text = ${pRequesterKeyId}, false)
+        ) END AS provenance
       FROM ranked r
-      ORDER BY final_score DESC, id
+      LEFT JOIN agents a ON a.id = r.agent_id
+      ORDER BY final_score DESC, r.id
       LIMIT ${pLimit};
     `;
 

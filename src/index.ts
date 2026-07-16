@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { shutdownContradictionRuntime } from './contradictions.js';
 import { shutdown } from './db.js';
 import { validateKey } from './auth.js';
+import { consumeRateLimit } from './security.js';
 import type { AuthContext } from './types.js';
 import { registerTools } from './tools/register.js';
 
@@ -23,6 +24,7 @@ export function createStdioAuthResolver(
     if (!apiKey) throw new Error('TOTAL_RECALL_API_KEY not set');
     const ctx = await validator(apiKey);
     if (!ctx) throw new Error('Invalid API key');
+    await consumeRateLimit(ctx);
     return ctx;
   };
 }

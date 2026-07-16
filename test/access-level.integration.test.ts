@@ -66,7 +66,7 @@ assertIncludes('migrations/009_api_key_access_ceiling.sql', 'NOT VALID');
 assertIncludes('migrations/009_api_key_access_ceiling.sql', 'RAISE NOTICE');
 
 assertIncludes('scripts/create-key.ts', '--max-access-level');
-assertIncludes('scripts/create-key.ts', "maxAccessLevel = 'normal'");
+assertIncludes('scripts/create-key.ts', "values.get('--max-access-level') ?? 'normal'");
 assertIncludes('README.md', 'max_access_level');
 assertIncludes('SPEC.md', 'max_access_level');
 

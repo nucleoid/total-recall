@@ -10,7 +10,9 @@ info:
     each embedding chunk to 2,000 UTF-8 bytes. Per-request metadata is limited
     to 65536 serialized JSON bytes, depth 16, and 1000 keys. Requests accept at
     most 100 tags and 256 JavaScript characters per tag. Administrative
-    operations require an API key with the explicit admin permission.
+    operations require an API key with the explicit admin permission. Every
+    authenticated operation may return 429 with Retry-After and RateLimit
+    headers when the API key's fixed UTC minute or daily quota is exhausted.
 servers:
   - url: https://recall.stakewatch.dev
 security:
@@ -43,6 +45,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /api/search:
     post:
       operationId: searchMemories
@@ -66,6 +72,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -102,6 +112,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "409":
           $ref: "#/components/responses/TombstonedIdempotencyKey"
         "413":
@@ -137,6 +151,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "409":
           $ref: "#/components/responses/DocumentIdempotencyConflict"
         "413":
@@ -177,6 +195,8 @@ paths:
         "400": { $ref: "#/components/responses/InvalidRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
     delete:
       operationId: forgetMemories
@@ -203,6 +223,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -227,6 +251,8 @@ paths:
         "400": { $ref: "#/components/responses/InvalidRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "404": { $ref: "#/components/responses/NotFound" }
     patch:
       operationId: updateMemory
@@ -254,6 +280,8 @@ paths:
         "400": { $ref: "#/components/responses/InvalidRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
         "428":
@@ -275,6 +303,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
   /api/agents:
@@ -299,6 +331,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
     post:
@@ -324,6 +360,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -363,6 +403,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
   /api/traces/{id}:
@@ -381,6 +425,8 @@ paths:
         "400": { $ref: "#/components/responses/InvalidRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "404": { $ref: "#/components/responses/NotFound" }
   /api/audit:
     get:
@@ -421,6 +467,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
   /api/media/search:
@@ -449,6 +499,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -510,6 +564,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
     post:
@@ -542,6 +600,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -565,6 +627,8 @@ paths:
         "400": { $ref: "#/components/responses/InvalidRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
   /api/media/rollup:
     post:
@@ -596,6 +660,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -719,6 +787,27 @@ components:
             $ref: "#/components/schemas/Error"
     UnsupportedContentEncoding:
       description: Content-Encoding is not identity; returns code unsupported_content_encoding.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: The API key's fixed UTC minute or daily quota is exhausted.
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+        RateLimit-Limit:
+          schema: { type: integer, minimum: 0 }
+        RateLimit-Remaining:
+          schema: { type: integer, minimum: 0 }
+        RateLimit-Reset:
+          schema: { type: integer, minimum: 0 }
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: Authentication succeeded but durable quota accounting is unavailable; the operation fails closed.
       content:
         application/json:
           schema:
@@ -1009,6 +1098,21 @@ components:
         revision: { type: [integer, "null"] }
         expires_at: { type: [string, "null"], format: date-time }
         consolidated_into_id: { type: [string, "null"], format: uuid }
+        provenance:
+          oneOf:
+            - $ref: "#/components/schemas/MemoryProvenance"
+            - type: "null"
+    MemoryProvenance:
+      type: object
+      description: Verifiable stored origin, not a trust assertion. Agent labels are client supplied.
+      required: [agent_id, agent_name, agent_type, agent_model, agent_runtime, same_key_as_requester]
+      properties:
+        agent_id: { type: string, format: uuid }
+        agent_name: { type: string }
+        agent_type: { type: string }
+        agent_model: { type: [string, "null"] }
+        agent_runtime: { type: [string, "null"] }
+        same_key_as_requester: { type: boolean }
     MemoryPage:
       type: object
       required: [memories, total, limit, offset]
@@ -1182,6 +1286,10 @@ components:
           type: number
         final_score:
           type: number
+        provenance:
+          oneOf:
+            - $ref: "#/components/schemas/MemoryProvenance"
+            - type: "null"
     Stats:
       type: object
       required: [total_memories, by_namespace, by_source, total_documents, oldest_memory, newest_memory]
@@ -1351,6 +1459,12 @@ components:
           type: [string, "null"]
         agent_name:
           type: [string, "null"]
+        resource_type:
+          type: [string, "null"]
+        resource_id:
+          type: [string, "null"]
+        details:
+          $ref: "#/components/schemas/JsonObject"
     MediaSearchRequest:
       type: object
       required: [query]

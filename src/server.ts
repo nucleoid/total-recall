@@ -10,7 +10,8 @@ import dotenv from 'dotenv';
 import { shutdownContradictionRuntime } from './contradictions.js';
 import { dbScopeFromAuth, shutdown } from './db.js';
 import { checkPermission, validateKey } from './auth.js';
-import type { AuthContext } from './types.js';
+import { consumeRateLimit, RateLimitExceededError, RateLimitUnavailableError } from './security.js';
+import type { AuthContext, RateLimitResult } from './types.js';
 import { agentRegisterSchema, registerTools } from './tools/register.js';
 import { memorySearch, searchSchema } from './tools/search.js';
 import { memoryStore, storeSchema } from './tools/store.js';
@@ -24,7 +25,7 @@ import { memoryForget } from './tools/forget.js';
 import { memoryUpdate } from './tools/update.js';
 import { isPublicApiError } from './errors.js';
 import { mediaSearch, mediaSearchSchema } from './tools/media-search.js';
-import { upsertAgent, listAgents } from './agents.js';
+import { registerAgent, listAgents } from './agents.js';
 import { getTrace, listTraces } from './traces.js';
 import { listAudit } from './audit.js';
 import { getMediaStats, parsePublicMediaEventBatch, toTrustedRestMediaEvents, upsertMediaEvents, listMediaEvents } from './media.js';
@@ -172,6 +173,68 @@ async function closeSessionRecord(record: SessionRecord): Promise<void> {
   }
 }
 
+function setRateLimitHeaders(res: express.Response, result: RateLimitResult): void {
+  const windows = [result.minute, result.day].filter(
+    (candidate): candidate is NonNullable<RateLimitResult['minute']> => candidate !== null
+  );
+  const window = result.allowed
+    ? windows.sort((left, right) => (left.remaining / Math.max(1, left.limit)) - (right.remaining / Math.max(1, right.limit)))[0]
+    : windows.filter(candidate => candidate.remaining === 0)
+        .sort((left, right) => right.resetAt.getTime() - left.resetAt.getTime())[0];
+  if (window) {
+    res.setHeader('RateLimit-Limit', String(window.limit));
+    res.setHeader('RateLimit-Remaining', String(window.remaining));
+    res.setHeader('RateLimit-Reset', String(Math.max(0, Math.ceil((window.resetAt.getTime() - Date.now()) / 1000))));
+  }
+  if (result.minute) {
+    res.setHeader('X-RateLimit-Minute-Limit', String(result.minute.limit));
+    res.setHeader('X-RateLimit-Minute-Remaining', String(result.minute.remaining));
+  }
+  if (result.day) {
+    res.setHeader('X-RateLimit-Daily-Limit', String(result.day.limit));
+    res.setHeader('X-RateLimit-Daily-Remaining', String(result.day.remaining));
+  }
+  if (!result.allowed) res.setHeader('Retry-After', String(result.retryAfterSeconds));
+}
+
+async function chargeRequestQuota(
+  auth: AuthContext,
+  res: express.Response,
+  responseType: 'json' | 'text',
+): Promise<boolean> {
+  try {
+    setRateLimitHeaders(res, await consumeRateLimit(auth));
+    return true;
+  } catch (error) {
+    if (error instanceof RateLimitExceededError) {
+      setRateLimitHeaders(res, error.result);
+      if (responseType === 'json') {
+        res.status(429).json({
+          jsonrpc: '2.0',
+          error: { code: -32001, message: 'Rate limit exceeded' },
+          id: null,
+        });
+      } else {
+        res.status(429).type('text/plain').send('Rate limit exceeded');
+      }
+      return false;
+    }
+    if (error instanceof RateLimitUnavailableError) {
+      if (responseType === 'json') {
+        res.status(503).json({
+          jsonrpc: '2.0',
+          error: { code: -32002, message: 'Rate limit service unavailable' },
+          id: null,
+        });
+      } else {
+        res.status(503).type('text/plain').send('Rate limit service unavailable');
+      }
+      return false;
+    }
+    throw error;
+  }
+}
+
 async function authenticateMcpRequest(
   req: express.Request,
   res: express.Response,
@@ -197,6 +260,19 @@ async function authenticateMcpRequest(
     return null;
   }
 
+  // Tool calls are charged by the per-invocation auth resolver so JSON-RPC
+  // batches charge each logical operation. Charge each non-tool control message
+  // here; GET/DELETE each represent one control operation.
+  const messages = Array.isArray(req.body) ? req.body : [req.body];
+  const controlCharges = req.method === 'POST'
+    ? (messages.length === 0 ? 1 : messages.filter(message =>
+        message === null || typeof message !== 'object' ||
+        (message as { method?: unknown }).method !== 'tools/call'
+      ).length)
+    : 1;
+  for (let charge = 0; charge < controlCharges; charge++) {
+    if (!await chargeRequestQuota(authContext, res, responseType)) return null;
+  }
   return authContext;
 }
 
@@ -325,6 +401,7 @@ app.post('/mcp', async (req, res) => {
         if (!freshAuth || freshAuth.keyId !== record.boundKeyId) {
           throw new Error('Invalid API key');
         }
+        await consumeRateLimit(freshAuth);
         return freshAuth;
       });
       await server.connect(transport);
@@ -400,6 +477,20 @@ async function authenticateRequest(req: express.Request, res: express.Response):
   if (!auth) {
     res.status(403).json({ error: 'Forbidden: invalid API key' });
     return null;
+  }
+  try {
+    setRateLimitHeaders(res, await consumeRateLimit(auth));
+  } catch (error) {
+    if (error instanceof RateLimitExceededError) {
+      setRateLimitHeaders(res, error.result);
+      res.status(429).json({ error: 'Rate limit exceeded', code: error.code });
+      return null;
+    }
+    if (error instanceof RateLimitUnavailableError) {
+      res.status(503).json({ error: 'Rate limit service unavailable', code: error.code });
+      return null;
+    }
+    throw error;
   }
   return auth;
 }
@@ -594,10 +685,10 @@ registerRestRoute(app, 'post', '/api/agents', async (req, res) => {
     checkPermission(auth, 'write');
     const params = agentRegisterSchema.parse(req.body);
     checkPermission(auth, 'admin');
-    const result = await upsertAgent({
+    const result = await registerAgent({
       ...params,
       api_key_id: auth.keyId,
-    }, dbScopeFromAuth(auth));
+    }, auth);
     res.json(result);
   } catch (err: any) {
     sendApiError(res, '/api/agents POST', err);

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { accessLevelSql, checkPermission, filterNamespaces } from '../auth.js';
+import { logAudit } from '../audit.js';
 
 export const listSchema = z.object({
   namespace: z.string().optional(),
@@ -23,6 +24,7 @@ export async function memoryList(
   );
 
   if (allowedNamespaces.length === 0) {
+    await logAudit({ clientId: auth.keyId, action: 'memory.list', resourceType: 'search', resultCount: 0 }, dbScopeFromAuth(auth));
     return { memories: [], total: 0 };
   }
 
@@ -70,6 +72,11 @@ export async function memoryList(
     `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.document_id,
             m.chunk_index, m.created_at, m.updated_at, m.memory_kind, m.valid_from, m.valid_to,
             m.superseded_at, m.revision, m.expires_at,
+            CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object(
+              'agent_id', a.id, 'agent_name', a.name, 'agent_type', a.type,
+              'agent_model', a.model, 'agent_runtime', a.runtime,
+              'same_key_as_requester', COALESCE(a.api_key_id::text = app_current_key_id(), false)
+            ) END AS provenance,
             (to_jsonb(m)->>'consolidated_into_id')::uuid AS consolidated_into_id,
             (to_jsonb(m)->>'consolidated_at')::timestamptz AS consolidated_at,
             (SELECT predecessor.id FROM memories predecessor
@@ -89,11 +96,18 @@ export async function memoryList(
                AND successor.namespace = ANY($1)
                AND ${accessLevelSql('successor.access_level', '$2')}
              LIMIT 1) AS superseded_by_id
-     FROM memories m WHERE ${where}
+     FROM memories m
+     LEFT JOIN agents a ON a.id = m.agent_id
+     WHERE ${where}
      ORDER BY m.created_at DESC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     values
   );
+
+  await logAudit({
+    clientId: auth.keyId, action: 'memory.list', resourceType: 'search',
+    resultCount: res.rows.length,
+  }, scope);
 
   return {
     memories: res.rows,

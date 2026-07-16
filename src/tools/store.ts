@@ -5,6 +5,7 @@ import { embedWithProfile, serializeEmbeddingVector } from '../embedding.js';
 import type { AuthContext, StoreResult } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
+import { logAudit } from '../audit.js';
 import { SupersededSourceKeyConflictError, TombstonedSourceKeyConflictError } from '../errors.js';
 import {
   contradictionPolicyFromEnv,
@@ -246,13 +247,20 @@ export async function memoryStore(
           if (boosted.rows.length !== 1) {
             throw new Error('Dedupe candidate changed while the namespace lock was held');
           }
-          return {
+          const result: StoreResult = {
             ...boosted.rows[0],
             expires_at: boosted.rows[0].expires_at ?? null,
             created: false,
             deduplicated: true,
             similarity,
           };
+          await logAudit({
+            clientId: auth.keyId, action: 'memory.store', namespace: ns,
+            memoryId: result.id, resourceType: 'memory', resourceId: result.id,
+            agentId, sessionId: params.session_id,
+            details: { created: false, deduplicated: true },
+          }, dbScopeFromAuth(auth), client);
+          return result;
         }
       }
 
@@ -263,7 +271,17 @@ export async function memoryStore(
          RETURNING id, namespace, expires_at`,
         values,
       );
-      return { ...inserted.rows[0], expires_at: inserted.rows[0].expires_at ?? null, created: true, deduplicated: false };
+      const result: StoreResult = {
+        ...inserted.rows[0], expires_at: inserted.rows[0].expires_at ?? null,
+        created: true, deduplicated: false,
+      };
+      await logAudit({
+        clientId: auth.keyId, action: 'memory.store', namespace: ns,
+        memoryId: result.id, resourceType: 'memory', resourceId: result.id,
+        agentId, sessionId: params.session_id,
+        details: { created: true, deduplicated: false },
+      }, dbScopeFromAuth(auth), client);
+      return result;
     });
     if (result.created) scheduleShadowAfterCommit(result.id);
     return result;
@@ -309,7 +327,16 @@ export async function memoryStore(
          RETURNING id, namespace, expires_at, (xmax = 0) AS created`,
         [...values, sourceKey, auth.namespaces]
       );
-      if (upsert.rows.length > 0) return upsert;
+      if (upsert.rows.length > 0) {
+        const stored = upsert.rows[0] as { id: string; created?: boolean };
+        await logAudit({
+          clientId: auth.keyId, action: 'memory.store', namespace: ns,
+          memoryId: stored.id, resourceType: 'memory', resourceId: stored.id,
+          agentId, sessionId: params.session_id,
+          details: { created: stored.created ?? false, deduplicated: false, idempotent: true },
+        }, dbScopeFromAuth(auth), client);
+        return upsert;
+      }
 
       // A tombstone remains SELECT-visible under the caller's RLS scope. Resolve
       // the zero-row conflict before leaving this transaction/client so a hidden

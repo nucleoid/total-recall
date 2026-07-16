@@ -35,7 +35,7 @@ import {
   sessionStatusSchema,
   storeSessionSchema,
 } from '../session-distillation.js';
-import { upsertAgent, listAgents } from '../agents.js';
+import { registerAgent, listAgents } from '../agents.js';
 import {
   DOCUMENT_TITLE_MAX_CHARS,
   MEMORY_CONTENT_MAX_CHARS,
@@ -182,7 +182,7 @@ const TOOL_DEFINITIONS = [
     description:
       'Hybrid vector + full-text search across memories. ' +
       'For accurate provenance and recall trace logging, pass agent_name identifying the agent ' +
-      'performing the search. When omitted, the API key name is used as a fallback.',
+      'performing the search. When omitted, the API key name is used as a fallback. Each result includes structured provenance; it reports origin and same-key status, not trust.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -223,7 +223,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_recall',
-    description: 'Recall a specific memory by ID, or all chunks of a document by document_id.',
+    description: 'Recall a specific memory by ID, or all chunks of a document by document_id. Results include structured origin provenance; client-supplied agent labels are not trust assertions.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -234,7 +234,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_list',
-    description: 'List and browse memories with filters (no vector search). Supports pagination.',
+    description: 'List and browse memories with filters (no vector search). Supports pagination and returns structured origin provenance.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -466,10 +466,10 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
         case 'agent_register': {
           checkPermission(auth, 'write');
           const params = agentRegisterSchema.parse(args);
-          const result = await upsertAgent({
+          const result = await registerAgent({
             ...params,
             api_key_id: auth.keyId,
-          }, scope);
+          }, auth);
           return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'agent_list': {
@@ -482,7 +482,8 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
           return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
       }
     } catch (err: any) {
-      return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+      const code = typeof err?.code === 'string' ? ` [${err.code}]` : '';
+      return { content: [{ type: 'text', text: `Error${code}: ${err.message}` }], isError: true };
     }
   });
 }

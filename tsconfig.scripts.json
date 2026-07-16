@@ -9,6 +9,9 @@
   "include": [
     "scripts/migrate.ts",
     "scripts/provision-db.ts",
+    "scripts/create-key.ts",
+    "scripts/rotate-key.ts",
+    "scripts/lib/key-policy.ts",
     "scripts/consolidate-memories.ts",
     "scripts/reflect.ts",
     "scripts/deconsolidate-memories.ts",

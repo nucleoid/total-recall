@@ -162,6 +162,10 @@ class FakeClient {
       return this.result([{ id: this.pendingMemories.at(-1)!.id } as T]);
     }
 
+    if (/^INSERT INTO audit_log/i.test(normalized)) {
+      return this.result([], 1);
+    }
+
     if (/^UPDATE documents SET chunk_count/i.test(normalized)) {
       if (this.failures.failCountUpdate) throw new Error('count update failed');
       if (this.failures.forceZeroRowUpdate) return this.result([], 0);
