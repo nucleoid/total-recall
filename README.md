@@ -364,6 +364,8 @@ All `/api/*` endpoints require `Authorization: Bearer tr_<key>`. `/health` is pu
 | GET | `/api/traces` | Paginated recall traces (`admin` + `read`) |
 | GET | `/api/traces/{id}` | Trace score evidence and accessible memory summaries (`admin` + `read`) |
 | GET | `/api/audit` | Paginated audit log (`admin` + `read`) |
+| GET | `/api/activity/events` | List owner-key private structured activity (`read`) |
+| POST | `/api/activity/events` | Idempotently ingest private structured activity (`write`) |
 | POST | `/api/media/search` | Vector search over authorized media history (`read`) |
 | POST | `/api/media/events` | Upsert media events (`admin` + `write`) |
 | GET | `/api/media/events` | List structured media events (`admin` + `read`) |
@@ -742,6 +744,10 @@ Media progress is nullable by design: `duration_ms` describes the item's duratio
 
 Historical Spotify rows that asserted `played_ms=duration_ms` and `completed=true` are not automatically rewritten because their ingestion provenance is ambiguous. `npm run spotify:repair-progress` is preview-only by default and writes nothing. For an authorized repair, pause Spotify sync, take and verify a restorable backup, independently prove connector provenance per candidate, and create an approval manifest containing only exact previewed event IDs, client IDs, and fingerprints. Apply requires both `--apply --confirm-backup --approval-manifest <file>`; broad predicates, counts, date ranges, and approval of the command itself are rejected. Unverified rows stay unchanged. See [the Spotify connector guide](docs/connectors/spotify.md#historical-progress-repair) for the full workflow.
 
+### Activity connector foundation and migration 035
+
+Migration 035 introduces owner/source-scoped connector state and credentials, source/event-key media identity, and the separate private `activity_events` domain. It requires a stopped-writer maintenance window and explicit assignment of legacy credential/state ownership. Follow the [migration 035 rollout runbook](docs/rollouts/035-activity-connector-foundation.md); never overlap pre-035 and post-035 connector binaries.
+
 ### Nullable media provider IDs and migration 022
 
 Migration 022 follows migration 021's tenant-local provider identity constraint and makes nullable or blank provider IDs idempotent without collapsing different content played at the same instant. PostgreSQL owns the effective identity: a nonblank `service_id` keeps its exact bytes, while a null/blank ID uses a versioned SHA-256 identity over the stable canonical event fields. Mutable genres, progress, completion, metadata, provenance, agent, and memory-link fields do not alter identity. The migration requires PostgreSQL 16 and owner permission to `CREATE EXTENSION IF NOT EXISTS pgcrypto`; the runtime role receives function execution only and is not granted DDL.
@@ -879,6 +885,8 @@ Deploy server support for `memory_store.idempotency_key` before deploying the ne
 - [x] Spotify connector ([setup](docs/connectors/spotify.md)) (Phase 2) — *requires Spotify Premium for the app owner*
 - [x] YouTube Music connector via `ytmusicapi` ([setup](docs/connectors/ytmusic.md)) (Phase 3)
 - [x] Plex connector via plex.tv account ([setup](docs/connectors/plex.md)) (Phase 2)
+- [x] Browser history connector for explicit Chromium/Firefox profiles ([setup](docs/connectors/browser-history.md))
+- [ ] GitHub activity, Google Calendar, Steam snapshots, Trakt, and Instapaper export — separate least-privilege follow-up connectors
 - [ ] Netflix quarterly Takeout importer (Phase 4)
 
 ## Links

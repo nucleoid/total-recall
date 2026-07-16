@@ -140,7 +140,7 @@ test('representative runtime response fixtures satisfy the published schemas', a
       base_score: 1.1, relevance: 1, final_score: 1.1,
     },
     MediaEvent: {
-      id, service: 'spotify', service_id: 'track:1', event_type: 'play', title: 'Song',
+      id, service: 'spotify', source_id: 'default', event_key: 'play:track:1', service_id: 'track:1', event_type: 'play', title: 'Song',
       artist: null, album: null, show: null, season: null, episode: null, year: null,
       genres: [], duration_ms: null, played_ms: null, completed: null, played_at: now,
       metadata: {}, client_id: id, agent_id: null, memory_id: null, created_at: now,

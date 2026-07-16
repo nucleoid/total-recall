@@ -1,7 +1,31 @@
 import type { MediaEventInput, TrustedMediaEventInput } from '../media.js';
-import { withScopedClient, type DbScope } from '../db.js';
 import {
-  getSyncState,
+  withCheckedOutClient,
+  withScopedClient,
+  withScopedTransactionOnClient,
+  type DbScope,
+  type ScopedClient,
+} from '../db.js';
+import { retryConnectorOperation, type RetryOptions } from './retry.js';
+import {
+  acquireConnectorSourceLock,
+  advanceConnectorState,
+  lockConnectorState,
+  readConnectorStateRowWithClient,
+  readConnectorStateWithClient,
+  releaseConnectorSourceLock,
+  type ConnectorStateRow,
+} from './state.js';
+import type {
+  ConnectorPage,
+  ConnectorPagePersistence,
+  ConnectorRunOutcome,
+  ConnectorSource,
+  ConnectorStoredState,
+  SourceSyncOutcome,
+} from './types.js';
+import {
+  mediaEventKey,
   mutateConnectorSyncStateWithClient,
   getConnectorCredentials,
   setConnectorCredentials,
@@ -30,6 +54,8 @@ export function trustConnectorMediaEvents(
 
   return events.map((event) => ({
     ...event,
+    source_id: event.source_id ?? 'default',
+    event_key: event.event_key ?? mediaEventKey(event),
     client_id: apiKeyId,
     agent_id: ctx.agentId ?? null,
   }));
@@ -121,6 +147,248 @@ export function resolveLastEventAt(
  * newer than the supplied cursor / timestamp. The base class handles
  * upsert, attribution, sync-state, and timing.
  */
+export interface SourceConnectorDefinition<Event> {
+  readonly service: string;
+  listSources(ctx: ConnectorContext, signal: AbortSignal): Promise<ConnectorSource[]>;
+  fetchPage(
+    source: ConnectorSource,
+    state: ConnectorStoredState,
+    ctx: ConnectorContext,
+    signal: AbortSignal,
+  ): Promise<ConnectorPage<Event>>;
+  persistPage: ConnectorPagePersistence<Event>;
+}
+
+export interface SourceConnectorRunOptions {
+  dryRun?: boolean;
+  maxPagesPerSource?: number;
+  signal?: AbortSignal;
+  retry?: RetryOptions;
+}
+
+/**
+ * Source-aware connector orchestration for life connectors. Every non-dry-run
+ * page is fetched while a source lock is held, then its events and cursor are
+ * committed in the same scoped transaction. Sources fail independently.
+ */
+export async function runSourceConnector<Event>(
+  connector: SourceConnectorDefinition<Event>,
+  ctx: ConnectorContext,
+  options: SourceConnectorRunOptions = {},
+): Promise<ConnectorRunOutcome> {
+  const started = Date.now();
+  const maxPages = options.maxPagesPerSource ?? 100;
+  if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > 10_000) {
+    throw new Error('maxPagesPerSource must be an integer from 1 to 10000');
+  }
+
+  const signal = options.signal ?? new AbortController().signal;
+  const sources = await connector.listSources(ctx, signal);
+  validateSources(sources, ctx.scope);
+
+  const outcomes: SourceSyncOutcome[] = [];
+  for (const source of sources) {
+    outcomes.push(await runOneSource(connector, source, ctx, { ...options, maxPagesPerSource: maxPages }, signal));
+  }
+
+  const failed = outcomes.filter((outcome) => outcome.status === 'failed').length;
+  return {
+    connector: connector.service,
+    status: options.dryRun
+      ? (failed ? 'failed' : 'dry_run')
+      : failed === 0 ? 'succeeded' : failed === outcomes.length ? 'failed' : 'partial_failure',
+    sources: outcomes,
+    events_ingested: outcomes.reduce((sum, outcome) => sum + outcome.events_ingested, 0),
+    events_skipped: outcomes.reduce((sum, outcome) => sum + outcome.events_skipped, 0),
+    duration_ms: Date.now() - started,
+  };
+}
+
+async function runOneSource<Event>(
+  connector: SourceConnectorDefinition<Event>,
+  source: ConnectorSource,
+  ctx: ConnectorContext,
+  options: Required<Pick<SourceConnectorRunOptions, 'maxPagesPerSource'>> & SourceConnectorRunOptions,
+  signal: AbortSignal,
+): Promise<SourceSyncOutcome> {
+  const outcome: SourceSyncOutcome = {
+    source_id: source.sourceId,
+    status: options.dryRun ? 'dry_run' : 'succeeded',
+    events_ingested: 0,
+    events_skipped: 0,
+    pages: 0,
+    cursor: null,
+    warnings: [],
+    errors: [],
+  };
+  const seenCursors = new Set<string>();
+  let dryState: ConnectorStoredState | null = null;
+  let completed = false;
+
+  try {
+    if (options.dryRun) {
+      dryState = await withScopedClient(ctx.scope, (client) =>
+        readConnectorStateWithClient(client, ctx.scope, connector.service, source.sourceId, source.namespace)
+      );
+    }
+
+    while (outcome.pages < options.maxPagesPerSource) {
+      const pageResult = options.dryRun
+        ? {
+            page: await fetchConnectorPage(connector, source, dryState!, ctx, signal, options.retry, seenCursors),
+            inserted: 0,
+            skipped: 0,
+          }
+        : await persistAtomicPage(connector, source, ctx, signal, options.retry, seenCursors);
+      const { page, inserted, skipped } = pageResult;
+      outcome.pages++;
+      outcome.events_ingested += options.dryRun ? page.events.length : inserted;
+      outcome.events_skipped += skipped;
+      outcome.cursor = page.cursor;
+      outcome.warnings.push(...(page.warnings ?? []));
+
+      if (page.done) {
+        completed = true;
+        break;
+      }
+      if (!page.cursor || seenCursors.has(page.cursor)) {
+        throw new Error(`Connector pagination did not advance for ${connector.service}/${source.sourceId}`);
+      }
+      seenCursors.add(page.cursor);
+      if (options.dryRun) {
+        dryState = {
+          cursor: page.cursor,
+          lastEventAt: page.lastEventAt ?? dryState!.lastEventAt,
+          metadata: page.metadata ?? dryState!.metadata,
+        };
+      }
+    }
+    if (!completed && outcome.pages >= options.maxPagesPerSource) {
+      throw new Error(`Connector pagination hit ${options.maxPagesPerSource} page cap for ${connector.service}/${source.sourceId}`);
+    }
+  } catch (error) {
+    outcome.status = 'failed';
+    outcome.errors.push(error instanceof Error ? error.message : String(error));
+  }
+  return outcome;
+}
+
+async function fetchConnectorPage<Event>(
+  connector: SourceConnectorDefinition<Event>,
+  source: ConnectorSource,
+  state: ConnectorStoredState,
+  ctx: ConnectorContext,
+  signal: AbortSignal,
+  retry: RetryOptions | undefined,
+  seenCursors?: Set<string>,
+): Promise<ConnectorPage<Event>> {
+  const page = await retryConnectorOperation(
+    () => connector.fetchPage(source, state, ctx, signal),
+    { ...retry, signal },
+  );
+  validatePage(page);
+  if (!page.done && page.cursor && (page.cursor === state.cursor || seenCursors?.has(page.cursor))) {
+    throw new Error(`Connector pagination did not advance for ${connector.service}/${source.sourceId}`);
+  }
+  return page;
+}
+
+async function persistAtomicPage<Event>(
+  connector: SourceConnectorDefinition<Event>,
+  source: ConnectorSource,
+  ctx: ConnectorContext,
+  signal: AbortSignal,
+  retry: RetryOptions | undefined,
+  seenCursors: Set<string>,
+): Promise<{ page: ConnectorPage<Event>; inserted: number; skipped: number }> {
+  return withCheckedOutClient(async (client: ScopedClient) => {
+    await acquireConnectorSourceLock(client, ctx.scope, connector.service, source.sourceId, source.namespace);
+    try {
+      const before = await withScopedTransactionOnClient(client, ctx.scope, (scoped) =>
+        readConnectorStateRowWithClient(scoped, ctx.scope, connector.service, source.sourceId, source.namespace)
+      );
+      const state: ConnectorStoredState = {
+        cursor: before?.cursor ?? null,
+        lastEventAt: before?.last_event_at ?? null,
+        metadata: before?.metadata ?? {},
+      };
+      const page = await fetchConnectorPage(connector, source, state, ctx, signal, retry, seenCursors);
+      return await withScopedTransactionOnClient(client, ctx.scope, async (scoped) => {
+        const row = await lockConnectorState(
+          scoped, ctx.scope, connector.service, source.sourceId, source.namespace,
+        );
+        if (before && (before.updated_at.getTime() !== row.updated_at.getTime() || before.cursor !== row.cursor)) {
+          throw new Error(`Connector state changed during fetch for ${connector.service}/${source.sourceId}`);
+        }
+        const persisted = await connector.persistPage(scoped, source, page.events, ctx.scope);
+        await advanceConnectorState(
+          scoped,
+          ctx.scope,
+          connector.service,
+          source.sourceId,
+          source.namespace,
+          {
+            cursor: page.cursor,
+            lastEventAt: page.lastEventAt,
+            metadata: page.metadata,
+          },
+        );
+        return { page, ...persisted };
+      });
+    } finally {
+      await releaseConnectorSourceLock(client, ctx.scope, connector.service, source.sourceId, source.namespace);
+    }
+  });
+}
+
+function validateSources(sources: ConnectorSource[], scope: DbScope): void {
+  const seen = new Set<string>();
+  for (const source of sources) {
+    if (!source.sourceId.trim() || !source.namespace.trim()) throw new Error('Connector source identity must be nonblank');
+    if (!scope.namespaces.includes(source.namespace)) {
+      throw new Error(`Connector source requires unauthorized namespace "${source.namespace}"`);
+    }
+    const key = `${source.namespace}\u0000${source.sourceId}`;
+    if (seen.has(key)) throw new Error(`Connector returned duplicate source_id "${source.sourceId}"`);
+    seen.add(key);
+  }
+}
+
+function validatePage<Event>(page: ConnectorPage<Event>): void {
+  if (!Array.isArray(page.events)) throw new Error('Connector page events must be an array');
+  if (!page.done && (!page.cursor || page.cursor.trim() === '')) {
+    throw new Error('A non-final connector page requires a nonblank cursor');
+  }
+}
+
+export async function withConnectorSessionLock<T>(
+  scope: DbScope,
+  service: string,
+  sourceId: string,
+  namespace: string,
+  fn: (client: ScopedClient) => Promise<T>,
+): Promise<T> {
+  return withCheckedOutClient(async (client) => {
+    await acquireConnectorSourceLock(client, scope, service, sourceId, namespace);
+    try {
+      return await fn(client);
+    } finally {
+      await releaseConnectorSourceLock(client, scope, service, sourceId, namespace);
+    }
+  });
+}
+
+export function assertStateUnchanged(
+  before: ConnectorStateRow | null,
+  current: ConnectorStateRow,
+  service: string,
+  sourceId: string,
+): void {
+  if (before && (before.updated_at.getTime() !== current.updated_at.getTime() || before.cursor !== current.cursor)) {
+    throw new Error(`Connector state changed during fetch for ${service}/${sourceId}`);
+  }
+}
+
 export abstract class BaseConnector {
   abstract readonly service: string;
 
@@ -151,37 +419,39 @@ export abstract class BaseConnector {
     let cursor: string | undefined;
 
     try {
-      const state = await getSyncState(this.service);
-      const since = state?.last_event_at ?? null;
+      await withConnectorSessionLock(ctx.scope, this.service, 'default', 'media', async (client) => {
+        const before = await withScopedTransactionOnClient(client, ctx.scope, (scoped) =>
+          readConnectorStateRowWithClient(scoped, ctx.scope, this.service, 'default', 'media')
+        );
+        const since = before?.last_event_at ?? null;
+        const {
+          events,
+          cursor: nextCursor,
+          errors: fetchErrors = [],
+          advanceLastEventAt = true,
+          syncState,
+        } = await this.fetchSince(since, ctx);
+        cursor = nextCursor;
+        errors.push(...fetchErrors);
+        const valid = filterValidMediaEventDates(events);
+        errors.push(...valid.errors);
+        skipped += valid.skipped;
+        const enriched = trustConnectorMediaEvents(valid.events, ctx);
 
-      const {
-        events,
-        cursor: nextCursor,
-        errors: fetchErrors = [],
-        advanceLastEventAt = true,
-        syncState,
-      } = await this.fetchSince(since, ctx);
-      cursor = nextCursor;
-      errors.push(...fetchErrors);
-      const valid = filterValidMediaEventDates(events);
-      errors.push(...valid.errors);
-      skipped += valid.skipped;
-
-      const enriched = trustConnectorMediaEvents(valid.events, ctx);
-
-      await withScopedClient(ctx.scope, async (client) => {
-        const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
-        ingested = result.inserted;
-        skipped += result.skipped;
-
-        const lastEventAt = resolveLastEventAt(valid.events, since, advanceLastEventAt);
-
-        await mutateConnectorSyncStateWithClient(client, this.service, (current) => ({
-          last_sync_at: new Date(),
-          last_event_at: lastEventAt,
-          cursor: nextCursor ?? current.cursor ?? state?.cursor ?? null,
-          ...(syncState ? syncState(current) : {}),
-        }));
+        await withScopedTransactionOnClient(client, ctx.scope, async (scoped) => {
+          const state = await lockConnectorState(scoped, ctx.scope, this.service, 'default', 'media');
+          assertStateUnchanged(before, state, this.service, 'default');
+          const result = await upsertMediaEventsWithClient(scoped, enriched, ctx.scope);
+          ingested = result.inserted;
+          skipped += result.skipped;
+          const lastEventAt = resolveLastEventAt(valid.events, since, advanceLastEventAt);
+          await mutateConnectorSyncStateWithClient(scoped, this.service, (current) => ({
+            last_sync_at: new Date(),
+            last_event_at: lastEventAt,
+            cursor: nextCursor ?? current.cursor ?? state.cursor ?? null,
+            ...(syncState ? syncState(current) : {}),
+          }));
+        });
       });
     } catch (err: any) {
       errors.push(err?.message ?? String(err));
@@ -208,16 +478,17 @@ export abstract class BaseConnector {
     let skipped = 0;
 
     try {
-      const { events } = await this.fetchSince(since, ctx);
-      const valid = filterValidMediaEventDates(events);
-      errors.push(...valid.errors);
-      skipped += valid.skipped;
-
-      const enriched = trustConnectorMediaEvents(valid.events, ctx);
-      await withScopedClient(ctx.scope, async (client) => {
-        const result = await upsertMediaEventsWithClient(client, enriched, ctx.scope);
-        ingested = result.inserted;
-        skipped += result.skipped;
+      await withConnectorSessionLock(ctx.scope, this.service, 'default', 'media', async (client) => {
+        const { events } = await this.fetchSince(since, ctx);
+        const valid = filterValidMediaEventDates(events);
+        errors.push(...valid.errors);
+        skipped += valid.skipped;
+        const enriched = trustConnectorMediaEvents(valid.events, ctx);
+        await withScopedTransactionOnClient(client, ctx.scope, async (scoped) => {
+          const result = await upsertMediaEventsWithClient(scoped, enriched, ctx.scope);
+          ingested = result.inserted;
+          skipped += result.skipped;
+        });
       });
     } catch (err: any) {
       errors.push(err?.message ?? String(err));

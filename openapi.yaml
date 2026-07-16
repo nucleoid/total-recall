@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: >-
     Authenticated REST API for memory storage, hybrid search, provenance,
-    observability, media ingestion, and a V1 memory-only transfer feed. JSON
+    observability, owner-scoped media and life-activity ingestion, and a V1 memory-only transfer feed. JSON
     bodies are limited to 8 MiB and only identity Content-Encoding is accepted,
     except that the NDJSON transfer import route also accepts bounded gzip. Memory content is limited to
     100,000 JavaScript characters; document content to 1048576 UTF-8 bytes and
@@ -535,6 +535,61 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/activity/events:
+    get:
+      operationId: listActivityEvents
+      summary: List owner-key structured life activity
+      description: Requires read permission and access to the selected namespace. Rows are always restricted to the requesting owner key.
+      parameters:
+        - { name: namespace, in: query, schema: { type: string, default: activity, maxLength: 512 } }
+        - { name: connectors, in: query, description: Comma-separated OR group, schema: { type: string } }
+        - { name: source_ids, in: query, description: Comma-separated OR group, schema: { type: string } }
+        - { name: event_types, in: query, description: Comma-separated OR group, schema: { type: string } }
+        - { name: occurred_after, in: query, schema: { type: string, format: date-time } }
+        - { name: occurred_before, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 50 } }
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Activity events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events: { type: array, items: { $ref: "#/components/schemas/ActivityEvent" } }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      operationId: ingestActivityEvents
+      summary: Ingest owner-key structured life activity
+      description: Requires write permission and namespace authorization. Caller-supplied ownership fields are ignored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events: { type: array, maxItems: 500, items: { $ref: "#/components/schemas/ActivityEventInput" } }
+      responses:
+        "200":
+          description: Batch upsert result
+          content: { application/json: { schema: { $ref: "#/components/schemas/MediaUpsertResult" } } }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedContentEncoding" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /api/media/search:
     post:
       operationId: searchMedia
@@ -578,6 +633,11 @@ paths:
       description: Requires admin and read permissions. Date comparisons are inclusive.
       parameters:
         - name: service
+          in: query
+          schema:
+            type: string
+            maxLength: 512
+        - name: source_id
           in: query
           schema:
             type: string
@@ -1604,6 +1664,15 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+        source_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+          default: default
+        event_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
         service_id:
           type: [string, "null"]
           maxLength: 512
@@ -1650,6 +1719,32 @@ components:
           type: object
           description: Maximum 16384 serialized JSON characters.
           additionalProperties: true
+    ActivityEventInput:
+      type: object
+      required: [connector, source_id, event_key, event_type, title, occurred_at]
+      properties:
+        connector: { type: string, minLength: 1, maxLength: 128 }
+        source_id: { type: string, minLength: 1, maxLength: 512 }
+        event_key: { type: string, minLength: 1, maxLength: 1024 }
+        event_type: { type: string, minLength: 1, maxLength: 128 }
+        title: { type: string, minLength: 1, maxLength: 4096 }
+        occurred_at: { type: string, format: date-time }
+        observed_at: { type: string, format: date-time }
+        time_precision: { type: string, enum: [instant, minute, day, aggregate], default: instant }
+        source_timezone: { type: string, minLength: 1, maxLength: 128 }
+        metadata: { type: object, additionalProperties: true }
+        namespace: { type: string, minLength: 1, maxLength: 512, default: activity }
+    ActivityEvent:
+      allOf:
+        - $ref: "#/components/schemas/ActivityEventInput"
+        - type: object
+          required: [id, observed_at, time_precision, namespace, client_id, agent_id, created_at]
+          properties:
+            id: { type: string, format: uuid }
+            client_id: { type: string, format: uuid }
+            agent_id: { type: [string, "null"], format: uuid }
+            observed_at: { type: string, format: date-time }
+            created_at: { type: string, format: date-time }
     NullableInt32:
       type: [integer, "null"]
       minimum: -2147483648
@@ -1658,7 +1753,7 @@ components:
       allOf:
         - $ref: "#/components/schemas/MediaEventInput"
         - type: object
-          required: [id, service_id, artist, album, show, season, episode, year, genres, duration_ms, played_ms, completed, metadata, client_id, agent_id, memory_id, created_at]
+          required: [id, source_id, event_key, service_id, artist, album, show, season, episode, year, genres, duration_ms, played_ms, completed, metadata, client_id, agent_id, memory_id, created_at]
           properties:
             id:
               type: string

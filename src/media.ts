@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { queryScoped, queryUnscoped, withScopedClient, type DbScope, type ScopedClient } from './db.js';
 import type { AuthContext } from './types.js';
@@ -6,6 +7,8 @@ import type { QueryResultRow } from 'pg';
 export interface MediaEvent {
   id: string;
   service: string;
+  source_id: string;
+  event_key: string;
   service_id: string | null;
   event_type: string;
   title: string;
@@ -107,6 +110,8 @@ const metadataSchema = z
 export const publicMediaEventSchema = z
   .object({
     service: requiredText(128),
+    source_id: optionalText(512),
+    event_key: optionalText(1024),
     service_id: optionalText(512),
     event_type: requiredText(128),
     title: requiredText(MAX_TEXT_LENGTH),
@@ -131,6 +136,8 @@ export const publicMediaEventBatchSchema = z.object({
 
 export interface PublicMediaEventInput {
   service: string;
+  source_id?: string;
+  event_key?: string;
   service_id?: string;
   event_type: string;
   title: string;
@@ -160,6 +167,7 @@ export type TrustedMediaEventInput = PublicMediaEventInput & {
 
 export interface MediaListFilters {
   service?: string;
+  source_id?: string;
   event_type?: string;
   played_after?: Date | string;
   played_before?: Date | string;
@@ -228,9 +236,24 @@ export function toTrustedRestMediaEvents(
 ): TrustedMediaEventInput[] {
   return events.map((event) => ({
     ...event,
+    source_id: event.source_id ?? 'default',
+    event_key: event.event_key ?? mediaEventKey(event),
     client_id: auth.keyId,
     agent_id: null,
   }));
+}
+
+export function mediaEventKey(event: PublicMediaEventInput): string {
+  const instant = event.played_at instanceof Date ? event.played_at : new Date(event.played_at);
+  if (!Number.isFinite(instant.getTime())) throw new Error(`Invalid played_at: ${String(event.played_at)}`);
+  const identity = event.service_id?.trim()
+    ? `id:${event.service_id.trim()}`
+    : `fallback:v1:${createHash('sha256').update(JSON.stringify([
+        event.event_type, event.title, event.artist ?? null, event.album ?? null,
+        event.show ?? null, event.season ?? null, event.episode ?? null,
+        event.year ?? null, event.duration_ms ?? null,
+      ])).digest('hex')}`;
+  return `${identity}:at:${instant.toISOString()}`;
 }
 
 async function upsertMediaEventsWithQuery(
@@ -249,19 +272,22 @@ async function upsertMediaEventsWithQuery(
       throw new Error('Trusted media event client_id must match database scope');
     }
 
+    const sourceId = e.source_id?.trim() || 'default';
+    const eventKey = e.event_key?.trim() || mediaEventKey(e);
     const legacyBounds = ytmusicLegacyBucketBounds(e);
     if (legacyBounds) {
       const legacy = await query<{ id: string }>(
         `SELECT id FROM media_events
          WHERE client_id = $1
            AND service = $2
-           AND service_id = $3
+           AND source_id = $3
+           AND service_id = $4
            AND NOT (metadata ? 'played_raw')
            AND NOT (metadata ? 'played_bucket')
-           AND played_at >= $4::timestamptz
-           AND played_at < $5::timestamptz
+           AND played_at >= $5::timestamptz
+           AND played_at < $6::timestamptz
          LIMIT 1`,
-        [scope.keyId, e.service, e.service_id, legacyBounds.start, legacyBounds.end]
+        [scope.keyId, e.service, sourceId, e.service_id, legacyBounds.start, legacyBounds.end]
       );
       if (legacy.rows.length > 0) {
         skipped++;
@@ -271,13 +297,15 @@ async function upsertMediaEventsWithQuery(
 
     const res = await query<{ id: string }>(
       `INSERT INTO media_events
-         (service, service_id, event_type, title, artist, album, show, season, episode, year,
-          genres, duration_ms, played_ms, completed, played_at, metadata, client_id, agent_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         (service, source_id, event_key, service_id, event_type, title, artist, album, show, season, episode, year,
+          genres, duration_ms, played_ms, completed, played_at, metadata, client_id, agent_id, namespace)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'media')
        ON CONFLICT DO NOTHING
        RETURNING id`,
       [
         e.service,
+        sourceId,
+        eventKey,
         e.service_id ?? null,
         e.event_type,
         e.title,
@@ -447,12 +475,13 @@ export async function previewMediaEventUpserts(
 
 export async function listMediaEvents(auth: AuthContext, scope: DbScope, filters: MediaListFilters = {}): Promise<MediaEvent[]> {
   const isAdmin = auth.permissions.includes('admin');
-  const conditions: string[] = ['($2::boolean OR client_id = $1)'];
-  const values: unknown[] = [auth.keyId, isAdmin];
-  let idx = 2;
+  const conditions: string[] = ['client_id = $1'];
+  const values: unknown[] = [auth.keyId];
+  let idx = 1;
   const p = (v: unknown) => { values.push(v); return `$${++idx}`; };
 
   if (filters.service) conditions.push(`service = ${p(filters.service)}`);
+  if (filters.source_id) conditions.push(`source_id = ${p(filters.source_id)}`);
   if (filters.event_type) conditions.push(`event_type = ${p(filters.event_type)}`);
   if (filters.played_after) conditions.push(`played_at >= ${p(filters.played_after)}`);
   if (filters.played_before) conditions.push(`played_at <= ${p(filters.played_before)}`);
@@ -488,11 +517,11 @@ export interface MediaStats {
   daily: Array<{ date: string; count: number; duration_ms: number }>;
 }
 
-/** Aggregate key-owned media history. The REST route restricts this global observability view to admins. */
+/** Aggregate only the requesting owner's media history. The REST route also requires admin. */
 export async function getMediaStats(auth: AuthContext, scope: DbScope, filters: MediaStatsFilters = {}): Promise<MediaStats> {
   const isAdmin = auth.permissions.includes('admin');
-  const values: unknown[] = [auth.keyId, isAdmin];
-  const conditions = ['($2::boolean OR client_id = $1::uuid)'];
+  const values: unknown[] = [auth.keyId];
+  const conditions = ['client_id = $1::uuid'];
   const parameter = (value: unknown) => { values.push(value); return `$${values.length}`; };
   if (filters.service) conditions.push(`service = ${parameter(filters.service)}`);
   if (filters.played_after) conditions.push(`played_at >= ${parameter(filters.played_after)}::timestamptz`);
@@ -567,31 +596,66 @@ export async function linkEventToMemoryWithClient(
 
 // === Connector credentials ===
 
-export async function getConnectorCredentials(service: string): Promise<Record<string, unknown> | null> {
-  const res = await queryUnscoped<{ data: Record<string, unknown> }>(
-    `SELECT data FROM connector_credentials WHERE service = $1`,
-    [service]
+export async function getConnectorCredentials(
+  service: string,
+  sourceId = 'default',
+  scope?: DbScope,
+  namespace = 'media',
+): Promise<Record<string, unknown> | null> {
+  const resolvedScope = scope ?? await configuredConnectorScope(namespace);
+  const res = await queryScoped<{ data: Record<string, unknown> }>(
+    resolvedScope,
+    `SELECT data FROM connector_credentials
+     WHERE client_id = $1 AND namespace = $2 AND service = $3 AND source_id = $4`,
+    [resolvedScope.keyId, namespace, service, sourceId]
   );
   return res.rows[0]?.data ?? null;
 }
 
 export async function setConnectorCredentials(
   service: string,
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  sourceId = 'default',
+  scope?: DbScope,
+  namespace = 'media',
 ): Promise<void> {
-  await queryUnscoped(
-    `INSERT INTO connector_credentials (service, data, updated_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (service) DO UPDATE
+  const resolvedScope = scope ?? await configuredConnectorScope(namespace);
+  await queryScoped(
+    resolvedScope,
+    `INSERT INTO connector_credentials (service, source_id, namespace, client_id, data, updated_at)
+     VALUES ($1, $2, $3, $4, $5, NOW())
+     ON CONFLICT (client_id, namespace, service, source_id) DO UPDATE
        SET data = EXCLUDED.data, updated_at = NOW()`,
-    [service, JSON.stringify(data)]
+    [service, sourceId, namespace, resolvedScope.keyId, JSON.stringify(data)]
   );
+}
+
+async function configuredConnectorScope(namespace: string): Promise<DbScope> {
+  const configured = namespace === 'media'
+    ? process.env.MEDIA_CONNECTOR_API_KEY_NAMES ?? process.env.MEDIA_DEFAULT_API_KEY_NAME ?? 'openclaw-v2'
+    : process.env.ACTIVITY_CONNECTOR_API_KEY_NAME;
+  const keyName = configured?.split(',')[0]?.trim();
+  if (!keyName) throw new Error(`No connector API-key name configured for namespace ${namespace}`);
+  const result = await queryUnscoped<{ id: string; namespaces: string[]; permissions: string[] }>(
+    `SELECT id, namespaces, permissions FROM api_keys
+     WHERE name = $1 AND enabled = true AND (expires_at IS NULL OR expires_at > statement_timestamp())
+       AND revoked_at IS NULL LIMIT 1`,
+    [keyName],
+  );
+  const key = result.rows[0];
+  if (!key || !key.namespaces.includes(namespace) || !key.permissions.includes('write')) {
+    throw new Error(`Configured connector api_key "${keyName}" is not enabled for ${namespace}/write`);
+  }
+  return { keyId: key.id, namespaces: key.namespaces };
 }
 
 // === Per-connector sync state ===
 
 export interface ConnectorSyncState {
   service: string;
+  source_id: string;
+  namespace: string;
+  client_id: string;
   last_sync_at: Date | null;
   last_event_at: Date | null;
   cursor: string | null;
@@ -606,10 +670,18 @@ export interface ConnectorSyncStatePatch {
   metadata?: Record<string, unknown>;
 }
 
-export async function getSyncState(service: string): Promise<ConnectorSyncState | null> {
-  const res = await queryUnscoped<ConnectorSyncState>(
-    `SELECT * FROM connector_sync_state WHERE service = $1`,
-    [service]
+export async function getSyncState(
+  service: string,
+  sourceId = 'default',
+  scope?: DbScope,
+  namespace = 'media',
+): Promise<ConnectorSyncState | null> {
+  const resolvedScope = scope ?? await configuredConnectorScope(namespace);
+  const res = await queryScoped<ConnectorSyncState>(
+    resolvedScope,
+    `SELECT * FROM connector_sync_state
+     WHERE client_id = $1 AND namespace = $2 AND service = $3 AND source_id = $4`,
+    [resolvedScope.keyId, namespace, service, sourceId]
   );
   return res.rows[0] ?? null;
 }
@@ -617,18 +689,22 @@ export async function getSyncState(service: string): Promise<ConnectorSyncState 
 export async function mutateConnectorSyncStateWithClient(
   client: ScopedClient,
   service: string,
-  mutate: (current: ConnectorSyncState) => ConnectorSyncStatePatch
+  mutate: (current: ConnectorSyncState) => ConnectorSyncStatePatch,
+  sourceId = 'default',
+  namespace = 'media',
 ): Promise<ConnectorSyncState> {
   await client.query(
-    `INSERT INTO connector_sync_state (service, metadata, updated_at)
-     VALUES ($1, '{}'::jsonb, NOW())
-     ON CONFLICT (service) DO NOTHING`,
-    [service]
+    `INSERT INTO connector_sync_state (service, source_id, namespace, client_id, metadata, updated_at)
+     VALUES ($1, $2, $3, app_current_key_id()::uuid, '{}'::jsonb, NOW())
+     ON CONFLICT (client_id, namespace, service, source_id) DO NOTHING`,
+    [service, sourceId, namespace]
   );
 
   const currentRes = await client.query<ConnectorSyncState>(
-    `SELECT * FROM connector_sync_state WHERE service = $1 FOR UPDATE`,
-    [service]
+    `SELECT * FROM connector_sync_state
+     WHERE client_id = app_current_key_id()::uuid AND namespace = $2 AND service = $1 AND source_id = $3
+     FOR UPDATE`,
+    [service, namespace, sourceId]
   );
   const current = currentRes.rows[0];
   if (!current) {
@@ -645,15 +721,18 @@ export async function mutateConnectorSyncStateWithClient(
 
   const updated = await client.query<ConnectorSyncState>(
     `UPDATE connector_sync_state
-     SET last_sync_at = $2,
-         last_event_at = $3,
-         cursor = $4,
-         metadata = $5,
+     SET last_sync_at = $4,
+         last_event_at = $5,
+         cursor = $6,
+         metadata = $7,
          updated_at = NOW()
-     WHERE service = $1
+     WHERE service = $1 AND namespace = $2 AND source_id = $3
+       AND client_id = app_current_key_id()::uuid
      RETURNING *`,
     [
       service,
+      namespace,
+      sourceId,
       next.last_sync_at,
       next.last_event_at,
       next.cursor,
@@ -665,19 +744,28 @@ export async function mutateConnectorSyncStateWithClient(
 
 export async function setSyncState(
   service: string,
-  patch: Partial<Omit<ConnectorSyncState, 'service' | 'updated_at'>>
+  patch: Partial<Omit<ConnectorSyncState, 'service' | 'updated_at'>>,
+  sourceId = 'default',
+  scope?: DbScope,
+  namespace = 'media',
 ): Promise<void> {
-  await queryUnscoped(
-    `INSERT INTO connector_sync_state (service, last_sync_at, last_event_at, cursor, metadata, updated_at)
-     VALUES ($1, $2, $3, $4, $5, NOW())
-     ON CONFLICT (service) DO UPDATE SET
+  const resolvedScope = scope ?? await configuredConnectorScope(namespace);
+  await queryScoped(
+    resolvedScope,
+    `INSERT INTO connector_sync_state
+       (service, source_id, namespace, client_id, last_sync_at, last_event_at, cursor, metadata, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::jsonb, '{}'::jsonb), NOW())
+     ON CONFLICT (client_id, namespace, service, source_id) DO UPDATE SET
        last_sync_at  = COALESCE(EXCLUDED.last_sync_at,  connector_sync_state.last_sync_at),
        last_event_at = COALESCE(EXCLUDED.last_event_at, connector_sync_state.last_event_at),
        cursor        = COALESCE(EXCLUDED.cursor,        connector_sync_state.cursor),
-       metadata      = COALESCE(EXCLUDED.metadata,      connector_sync_state.metadata),
+       metadata      = COALESCE($8::jsonb, connector_sync_state.metadata),
        updated_at    = NOW()`,
     [
       service,
+      sourceId,
+      namespace,
+      resolvedScope.keyId,
       patch.last_sync_at ?? null,
       patch.last_event_at ?? null,
       patch.cursor ?? null,

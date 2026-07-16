@@ -42,15 +42,17 @@ function installFakeMediaClient(seed: StoredEvent[] = []) {
 
       if (text.includes('SELECT id FROM media_events')) {
         const service = params[1] as string;
-        const serviceId = params[2] as string;
-        const bucketStart = new Date(params[3] as string).getTime();
-        const bucketEnd = new Date(params[4] as string).getTime();
+        const sourceId = params[2] as string;
+        const serviceId = params[3] as string;
+        const bucketStart = new Date(params[4] as string).getTime();
+        const bucketEnd = new Date(params[5] as string).getTime();
         return {
           rows: rows
             .filter((row) => {
               const playedAt = new Date(row.played_at).getTime();
               return (
                 row.service === service &&
+                sourceId === 'default' &&
                 row.service_id === serviceId &&
                 !('played_raw' in row.metadata) &&
                 !('played_bucket' in row.metadata) &&
@@ -68,8 +70,8 @@ function installFakeMediaClient(seed: StoredEvent[] = []) {
       }
 
       const service = params[0] as string;
-      const serviceId = (params[1] as string | null) ?? null;
-      const playedAt = new Date(params[14] as string).toISOString();
+      const serviceId = (params[3] as string | null) ?? null;
+      const playedAt = new Date(params[16] as string).toISOString();
       const existing = rows.find(
         (row) =>
           row.service === service &&
@@ -83,7 +85,7 @@ function installFakeMediaClient(seed: StoredEvent[] = []) {
         service,
         service_id: serviceId,
         played_at: playedAt,
-        metadata: JSON.parse(params[15] as string),
+        metadata: JSON.parse(params[17] as string),
       };
       rows.push(row);
       inserts.push(row);

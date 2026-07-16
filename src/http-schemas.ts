@@ -77,6 +77,7 @@ export const auditQuerySchema = z.object({
 
 export const mediaEventsQuerySchema = z.object({
   service: boundedText.optional(),
+  source_id: boundedText.optional(),
   event_type: boundedText.optional(),
   played_after: offsetDateTime.optional(),
   played_before: offsetDateTime.optional(),
