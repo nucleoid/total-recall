@@ -24,6 +24,8 @@
     "test:migrations": "tsx --test test/migrations/decay.integration.test.ts",
     "create-key": "tsx scripts/create-key.ts",
     "rotate-key": "tsx scripts/rotate-key.ts",
+    "memory:export": "tsx scripts/memory-export.ts",
+    "memory:import": "tsx scripts/memory-import.ts",
     "preseed": "tsx scripts/preseed-openclaw.ts",
     "preseed:claude": "tsx scripts/preseed-claude.ts",
     "start:http": "node dist/server.js",

@@ -32,6 +32,7 @@ import { getMediaStats, parsePublicMediaEventBatch, toTrustedRestMediaEvents, up
 import { getMemory, getMemorySummaries, listMemories } from './memories.js';
 import { rollupPendingEvents } from './rollup.js';
 import { JSON_BODY_LIMIT_BYTES, validateMetadataInRequest } from './http-limits.js';
+import { handleTransferExport, handleTransferImport } from './transfer/http.js';
 import {
   auditQuerySchema,
   mediaEventsQuerySchema,
@@ -330,6 +331,16 @@ function metadataContractPayloads(req: express.Request): unknown[] {
 
 export function createApp(): express.Express {
 const app = express();
+
+// Streaming transfer routes must run before JSON parsing and the ordinary
+// identity-only content-encoding gate. They parse bounded NDJSON themselves.
+registerRestRoute(app, 'get', '/api/transfer/export', (req, res) => {
+  void handleTransferExport(req, res, authenticateRequest);
+});
+registerRestRoute(app, 'post', '/api/transfer/import', (req, res) => {
+  void handleTransferImport(req, res, authenticateRequest);
+});
+
 app.use((req, res, next) => {
   const encoding = req.headers['content-encoding'];
   if (encoding !== undefined && String(encoding).trim().toLowerCase() !== 'identity') {
@@ -538,7 +549,7 @@ registerRestRoute(app, 'get', '/api/capabilities', async (req, res) => {
       namespaces: auth.namespaces,
       max_access_level: auth.maxAccessLevel,
       capabilities: Object.fromEntries(
-        ['read', 'write', 'delete', 'admin'].map((permission) => [permission, auth.permissions.includes(permission)])
+        ['read', 'write', 'delete', 'admin', 'export', 'import'].map((permission) => [permission, auth.permissions.includes(permission)])
       ),
     });
   } catch (err: any) {

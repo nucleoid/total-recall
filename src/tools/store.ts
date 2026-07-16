@@ -305,7 +305,7 @@ export async function memoryStore(
         `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id, embedding_provider, embedding_model, embedding_dimensions, source_key${columns}, expires_at)
          VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15${insertedValues},
            CASE WHEN $14::bigint IS NULL THEN NULL ELSE statement_timestamp() + $14::double precision * interval '1 second' END)
-         ON CONFLICT (source_key) DO UPDATE SET
+         ON CONFLICT (client_id, source_key) DO UPDATE SET
            content = EXCLUDED.content,
            embedding = EXCLUDED.embedding,
            embedding_provider = EXCLUDED.embedding_provider,
@@ -345,9 +345,10 @@ export async function memoryStore(
         `SELECT 1
          FROM memories
          WHERE source_key = $1
+           AND client_id = $2
            AND deleted_at IS NOT NULL
          LIMIT 1`,
-        [sourceKey]
+        [sourceKey, auth.keyId]
       );
       if (tombstone.rows.length > 0) {
         throw new TombstonedSourceKeyConflictError();
@@ -355,9 +356,9 @@ export async function memoryStore(
       if (schema !== 'legacy') {
         const superseded = await client.query(
           `SELECT 1 FROM memories
-           WHERE source_key = $1 AND deleted_at IS NULL AND superseded_at IS NOT NULL
+           WHERE source_key = $1 AND client_id = $2 AND deleted_at IS NULL AND superseded_at IS NOT NULL
            LIMIT 1`,
-          [sourceKey],
+          [sourceKey, auth.keyId],
         );
         if (superseded.rows.length > 0) {
           throw new SupersededSourceKeyConflictError();

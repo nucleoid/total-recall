@@ -534,7 +534,7 @@ export async function applySessionDistillation(
         embedding_dimensions, memory_kind, valid_from
       ) VALUES ($1, $2::vector, 'session-distillation', $3, $4::text[], $5::jsonb, $6, $7,
         $8::uuid, $9, $10, $11, $12, $13, 'semantic', statement_timestamp())
-      ON CONFLICT (source_key) DO NOTHING RETURNING id
+      ON CONFLICT (client_id, source_key) DO NOTHING RETURNING id
     `, [fact.content, vectors[index], job.namespace, ['session-distilled', fact.kind].sort(),
       JSON.stringify({ schema: 1, episode_id: job.episodeId, run_id: job.runId, durable_kind: fact.kind,
         generation_provider: policy.generation.provider, generation_model: policy.generation.model,

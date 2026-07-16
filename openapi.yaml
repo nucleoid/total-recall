@@ -4,8 +4,9 @@ info:
   version: 1.0.0
   description: >-
     Authenticated REST API for memory storage, hybrid search, provenance,
-    observability, and media ingestion. JSON bodies are limited to 8 MiB and
-    only identity Content-Encoding is accepted. Memory content is limited to
+    observability, media ingestion, and a V1 memory-only transfer feed. JSON
+    bodies are limited to 8 MiB and only identity Content-Encoding is accepted,
+    except that the NDJSON transfer import route also accepts bounded gzip. Memory content is limited to
     100,000 JavaScript characters; document content to 1048576 UTF-8 bytes and
     each embedding chunk to 2,000 UTF-8 bytes. Per-request metadata is limited
     to 65536 serialized JSON bytes, depth 16, and 1000 keys. Requests accept at
@@ -49,6 +50,67 @@ paths:
           $ref: "#/components/responses/RateLimited"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+  /api/transfer/export:
+    get:
+      operationId: exportMemoryFeed
+      summary: Stream a V1 memory-only NDJSON feed
+      description: >-
+        Requires export permission. This is not a faithful backup: vectors,
+        document records/topology, retrieval counters, and local foreign keys
+        are omitted. Normal rows are the default. Including sensitive or secret
+        rows requires both query flags and a key whose access ceiling permits them.
+      parameters:
+        - name: namespace
+          in: query
+          schema: { type: array, maxItems: 100, items: { type: string, maxLength: 512 } }
+          style: form
+          explode: true
+        - { name: include_sensitive, in: query, schema: { type: boolean, default: false } }
+        - { name: acknowledge_plaintext_sensitive, in: query, schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: Manifest followed by memory records as UTF-8 JSONL.
+          content:
+            application/x-ndjson:
+              schema: { type: string }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/transfer/import:
+    post:
+      operationId: importMemoryFeed
+      summary: Import a V1 memory-only NDJSON feed
+      description: >-
+        Requires import permission. Input is committed in batches of at most 100;
+        every inserted memory is re-embedded using the destination profile.
+        Replays skip exact matches and divergent source-key matches conflict
+        without overwrite. Content-Encoding may be identity or gzip.
+      parameters:
+        - { name: dry_run, in: query, schema: { type: boolean, default: false } }
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema: { type: string }
+          application/ndjson:
+            schema: { type: string }
+      responses:
+        "200":
+          description: Content-free import counts and durable resume boundary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TransferImportResult" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedContentEncoding" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /api/search:
     post:
       operationId: searchMemories
@@ -1063,12 +1125,29 @@ components:
         max_access_level: { type: string, enum: [normal, sensitive, secret] }
         capabilities:
           type: object
-          required: [read, write, delete, admin]
+          required: [read, write, delete, admin, export, import]
           properties:
             read: { type: boolean }
             write: { type: boolean }
             delete: { type: boolean }
             admin: { type: boolean }
+            export: { type: boolean }
+            import: { type: boolean }
+    TransferImportResult:
+      type: object
+      required: [inserted, updated, skipped, conflicted, denied, failed, embedding_calls, committed, dry_run, last_committed_line, last_committed_record]
+      properties:
+        inserted: { type: integer, minimum: 0 }
+        updated: { type: integer, minimum: 0 }
+        skipped: { type: integer, minimum: 0 }
+        conflicted: { type: integer, minimum: 0 }
+        denied: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        embedding_calls: { type: integer, minimum: 0 }
+        committed: { type: boolean }
+        dry_run: { type: boolean }
+        last_committed_line: { type: [integer, "null"], minimum: 1 }
+        last_committed_record: { type: [integer, "null"], minimum: 0 }
     MemoryRecord:
       type: object
       required: [id, content, source, namespace, tags, metadata, access_level, client_id, created_at, updated_at, accessed_at, access_count]

@@ -76,7 +76,7 @@ test('capabilities are derived from the authenticated key without exposing the k
     name: 'dashboard-test',
     namespaces: ['shared'],
     max_access_level: 'normal',
-    capabilities: { read: true, write: true, delete: true, admin: false },
+    capabilities: { read: true, write: true, delete: true, admin: false, export: false, import: false },
   });
   assert.doesNotMatch(JSON.stringify(response.body), /tr_dashboard/);
   assert.equal(Object.hasOwn(response.body, 'keyId'), false);

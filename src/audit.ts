@@ -10,13 +10,16 @@ export async function logAudit(params: {
   resultCount?: number;
   agentId?: string;
   sessionId?: string;
-  resourceType?: 'memory' | 'document' | 'agent' | 'search' | 'subscription' | 'session' | 'system';
+  resourceType?: 'memory' | 'document' | 'agent' | 'search' | 'subscription' | 'session' | 'transfer' | 'system';
   resourceId?: string;
   /** Call-site-owned, allowlisted metadata only; never request serialization. */
   details?: Record<string, string | number | boolean | null>;
 }, scope: DbScope, client?: ScopedClient): Promise<void> {
   const details = params.details ?? {};
-  const allowedDetailKeys = new Set(['created', 'deduplicated', 'idempotent', 'chunks']);
+  const allowedDetailKeys = new Set([
+    'created', 'deduplicated', 'idempotent', 'chunks', 'records',
+    'inserted', 'updated', 'skipped', 'conflicted', 'denied', 'failed',
+  ]);
   const unapprovedDetailKey = Object.keys(details).find(key => !allowedDetailKeys.has(key));
   if (unapprovedDetailKey) throw new Error(`Unapproved audit detail key: ${unapprovedDetailKey}`);
   const sql = `INSERT INTO audit_log

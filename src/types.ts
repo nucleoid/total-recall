@@ -161,6 +161,20 @@ export interface ForgetResult {
   count: number;
 }
 
+export interface MemoryTransferCounts {
+  inserted: number;
+  updated: number;
+  skipped: number;
+  conflicted: number;
+  denied: number;
+  failed: number;
+}
+
+export interface MemoryImportResult extends MemoryTransferCounts {
+  embedding_calls: number;
+  committed: boolean;
+}
+
 export interface StatsParams {
   namespace?: string;
 }

@@ -5,3 +5,7 @@ dist/
 __pycache__/
 *.pyc
 .fire-off/
+# Memory-only transfer feeds and import result/checkpoint files contain sensitive data.
+*.memory-export.jsonl
+*.memory-export.jsonl.gz
+*.memory-import-result.json
