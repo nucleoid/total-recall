@@ -7,7 +7,7 @@ import {
 import type { AuthContext } from '../types.js';
 import { dbScopeFromAuth } from '../db.js';
 import { checkPermission } from '../auth.js';
-import { storeSchema, memoryStore } from './store.js';
+import { MAX_MEMORY_TTL_SECONDS, storeSchema, memoryStore } from './store.js';
 import { MAX_DOCUMENT_CONTENT_BYTES, storeDocumentSchema, memoryStoreDocument } from './store-document.js';
 import { searchSchema, memorySearch } from './search.js';
 import { recallSchema, memoryRecall } from './recall.js';
@@ -65,7 +65,8 @@ const TOOL_DEFINITIONS = [
     description:
       'Store a memory with automatic embedding generation. Near-duplicates in the same namespace, ' +
       'access level, and embedding space reuse and boost the canonical memory by default; the result ' +
-      'reports created/deduplicated and similarity. For accurate provenance, pass agent_name identifying ' +
+      'reports created/deduplicated and similarity. Optional ttl is a positive integer lifetime in seconds; ' +
+      'expiring writes bypass semantic dedupe and return their database-computed expires_at. For accurate provenance, pass agent_name identifying ' +
       'the agent storing this memory (e.g. "openclaw", "cursor-dev"). When omitted, the API key name is used as a fallback.',
     inputSchema: {
       type: 'object' as const,
@@ -93,7 +94,13 @@ const TOOL_DEFINITIONS = [
         dedupe: {
           type: 'boolean',
           default: true,
-          description: 'Set false to force insertion of a semantically similar but distinct memory (default: true).',
+          description: 'Set false to force insertion of a semantically similar but distinct memory (default: true). Cannot be true with ttl.',
+        },
+        ttl: {
+          type: 'integer',
+          minimum: 1,
+          maximum: MAX_MEMORY_TTL_SECONDS,
+          description: 'Optional lifetime in seconds. Expiry is computed once using PostgreSQL statement time; omitted means permanent.',
         },
       },
       required: ['content'],

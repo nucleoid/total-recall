@@ -449,6 +449,7 @@ export async function findContradictionCandidates(
        AND m.access_level = 'normal'
        AND m.memory_kind = 'semantic'
        AND m.deleted_at IS NULL
+       AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
        AND m.superseded_at IS NULL
        AND m.valid_to IS NULL
        AND m.valid_from <= statement_timestamp()
@@ -668,6 +669,7 @@ export async function commitAutomaticRevision(
          AND m.access_level = 'normal'
          AND m.memory_kind = 'semantic'
          AND m.deleted_at IS NULL
+         AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
          AND m.superseded_at IS NULL
          AND m.valid_to IS NULL
          AND m.valid_from <= statement_timestamp()
@@ -691,6 +693,7 @@ export async function commitAutomaticRevision(
            updated_at = $2::timestamptz
        WHERE id = $1::uuid
          AND deleted_at IS NULL
+         AND (expires_at IS NULL OR expires_at > statement_timestamp())
          AND superseded_at IS NULL
          AND valid_to IS NULL
          AND consolidated_into_id IS NULL`,

@@ -201,6 +201,7 @@ const ELIGIBLE_SQL = `
   AND m.access_level = 'normal'
   AND m.memory_kind = 'semantic'
   AND m.deleted_at IS NULL
+  AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
   AND m.superseded_at IS NULL
   AND m.valid_to IS NULL
   AND m.valid_from <= statement_timestamp()
@@ -727,7 +728,8 @@ async function loadMembers(client: ScopedClient, ids: string[]): Promise<LoadedM
     FROM memories
     WHERE id = ANY($1::uuid[])
       AND access_level = 'normal' AND memory_kind = 'semantic'
-      AND deleted_at IS NULL AND superseded_at IS NULL AND valid_to IS NULL
+      AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())
+      AND superseded_at IS NULL AND valid_to IS NULL
       AND valid_from <= statement_timestamp() AND consolidated_into_id IS NULL
       AND document_id IS NULL AND source_key IS NULL
       AND embedding IS NOT NULL
@@ -767,7 +769,8 @@ async function applyCluster(
     FROM memories
     WHERE id = ANY($1::uuid[])
       AND namespace = $2 AND access_level = 'normal' AND memory_kind = 'semantic'
-      AND deleted_at IS NULL AND superseded_at IS NULL AND valid_to IS NULL
+      AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())
+      AND superseded_at IS NULL AND valid_to IS NULL
       AND consolidated_into_id IS NULL AND document_id IS NULL AND source_key IS NULL
       AND embedding IS NOT NULL AND embedding_provider = $3 AND embedding_model = $4 AND embedding_dimensions = $5
     ORDER BY id FOR UPDATE
@@ -864,6 +867,7 @@ async function applyCluster(
     UPDATE memories SET consolidated_into_id = $1::uuid, consolidated_at = $2::timestamptz,
                         updated_at = $2::timestamptz
     WHERE id = ANY($3::uuid[]) AND consolidated_into_id IS NULL
+      AND (expires_at IS NULL OR expires_at > statement_timestamp())
   `, [canonicalId, timestamp, ids]);
   if (linked.rowCount !== ids.length) throw new Error('Consolidation members changed while linking');
   for (const memoryId of [canonicalId, ...current.map(member => member.id)]) {

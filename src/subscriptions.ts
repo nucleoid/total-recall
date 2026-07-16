@@ -252,7 +252,8 @@ export async function loadAuthorizedDelivery(client: ScopedClient, deliveryId: s
       AND s.access_level_policy = 'normal' AND k.enabled = true AND 'read' = ANY(k.permissions)
       AND d.namespace = ANY(k.namespaces) AND COALESCE(m.access_level, 'normal') = 'normal'
       AND (NOT s.exclude_self OR m.client_id <> s.api_key_id::text)
-      AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
+      AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+      AND m.superseded_at IS NULL AND m.valid_to IS NULL
       AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
       AND m.consolidated_into_id IS NULL
     FOR SHARE OF s, k, m

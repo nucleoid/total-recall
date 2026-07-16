@@ -31,6 +31,7 @@
     "start:watcher": "node dist/watcher.js",
     "preseed:chatgpt": "tsx scripts/preseed-chatgpt.ts",
     "decay:update": "tsx scripts/decay-update.ts",
+    "maintenance": "npm run decay:update",
     "consolidate": "tsx scripts/consolidate-memories.ts",
     "reflect": "tsx scripts/reflect.ts",
     "entity:enrich": "tsx scripts/entity-enrich.ts",

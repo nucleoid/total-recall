@@ -124,6 +124,9 @@ test('hybridSearch sets local HNSW inside the scoped transaction before search a
     ]
   );
   assert.deepEqual(client.calls[5].params, ['321']);
+  assert.match(client.calls[7].text, /m\.expires_at IS NULL OR m\.expires_at > statement_timestamp\(\)/);
+  assert.match(client.calls[7].text, /r\.expires_at/);
+  assert.match(client.calls[8].text, /expires_at IS NULL OR expires_at > statement_timestamp\(\)/);
   assert.deepEqual(client.calls[8].params, [['memory-1']]);
   assert.deepEqual(client.releaseArgs, []);
 });

@@ -146,7 +146,8 @@ export async function selectReflectionCandidates(
       FROM memories m
       WHERE m.namespace = $1 AND m.access_level = 'normal'
         AND m.created_at >= $2::timestamptz AND m.created_at < $3::timestamptz
-        AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
+        AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+        AND m.superseded_at IS NULL AND m.valid_to IS NULL
         AND m.valid_from <= $3::timestamptz AND m.consolidated_into_id IS NULL
         AND m.document_id IS NULL
         AND m.memory_kind NOT IN ('document_chunk', 'episode_chunk', 'insight')
@@ -156,7 +157,8 @@ export async function selectReflectionCandidates(
       FROM memories m
       WHERE m.namespace = $1 AND m.access_level = 'normal'
         AND m.accessed_at < $3::timestamptz AND m.access_count > 0
-        AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
+        AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+        AND m.superseded_at IS NULL AND m.valid_to IS NULL
         AND m.valid_from <= $3::timestamptz AND m.consolidated_into_id IS NULL
         AND m.document_id IS NULL
         AND m.memory_kind NOT IN ('document_chunk', 'episode_chunk', 'insight')
@@ -206,7 +208,11 @@ export async function materializeReflectionInput(
   // Fetch in selection order and stop fetching as soon as the prompt is full;
   // this bounds local materialization as well as provider export.
   for (const candidate of selected) {
-    const row = await client.query<{ content: string }>('SELECT content FROM memories WHERE id = $1::uuid', [candidate.id]);
+    const row = await client.query<{ content: string }>(
+      `SELECT content FROM memories WHERE id = $1::uuid AND deleted_at IS NULL
+         AND (expires_at IS NULL OR expires_at > statement_timestamp())`,
+      [candidate.id],
+    );
     const text = row.rows[0]?.content;
     if (text === undefined) { truncated = true; continue; }
     const next = [...included, { ...candidate, content: text }];
@@ -502,7 +508,8 @@ async function applyReflectionInsights(client: ScopedClient, options: ApplyRefle
   const evidence = await client.query<any>(`
     SELECT id, revision, access_level, content FROM memories
     WHERE id = ANY($1::uuid[]) AND namespace = $2 AND access_level = 'normal'
-      AND deleted_at IS NULL AND superseded_at IS NULL AND valid_to IS NULL
+      AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())
+      AND superseded_at IS NULL AND valid_to IS NULL
       AND consolidated_into_id IS NULL AND document_id IS NULL
       AND memory_kind NOT IN ('document_chunk', 'episode_chunk', 'insight')
     ORDER BY id FOR SHARE

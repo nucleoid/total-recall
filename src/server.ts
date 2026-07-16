@@ -447,6 +447,7 @@ registerRestRoute(app, 'post', '/api/store', async (req, res) => {
       namespace: result.namespace,
       created: result.created,
       deduplicated: result.deduplicated,
+      expires_at: result.expires_at,
       ...(result.similarity !== undefined && { similarity: result.similarity }),
       ...(result.idempotency_key_honored && { idempotency_key_honored: true }),
     });

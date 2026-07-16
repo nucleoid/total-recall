@@ -26,7 +26,12 @@ export async function memoryList(
     return { memories: [], total: 0 };
   }
 
-  const conditions: string[] = ['m.namespace = ANY($1)', 'm.deleted_at IS NULL', "to_jsonb(m)->>'consolidated_into_id' IS NULL"];
+  const conditions: string[] = [
+    'm.namespace = ANY($1)',
+    'm.deleted_at IS NULL',
+    '(m.expires_at IS NULL OR m.expires_at > statement_timestamp())',
+    "to_jsonb(m)->>'consolidated_into_id' IS NULL",
+  ];
   const values: any[] = [allowedNamespaces];
   let idx = 2;
 
@@ -64,12 +69,13 @@ export async function memoryList(
     scope,
     `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.document_id,
             m.chunk_index, m.created_at, m.updated_at, m.memory_kind, m.valid_from, m.valid_to,
-            m.superseded_at, m.revision,
+            m.superseded_at, m.revision, m.expires_at,
             (to_jsonb(m)->>'consolidated_into_id')::uuid AS consolidated_into_id,
             (to_jsonb(m)->>'consolidated_at')::timestamptz AS consolidated_at,
             (SELECT predecessor.id FROM memories predecessor
              WHERE predecessor.id = m.supersedes_id
                AND predecessor.deleted_at IS NULL
+               AND (predecessor.expires_at IS NULL OR predecessor.expires_at > statement_timestamp())
                AND predecessor.namespace = m.namespace
                AND predecessor.namespace = ANY($1)
                AND ${accessLevelSql('predecessor.access_level', '$2')}
@@ -78,6 +84,7 @@ export async function memoryList(
             (SELECT successor.id FROM memories successor
              WHERE successor.supersedes_id = m.id
                AND successor.deleted_at IS NULL
+               AND (successor.expires_at IS NULL OR successor.expires_at > statement_timestamp())
                AND successor.namespace = m.namespace
                AND successor.namespace = ANY($1)
                AND ${accessLevelSql('successor.access_level', '$2')}

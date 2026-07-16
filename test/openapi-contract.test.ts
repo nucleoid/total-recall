@@ -103,7 +103,7 @@ test('representative runtime response fixtures satisfy the published schemas', a
   const now = '2026-07-16T00:00:00.000Z';
   const fixtures: Record<string, unknown> = {
     Health: { status: 'ok', version: '1.0.0' },
-    StoreResponse: { id, namespace: 'shared', created: true, deduplicated: false, idempotency_key_honored: true },
+    StoreResponse: { id, namespace: 'shared', created: true, deduplicated: false, expires_at: null, idempotency_key_honored: true },
     StoreDocumentResponse: { id, chunks: 2 },
     ForgetResponse: { forgotten: [id], count: 1 },
     Stats: {
@@ -131,7 +131,7 @@ test('representative runtime response fixtures satisfy the published schemas', a
     },
     SearchResult: {
       id, content: 'remember this', metadata: { source: 'fixture' }, tags: ['test'],
-      source: 'test', namespace: 'shared', created_at: now, event_at: null,
+      source: 'test', namespace: 'shared', created_at: now, event_at: null, expires_at: null,
       relevance_score: 1, relevance_base_score: 1, decay_rate: 0.01,
       updated_at: now, accessed_at: now, access_count: 2, access_level: 'normal',
       client_id: id, memory_kind: 'semantic', valid_from: now, valid_to: null,

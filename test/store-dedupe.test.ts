@@ -49,10 +49,14 @@ class DedupePool {
           }]);
         }
         if (/UPDATE memories SET access_count/i.test(sql)) {
-          return result([{ id: CANDIDATE_ID, namespace: 'shared' }]);
+          return result([{ id: CANDIDATE_ID, namespace: 'shared', expires_at: null }]);
         }
         if (/INSERT INTO memories/i.test(sql)) {
-          return result([{ id: INSERTED_ID, namespace: String(params[3]) }]);
+          return result([{
+            id: INSERTED_ID,
+            namespace: String(params[3]),
+            expires_at: params[13] == null ? null : new Date('2026-07-16T00:01:00.000Z'),
+          }]);
         }
         throw new Error(`Unexpected SQL: ${sql}`);
       },
@@ -75,6 +79,15 @@ function mockEmbedding(t: TestContext): void {
 
 test('dedupe threshold parser defaults to 0.95 and rejects invalid configuration', () => {
   assert.equal(storeSchema.parse({ content: 'defaults' }).dedupe, true);
+  assert.deepEqual(
+    { ttl: storeSchema.parse({ content: 'scratch', ttl: 60 }).ttl,
+      dedupe: storeSchema.parse({ content: 'scratch', ttl: 60 }).dedupe },
+    { ttl: 60, dedupe: false },
+  );
+  for (const ttl of [0, -1, 1.5, Number.MAX_SAFE_INTEGER, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => storeSchema.parse({ content: 'scratch', ttl }));
+  }
+  assert.throws(() => storeSchema.parse({ content: 'scratch', ttl: 60, dedupe: true }), /cannot be combined/);
   assert.equal(parseMemoryDedupeThreshold(undefined), 0.95);
   assert.equal(parseMemoryDedupeThreshold('0'), 0);
   assert.equal(parseMemoryDedupeThreshold('1'), 1);
@@ -100,6 +113,7 @@ test('memory_store reuses a candidate at the threshold and boosts only safe muta
     created: false,
     deduplicated: true,
     similarity: 0.95,
+    expires_at: null,
   });
   const lock = pool.statements.find(statement => /pg_advisory_xact_lock/i.test(statement.text));
   const candidate = pool.statements.find(statement => /AS similarity/i.test(statement.text));
@@ -109,7 +123,7 @@ test('memory_store reuses a candidate at the threshold and boosts only safe muta
   assert.ok(pool.statements.indexOf(candidate) < pool.statements.indexOf(boost));
   assert.match(candidate.text, /m\.namespace = \$2[\s\S]*COALESCE\(m\.access_level, 'normal'\) = \$3/);
   assert.match(candidate.text, /embedding_provider = \$4[\s\S]*embedding_model = \$5[\s\S]*embedding_dimensions = \$6/);
-  assert.match(candidate.text, /source_key IS NULL[\s\S]*document_id IS NULL[\s\S]*deleted_at IS NULL/);
+  assert.match(candidate.text, /source_key IS NULL[\s\S]*document_id IS NULL[\s\S]*deleted_at IS NULL[\s\S]*expires_at IS NULL/);
   assert.match(candidate.text, /valid_to IS NULL[\s\S]*consolidated_into_id IS NULL/);
   assert.match(candidate.text, /ORDER BY m\.embedding <=> \$1::vector ASC,[\s\S]*calculate_relevance[\s\S]*m\.created_at ASC,[\s\S]*m\.id ASC[\s\S]*FOR UPDATE/);
   assert.match(boost.text, /access_count = COALESCE\(access_count, 0\) \+ 1/);
@@ -126,16 +140,34 @@ test('below-threshold and opt-out stores insert with the additive result contrac
   setPoolForTesting(below as unknown as pg.Pool);
   assert.deepEqual(
     await memoryStore(storeSchema.parse({ content: 'distinct enough' }), AUTH),
-    { id: INSERTED_ID, namespace: 'shared', created: true, deduplicated: false },
+    { id: INSERTED_ID, namespace: 'shared', created: true, deduplicated: false, expires_at: null },
   );
 
   const bypassed = new DedupePool(1);
   setPoolForTesting(bypassed as unknown as pg.Pool);
   assert.deepEqual(
     await memoryStore(storeSchema.parse({ content: 'intentionally distinct', dedupe: false }), AUTH),
-    { id: INSERTED_ID, namespace: 'shared', created: true, deduplicated: false },
+    { id: INSERTED_ID, namespace: 'shared', created: true, deduplicated: false, expires_at: null },
   );
   assert.equal(bypassed.statements.some(statement => /pg_advisory_xact_lock|AS similarity/i.test(statement.text)), false);
+
+  const expiring = new DedupePool(1);
+  setPoolForTesting(expiring as unknown as pg.Pool);
+  assert.deepEqual(
+    await memoryStore(storeSchema.parse({ content: 'temporary state', ttl: 60 }), AUTH),
+    {
+      id: INSERTED_ID,
+      namespace: 'shared',
+      created: true,
+      deduplicated: false,
+      expires_at: new Date('2026-07-16T00:01:00.000Z'),
+    },
+  );
+  assert.equal(expiring.statements.some(statement => /pg_advisory_xact_lock|AS similarity/i.test(statement.text)), false);
+  const insert = expiring.statements.find(statement => /INSERT INTO memories/i.test(statement.text));
+  assert.ok(insert);
+  assert.match(insert.text, /statement_timestamp\(\) \+ \$14::double precision \* interval '1 second'/);
+  assert.equal(insert.params[13], 60);
 });
 
 test('REST passes through dedupe status, namespace, and similarity', async t => {
@@ -157,5 +189,6 @@ test('REST passes through dedupe status, namespace, and similarity', async t => 
     created: false,
     deduplicated: true,
     similarity: 0.99,
+    expires_at: null,
   });
 });

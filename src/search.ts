@@ -227,7 +227,7 @@ export async function hybridSearch(
       ? 'm.supersedes_id AS linked_supersedes_id, m.superseded_at'
       : 'NULL::uuid AS linked_supersedes_id, NULL::timestamptz AS superseded_at';
     const revisionColumn = capabilities.revision_schema ? 'm.revision' : '0::integer AS revision';
-    const selectedColumns = `id, content, metadata, tags, source, namespace, created_at, event_at,
+    const selectedColumns = `id, content, metadata, tags, source, namespace, created_at, event_at, expires_at,
       relevance_score, relevance_base_score, decay_rate, updated_at, accessed_at, access_count,
       access_level, client_id, ${beliefColumns}, ${supersessionColumns}, ${revisionColumn}`;
 
@@ -244,7 +244,9 @@ export async function hybridSearch(
         1 - (embedding <=> ${pVec}::vector) AS vec_score
        FROM memories m
        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
-         AND m.deleted_at IS NULL AND ${lifecycle}
+         AND m.deleted_at IS NULL
+         AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+         AND ${lifecycle}
          ${consolidationVisibility}
          AND ${vectorPredicate}
        ORDER BY embedding <=> ${pVec}::vector, id
@@ -254,7 +256,9 @@ export async function hybridSearch(
       (SELECT ${selectedColumns}, NULL::double precision AS vec_score
        FROM memories m
        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
-         AND m.deleted_at IS NULL AND ${lifecycle}
+         AND m.deleted_at IS NULL
+         AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+         AND ${lifecycle}
          ${consolidationVisibility}
          AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
          AND NOT EXISTS (SELECT 1 FROM vector_results v WHERE v.id = m.id)
@@ -268,6 +272,7 @@ export async function hybridSearch(
       ? `(SELECT predecessor.id FROM memories predecessor
          WHERE predecessor.id = r.linked_supersedes_id
            AND predecessor.deleted_at IS NULL
+           AND (predecessor.expires_at IS NULL OR predecessor.expires_at > statement_timestamp())
            AND predecessor.namespace = r.namespace
            AND predecessor.namespace = ANY(${pNs})
            AND ${accessLevelSql('predecessor.access_level', pMaxAccessLevel)}
@@ -277,6 +282,7 @@ export async function hybridSearch(
       ? `(SELECT successor.id FROM memories successor
          WHERE successor.supersedes_id = r.id
            AND successor.deleted_at IS NULL
+           AND (successor.expires_at IS NULL OR successor.expires_at > statement_timestamp())
            AND successor.namespace = r.namespace
            AND successor.namespace = ANY(${pNs})
            AND ${accessLevelSql('successor.access_level', pMaxAccessLevel)}
@@ -301,6 +307,7 @@ export async function hybridSearch(
         FROM memories m
         WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
           AND m.deleted_at IS NULL
+          AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
           ${consolidationVisibility}
           AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
       ),
@@ -320,7 +327,7 @@ export async function hybridSearch(
             * ${demotionMultiplier} AS final_score
         FROM scored s
       )
-      SELECT r.id, r.content, r.metadata, r.tags, r.source, r.namespace, r.created_at, r.event_at,
+      SELECT r.id, r.content, r.metadata, r.tags, r.source, r.namespace, r.created_at, r.event_at, r.expires_at,
         r.relevance_score, r.relevance_base_score, r.decay_rate, r.updated_at, r.accessed_at,
         r.access_count, r.access_level, r.client_id, r.memory_kind, r.valid_from, r.valid_to,
         r.superseded_at, r.revision, r.vec_score, r.text_score, r.base_score, r.relevance, r.final_score,
@@ -337,7 +344,9 @@ export async function hybridSearch(
     if (res.rows.length > 0) {
       const ids = res.rows.map((r: any) => r.id);
       await client.query(
-        `UPDATE memories SET accessed_at = NOW(), access_count = access_count + 1, last_boosted_at = NOW() WHERE id = ANY($1) AND deleted_at IS NULL${capabilities.consolidation_schema ? ' AND consolidated_into_id IS NULL' : ''}`,
+        `UPDATE memories SET accessed_at = NOW(), access_count = access_count + 1, last_boosted_at = NOW()
+         WHERE id = ANY($1) AND deleted_at IS NULL
+           AND (expires_at IS NULL OR expires_at > statement_timestamp())${capabilities.consolidation_schema ? ' AND consolidated_into_id IS NULL' : ''}`,
         [ids]
       );
     }
