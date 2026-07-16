@@ -25,6 +25,7 @@ export interface Memory {
   superseded_by_id?: string | null;
   is_superseded?: boolean;
   revision?: number;
+  entity_source_revision?: number;
   consolidated_into_id?: string | null;
   consolidated_at?: Date | null;
 }

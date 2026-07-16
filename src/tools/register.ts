@@ -18,6 +18,7 @@ import { forgetSchema, memoryForget } from './forget.js';
 import { updateSchema, memoryUpdate } from './update.js';
 import { MAX_DELETION_REASON_CHARS, MAX_FORGET_IDS } from '../memory-lifecycle.js';
 import { mediaSearchSchema, mediaSearch } from './media-search.js';
+import { graphSchema, memoryGraph } from './graph.js';
 import { upsertAgent, listAgents } from '../agents.js';
 import {
   DOCUMENT_TITLE_MAX_CHARS,
@@ -145,6 +146,21 @@ const TOOL_DEFINITIONS = [
         session_id: { type: 'string', description: 'Optional session/conversation ID for grouping related operations' },
       },
       required: ['query'],
+    },
+  },
+  {
+    name: 'memory_graph',
+    description: 'Traverse the bounded namespace-scoped entity graph. Returns exact-name seeds, linked active memories, co-occurring entities, edges, indexing completeness, and truncation flags.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        entity: { type: 'string', minLength: 1, maxLength: 256, description: 'Exact entity display name after conservative Unicode/case normalization' },
+        type: { type: 'string', enum: ['person', 'project', 'tool', 'place'], description: 'Optional entity type disambiguator' },
+        namespaces: { type: 'array', maxItems: 100, items: { type: 'string', minLength: 1, maxLength: TEXT_FIELD_MAX_CHARS }, description: 'Namespaces to intersect with the caller ACL' },
+        depth: { type: 'integer', minimum: 0, maximum: 3, default: 1, description: 'Co-occurring entity hops (default 1)' },
+      },
+      required: ['entity'],
     },
   },
   {
@@ -287,6 +303,11 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
           const params = searchSchema.parse(args);
           const results = await memorySearch(params, auth);
           return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+        }
+        case 'memory_graph': {
+          const params = graphSchema.parse(args);
+          const result = await memoryGraph(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
         }
         case 'memory_recall': {
           const params = recallSchema.parse(args);
