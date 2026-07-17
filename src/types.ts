@@ -4,6 +4,8 @@ export type MemoryKind = 'unspecified' | 'semantic' | 'document_chunk' | 'episod
 export interface Memory {
   id: string;
   content: string;
+  /** Stable external identity when the writer supplied one. */
+  source_key?: string | null;
   embedding?: number[];
   embedding_provider?: string | null;
   embedding_model?: string | null;
@@ -79,7 +81,42 @@ export interface RateLimitResult {
 export interface SearchResult extends Memory {
   vec_score: number | null;
   text_score: number;
+  /** Diagnostic legacy formula; its text-hit bonus intentionally differs from final_score. */
+  base_score: number;
+  relevance: number;
   final_score: number;
+}
+
+export interface SearchRankingConfig {
+  vectorWeight: number;
+  textWeight: number;
+  diagnosticTextMatchBonus: number;
+  finalTextMatchBonus: number;
+  relevanceCap: number;
+  vectorCandidateLimit: number;
+  textCandidateLimit: number;
+  resultLimitCap: number;
+}
+
+export interface SearchQueryVector {
+  profile: {
+    name: string;
+    provider: 'gemini' | 'ollama';
+    model: string;
+    dimensions: 768;
+  };
+  vector: number[];
+}
+
+export interface SearchExecutionOptions {
+  /** Production defaults to true. Evaluation must explicitly disable this. */
+  trackAccess?: boolean;
+  /** Fixed clock used by relevance decay, as an ISO-8601 instant. */
+  asOf?: string;
+  /** Internal-only tuning surface. Never pass this from MCP or REST input. */
+  ranking?: SearchRankingConfig;
+  /** Avoids another provider call and makes integration tests deterministic. */
+  queryVectors?: readonly SearchQueryVector[];
 }
 
 export interface StoreParams {

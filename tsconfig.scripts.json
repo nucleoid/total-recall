@@ -13,6 +13,7 @@
     "scripts/rotate-key.ts",
     "scripts/memory-export.ts",
     "scripts/memory-import.ts",
+    "scripts/eval.ts",
     "scripts/lib/key-policy.ts",
     "scripts/consolidate-memories.ts",
     "scripts/reflect.ts",

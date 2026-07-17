@@ -22,6 +22,8 @@
     "provision": "tsx scripts/provision-db.ts",
     "migrate": "tsx scripts/migrate.ts",
     "test:migrations": "tsx --test test/migrations/decay.integration.test.ts",
+    "eval": "tsx scripts/eval.ts",
+    "eval:check": "tsx scripts/eval.ts --check-only",
     "create-key": "tsx scripts/create-key.ts",
     "rotate-key": "tsx scripts/rotate-key.ts",
     "memory:export": "tsx scripts/memory-export.ts",
