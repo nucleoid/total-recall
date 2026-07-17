@@ -131,6 +131,32 @@ test('hybridSearch sets local HNSW inside the scoped transaction before search a
   assert.deepEqual(client.releaseArgs, []);
 });
 
+test('evaluation search uses a read-only transaction, injected vector, fixed relevance clock, and no access update', async () => {
+  const client = new FakeClient();
+  client.rows = [{
+    id: 'memory-eval', content: 'result', vec_score: 0.8, text_score: 0,
+    base_score: 0.24, relevance: 1, final_score: 0.24,
+  }];
+  setPoolForTesting(new FakePool(client) as unknown as pg.Pool);
+
+  const { executeHybridSearch, DEFAULT_SEARCH_RANKING_CONFIG } = await loadSearch();
+  await executeHybridSearch(params, ['shared'], scope, 'normal', {
+    trackAccess: false,
+    asOf: '2026-07-01T00:00:00Z',
+    ranking: { ...DEFAULT_SEARCH_RANKING_CONFIG },
+    queryVectors: [{
+      profile: { name: 'fake', provider: 'gemini', model: 'gemini-embedding-2-preview', dimensions: 768 },
+      vector: Array(768).fill(0.1),
+    }],
+  });
+
+  assert.equal(client.calls.some(call => call.text.startsWith('UPDATE memories')), false);
+  assert.equal(client.calls.some(call => call.text === 'SET TRANSACTION READ ONLY'), true);
+  const searchCall = client.calls.find(call => call.text.includes('WITH vector_results'))!;
+  assert.match(searchCall.text, /EXTRACT\(EPOCH FROM \(\$\d+::timestamptz/);
+  assert.ok(searchCall.params?.includes('2026-07-01T00:00:00.000Z'));
+});
+
 test('hybridSearch commits empty result searches without an access-count update', async () => {
   const client = new FakeClient();
   setPoolForTesting(new FakePool(client) as unknown as pg.Pool);

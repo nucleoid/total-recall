@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "synthetic-format-example",
+  "description": "Synthetic format demonstration only; this is not a retrieval-quality benchmark.",
+  "namespaces": ["eval-synthetic"],
+  "defaults": { "k": 5, "threshold": 0.3 },
+  "cases": [
+    {
+      "id": "synthetic-exact-entity",
+      "query": "What instrument does Example Person play?",
+      "relevant": [{ "source_key": "eval:synthetic:example-person-instrument" }]
+    },
+    {
+      "id": "synthetic-no-result-diagnostic",
+      "query": "A deliberately absent synthetic fact",
+      "expect_no_results": true,
+      "k": 3,
+      "filters": { "tags": ["synthetic"] }
+    }
+  ]
+}

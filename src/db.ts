@@ -66,9 +66,14 @@ export async function queryScoped<T extends pg.QueryResultRow = any>(
   return withScopedClient(scope, (client) => client.query<T>(text, params));
 }
 
+export interface ScopedTransactionOptions {
+  readOnly?: boolean;
+}
+
 export async function withScopedClient<T>(
   scope: DbScope,
-  fn: (client: ScopedClient) => Promise<T>
+  fn: (client: ScopedClient) => Promise<T>,
+  options: ScopedTransactionOptions = {},
 ): Promise<T> {
   validateScope(scope);
   const client = await getPool().connect();
@@ -81,6 +86,7 @@ export async function withScopedClient<T>(
     await client.query("SELECT set_config('app.allowed_namespaces', '', false)");
     await client.query('BEGIN');
     transactionStarted = true;
+    if (options.readOnly) await client.query('SET TRANSACTION READ ONLY');
     await client.query("SELECT set_config('app.allowed_namespaces', $1, true)", [JSON.stringify(scope.namespaces)]);
     await client.query("SELECT set_config('app.current_key_id', $1, true)", [scope.keyId]);
     await client.query("SELECT set_config('app.current_key_is_admin', $1, true)", [scope.isAdmin === true ? 'true' : 'false']);

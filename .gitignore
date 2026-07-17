@@ -9,3 +9,7 @@ __pycache__/
 *.memory-export.jsonl
 *.memory-export.jsonl.gz
 *.memory-import-result.json
+# Real evaluation queries, judgments, reports, and baselines are private.
+eval/private/
+*.eval-report.json
+*.eval-baseline.json

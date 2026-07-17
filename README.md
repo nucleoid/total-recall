@@ -21,6 +21,10 @@ MIGRATION_DATABASE_URL is required by both owner-only commands; there is no DATA
 
 Recall queries set pgvector's transaction-local HNSW search breadth from `HNSW_EF_SEARCH`. The value must be a decimal integer from `1` to `1000`; when unset, empty, or whitespace-only, Total Recall uses `200`. Invalid non-blank values fail during startup before the MCP server or REST API starts accepting traffic.
 
+### Retrieval-quality evaluation
+
+`npm run eval` measures a private, owner-judged binary query set with macro recall@k, MRR, and hit-rate@k. Evaluation uses request-scoped read-only transactions, embeds each query once, fixes relevance time with `--as-of`, and never updates access state or creates agents/traces. Start with `npm run eval:check -- --dataset eval/private/golden.json`; see [`eval/README.md`](eval/README.md) for the schema, privacy rules, baseline compatibility, and explicit opt-in gates. The committed example is synthetic and makes no quality claim. Real datasets and reports are gitignored and must not be put in CI artifacts.
+
 ### Coordinated database password rotation
 
 Treat the formerly committed application-role password as compromised. Use one controlled, backed-up deployment window:
