@@ -50,7 +50,7 @@ Every `memory_store` and `memory_search` call should pass `agent_name` so the op
 **Pass these fields on every call:**
 - **`agent_name`** *(strongly recommended)* — unique identifier for the agent (e.g. `"openclaw"`, `"cursor-dev"`, `"claude-code-mobile"`)
 - **`agent_runtime`** *(optional)* — the platform running the agent (e.g. `"claude-code"`, `"cursor"`, `"openclaw"`)
-- **`agent_model`** *(optional)* — the LLM model (e.g. `"claude-opus-4-7"`)
+- **`agent_model`** *(optional)* — the LLM model (e.g. `"claude-opus-4-8"`)
 - **`session_id`** *(optional)* — groups related operations within a conversation
 
 Total Recall will fall back to the API key's name if `agent_name` is missing, but explicit values give cleaner provenance and let you track multiple sub-agents under one key.
@@ -63,7 +63,7 @@ mcporter call total-recall.memory_store --args '{
   "tags": ["architecture", "database"],
   "agent_name": "my-coding-agent",
   "agent_runtime": "claude-code",
-  "agent_model": "claude-opus-4-7"
+  "agent_model": "claude-opus-4-8"
 }'
 ```
 

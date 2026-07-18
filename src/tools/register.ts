@@ -86,7 +86,7 @@ const TOOL_DEFINITIONS = [
             'Strongly recommended for provenance. Falls back to the API key name if omitted.',
         },
         agent_type: { type: 'string', description: 'Agent type: llm, system, human, tool (default: llm when agent_name explicit)' },
-        agent_model: { type: 'string', description: 'LLM model identifier (e.g. "claude-opus-4-7")' },
+        agent_model: { type: 'string', description: 'LLM model identifier (e.g. "claude-opus-4-8")' },
         agent_runtime: { type: 'string', description: 'Runtime environment (e.g. "claude-code", "openclaw")' },
         session_id: { type: 'string', description: 'Optional session/conversation ID for grouping related operations' },
         idempotency_key: {
@@ -373,7 +373,7 @@ const TOOL_DEFINITIONS = [
       properties: {
         name: { type: 'string', description: 'Unique agent name' },
         type: { type: 'string', description: 'Agent type: llm, system, human, tool (default: llm)' },
-        model: { type: 'string', description: 'Model identifier (e.g. claude-opus-4-6)' },
+        model: { type: 'string', description: 'Model identifier (e.g. claude-opus-4-8)' },
         runtime: { type: 'string', description: 'Runtime environment (e.g. openclaw, claude-code)' },
         parent_agent_name: { type: 'string', description: 'Name of the parent agent' },
         metadata: { type: 'object', description: 'Additional metadata' },

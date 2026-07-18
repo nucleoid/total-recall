@@ -317,7 +317,7 @@ Every memory can be linked to the agent that created it. Agents are identified b
 **Agent fields:**
 - `name` — unique identifier (e.g., "openclaw", "cursor-dev", "claude-work")
 - `type` — `llm`, `system`, `human`, or `tool`
-- `model` — the LLM model used (e.g., "claude-opus-4-6")
+- `model` — the LLM model used (e.g., "claude-opus-4-8")
 - `runtime` — the tool/platform running the agent (e.g., "openclaw", "cursor", "claude-code")
 - `parent_agent_id` — for spawned sub-agents, links to the parent
 
