@@ -39,7 +39,7 @@ test.after(async () => {
 test('real PostgreSQL enforces document idempotency migration, RLS, concurrency, CHECK, rollback, and completeness', async (t) => {
   await ensureDatabase();
   await resetDatabase();
-  await applyMigrationsThrough('025_memory_supersession');
+  await applyMigrationsThrough('035_activity_connector_foundation');
   await seedApiKeys();
 
   await t.test('CHECK accepts only the canonical versioned lowercase SHA-256 format', async () => {

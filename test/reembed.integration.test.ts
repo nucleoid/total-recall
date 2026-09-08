@@ -70,6 +70,7 @@ async function createFixture(): Promise<Fixture> {
           embedding_dimensions integer,
           updated_at timestamptz NOT NULL DEFAULT NOW(),
           deleted_at timestamptz,
+          expires_at timestamptz,
           revision integer NOT NULL DEFAULT 0
         )
       `);

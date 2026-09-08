@@ -77,11 +77,11 @@ BEGIN
       );
       IF origin_match THEN
         IF NOT (memory_namespace = ANY(COALESCE(p_namespaces, ARRAY[]::TEXT[]))) THEN RETURN 'denied'; END IF;
-        IF CASE memory_access_level
+        IF (CASE memory_access_level
              WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 WHEN 'secret' THEN 2 ELSE 3
-           END > CASE p_max_access_level
+           END) > (CASE p_max_access_level
              WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 WHEN 'secret' THEN 2 ELSE -1
-           END THEN RETURN 'denied'; END IF;
+           END) THEN RETURN 'denied'; END IF;
         RETURN 'origin';
       END IF;
     END IF;
@@ -96,11 +96,11 @@ BEGIN
 
   IF NOT FOUND THEN RETURN 'none'; END IF;
   IF NOT (memory_namespace = ANY(COALESCE(p_namespaces, ARRAY[]::TEXT[]))) THEN RETURN 'denied'; END IF;
-  IF CASE memory_access_level
+  IF (CASE memory_access_level
        WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 WHEN 'secret' THEN 2 ELSE 3
-     END > CASE p_max_access_level
+     END) > (CASE p_max_access_level
        WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 WHEN 'secret' THEN 2 ELSE -1
-     END THEN RETURN 'denied'; END IF;
+     END) THEN RETURN 'denied'; END IF;
   RETURN 'visible';
 END;
 $$;

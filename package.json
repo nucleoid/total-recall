@@ -21,6 +21,7 @@
     "start": "node dist/index.js",
     "provision": "tsx scripts/provision-db.ts",
     "migrate": "tsx scripts/migrate.ts",
+    "reconcile:legacy-ledger": "tsx scripts/reconcile-legacy-ledger.ts",
     "test:migrations": "tsx --test test/migrations/decay.integration.test.ts",
     "eval": "tsx scripts/eval.ts",
     "eval:check": "tsx scripts/eval.ts --check-only",

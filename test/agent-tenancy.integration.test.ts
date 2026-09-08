@@ -98,7 +98,8 @@ async function resetDatabase(options: {
 
     const files = readdirSync('migrations').filter((f) => f.endsWith('.sql')).sort();
     const tenantMigration = '010_tenant_scoped_agents.sql';
-    const beforeTenant = files.filter((f) => f !== tenantMigration);
+    const beforeTenant = files.filter((f) => Number(f.slice(0, 3)) < 10);
+    const afterTenant = files.filter((f) => Number(f.slice(0, 3)) > 10);
 
     for (const file of beforeTenant) {
       await applyMigrationFile(client, file);
@@ -110,6 +111,9 @@ async function resetDatabase(options: {
 
     if (files.includes(tenantMigration)) {
       await applyMigrationFile(client, tenantMigration);
+    }
+    for (const file of afterTenant) {
+      await applyMigrationFile(client, file);
     }
   } finally {
     await client.end();

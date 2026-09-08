@@ -66,8 +66,9 @@ describe('metadata tenancy isolation contract', () => {
     const media = read('src/media.ts');
     assert.match(media, /rowCount !== 1/, 'media event linking must fail when ownership predicate updates no rows');
 
-    const server = read('src/server.ts');
-    assert.match(server, /parseSingleString\(req\.query\.session_id, 'session_id'\)/, 'trace session_id filter must be scalar-validated');
+    const schemas = read('src/http-schemas.ts');
+    assert.match(schemas, /tracesQuerySchema[\s\S]*?session_id:\s*boundedText\.optional\(\)/,
+      'trace session_id filter must be scalar-validated by the route schema');
   });
 
   it('fails fast when media connector rollout keys cannot write to the media namespace', () => {

@@ -68,6 +68,9 @@ async function memoryReferenceColumns(client: QueryClient): Promise<MemoryRefere
       ON target_column.attrelid = constraint_row.confrelid AND target_column.attnum = target_key.attnum
     WHERE constraint_row.contype = 'f'
       AND constraint_row.confrelid = 'public.memories'::regclass
+      -- Content-free relationship tables introduced by memory TTL are
+      -- intentionally deleted with their memory and must not block purge.
+      AND constraint_row.confdeltype <> 'c'
       AND target_column.attname = 'id'
     ORDER BY ns.nspname, rel.relname, source_column.attname
   `);

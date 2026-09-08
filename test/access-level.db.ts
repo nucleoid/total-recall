@@ -83,6 +83,7 @@ const auth = (maxAccessLevel: AuthContext['maxAccessLevel']): AuthContext => ({
 async function setup(): Promise<Record<string, string>> {
   await client.connect();
   await client.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+  await client.query('DROP TABLE IF EXISTS audit_log');
   await client.query('DROP TABLE IF EXISTS memories');
   await client.query('DROP TABLE IF EXISTS agents');
   await client.query(`
@@ -100,6 +101,12 @@ async function setup(): Promise<Record<string, string>> {
     )
   `);
   await client.query(`CREATE UNIQUE INDEX agents_api_key_name_idx ON agents (api_key_id, name) WHERE api_key_id IS NOT NULL`);
+  await client.query(`
+    CREATE OR REPLACE FUNCTION app_current_key_id() RETURNS text
+    LANGUAGE sql STABLE AS $$
+      SELECT NULLIF(current_setting('app.current_key_id', true), '')
+    $$
+  `);
   await client.query(`
     CREATE TABLE memories (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -119,11 +126,29 @@ async function setup(): Promise<Record<string, string>> {
       valid_to TIMESTAMPTZ,
       supersedes_id UUID,
       superseded_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
       revision INT NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       accessed_at TIMESTAMPTZ DEFAULT NOW(),
       access_count INT DEFAULT 0
+    )
+  `);
+  await client.query(`
+    CREATE TABLE audit_log (
+      id BIGSERIAL PRIMARY KEY,
+      client_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      namespace TEXT,
+      memory_id UUID,
+      query_text TEXT,
+      result_count INT,
+      agent_id UUID,
+      session_id TEXT,
+      resource_type TEXT,
+      resource_id TEXT,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
 

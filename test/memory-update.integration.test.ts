@@ -79,6 +79,13 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
     for (const file of migrationFiles.filter(file => Number(file.slice(0, 3)) <= 25)) {
       await owner.query(readFileSync(join(process.cwd(), 'migrations', file), 'utf8'));
     }
+    // Keep the pre-026 compatibility phase focused on validity columns while
+    // satisfying unrelated columns required by the current runtime.
+    await owner.query('ALTER TABLE memories ADD COLUMN expires_at timestamptz');
+    await owner.query(`ALTER TABLE audit_log
+      ADD COLUMN resource_type text,
+      ADD COLUMN resource_id text,
+      ADD COLUMN details jsonb NOT NULL DEFAULT '{}'::jsonb`);
     const finalization = await finalizeMemorySupersession({ connectionString: ownerUrl });
     assert.equal(finalization.constraints.every(row => row.constraintValid), true);
     assert.equal(finalization.indexes.every(row => row.indexValid), true);
@@ -104,6 +111,12 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
     const preValidityUpdated = await memoryUpdate({ id: preValidityNew, supersedes: preValidityOld }, auth);
     assert.equal(preValidityUpdated.supersedes_id, preValidityOld);
     assert.equal(preValidityUpdated.valid_from, null);
+
+    await owner.query('ALTER TABLE memories DROP COLUMN expires_at');
+    await owner.query(`ALTER TABLE audit_log
+      DROP COLUMN resource_type,
+      DROP COLUMN resource_id,
+      DROP COLUMN details`);
 
     for (const file of migrationFiles.filter(file => Number(file.slice(0, 3)) > 25)) {
       await owner.query(readFileSync(join(process.cwd(), 'migrations', file), 'utf8'));
@@ -488,6 +501,8 @@ test('memory update enforces online-finalized, private, atomic, revisioned super
     );
     assert.deepEqual(audits.rows, [
       { action: 'belief.supersede', memory_id: OLD },
+      { action: 'memory.recall', memory_id: OLD },
+      { action: 'memory.recall', memory_id: CURRENT },
       { action: 'memory.update', memory_id: CURRENT },
       { action: 'memory.update', memory_id: OTHER },
     ]);
