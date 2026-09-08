@@ -136,6 +136,9 @@ class FetchCommandTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 pass
 
+            def _send_request(self, *args, **kwargs):
+                return {}
+
             def get_history(self):
                 return [dict(item) for item in items]
 
@@ -239,6 +242,96 @@ class FetchCommandTests(unittest.TestCase):
                 "videoId": "ancient",
             }
         }])
+
+    def test_expired_browser_session_reports_reauthentication_instead_of_none(self):
+        fake_module = types.ModuleType("ytmusicapi")
+
+        class FakeYTMusic:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def _send_request(self, endpoint, body, *args, **kwargs):
+                self.assert_request = (endpoint, body)
+                return {
+                    "contents": {
+                        "singleColumnBrowseResultsRenderer": {
+                            "tabs": [{
+                                "tabRenderer": {
+                                    "content": {
+                                        "sectionListRenderer": {
+                                            "contents": [{
+                                                "itemSectionRenderer": {
+                                                    "contents": [{
+                                                        "messageRenderer": {
+                                                            "subtext": {
+                                                                "messageSubtextRenderer": {
+                                                                    "text": "Sign in to see your history"
+                                                                }
+                                                            }
+                                                        }
+                                                    }]
+                                                }
+                                            }]
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    }
+                }
+
+            def get_history(self):
+                # ytmusicapi asks for this response and would otherwise raise
+                # YTMusicServerError(None) when no music shelf is present.
+                self._send_request("browse", {"browseId": "FEmusic_history"})
+                raise RuntimeError(None)
+
+        class FakeOAuthCredentials:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        fake_module.YTMusic = FakeYTMusic
+        fake_module.OAuthCredentials = FakeOAuthCredentials
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as token_file:
+            json.dump({"_auth_type": "browser"}, token_file)
+            token_path = token_file.name
+
+        args = Namespace(token_file=token_path, since=None, client_id=None, client_secret=None)
+        try:
+            with mock.patch.dict(sys.modules, {"ytmusicapi": fake_module}):
+                with self.assertRaisesRegex(RuntimeError, "browser authentication expired"):
+                    ytmusic_helper.cmd_fetch(args)
+        finally:
+            Path(token_path).unlink(missing_ok=True)
+
+    def test_non_history_sections_do_not_block_valid_history_shelves(self):
+        response = {
+            "contents": {
+                "singleColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [
+                                        {"musicCarouselShelfRenderer": {"contents": []}},
+                                        {"musicShelfRenderer": {"contents": []}},
+                                    ]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        }
+
+        prepared, ignored = ytmusic_helper._prepare_history_response(response)
+
+        self.assertEqual(ignored, 1)
+        self.assertEqual(
+            list(ytmusic_helper._history_sections(prepared)[0]),
+            ["musicShelfRenderer"],
+        )
 
 
 if __name__ == "__main__":

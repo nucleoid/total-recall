@@ -195,6 +195,10 @@ The summary's calendar date uses the optional `MEDIA_TIME_ZONE` IANA zone (for e
 
 **Headers stop working after a while** — YouTube Music sessions roll over occasionally (every few weeks typically). Re-capture and re-run `npm run ytmusic:auth-browser`.
 
+The sync command detects YouTube Music's signed-out history response, reports
+`browser authentication expired`, and exits nonzero so cron monitoring can alert
+instead of treating the run as successful.
+
 **Cron has no PATH for python3** — keep `YTMUSIC_PYTHON` set to the absolute venv path in `.env`.
 
 **Recovering from prior cursor misses** — run another normal sync. The connector now refetches the retained history window, so tracks that are still present in YouTube Music history can be picked up without resetting credentials or editing sync state.

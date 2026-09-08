@@ -296,6 +296,94 @@ def _eprint(payload):
     sys.stderr.write(json.dumps(payload) + "\n")
 
 
+def _iter_string_values(value):
+    """Yield response strings without ever including them in diagnostics."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_string_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_string_values(child)
+
+
+def _history_sections(response):
+    try:
+        return response["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0][
+            "tabRenderer"
+        ]["content"]["sectionListRenderer"]["contents"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _prepare_history_response(response):
+    """Make current history responses safe for ytmusicapi's strict parser.
+
+    ytmusicapi 1.12.x assumes every history section is a music shelf. YouTube
+    now also returns sign-in prompts and occasional non-history sections. The
+    upstream parser raises ``YTMusicServerError(None)`` for either shape.
+    Detect an expired browser session explicitly and ignore unrelated sections
+    only when at least one real history shelf remains for upstream to parse.
+    """
+    sections = _history_sections(response)
+    if not isinstance(sections, list):
+        return response, 0
+
+    music_sections = [
+        section
+        for section in sections
+        if isinstance(section, dict) and "musicShelfRenderer" in section
+    ]
+    other_sections = [
+        section
+        for section in sections
+        if not (isinstance(section, dict) and "musicShelfRenderer" in section)
+    ]
+
+    if not music_sections:
+        response_text = " ".join(_iter_string_values(other_sections)).casefold()
+        if "sign in" in response_text or "signin" in response_text or "log in" in response_text:
+            raise RuntimeError(
+                "YouTube Music browser authentication expired; run "
+                "`npm run ytmusic:auth-browser` to capture fresh request headers"
+            )
+        return response, 0
+
+    # Unknown promotional/notice sections must not prevent real history shelves
+    # from being parsed. Do not include their content in the diagnostic.
+    sections[:] = music_sections
+    return response, len(other_sections)
+
+
+def _get_history(yt):
+    """Use ytmusicapi's parser after normalizing its raw history response."""
+    original_send_request = yt._send_request
+    ignored_sections = 0
+
+    def send_request(endpoint, body, *args, **kwargs):
+        nonlocal ignored_sections
+        response = original_send_request(endpoint, body, *args, **kwargs)
+        if endpoint == "browse" and body.get("browseId") == "FEmusic_history":
+            response, ignored_sections = _prepare_history_response(response)
+        return response
+
+    yt._send_request = send_request
+    try:
+        items = yt.get_history()
+    finally:
+        yt._send_request = original_send_request
+
+    if ignored_sections:
+        _eprint({
+            "warning": {
+                "reason": "ignored unsupported YouTube Music history sections",
+                "count": ignored_sections,
+            }
+        })
+    return items
+
+
 def cmd_auth(args):
     try:
         import ytmusicapi
@@ -407,7 +495,7 @@ def cmd_fetch(args):
     try:
         yt = YTMusic(clean_token_path, oauth_credentials=creds) if creds else YTMusic(clean_token_path)
 
-        items = yt.get_history() or []
+        items = _get_history(yt) or []
 
         since_ts = None
         if args.since:
