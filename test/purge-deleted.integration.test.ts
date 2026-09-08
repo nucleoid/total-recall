@@ -139,8 +139,8 @@ test('hard purge safety holds against real PostgreSQL', { timeout: 60_000 }, asy
     }
     await owner.query(
       `INSERT INTO public.media_events
-         (service, service_id, event_type, title, played_at, memory_id)
-       VALUES ('purge-test', 'media-block', 'play', 'blocked', statement_timestamp(), $1::uuid)`,
+         (service, service_id, event_key, event_type, title, played_at, memory_id)
+       VALUES ('purge-test', 'media-block', 'purge-media-block', 'play', 'blocked', statement_timestamp(), $1::uuid)`,
       [IDS.mediaBlocked],
     );
     await owner.query(

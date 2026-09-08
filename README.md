@@ -19,6 +19,36 @@ DATABASE_URL=postgresql://total_recall_app:<app-password>@localhost:5432/<databa
 
 MIGRATION_DATABASE_URL is required by both owner-only commands; there is no DATABASE_URL fallback. Keep the owner URL and one-shot `APP_DATABASE_PASSWORD` out of runtime/service environments. The MCP server, REST API, importers, watcher, connector syncs, rollup, and other DB-backed processes use only `DATABASE_URL`. Provisioning keeps the fixed `total_recall_app` role required by the migrations, discovers the connected database rather than assuming its name, and preserves an existing password unless `npm run provision -- --rotate-app-password` is explicitly requested.
 
+### Staged upgrades and legacy ledger repair
+
+Use an exact migration version to stop before an online finalizer or other rollout gate:
+
+```bash
+npm run migrate -- --through 024_memory_lifecycle
+npm run finalize:memory-lifecycle
+npm run migrate -- --through 025_memory_supersession
+npm run finalize:memory-supersession
+npm run migrate -- --through 026_memory_kind_and_validity
+npm run backfill:memory-validity
+npm run finalize:memory-validity
+```
+
+The migration command validates the complete applied ledger even during a staged run, refuses an unknown target, and refuses to target below already-applied history. Resume with another exact `--through` target or an untargeted `npm run migrate`.
+
+One known legacy deployment recorded only `001_initial` and `006_media_events` even though the exact 002–005 schema was applied. Do not manually insert ledger rows or bypass the out-of-order guard. From this reviewed release, first run the read-only proof:
+
+```bash
+npm run reconcile:legacy-ledger
+```
+
+It accepts only the exact reviewed 001–006 migration bytes, exact two-row legacy ledger, schema-owner authority, and an independently verified catalog proof for migrations 002–005; it also refuses evidence of unledgered post-006 schema. After taking and verifying a restorable backup, apply the same proof and atomic ledger repair explicitly:
+
+```bash
+npm run reconcile:legacy-ledger -- --apply --confirm-backup
+```
+
+Any proof failure requires human investigation; never weaken the checks or infer missing history. The command uses only `MIGRATION_DATABASE_URL`, shares the migration advisory lock, and does not execute migration DDL. Continue with staged migrations only after the normal runner accepts the repaired checksummed ledger.
+
 Recall queries set pgvector's transaction-local HNSW search breadth from `HNSW_EF_SEARCH`. The value must be a decimal integer from `1` to `1000`; when unset, empty, or whitespace-only, Total Recall uses `200`. Invalid non-blank values fail during startup before the MCP server or REST API starts accepting traffic.
 
 ### Retrieval-quality evaluation

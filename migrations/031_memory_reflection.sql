@@ -99,8 +99,8 @@ BEGIN
      OR evidence_row.namespace <> NEW.origin_namespace
      OR evidence_row.namespace = 'insights' OR evidence_row.memory_kind IN ('document_chunk', 'episode_chunk', 'insight')
      OR evidence_row.deleted_at IS NOT NULL
-     OR CASE insight_row.access_level WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 WHEN 'secret' THEN 2 ELSE -1 END
-        < CASE evidence_row.access_level WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 WHEN 'secret' THEN 2 ELSE 3 END THEN
+     OR (CASE insight_row.access_level WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 WHEN 'secret' THEN 2 ELSE -1 END)
+        < (CASE evidence_row.access_level WHEN 'normal' THEN 0 WHEN 'sensitive' THEN 1 WHEN 'secret' THEN 2 ELSE 3 END) THEN
     RAISE EXCEPTION 'invalid insight evidence relationship' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;

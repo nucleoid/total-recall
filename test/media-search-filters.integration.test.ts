@@ -471,8 +471,8 @@ test('media rollup writes event_at from the structured event played_at', async (
   const playedAt = '2019-07-08T09:10:11.000Z';
   await admin.query(
     `INSERT INTO media_events
-       (service, service_id, event_type, title, artist, album, genres, played_at, client_id)
-     VALUES ($1, 'track-1', 'play', 'Rollup Event Time', 'Test Artist', 'Test Album', $2, $3::timestamptz, $4)`,
+       (service, service_id, event_key, event_type, title, artist, album, genres, played_at, client_id)
+     VALUES ($1, 'track-1', 'test-rollup-event', 'play', 'Rollup Event Time', 'Test Artist', 'Test Album', $2, $3::timestamptz, $4)`,
     [service, ['integration'], playedAt, API_KEY_ID]
   );
 

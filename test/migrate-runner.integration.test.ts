@@ -9,6 +9,7 @@ import pg from 'pg';
 import {
   isCompatibleAppliedChecksum,
   loadMigrationInventory,
+  parseMigrationTarget,
   parseMigrationLockTimeout,
   resolveMigrationDatabaseUrl,
   runMigrations,
@@ -63,6 +64,17 @@ test('migration lock timeout is bounded and validated', () => {
   for (const invalid of ['', '0', '-1', '1.5', '600001', 'wat']) {
     assert.throws(() => parseMigrationLockTimeout(invalid), /MIGRATION_LOCK_TIMEOUT_MS/i);
   }
+});
+
+test('staged migration target requires an exact known version', () => {
+  const inventory = loadMigrationInventory(migrationDirectory({
+    '001_first.sql': 'SELECT 1;',
+    '003_third.sql': 'SELECT 3;',
+  }));
+  assert.equal(parseMigrationTarget([], inventory), undefined);
+  assert.equal(parseMigrationTarget(['--through', '001_first'], inventory), 1);
+  assert.throws(() => parseMigrationTarget(['--through', '001'], inventory), /exact migration version/i);
+  assert.throws(() => parseMigrationTarget(['--bad', '001_first'], inventory), /usage/i);
 });
 
 test('migration runner requires the owner-only URL without a runtime fallback', () => {
@@ -246,6 +258,26 @@ test('a migration cannot back-fill a numeric gap below applied history', { skip:
   const check = await connected(url);
   assert.equal((await check.query("SELECT to_regclass('public.must_not_run') AS marker")).rows[0].marker, null);
   await check.end();
+});
+
+test('a staged run applies only through its target and then resumes forward', { skip: !databaseUrl }, async () => {
+  const url = await temporaryDatabase();
+  const inventory = loadMigrationInventory(migrationDirectory({
+    '001_first.sql': 'CREATE TABLE staged_first (id integer);',
+    '002_second.sql': 'CREATE TABLE staged_second (id integer);',
+    '003_third.sql': 'CREATE TABLE staged_third (id integer);',
+  }));
+  const runner = await connected(url);
+  await runMigrations(runner, inventory, { lockTimeoutMs: 2_000, throughNumber: 2 });
+  assert.notEqual((await runner.query("SELECT to_regclass('public.staged_second') AS relation")).rows[0].relation, null);
+  assert.equal((await runner.query("SELECT to_regclass('public.staged_third') AS relation")).rows[0].relation, null);
+  await runMigrations(runner, inventory, { lockTimeoutMs: 2_000 });
+  assert.notEqual((await runner.query("SELECT to_regclass('public.staged_third') AS relation")).rows[0].relation, null);
+  await assert.rejects(
+    runMigrations(runner, inventory, { lockTimeoutMs: 2_000, throughNumber: 2 }),
+    /target 2 is below already applied migration number 3/i,
+  );
+  await runner.end();
 });
 
 test('the ledger create remains idempotent against non-runner creators', () => {

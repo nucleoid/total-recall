@@ -132,7 +132,7 @@ const MIGRATION_OWNED_TABLES = [
   'sync_state',
 ] as const;
 
-async function assertMigrationAuthority(client: pg.Client): Promise<void> {
+export async function assertMigrationAuthority(client: pg.Client): Promise<void> {
   const identity = await client.query<CurrentRole>(`
     SELECT current_user AS "currentUser",
            current_database() AS "currentDatabase",
@@ -254,8 +254,8 @@ async function assertCanGrantForMigration(
   );
 }
 
-const MIGRATION_LOCK_KEY_1 = 1_414_676_812;
-const MIGRATION_LOCK_KEY_2 = 1_296_650_834;
+export const MIGRATION_LOCK_KEY_1 = 1_414_676_812;
+export const MIGRATION_LOCK_KEY_2 = 1_296_650_834;
 const CHECKSUM_PATTERN = /^[0-9a-f]{64}$/;
 const COMPATIBLE_APPLIED_CHECKSUMS: Readonly<Record<string, ReadonlySet<string>>> = {
   // The only mutable-history exception: #49 sanitizes 003 for fresh installs while
@@ -273,6 +273,7 @@ export function isCompatibleAppliedChecksum(version: string, checksum: string): 
 
 export type MigrationRunOptions = {
   lockTimeoutMs: number;
+  throughNumber?: number;
   signal?: AbortSignal;
   log?: (message: string) => void;
   warn?: (message: string) => void;
@@ -310,6 +311,14 @@ export async function runMigrations(
   migrations: MigrationFile[],
   options: MigrationRunOptions,
 ): Promise<void> {
+  if (options.throughNumber !== undefined &&
+      (!Number.isSafeInteger(options.throughNumber) ||
+       !migrations.some(migration => migration.number === options.throughNumber))) {
+    throw new Error(`Unknown migration target ${String(options.throughNumber)}`);
+  }
+  const targetedMigrations = options.throughNumber === undefined
+    ? migrations
+    : migrations.filter(migration => migration.number <= options.throughNumber!);
   const byVersion = new Map(migrations.map(migration => [migration.version, migration]));
   let lockAcquired = false;
   let failed = false;
@@ -324,7 +333,7 @@ export async function runMigrations(
         'SELECT version FROM schema_migrations ORDER BY version',
       );
       const appliedVersions = new Set(existingVersions.rows.map(row => row.version));
-      for (const migration of migrations) {
+      for (const migration of targetedMigrations) {
         const ownerRequired = OWNER_REQUIRED_MIGRATIONS[migration.version];
         if (ownerRequired && !appliedVersions.has(migration.version)) {
           await assertCanGrantForMigration(client, migration.version, migration.file, ownerRequired);
@@ -359,7 +368,12 @@ export async function runMigrations(
       (maximum, row) => Math.max(maximum, byVersion.get(row.version)!.number),
       -1,
     );
-    const outOfOrder = migrations.find(
+    if (options.throughNumber !== undefined && maxAppliedNumber > options.throughNumber) {
+      throw new Error(
+        `Migration target ${options.throughNumber} is below already applied migration number ${maxAppliedNumber}`,
+      );
+    }
+    const outOfOrder = targetedMigrations.find(
       migration => !appliedSet.has(migration.version) && migration.number < maxAppliedNumber,
     );
     if (outOfOrder) {
@@ -401,7 +415,7 @@ export async function runMigrations(
       }
     }
 
-    for (const migration of migrations) {
+    for (const migration of targetedMigrations) {
       interrupted(options.signal);
       const { file, version, sql, checksum } = migration;
       if (appliedSet.has(version)) {
@@ -429,7 +443,9 @@ export async function runMigrations(
       }
     }
 
-    options.log?.('All migrations complete.');
+    options.log?.(options.throughNumber === undefined
+      ? 'All migrations complete.'
+      : `Migrations complete through ${String(options.throughNumber).padStart(3, '0')}.`);
   } catch (error) {
     failed = true;
     throw error;
@@ -453,10 +469,23 @@ export async function runMigrations(
   }
 }
 
+export function parseMigrationTarget(args: string[], migrations: MigrationFile[]): number | undefined {
+  if (args.length === 0) return undefined;
+  if (args.length !== 2 || args[0] !== '--through' || !args[1]) {
+    throw new Error('Usage: npm run migrate -- [--through NNN_migration_name]');
+  }
+  const target = migrations.find(migration => migration.version === args[1]);
+  if (!target) {
+    throw new Error(`Unknown --through migration ${args[1]}; use an exact migration version`);
+  }
+  return target.number;
+}
+
 async function migrate() {
   const connectionString = resolveMigrationDatabaseUrl(process.env);
 
   const migrations = loadMigrationInventory(join(__dirname, '..', 'migrations'));
+  const throughNumber = parseMigrationTarget(process.argv.slice(2), migrations);
   const lockTimeoutMs = parseMigrationLockTimeout(process.env.MIGRATION_LOCK_TIMEOUT_MS);
   const client = new pg.Client({ connectionString });
   const abortController = new AbortController();
@@ -473,6 +502,7 @@ async function migrate() {
     await client.connect();
     await runMigrations(client, migrations, {
       lockTimeoutMs,
+      throughNumber,
       signal: abortController.signal,
       log: console.log,
       warn: console.warn,
