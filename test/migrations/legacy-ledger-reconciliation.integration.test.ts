@@ -28,7 +28,7 @@ async function connectWhenReady(connectionString: string): Promise<pg.Client> {
   throw new Error('PostgreSQL did not become ready', { cause: lastError });
 }
 
-test('reviewed 001/006 legacy ledger is schema-proved before atomic reconciliation', { timeout: 120_000 }, async t => {
+test('reviewed 001/006 ledger with legacy 007 footprint is schema-proved before atomic reconciliation', { timeout: 120_000 }, async t => {
   if (!dockerAvailable()) { t.skip('Docker is unavailable'); return; }
   const container = execFileSync('docker', [
     'run', '--rm', '-d', '-e', 'POSTGRES_PASSWORD=postgres',
@@ -50,6 +50,10 @@ test('reviewed 001/006 legacy ledger is schema-proved before atomic reconciliati
   for (const file of readdirSync(migrationsDir).filter(file => /^00[1-6]_.*\.sql$/.test(file)).sort()) {
     await owner.query(readFileSync(join(migrationsDir, file), 'utf8'));
   }
+  await owner.query(readFileSync(join(migrationsDir, '007_decay.sql'), 'utf8'));
+  await owner.query(`ALTER FUNCTION public.calculate_relevance(
+    DOUBLE PRECISION, DOUBLE PRECISION, TIMESTAMPTZ, INTEGER
+  ) IMMUTABLE`);
   await owner.query("INSERT INTO schema_migrations(version) VALUES ('001_initial'), ('006_media_events')");
 
   await owner.query('DROP INDEX public.idx_recall_traces_session');

@@ -123,9 +123,52 @@ async function missingSchemaProofs(client: pg.Client): Promise<string[]> {
         has_table_privilege('total_recall_app', 'public.memories', 'SELECT,INSERT,UPDATE')
         AND has_table_privilege('total_recall_app', 'public.documents', 'SELECT,INSERT,UPDATE')
         AND has_table_privilege('total_recall_app', 'public.audit_log', 'SELECT,INSERT')),
-      ('no unledgered post-006 schema',
-        NOT EXISTS (SELECT 1 FROM information_schema.columns
-                    WHERE table_schema='public' AND table_name='memories' AND column_name='relevance_score'))
+      ('recognized legacy 007 footprint',
+        (
+          -- Some legacy installations ran the old migration 007 without
+          -- recording it.  It is safe to let the normal runner execute the
+          -- current, idempotent 007 again, but only when the catalog is either
+          -- wholly pre-007 or has the complete reviewed decay footprint.
+          (
+            NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='memories'
+                          AND column_name = ANY(ARRAY['relevance_score','decay_rate','last_boosted_at']))
+          )
+          OR
+          (
+            (SELECT count(*) = 3 FROM information_schema.columns
+             WHERE table_schema='public' AND table_name='memories'
+               AND column_name = ANY(ARRAY['relevance_score','decay_rate','last_boosted_at']))
+            AND EXISTS (
+              SELECT 1
+              FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+              JOIN pg_language l ON l.oid = p.prolang
+              WHERE n.nspname='public'
+                AND p.proname='calculate_relevance'
+                AND pg_get_function_identity_arguments(p.oid) =
+                  'p_relevance_score double precision, p_decay_rate double precision, p_accessed_at timestamp with time zone, p_access_count integer'
+                AND pg_get_function_result(p.oid) = 'double precision'
+                AND l.lanname = 'plpgsql'
+                AND p.provolatile IN ('i', 's')
+                AND NOT p.prosecdef
+            )
+            AND has_function_privilege(
+              'total_recall_app',
+              'public.calculate_relevance(double precision,double precision,timestamp with time zone,integer)',
+              'EXECUTE'
+            )
+          )
+        )
+        -- Any durable marker from a later migration remains a hard stop.
+        AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='api_keys' AND column_name='max_access_level')
+        AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='memories'
+                          AND column_name = ANY(ARRAY['event_at','relevance_base_score','deleted_at']))
+        AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='documents' AND column_name='idempotency_key')
+        AND to_regprocedure('public.app_allowed_namespaces()') IS NULL)
     )
     SELECT proof FROM proofs WHERE NOT ok ORDER BY proof
   `);
