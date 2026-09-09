@@ -3,7 +3,7 @@ import test from 'node:test';
 import {Readable} from 'node:stream';
 import {randomUUID} from 'node:crypto';
 import {protocolLines,recordSchema,manifestSchema,digest,recordKey,type SyncRecord,type SyncManifest} from '../src/archive/sync-format.js';
-import {parseSyncArgs} from '../src/archive/sync-cli.js';
+import {parseSyncArgs,embeddingRanges} from '../src/archive/sync-cli.js';
 
 export const fixtureRecord=(id='one',content='Synthetic historical evidence'):SyncRecord=>({
   type:'record',record_id:digest(id),chunk_index:0,origin:'evidence',kind:'email',title:'Synthetic email',content,
@@ -40,4 +40,12 @@ test('CLI requires explicit operation, archive and key; no default access grants
   assert.equal(parseSyncArgs(['status','--archive-id','test','--key-id',randomUUID()]).command,'status');
   for(const args of [[],['receive'],['embed','--archive-id','a','--key-id',randomUUID(),'--batch-size','1000'],
     ['provision','--archive-id','a','--key-id',randomUUID()]])assert.throws(()=>parseSyncArgs(args));
+});
+test('parallel embedding partitions cover the UUID space without gaps or overlap',()=>{
+  for(let concurrency=1;concurrency<=8;concurrency++){
+    const ranges=embeddingRanges(concurrency);assert.equal(ranges[0].lower,null);assert.equal(ranges.at(-1)!.upper,null);
+    for(let i=1;i<ranges.length;i++)assert.equal(ranges[i-1].upper,ranges[i].lower);
+  }
+  for(const value of [0,9,1.5,NaN])assert.throws(()=>embeddingRanges(value));
+  assert.throws(()=>parseSyncArgs(['embed','--archive-id','test','--key-id',randomUUID(),'--concurrency','9']));
 });
