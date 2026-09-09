@@ -33,6 +33,7 @@
     "preseed:claude": "tsx scripts/preseed-claude.ts",
     "start:http": "node dist/server.js",
     "start:gateway": "node dist/archive/gateway.js",
+    "archive:sync": "node dist/archive/sync-cli.js",
     "start:stdio": "node dist/index.js",
     "preseed:gemini": "tsx scripts/preseed-gemini.ts",
     "repair:gemini-source-keys": "tsx scripts/repair-gemini-source-keys.ts",

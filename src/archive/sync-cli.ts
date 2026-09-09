@@ -1,0 +1,84 @@
+import dotenv from 'dotenv';
+import pg from 'pg';
+import {pathToFileURL} from 'node:url';
+import {setTimeout as delay} from 'node:timers/promises';
+import {archiveIdSchema} from './sync-format.js';
+import {archiveSyncStatus,assertSafeSyncRole,embedArchiveBatch,receiveArchive,syncAuth} from './sync-store.js';
+import {provisionArchiveSync} from './sync-admin.js';
+
+dotenv.config({quiet:true} as dotenv.DotenvConfigOptions);
+const log=(value:unknown)=>process.stdout.write(JSON.stringify(value)+'\n');
+
+export function parseSyncArgs(args:string[]){
+  const [command,...rest]=args;
+  if(!['provision','receive','embed','status'].includes(command))throw new Error('archive_sync.command_required');
+  const options=new Map<string,string>();
+  const allowed=command==='provision'?['--archive-id','--reader-keys']:command==='embed'
+    ?['--archive-id','--key-id','--batch-size']:['--archive-id','--key-id'];
+  for(let i=0;i<rest.length;i+=2){
+    if(!allowed.includes(rest[i])||!rest[i+1]||rest[i+1].startsWith('--')||options.has(rest[i]))throw new Error('archive_sync.invalid_option');
+    options.set(rest[i],rest[i+1]);
+  }
+  const archiveId=archiveIdSchema.parse(options.get('--archive-id'));
+  const keyId=options.get('--key-id')??'';
+  if(command!=='provision'&&!/^[-a-f0-9]{36}$/i.test(keyId))throw new Error('archive_sync.key_id_required');
+  const batchSize=Number(options.get('--batch-size')??64);
+  if(!Number.isInteger(batchSize)||batchSize<1||batchSize>100)throw new Error('archive_sync.embedding_batch_limit');
+  return {command,archiveId,keyId,batchSize,readerIds:(options.get('--reader-keys')??'').split(',').filter(Boolean)};
+}
+
+export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:string,batchSize:number){
+  // A separate session lock prevents duplicate provider charges from two workers.
+  const lockClient=await pool.connect();let locked=false;
+  const lockName=`my-life-embed:${keyId}:${archiveId}`;
+  try{
+    await assertSafeSyncRole(lockClient);await syncAuth(lockClient,keyId);
+    locked=(await lockClient.query('select pg_try_advisory_lock(hashtextextended($1,0)) acquired',[lockName])).rows[0].acquired;
+    if(!locked)throw new Error('archive_sync.embedding_already_running');
+    const initial=await archiveSyncStatus(pool,keyId,archiveId);
+    if(!initial.sync?.manifest||initial.sync.copy_in_progress)throw new Error('archive_sync.completed_copy_required');
+    let cursor:string|null=null,processed=0,attempt=0,passes=0;
+    while(true){
+      try{
+        const batch=await embedArchiveBatch(pool,keyId,archiveId,batchSize,undefined,cursor);
+        attempt=0;
+        if(!batch.selected){
+          const status=await archiveSyncStatus(pool,keyId,archiveId);
+          if(status.pending===0){
+            if(!status.sync?.manifest||status.sync.copy_in_progress)throw new Error('archive_sync.completed_copy_required');
+            log({event:'archive_sync.embedding_complete',...status});return;
+          }
+          if(++passes>3)throw new Error('archive_sync.embedding_nonconvergent');
+          cursor=null;continue;
+        }
+        cursor=batch.cursor;processed+=batch.written;
+        log({event:'archive_sync.embedding_progress',processed,cursor});
+      }catch(error){
+        // Never log provider response bodies, database parameters or archive text.
+        if(error instanceof Error&&error.message.startsWith('archive_sync.'))throw error;
+        if(++attempt>8)throw new Error('archive_sync.embedding_retry_exhausted');
+        const waitMs=Math.min(120000,1000*2**attempt);
+        log({event:'archive_sync.embedding_retry',attempt,wait_ms:waitMs});await delay(waitMs);
+      }
+    }
+  }finally{
+    if(locked)await lockClient.query('select pg_advisory_unlock(hashtextextended($1,0))',[lockName]).catch(()=>{});
+    lockClient.release();
+  }
+}
+
+async function main(){
+  const options=parseSyncArgs(process.argv.slice(2));
+  if(!process.env.DATABASE_URL)throw new Error('archive_sync.database_required');
+  const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,max:3});
+  try{
+    if(options.command==='provision')log(await provisionArchiveSync(pool,options.archiveId,options.readerIds));
+    else if(options.command==='receive')await receiveArchive(pool,process.stdin,options.keyId,options.archiveId,log);
+    else if(options.command==='status')log(await archiveSyncStatus(pool,options.keyId,options.archiveId));
+    else await runEmbeddingWorker(pool,options.keyId,options.archiveId,options.batchSize);
+  }finally{await pool.end();}
+}
+if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main().catch(error=>{
+  const code=error instanceof Error&&/^archive_sync\.[a-z_]+$/.test(error.message)?error.message:'archive_sync.failed';
+  process.stderr.write(JSON.stringify({event:code})+'\n');process.exitCode=1;
+});
