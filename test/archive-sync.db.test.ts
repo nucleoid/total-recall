@@ -5,6 +5,7 @@ import {randomUUID} from 'node:crypto';
 import {readFile,readdir} from 'node:fs/promises';
 import {provisionArchiveSync} from '../src/archive/sync-admin.js';
 import {archiveSyncStatus,receiveArchive,embedArchiveBatch} from '../src/archive/sync-store.js';
+import {runEmbeddingWorker} from '../src/archive/sync-cli.js';
 import {ACTIVE_EMBEDDING_PROFILE} from '../src/embedding.js';
 import {authContextFromRow} from '../src/auth.js';
 import {memoryRecall} from '../src/tools/recall.js';
@@ -79,6 +80,17 @@ test('real RLS: private copy, retries, tombstones, stale streams and detached em
     assert.equal((await archiveSyncStatus(app,key,m8.archive_id)).chunks,2,'incomplete coverage must not erase a source');
     const empty=await receiveArchive(app,fixtureStream(m8,[]),key,m8.archive_id);
     assert.equal(empty.removed,2,'a verified empty snapshot propagates removal of every source');
+    const m9=fixtureManifest('2026-01-09T00:00:00.000Z');
+    const parallel=Array.from({length:64},(_,i)=>fixtureRecord('parallel-'+i,'Parallel synthetic '+i));
+    await receiveArchive(app,fixtureStream(m9,parallel),key,m9.archive_id);
+    const seen=new Set<string>();let active=0,peak=0;
+    await runEmbeddingWorker(app,key,m9.archive_id,3,4,async texts=>{
+      for(const text of texts){if(seen.has(text))throw new Error('archive_sync.duplicate_test_embedding');seen.add(text);}
+      active++;peak=Math.max(peak,active);await new Promise(resolve=>setTimeout(resolve,20));active--;
+      return embed(texts);
+    },()=>{});
+    assert.equal(seen.size,64);assert.ok(peak>=2&&peak<=4);
+    assert.equal((await archiveSyncStatus(app,key,m9.archive_id)).pending,0);
     await owner.query('update api_keys set revoked_at=now() where id=$1',[key]);
     await assert.rejects(embedArchiveBatch(app,key,m7.archive_id,64,embed),/identity_denied/);
     assert.equal((await owner.query("select count(*)::int n from memories where namespace='my-life' and access_level<>'sensitive'")).rows[0].n,0);

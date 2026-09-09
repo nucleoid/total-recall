@@ -45,7 +45,7 @@ not a login secret. A revoked or modified identity is not silently repaired.
 node dist/archive/sync-cli.js receive --archive-id ARCHIVE_ID --key-id SYNC_KEY_UUID
 
 # These operations run entirely from Total Recall's database after copying.
-node dist/archive/sync-cli.js embed --archive-id ARCHIVE_ID --key-id SYNC_KEY_UUID --batch-size 64
+node dist/archive/sync-cli.js embed --archive-id ARCHIVE_ID --key-id SYNC_KEY_UUID --batch-size 64 --concurrency 4
 node dist/archive/sync-cli.js status --archive-id ARCHIVE_ID --key-id SYNC_KEY_UUID
 ```
 
@@ -60,10 +60,17 @@ Embedding uses the already configured Total Recall embedding provider and model.
 Parsed content is sent to that provider just like ordinary stored memories;
 this consumes the configured API's quota/billing. Source files are not sent.
 The worker holds no source connection or database transaction during provider
-requests. Only one worker for an archive may run at a time. It uses bounded
-batches, keyset scanning and bounded exponential retries, and writes vectors
+requests. Only one worker process for an archive may run at a time. `--concurrency`
+defaults to 1 and allows at most 8 parallel batches. Disjoint UUID intervals
+prevent duplicate requests across those batches. The worker uses keyset scanning
+and bounded exponential retries with jitter, and writes vectors
 only if the selected content is still unchanged. Logs contain counters and
 failure codes, never record contents, SQL parameters or provider responses.
+
+Choose concurrency within the provider's quota and the database's capacity;
+increasing it does not bypass rate limits. A fatal partition failure stops new
+work and waits for the other bounded in-flight operations before releasing the
+archive lock. Restarting resumes rows that still need vectors.
 
 `copy_complete` means parsed records are stored independently of the drive.
 `embedding_complete`, `pending: 0`, and a completed copy in status mean the

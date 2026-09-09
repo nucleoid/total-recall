@@ -152,7 +152,8 @@ export async function receiveArchive(pool:Pool,input:Readable,keyId:string,archi
 }
 
 export async function embedArchiveBatch(pool:Pool,keyId:string,archiveId:string,limit=64,
-  embedder:(texts:string[])=>Promise<EmbeddingResult[]>=embedBatchWithProfile,afterId:string|null=null):Promise<{selected:number;written:number;cursor:string|null}>{
+  embedder:(texts:string[])=>Promise<EmbeddingResult[]>=embedBatchWithProfile,afterId:string|null=null,
+  range:{lower:string|null;upper:string|null}={lower:null,upper:null}):Promise<{selected:number;written:number;cursor:string|null}>{
   if(!Number.isInteger(limit)||limit<1||limit>100)throw new Error('archive_sync.embedding_batch_limit');
   const client=await pool.connect();
   try{
@@ -162,7 +163,8 @@ export async function embedArchiveBatch(pool:Pool,keyId:string,archiveId:string,
         and source_key like $2 and embedding is null and deleted_at is null and superseded_at is null and consolidated_into_id is null
         and (expires_at is null or expires_at>statement_timestamp())
         and ($4::uuid is null or id>$4::uuid)
-      order by id limit $3`,[keyId,archivePrefix(archiveId)+'%',limit,afterId])).rows);
+        and ($5::uuid is null or id>=$5::uuid) and ($6::uuid is null or id<$6::uuid)
+      order by id limit $3`,[keyId,archivePrefix(archiveId)+'%',limit,afterId,range.lower,range.upper])).rows);
     if(!rows.length)return {selected:0,written:0,cursor:afterId};
     // External provider work never holds a database transaction or source-drive connection.
     const embedded=await embedder(rows.map(row=>row.content));

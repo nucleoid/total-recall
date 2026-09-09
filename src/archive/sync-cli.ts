@@ -3,6 +3,7 @@ import pg from 'pg';
 import {pathToFileURL} from 'node:url';
 import {setTimeout as delay} from 'node:timers/promises';
 import {archiveIdSchema} from './sync-format.js';
+import {embedBatchWithProfile,type EmbeddingResult} from '../embedding.js';
 import {archiveSyncStatus,assertSafeSyncRole,embedArchiveBatch,receiveArchive,syncAuth} from './sync-store.js';
 import {provisionArchiveSync} from './sync-admin.js';
 
@@ -14,7 +15,7 @@ export function parseSyncArgs(args:string[]){
   if(!['provision','receive','embed','status'].includes(command))throw new Error('archive_sync.command_required');
   const options=new Map<string,string>();
   const allowed=command==='provision'?['--archive-id','--reader-keys']:command==='embed'
-    ?['--archive-id','--key-id','--batch-size']:['--archive-id','--key-id'];
+    ?['--archive-id','--key-id','--batch-size','--concurrency']:['--archive-id','--key-id'];
   for(let i=0;i<rest.length;i+=2){
     if(!allowed.includes(rest[i])||!rest[i+1]||rest[i+1].startsWith('--')||options.has(rest[i]))throw new Error('archive_sync.invalid_option');
     options.set(rest[i],rest[i+1]);
@@ -24,10 +25,19 @@ export function parseSyncArgs(args:string[]){
   if(command!=='provision'&&!/^[-a-f0-9]{36}$/i.test(keyId))throw new Error('archive_sync.key_id_required');
   const batchSize=Number(options.get('--batch-size')??64);
   if(!Number.isInteger(batchSize)||batchSize<1||batchSize>100)throw new Error('archive_sync.embedding_batch_limit');
-  return {command,archiveId,keyId,batchSize,readerIds:(options.get('--reader-keys')??'').split(',').filter(Boolean)};
+  const concurrency=Number(options.get('--concurrency')??1);embeddingRanges(concurrency);
+  return {command,archiveId,keyId,batchSize,concurrency,readerIds:(options.get('--reader-keys')??'').split(',').filter(Boolean)};
 }
 
-export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:string,batchSize:number){
+export function embeddingRanges(concurrency:number){
+  if(!Number.isInteger(concurrency)||concurrency<1||concurrency>8)throw new Error('archive_sync.embedding_concurrency_limit');
+  const boundary=(n:number)=>Math.floor(n*2**32/concurrency).toString(16).padStart(8,'0')+'-0000-0000-0000-000000000000';
+  return Array.from({length:concurrency},(_,i)=>({lower:i===0?null:boundary(i),upper:i===concurrency-1?null:boundary(i+1)}));
+}
+
+export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:string,batchSize:number,concurrency=1,
+  embedder:(texts:string[])=>Promise<EmbeddingResult[]>=embedBatchWithProfile,progress:(value:unknown)=>void=log){
+  const ranges=embeddingRanges(concurrency);
   // A separate session lock prevents duplicate provider charges from two workers.
   const lockClient=await pool.connect();let locked=false;
   const lockName=`my-life-embed:${keyId}:${archiveId}`;
@@ -37,29 +47,36 @@ export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:str
     if(!locked)throw new Error('archive_sync.embedding_already_running');
     const initial=await archiveSyncStatus(pool,keyId,archiveId);
     if(!initial.sync?.manifest||initial.sync.copy_in_progress)throw new Error('archive_sync.completed_copy_required');
-    let cursor:string|null=null,processed=0,attempt=0,passes=0;
-    while(true){
-      try{
-        const batch=await embedArchiveBatch(pool,keyId,archiveId,batchSize,undefined,cursor);
-        attempt=0;
-        if(!batch.selected){
-          const status=await archiveSyncStatus(pool,keyId,archiveId);
-          if(status.pending===0){
-            if(!status.sync?.manifest||status.sync.copy_in_progress)throw new Error('archive_sync.completed_copy_required');
-            log({event:'archive_sync.embedding_complete',...status});return;
+    let processed=0,stopped=false;
+    for(let pass=0;pass<4;pass++){
+      // Disjoint UUID intervals prevent duplicate provider work. Each interval
+      // advances by keyset cursor, with no long transaction or database lease.
+      const outcomes=await Promise.allSettled(ranges.map(async(range,partition)=>{
+        let cursor:string|null=null,attempt=0;
+        while(!stopped){
+          try{
+            const batch=await embedArchiveBatch(pool,keyId,archiveId,batchSize,embedder,cursor,range);
+            attempt=0;
+            if(!batch.selected)return;
+            cursor=batch.cursor;processed+=batch.written;
+            progress({event:'archive_sync.embedding_progress',processed,partition,cursor});
+          }catch(error){
+            // Never log provider response bodies, SQL parameters or source text.
+            if((error instanceof Error&&error.message.startsWith('archive_sync.'))||++attempt>8){
+              stopped=true;throw new Error(error instanceof Error&&/^archive_sync\.[a-z_]+$/.test(error.message)
+                ?error.message:'archive_sync.embedding_retry_exhausted');
+            }
+            const waitMs=Math.min(120000,1000*2**attempt)+Math.floor(Math.random()*1000);
+            progress({event:'archive_sync.embedding_retry',partition,attempt,wait_ms:waitMs});await delay(waitMs);
           }
-          if(++passes>3)throw new Error('archive_sync.embedding_nonconvergent');
-          cursor=null;continue;
         }
-        cursor=batch.cursor;processed+=batch.written;
-        log({event:'archive_sync.embedding_progress',processed,cursor});
-      }catch(error){
-        // Never log provider response bodies, database parameters or archive text.
-        if(error instanceof Error&&error.message.startsWith('archive_sync.'))throw error;
-        if(++attempt>8)throw new Error('archive_sync.embedding_retry_exhausted');
-        const waitMs=Math.min(120000,1000*2**attempt);
-        log({event:'archive_sync.embedding_retry',attempt,wait_ms:waitMs});await delay(waitMs);
-      }
+      }));
+      const failure=outcomes.find((outcome):outcome is PromiseRejectedResult=>outcome.status==='rejected');
+      if(failure)throw failure.reason;
+      const status=await archiveSyncStatus(pool,keyId,archiveId);
+      if(!status.sync?.manifest||status.sync.copy_in_progress)throw new Error('archive_sync.completed_copy_required');
+      if(status.pending===0){progress({event:'archive_sync.embedding_complete',...status});return;}
+      if(pass===3)throw new Error('archive_sync.embedding_nonconvergent');
     }
   }finally{
     if(locked)await lockClient.query('select pg_advisory_unlock(hashtextextended($1,0))',[lockName]).catch(()=>{});
@@ -70,12 +87,12 @@ export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:str
 async function main(){
   const options=parseSyncArgs(process.argv.slice(2));
   if(!process.env.DATABASE_URL)throw new Error('archive_sync.database_required');
-  const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,max:3});
+  const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,max:Math.max(3,options.concurrency+1)});
   try{
     if(options.command==='provision')log(await provisionArchiveSync(pool,options.archiveId,options.readerIds));
     else if(options.command==='receive')await receiveArchive(pool,process.stdin,options.keyId,options.archiveId,log);
     else if(options.command==='status')log(await archiveSyncStatus(pool,options.keyId,options.archiveId));
-    else await runEmbeddingWorker(pool,options.keyId,options.archiveId,options.batchSize);
+    else await runEmbeddingWorker(pool,options.keyId,options.archiveId,options.batchSize,options.concurrency);
   }finally{await pool.end();}
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main().catch(error=>{
