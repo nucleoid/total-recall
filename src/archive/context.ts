@@ -35,7 +35,7 @@ export class ContextService {
         }else{
           if(!this.archive)throw new ProviderError('not_configured');
           const response=await this.archive.search(input);lists.archive=response.results;
-          providers.archive={status:response.truncated?'partial':'ok',coverage:response.coverage,truncated:response.truncated??false};
+          providers.archive={status:response.truncated||response.partial?'partial':'ok',coverage:response.coverage,truncated:response.truncated??false};
         }
         providers[provider]??={status:'ok'};
       }catch(error){providers[provider]={status:failure(error)};lists[provider]=[];}
@@ -65,7 +65,7 @@ export class ContextService {
     throw new ProviderError('not_found');
   }
   async status(){
-    try{if(!this.archive)throw new ProviderError('not_configured');return await this.archive.status();}
+    try{if(!this.archive)throw new ProviderError('not_configured');return {...z.record(z.unknown()).parse(await this.archive.status()),provider:'my-life'};}
     catch(error){return {schema_version:1,provider:'my-life',status:failure(error)};}
   }
 }

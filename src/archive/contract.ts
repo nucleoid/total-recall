@@ -28,7 +28,7 @@ export const contextSearchSchema = z.object({
 });
 export const contextRecallSchema=z.object({ref:z.string().min(1).max(4096)}).strict();
 export type ContextSearch=z.infer<typeof contextSearchSchema>;
-export type ProviderStatus='ok'|'partial'|'offline'|'timeout'|'not_authorized'|'not_configured'|'invalid_response'|'not_found'|'provider_error';
+export type ProviderStatus='ok'|'partial'|'offline'|'timeout'|'write_outcome_unknown'|'not_authorized'|'not_configured'|'invalid_response'|'not_found'|'provider_error';
 export class ProviderError extends Error {
   constructor(readonly status:ProviderStatus){super(status);}
 }
@@ -45,7 +45,7 @@ export const archiveResultSchema=z.object({
 });
 export type ArchiveResult=z.infer<typeof archiveResultSchema>;
 export interface ArchiveProvider {
-  search(input:ContextSearch):Promise<{results:ArchiveResult[];coverage:unknown;truncated?:boolean}>;
+  search(input:ContextSearch):Promise<{results:ArchiveResult[];coverage:unknown;truncated?:boolean;partial?:boolean}>;
   recall(ref:string):Promise<ArchiveResult>;
   status():Promise<unknown>;
 }

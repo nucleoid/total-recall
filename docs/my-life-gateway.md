@@ -46,7 +46,10 @@ metadata, not inferred image content. Facebook/LinkedIn include undated records
 from the optional structured-import adapter. My Life detects those tables when
 the separate importer work lands. No importer code is duplicated here.
 
-Archive search is currently lexical: use focused keywords, names or identifiers.
+Archive search is currently lexical with English stopword/stemming support and
+an explicitly labelled any-term fallback for plain queries with no initial match.
+Quoted/excluded/OR syntax is preserved. A no-lexical-match marker is not evidence
+of historical absence. Use focused keywords, names or identifiers.
 The assistant can make several focused searches for a complex question. Rank
 fusion combines provider ranks, not incompatible embedding scores. A returned
 memory’s `created_at` is not an event date. Memory `after`/`before` preserve their
@@ -65,10 +68,14 @@ not independent corroboration.
 
 Provider failure does not erase successful results from the other provider.
 Responses distinguish offline, timeout, absent configuration and rejected
-capabilities. Archive identity, bounded response size and citation shape are
-validated. Neither archive HTTP redirects nor upstream HTTP redirects are
+capabilities. Invalid individual archive rows are dropped with partial coverage;
+archive identity mismatch still fails closed. Archive identity, bounded response
+size and citation shape are validated. Neither archive HTTP redirects nor upstream HTTP redirects are
 followed with credentials. Errors do not echo provider response bodies, queries
-or secrets. A failed upstream write is never automatically retried.
+or secrets. A failed upstream write is never automatically retried. A per-request
+timeout leaves the shared MCP transport open for concurrent calls. If a dispatched
+write times out or loses transport, `write_outcome_unknown` directs the caller to
+reconcile using its idempotency key before retrying; it does not imply no write occurred.
 
 My Life’s search verifies stored evidence hashes. Its email/Calendar recall also
 verifies original bytes and replays extraction. Other source adapters currently

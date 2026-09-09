@@ -8,7 +8,8 @@ import { contextSearchSchema,ProviderError,type ArchiveResult } from '../src/arc
 import { MyLifeProvider,validateMyLifeConfig } from '../src/archive/my-life.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { createGateway } from '../src/archive/gateway.js';
+import { createGateway,HttpMemoryUpstream } from '../src/archive/gateway.js';
+import { McpError,ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 
 const memoryId='a0000000-0000-4000-8000-000000000001';
 test('MCP gateway advertises combined tools and passes existing memory tools unchanged',async()=>{
@@ -80,6 +81,22 @@ test('My Life destination is pinned to numeric loopback and cannot carry URL cre
   for(const url of ['https://example.com','http://localhost:8799','http://127.0.0.1/path','http://user:pass@127.0.0.1','http://127.0.0.1/?token=x'])
     assert.throws(()=>validateMyLifeConfig({...config,url}));
 });
+test('an upstream request timeout preserves concurrent write responses and signals unknown write outcomes',async()=>{
+  let closes=0;let resolveWrite!:(value:unknown)=>void;let timeoutWrites=false;
+  const client={connect:async()=>{},close:async()=>{closes++;},
+    listTools:async()=>{throw new McpError(ErrorCode.RequestTimeout,'synthetic timeout');},
+    callTool:async({name}:{name:string})=>{
+      if(name==='memory_search'||timeoutWrites)throw new McpError(ErrorCode.RequestTimeout,'synthetic timeout');
+      return new Promise(resolve=>{resolveWrite=resolve;});
+    }} as unknown as Client;
+  const upstream=new HttpMemoryUpstream('http://127.0.0.1:1','synthetic',()=>client);
+  const write=upstream.call('memory_store',{content:'synthetic'});
+  await assert.rejects(upstream.call('memory_search',{query:'synthetic'}),/timeout/);
+  assert.equal(closes,0);resolveWrite(response({stored:true}));assert.deepEqual(await write,response({stored:true}));
+  await assert.rejects(upstream.list(),/timeout/);assert.equal(closes,0);
+  timeoutWrites=true;await assert.rejects(upstream.call('memory_store',{content:'synthetic'}),/write_outcome_unknown/);
+  await upstream.close();assert.equal(closes,1);
+});
 test('real HTTP adapter validates archive identity, scopes, response limits and redirects',async()=>{
   let mode='ok';let received:Record<string,unknown>|undefined;
   const server=createServer(async(req,res)=>{
@@ -89,7 +106,7 @@ test('real HTTP adapter validates archive identity, scopes, response limits and 
     if(mode==='forbidden'){res.writeHead(403).end();return;}
     if(mode==='redirect'){res.writeHead(302,{location:'http://127.0.0.1:1/'}).end();return;}
     if(mode==='huge'){res.end('x'.repeat(300*1024));return;}
-    res.setHeader('content-type','application/json');res.end(JSON.stringify({schema_version:1,archive_id:mode==='wrong'?'wrong':'test',results:[result],coverage:{},truncated:mode==='truncated'}));
+    res.setHeader('content-type','application/json');res.end(JSON.stringify({schema_version:1,archive_id:mode==='wrong'?'wrong':'test',results:mode==='bad-row'?[result,{...result,kind:'x'.repeat(65)}]:[result],coverage:{},truncated:mode==='truncated'}));
   });server.listen(0,'127.0.0.1');await once(server,'listening');
   const provider=new MyLifeProvider({url:`http://127.0.0.1:${(server.address() as AddressInfo).port}`,token:'x'.repeat(40),archiveId:'test'});
   try{
@@ -99,6 +116,7 @@ test('real HTTP adapter validates archive identity, scopes, response limits and 
     const partial=await new ContextService(async()=>{assert.fail('unexpected upstream call');},provider).search({...input,sources:['archive']});
     assert.equal(partial.providers.archive.status,'partial');assert.equal(partial.providers.archive.truncated,true);
     assert.ok(partial.warnings.some(w=>w.includes('coverage gap')));
+    mode='bad-row';const surviving=await provider.search(input);assert.equal(surviving.results.length,1);assert.equal(surviving.partial,true);
     mode='wrong';await assert.rejects(provider.search(input),/invalid_response/);
     mode='forbidden';await assert.rejects(provider.search(input),/not_authorized/);
     mode='huge';await assert.rejects(provider.search(input),/invalid_response/);

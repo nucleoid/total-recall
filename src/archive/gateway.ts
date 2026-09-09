@@ -2,7 +2,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { CallToolRequestSchema,ListToolsRequestSchema,type Tool } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema,ListToolsRequestSchema,McpError,ErrorCode,type Tool } from '@modelcontextprotocol/sdk/types.js';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
@@ -14,13 +14,16 @@ const PASSTHROUGH=new Set(['memory_search','memory_recall','memory_store','memor
   'memory_store_session','memory_session_status','memory_list','memory_list_namespaces','memory_stats','memory_forget',
   'memory_export','memory_import','memory_graph','media_search','agent_register','agent_list',
   'agent_subscribe','agent_list_subscriptions','agent_unsubscribe']);
+const READ_ONLY=new Set(['memory_search','memory_recall','memory_session_status','memory_list','memory_list_namespaces',
+  'memory_stats','memory_export','memory_graph','media_search','agent_list','agent_list_subscriptions']);
 export interface MemoryUpstream {
   list():Promise<Tool[]>;call(name:string,args:Record<string,unknown>):Promise<any>;close():Promise<void>;
 }
 /** Lazy connection: the archive works even while the remote memory service is down. */
 export class HttpMemoryUpstream implements MemoryUpstream {
   private client?:Client;private connecting?:Promise<Client>;
-  constructor(private readonly url:string,private readonly key:string){
+  constructor(private readonly url:string,private readonly key:string,
+    private readonly makeClient:()=>Client=()=>new Client({name:'total-recall-local-gateway',version:'1.0.0'})){
     const target=new URL(url);
     if((target.protocol!=='https:'&&!(target.protocol==='http:'&&['127.0.0.1','[::1]'].includes(target.hostname)))
       ||target.username||target.password||target.search||target.hash||!key)throw new Error('Invalid Total Recall upstream configuration');
@@ -28,7 +31,8 @@ export class HttpMemoryUpstream implements MemoryUpstream {
   private async connected():Promise<Client>{
     if(this.client)return this.client;
     if(!this.connecting)this.connecting=(async()=>{
-      const client=new Client({name:'total-recall-local-gateway',version:'1.0.0'});
+      const client=this.makeClient();
+      client.onclose=()=>{if(this.client===client)this.client=undefined;};
       try{
         const transport=new StreamableHTTPClientTransport(new URL(this.url),{requestInit:{headers:{authorization:`Bearer ${this.key}`}},
           fetch:((url,init)=>fetch(url,{...init,redirect:'error',signal:init?.signal
@@ -39,11 +43,21 @@ export class HttpMemoryUpstream implements MemoryUpstream {
     return this.connecting;
   }
   async list(){try{return(await(await this.connected()).listTools({}, {timeout:15000})).tools;}
-    catch(error){await this.close();throw error;}}
+    catch(error){if(error instanceof McpError&&error.code===ErrorCode.RequestTimeout)throw new ProviderError('timeout');throw error;}}
   async call(name:string,args:Record<string,unknown>){
     // No retry: a failed write response does not imply the upstream write failed.
-    try{return await(await this.connected()).callTool({name,arguments:args},undefined,{timeout:20000});}
-    catch(error){await this.close();throw error;}
+    const client=await this.connected();
+    try{return await client.callTool({name,arguments:args},undefined,{timeout:20000});}
+    catch(error){
+      // A request deadline is not a transport close: unrelated writes must keep
+      // their response channel. Actual transport closure invalidates via onclose.
+      const timeout=error instanceof McpError&&error.code===ErrorCode.RequestTimeout
+        ||error instanceof Error&&['TimeoutError','AbortError'].includes(error.name);
+      if(timeout)throw new ProviderError(READ_ONLY.has(name)?'timeout':'write_outcome_unknown');
+      if(!(error instanceof McpError)||error.code===ErrorCode.ConnectionClosed)
+        throw new ProviderError(READ_ONLY.has(name)?'offline':'write_outcome_unknown');
+      throw new ProviderError('provider_error');
+    }
   }
   async close(){const client=this.client;this.client=undefined;await client?.close().catch(()=>{});}
 }

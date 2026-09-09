@@ -21,7 +21,7 @@ export class MyLifeProvider implements ArchiveProvider {
       });
       if(response.status===401||response.status===403)throw new ProviderError('not_authorized');
       if(response.status===404)throw new ProviderError(operation==='recall'?'not_found':'not_configured');
-      if(!response.ok)throw new ProviderError('offline');
+      if(!response.ok)throw new ProviderError('provider_error');
       if(!response.body)throw new ProviderError('invalid_response');
       const reader=response.body.getReader();const chunks:Uint8Array[]=[];let size=0;
       try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;
@@ -39,9 +39,16 @@ export class MyLifeProvider implements ArchiveProvider {
   }
   async search(input:ContextSearch){
     const data=await this.call('search',{...input.archive_filters,query:input.query,limit:input.limit});
-    const parsed=z.object({results:z.array(archiveResultSchema).max(20),coverage:z.unknown(),truncated:z.boolean().default(false)}).safeParse(data);
-    if(!parsed.success||parsed.data.results.some(r=>r.citation.archive_id!==this.config.archiveId))throw new ProviderError('invalid_response');
-    return {results:parsed.data.results,coverage:parsed.data.coverage,truncated:parsed.data.truncated};
+    const parsed=z.object({results:z.array(z.unknown()).max(20),coverage:z.unknown(),truncated:z.boolean().default(false),partial:z.boolean().default(false)}).safeParse(data);
+    if(!parsed.success)throw new ProviderError('invalid_response');
+    const results=[];let invalid=0;
+    for(const candidate of parsed.data.results){
+      const result=archiveResultSchema.safeParse(candidate);
+      if(!result.success){invalid++;continue;}
+      if(result.data.citation.archive_id!==this.config.archiveId)throw new ProviderError('invalid_response');
+      results.push(result.data);
+    }
+    return {results,coverage:{archive:parsed.data.coverage,invalid_results_skipped:invalid},truncated:parsed.data.truncated,partial:parsed.data.partial||invalid>0};
   }
   async recall(ref:string){
     const parsed=z.object({result:archiveResultSchema}).safeParse(await this.call('recall',{ref}));
