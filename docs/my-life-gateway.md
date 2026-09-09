@@ -88,3 +88,11 @@ dependencies. My Lifeâ€™s `tests/retrieval-db.test.ts`, with
 adapter against a migrated synthetic PostgreSQL archive and combines its
 results with a synthetic memory provider. This verifies the shared interface
 without accessing personal data or the production memory service.
+
+My Life shares a three-second database deadline across strict and relaxed search.
+The adapter uses a 15-second network timeout by default and accepts only 5–30
+seconds when configured programmatically. Search budget exhaustion is partial
+coverage (`search_incomplete`), not evidence of absence. Status can report
+`worker_stopped` while already indexed evidence is still searchable. Results
+preserve top-level `event_time.precision` and source-bound citation IDs; month,
+year and all-day bounds must not be interpreted as exact event instants.

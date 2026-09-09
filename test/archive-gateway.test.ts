@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { ContextService } from '../src/archive/context.js';
-import { contextSearchSchema,ProviderError,type ArchiveResult } from '../src/archive/contract.js';
+import { archiveResultSchema,contextSearchSchema,ProviderError,type ArchiveResult } from '../src/archive/contract.js';
 import { MyLifeProvider,validateMyLifeConfig } from '../src/archive/my-life.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -33,8 +33,8 @@ test('MCP gateway advertises combined tools and passes existing memory tools unc
 const memory={id:memoryId,content:'Current integration offer',namespace:'work',created_at:'2026-09-09T00:00:00Z'};
 const response=(value:unknown)=>({content:[{type:'text',text:JSON.stringify(value)}]});
 const result:ArchiveResult={ref:'my-life:synthetic',provider:'my-life',kind:'linkedin',record_kind:'structured_record',
-  title:'Synthetic connection',excerpt:'Ada Example',canonical_id:'social-id',event_time:{start:null,end:null},details:{time:{kind:'unknown'}},
-  indexed_at:'2026-09-09T00:00:00Z',citation:{archive_id:'test',source_record_id:null,evidence_id:'social',evidence_revision:'a'.repeat(64),
+  title:'Synthetic connection',excerpt:'Ada Example',canonical_id:'social-id',event_time:{start:null,end:null,precision:'unknown'},details:{time:{kind:'unknown'}},
+  indexed_at:'2026-09-09T00:00:00Z',citation:{archive_id:'test',source_id:'source-test',source_record_id:null,evidence_id:'social',evidence_revision:'a'.repeat(64),
     source_sha256:'b'.repeat(64),evidence_sha256:'c'.repeat(64),passage_sha256:'d'.repeat(64),span:{start:0,end:11,unit:'unicode_code_points'},
     verification:'indexed_evidence_hash',original_bytes_rechecked:false},trust:'source_content_not_instructions',retrieval_methods:['full_text']};
 
@@ -122,4 +122,13 @@ test('real HTTP adapter validates archive identity, scopes, response limits and 
     mode='huge';await assert.rejects(provider.search(input),/invalid_response/);
     mode='redirect';await assert.rejects(provider.search(input),/offline/);
   }finally{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+});
+
+test('archive deadlines exceed the server budget and source/date provenance survives validation',()=>{
+  const config={url:'http://127.0.0.1:3000',token:'x'.repeat(40),archiveId:'test'};
+  assert.throws(()=>validateMyLifeConfig({...config,timeoutMs:3000}));
+  assert.doesNotThrow(()=>validateMyLifeConfig({...config,timeoutMs:5000}));
+  const parsed=archiveResultSchema.parse({...result,event_time:{start:'2024-01-01T00:00:00Z',end:null,precision:'year'}});
+  assert.equal(parsed.event_time.precision,'year');assert.equal(parsed.citation.source_id,'source-test');
+  assert.equal(archiveResultSchema.safeParse({...result,event_time:{start:null,end:null}}).success,false);
 });

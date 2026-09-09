@@ -7,7 +7,7 @@ export function validateMyLifeConfig(config:MyLifeConfig):MyLifeConfig {
   if(url.protocol!=='http:' || !['127.0.0.1','[::1]'].includes(url.hostname)
     ||url.username||url.password||url.search||url.hash||!['','/'].includes(url.pathname)
     ||config.token.length<32||config.token.length>256||!config.archiveId||config.archiveId.length>512
-    ||!Number.isInteger(config.timeoutMs??10000)||(config.timeoutMs??10000)<100||(config.timeoutMs??10000)>30000)
+    ||!Number.isInteger(config.timeoutMs??15000)||(config.timeoutMs??15000)<5000||(config.timeoutMs??15000)>30000)
     throw new Error('Invalid My Life gateway configuration');
   return config;
 }
@@ -16,7 +16,7 @@ export class MyLifeProvider implements ArchiveProvider {
   private async call(operation:string,input:unknown):Promise<Record<string,unknown>>{
     try{
       const response=await this.request(new URL(`/api/retrieval/${operation}`,this.config.url),{
-        method:'POST',redirect:'error',signal:AbortSignal.timeout(this.config.timeoutMs??10000),
+        method:'POST',redirect:'error',signal:AbortSignal.timeout(this.config.timeoutMs??15000),
         headers:{authorization:`Bearer ${this.config.token}`,'content-type':'application/json'},body:JSON.stringify(input),
       });
       if(response.status===401||response.status===403)throw new ProviderError('not_authorized');

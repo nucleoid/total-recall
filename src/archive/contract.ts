@@ -28,16 +28,16 @@ export const contextSearchSchema = z.object({
 });
 export const contextRecallSchema=z.object({ref:z.string().min(1).max(4096)}).strict();
 export type ContextSearch=z.infer<typeof contextSearchSchema>;
-export type ProviderStatus='ok'|'partial'|'offline'|'timeout'|'write_outcome_unknown'|'not_authorized'|'not_configured'|'invalid_response'|'not_found'|'provider_error';
+export type ProviderStatus='ok'|'partial'|'offline'|'timeout'|'write_outcome_unknown'|'not_authorized'|'not_configured'|'invalid_response'|'not_found'|'worker_stopped'|'provider_error';
 export class ProviderError extends Error {
   constructor(readonly status:ProviderStatus){super(status);}
 }
 export const archiveResultSchema=z.object({
   ref:z.string().startsWith('my-life:').max(4096),provider:z.literal('my-life'),kind:z.string().max(64),
   record_kind:z.string().max(128),title:z.string().max(2048),excerpt:z.string().max(4800),
-  canonical_id:z.string().max(512),event_time:z.object({start:z.string().nullable(),end:z.string().nullable()}),
+  canonical_id:z.string().max(512),event_time:z.object({start:z.string().nullable(),end:z.string().nullable(),precision:z.enum(['instant','day','month','year','unknown'])}),
   details:z.record(z.unknown()),indexed_at:z.string(),
-  citation:z.object({archive_id:z.string(),source_record_id:z.string().nullable(),evidence_id:z.string(),evidence_revision:z.string(),
+  citation:z.object({archive_id:z.string(),source_id:z.string(),source_record_id:z.string().nullable(),evidence_id:z.string(),evidence_revision:z.string(),
     source_sha256:z.string(),evidence_sha256:z.string(),passage_sha256:z.string(),
     span:z.object({start:z.number().int(),end:z.number().int(),unit:z.literal('unicode_code_points')}),
     verification:z.enum(['indexed_evidence_hash','verified_normalized']),original_bytes_rechecked:z.boolean()}),
