@@ -88,7 +88,7 @@ test('real RLS: private copy, retries, tombstones, stale streams and detached em
       for(const text of texts){if(seen.has(text))throw new Error('archive_sync.duplicate_test_embedding');seen.add(text);}
       active++;peak=Math.max(peak,active);await new Promise(resolve=>setTimeout(resolve,20));active--;
       return embed(texts);
-    },()=>{});
+    },()=>{},0);
     assert.equal(seen.size,64);assert.ok(peak>=2&&peak<=4);
     assert.equal((await archiveSyncStatus(app,key,m9.archive_id)).pending,0);
     await owner.query('update api_keys set revoked_at=now() where id=$1',[key]);

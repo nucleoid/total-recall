@@ -45,7 +45,7 @@ not a login secret. A revoked or modified identity is not silently repaired.
 node dist/archive/sync-cli.js receive --archive-id ARCHIVE_ID --key-id SYNC_KEY_UUID
 
 # These operations run entirely from Total Recall's database after copying.
-node dist/archive/sync-cli.js embed --archive-id ARCHIVE_ID --key-id SYNC_KEY_UUID --batch-size 64 --concurrency 4
+node dist/archive/sync-cli.js embed --archive-id ARCHIVE_ID --key-id SYNC_KEY_UUID --batch-size 64 --concurrency 4 --request-interval-ms 4000
 node dist/archive/sync-cli.js status --archive-id ARCHIVE_ID --key-id SYNC_KEY_UUID
 ```
 
@@ -68,7 +68,13 @@ only if the selected content is still unchanged. Logs contain counters and
 failure codes, never record contents, SQL parameters or provider responses.
 
 Choose concurrency within the provider's quota and the database's capacity;
-increasing it does not bypass rate limits. A fatal partition failure stops new
+increasing it does not bypass rate limits. `--request-interval-ms` spaces request
+starts across all partitions (default 1000, range 0–120000). A Gemini 429 pauses
+all partitions for at least 60 seconds and increases the shared interval by 50%
+once per throttled burst. Subsequent starts retain that slower rate. These are
+operator pacing settings, not a claim about the account's provider quota.
+Non-retryable HTTP errors stop immediately; other failures retain bounded retries.
+A fatal partition failure stops new
 work and waits for the other bounded in-flight operations before releasing the
 archive lock. Restarting resumes rows that still need vectors.
 

@@ -3,7 +3,7 @@ import test from 'node:test';
 import {Readable} from 'node:stream';
 import {randomUUID} from 'node:crypto';
 import {protocolLines,recordSchema,manifestSchema,digest,recordKey,type SyncRecord,type SyncManifest} from '../src/archive/sync-format.js';
-import {parseSyncArgs,embeddingRanges} from '../src/archive/sync-cli.js';
+import {parseSyncArgs,embeddingRanges,safeFailureDetails,createEmbeddingPacer} from '../src/archive/sync-cli.js';
 
 export const fixtureRecord=(id='one',content='Synthetic historical evidence'):SyncRecord=>({
   type:'record',record_id:digest(id),chunk_index:0,origin:'evidence',kind:'email',title:'Synthetic email',content,
@@ -48,4 +48,32 @@ test('parallel embedding partitions cover the UUID space without gaps or overlap
   }
   for(const value of [0,9,1.5,NaN])assert.throws(()=>embeddingRanges(value));
   assert.throws(()=>parseSyncArgs(['embed','--archive-id','test','--key-id',randomUUID(),'--concurrency','9']));
+});
+test('failure diagnostics retain codes without exposing provider responses or database details',()=>{
+  assert.deepEqual(safeFailureDetails(new Error('Gemini batchEmbedContents failed (429): {"private":"DO_NOT_LOG"}')),{http_status:429});
+  assert.deepEqual(safeFailureDetails(Object.assign(new Error('private source text'),{code:'23514',detail:'DO_NOT_LOG'})),{database_code:'23514'});
+  assert.deepEqual(safeFailureDetails(new Error('unclassified private response')),{});
+  assert.deepEqual(safeFailureDetails('DO_NOT_LOG'),{});
+});
+
+test('shared pacer spaces concurrent requests and applies one slowdown per throttled burst',async()=>{
+  let time=0;const waits:number[]=[];
+  const pacer=createEmbeddingPacer(4000,()=>time,async ms=>{waits.push(ms);time+=ms;});
+  await Promise.all([pacer.wait(),pacer.wait(),pacer.wait()]);
+  assert.deepEqual(waits,[4000,4000]);
+  assert.deepEqual(pacer.throttle(2000),{request_interval_ms:6000,cooldown_ms:60000});
+  assert.deepEqual(pacer.throttle(3000),{request_interval_ms:6000,cooldown_ms:60000});
+  await pacer.wait();assert.equal(time,68000);
+  await pacer.wait();assert.equal(time,74000);
+  assert.equal(pacer.throttle(2000).request_interval_ms,9000);
+  for(const value of [-1,120001,0.1,NaN])assert.throws(()=>createEmbeddingPacer(value));
+});
+
+test('a cooldown extends requests that were already queued',async()=>{
+  let time=0;const waits:number[]=[];
+  const pacer=createEmbeddingPacer(1000,()=>time,async ms=>{
+    waits.push(ms);if(waits.length===1)pacer.throttle(2000);time+=ms;
+  });
+  await pacer.wait();await pacer.wait();
+  assert.deepEqual(waits,[1000,59000]);assert.equal(time,60000);
 });
