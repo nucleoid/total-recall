@@ -1065,3 +1065,7 @@ ordinary source writes. Run a call-free, write-free estimate with
 `npm run reflect -- --namespace <one> --dry-run`, then externally schedule the normal command for
 the last completed ISO week. No MCP/HTTP trigger or in-process scheduler is installed. See
 [docs/reflection-rollout-runbook.md](docs/reflection-rollout-runbook.md).
+
+## My Life historical context
+
+See [My Life gateway](docs/my-life-gateway.md) for a local stdio connection that combines Total Recall memories with historical evidence from all authorized My Life sources.
