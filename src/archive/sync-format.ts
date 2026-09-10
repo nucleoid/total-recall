@@ -17,13 +17,17 @@ export const recordSchema=z.object({type:z.literal('record'),record_id:sha,chunk
   content_sha256:sha,record_sha256:sha,event_at:z.string().datetime().nullable(),
   precision:z.enum(['instant','day','month','year','unknown']),source_ids:z.array(sha).min(1).max(256),
   evidence_sha256:sha.nullable(),original_bytes_rechecked:z.literal(false),
-}).strict().refine(value=>digest(value.content)===value.content_sha256);
+}).strict().refine(value=>digest(value.content)===value.content_sha256)
+  // Calendar bodies are normalized assertions; serialized components belong only in the source archive.
+  .refine(value=>!(value.kind==='calendar'||value.origin==='calendar_occurrence')||
+    !/BEGIN:(?:VCALENDAR|VEVENT|VALARM|VTIMEZONE)/i.test(value.content),{message:'archive_sync.raw_content_rejected'});
+export const REQUIRED_EXCLUSIONS=['raw_export_files','binary_media','attachment_bytes','unparsed_files','unpublished_or_removed_sources'] as const;
 const exported=z.object({status:z.literal('exported'),records:z.number().int().nonnegative()}).strict();
 export const completeSchema=z.object({type:z.literal('complete'),records:z.number().int().nonnegative(),
   chunks:z.number().int().nonnegative(),sha256:sha,
   coverage:z.object({evidence:exported,calendar_occurrence:exported,photo_media:exported,photo_sidecar:exported,timeline_event:exported,
     structured_record:z.union([exported,z.object({status:z.literal('not_installed'),records:z.literal(0)}).strict()])}).strict(),
-  exclusions:z.array(z.enum(['raw_export_files','binary_media','attachment_bytes','unparsed_files','unpublished_or_removed_sources'])),
+  exclusions:z.array(z.enum(REQUIRED_EXCLUSIONS)).refine(values=>REQUIRED_EXCLUSIONS.every(value=>values.includes(value))),
 }).strict();
 export type SyncManifest=z.infer<typeof manifestSchema>;
 export type SyncRecord=z.infer<typeof recordSchema>;

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { SYNC_NAMESPACE } from '../archive/sync-format.js';
 import { hybridSearch } from '../search.js';
 import { dbScopeFromAuth } from '../db.js';
 import type { AuthContext, SearchResult } from '../types.js';
@@ -39,7 +40,7 @@ export const searchSchema = z.object({
 });
 
 export function searchNamespaces(requested:string[]|undefined,allowed:string[]):string[]{
-  return filterNamespaces(requested,allowed).filter(namespace=>namespace!=='my-life'||requested?.includes('my-life'));
+  return filterNamespaces(requested,allowed).filter(namespace=>namespace!==SYNC_NAMESPACE||requested?.includes(SYNC_NAMESPACE));
 }
 
 export async function memorySearch(

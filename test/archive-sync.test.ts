@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {Readable} from 'node:stream';
 import {randomUUID} from 'node:crypto';
-import {protocolLines,recordSchema,manifestSchema,digest,recordKey,type SyncRecord,type SyncManifest} from '../src/archive/sync-format.js';
-import {parseSyncArgs,embeddingRanges,safeFailureDetails,createEmbeddingPacer} from '../src/archive/sync-cli.js';
+import {protocolLines,recordSchema,manifestSchema,completeSchema,REQUIRED_EXCLUSIONS,digest,recordKey,type SyncRecord,type SyncManifest} from '../src/archive/sync-format.js';
+import {parseSyncArgs,embeddingRanges,safeFailureDetails,createEmbeddingPacer,createEmbeddingFailureBudget} from '../src/archive/sync-cli.js';
 import {searchNamespaces} from '../src/tools/search.js';
 
 export const fixtureRecord=(id='one',content='Synthetic historical evidence'):SyncRecord=>({
@@ -99,4 +99,20 @@ test('pacing recovers after sustained success but ignores stale requests and nev
   assert.equal(pacer.intervalMs(),4000);
   for(let i=0;i<40;i++)pacer.succeeded(await pacer.wait());
   assert.equal(pacer.intervalMs(),4000);
+});
+
+
+test('receiver rejects raw Calendar markup and incomplete exclusion declarations',()=>{
+  for(const marker of ['VCALENDAR','VEVENT','VALARM','VTIMEZONE'])assert.ok(!recordSchema.safeParse({...fixtureRecord('cal','BEGIN:'+marker),kind:'calendar'}).success);
+  const complete={type:'complete',records:0,chunks:0,sha256:digest(''),exclusions:[...REQUIRED_EXCLUSIONS],
+    coverage:Object.fromEntries(['evidence','calendar_occurrence','photo_media','photo_sidecar','timeline_event','structured_record'].map(origin=>[origin,{status:'exported',records:0}]))};
+  assert.ok(completeSchema.safeParse(complete).success);
+  assert.ok(!completeSchema.safeParse({...complete,exclusions:[]}).success);
+});
+
+test('input-failure budget is shared across calls and ignores quota/auth failures',()=>{
+  const budget=createEmbeddingFailureBudget();
+  for(let i=0;i<100;i++)budget(new Error('Gemini batchEmbedContents failed (429): PRIVATE'));
+  for(let i=0;i<31;i++)budget(new Error('Gemini batchEmbedContents failed (400): PRIVATE'));
+  assert.throws(()=>budget(new Error('Gemini batchEmbedContents failed (413): PRIVATE')),/embedding_input_failure_budget/);
 });

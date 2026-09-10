@@ -42,6 +42,7 @@ async function startSnapshot(client:PoolClient,keyId:string,manifest:SyncManifes
       where memories.namespace='my-life' and memories.source='my-life:sync-state' and memories.access_level='sensitive' and memories.deleted_at is null`,
       [JSON.stringify({started_manifest:manifest,copy_in_progress:true}),keyId,`mylife:state:${manifest.archive_id}`]);
     if(saved.rowCount!==1)throw new Error('archive_sync.state_protected');
+    await retirePrivateEnrichment(client,keyId,[`mylife:state:${manifest.archive_id}`]);
   });
 }
 async function scoped<T>(client:PoolClient,keyId:string,work:()=>Promise<T>):Promise<T>{
@@ -157,7 +158,15 @@ export async function finalizeArchive(pool:Pool,keyId:string,archiveId:string,pr
   }finally{if(locked)await client.query('select pg_advisory_unlock(hashtextextended($1,0))',[lockName]).catch(()=>{});client.release();}
 }
 
-export async function receiveArchive(pool:Pool,input:Readable,keyId:string,archiveId:string,progress:Progress=()=>{}):Promise<Record<string,unknown>>{
+/** A wrong/empty source must never silently remove a substantial destination archive. */
+export function assertSnapshotSize(previous:SyncComplete|undefined,next:SyncComplete,allowShrink=false){
+  if(allowShrink||!previous)return;
+  if(Object.entries(previous.coverage).some(([origin,value])=>value.records>=100&&
+    (next.coverage[origin as keyof SyncComplete['coverage']]?.records??0)<value.records*0.9))
+    throw new Error('archive_sync.shrink_requires_override');
+}
+
+export async function receiveArchive(pool:Pool,input:Readable,keyId:string,archiveId:string,progress:Progress=()=>{},options:{allowShrink?:boolean}={}):Promise<Record<string,unknown>>{
   const client=await pool.connect();const hash=createHash('sha256');
   let manifest:SyncManifest|undefined,complete:SyncComplete|undefined;
   let rows:SyncRecord[]=[],received=0,records=0,written=0,lastId='',lastIndex=-1,locked=false,lastRecordHash='';
@@ -193,6 +202,10 @@ export async function receiveArchive(pool:Pool,input:Readable,keyId:string,archi
     if(Object.values(complete.coverage).reduce((sum,value)=>sum+value.records,0)!==records||
       Object.entries(complete.coverage).some(([origin,value])=>value.records!==(origins[origin]??0)))throw new Error('archive_sync.coverage_mismatch');
     if(rows.length)written+=await ingestBatch(client,keyId,manifest,rows);
+    await scoped(client,keyId,async()=>{
+      const previous=(await client.query("select metadata->'complete' complete from memories where client_id=$1 and source_key=$2",[keyId,`mylife:state:${archiveId}`])).rows[0]?.complete;
+      assertSnapshotSize(previous,complete!,options.allowShrink===true);
+    });
     await scoped(client,keyId,async()=>{
       const saved=await client.query(`update memories set metadata=jsonb_set(metadata,'{pending_finalization}',$3::jsonb)
         where client_id=$1 and source_key=$2 and namespace='my-life' and source='my-life:sync-state' and access_level='sensitive'`,
@@ -275,28 +288,34 @@ export async function embedArchiveBatch(pool:Pool,keyId:string,archiveId:string,
 /** Explicit operator retry after correcting a provider/input problem; no source drive needed. */
 export async function retryArchiveFailures(pool:Pool,keyId:string,archiveId:string){
   const client=await pool.connect();const lockName=`my-life-embed:${keyId}:${archiveId}`;let locked=false,total=0;
+  let cursor:string|null=null;
   try{
     await assertSafeSyncRole(client);await syncAuth(client,keyId);
     locked=(await client.query('select pg_try_advisory_lock(hashtextextended($1,0)) acquired',[lockName])).rows[0].acquired;
     if(!locked)throw new Error('archive_sync.embedding_already_running');
     for(;;){
-      const n=await scoped(client,keyId,async()=>{
+      const rows=await scoped(client,keyId,async()=>{
         const result=await client.query(`with targets as (select id from memories where client_id=$1 and namespace='my-life'
           and source='my-life' and source_key like $2 and access_level='sensitive' and embedding is null
           and deleted_at is null and superseded_at is null and consolidated_into_id is null
           and (expires_at is null or expires_at>statement_timestamp()) and metadata->'my_life'->'embedding_failure' is not null
+          and ($3::uuid is null or id>$3::uuid)
           order by id limit 500 for update)
-          update memories m set metadata=m.metadata #- '{my_life,embedding_failure}' from targets t where m.id=t.id`,
-          [keyId,archivePrefix(archiveId)+'%']);return result.rowCount??0;
+          update memories m set metadata=m.metadata #- '{my_life,embedding_failure}' from targets t where m.id=t.id returning m.id`,
+          [keyId,archivePrefix(archiveId)+'%',cursor]);return result.rows as {id:string}[];
       });
-      total+=n;if(!n)return {event:'archive_sync.failures_reset',records:total};
+      total+=rows.length;if(!rows.length)return {event:'archive_sync.failures_reset',records:total};
+      cursor=rows.map(row=>row.id).sort().at(-1)!;
     }
   }finally{if(locked)await client.query('select pg_advisory_unlock(hashtextextended($1,0))',[lockName]).catch(()=>{});client.release();}
 }
 
 export async function archiveSyncStatus(pool:Pool,keyId:string,archiveId:string){
   const client=await pool.connect();
-  try{await assertSafeSyncRole(client);return await scoped(client,keyId,async()=>({archive_id:archiveId,...(await client.query(`select count(*)::int chunks,
+  try{await assertSafeSyncRole(client);return await scoped(client,keyId,async()=>{
+    // Read-only aggregate over the complete archive needs more headroom than an ingest batch.
+    await client.query("set local statement_timeout='300s'");
+    return {archive_id:archiveId,...(await client.query(`select count(*)::int chunks,
     count(*) filter(where embedding is not null)::int embedded,
     count(*) filter(where embedding is null and access_level='sensitive' and metadata->'my_life'->'embedding_failure' is null)::int pending,
     count(*) filter(where embedding is null and access_level='sensitive' and metadata->'my_life'->'embedding_failure' is not null)::int failed,
@@ -307,5 +326,5 @@ export async function archiveSyncStatus(pool:Pool,keyId:string,archiveId:string)
     from memories where client_id=$1 and namespace='my-life' and source='my-life' and source_key like $2 and deleted_at is null
       and superseded_at is null and consolidated_into_id is null and (expires_at is null or expires_at>statement_timestamp())`,
     [keyId,archivePrefix(archiveId)+'%'])).rows[0],sync:(await client.query('select metadata from memories where client_id=$1 and source_key=$2',
-      [keyId,`mylife:state:${archiveId}`])).rows[0]?.metadata??null}));}finally{client.release();}
+      [keyId,`mylife:state:${archiveId}`])).rows[0]?.metadata??null};});}finally{client.release();}
 }

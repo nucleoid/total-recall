@@ -165,3 +165,13 @@ The integration test recreates that test database's public schema and applies
 all numbered migrations. It exercises real RLS and public list/recall functions,
 access ceilings, denied grants, interrupted copies, stale snapshots, repeated
 imports, protected manual deletion, concurrent edits, and embedding retries.
+
+## Additional recovery and boundary checks
+
+The receiver independently rejects serialized Calendar component markers in Calendar chunks and requires every declared exclusion in the completion trailer. This is a targeted guard, not a classifier of arbitrary private email prose: parsed email bodies can legitimately discuss file formats. Raw field exclusion is enforced by the reviewed source projections.
+
+A completed snapshot that decreases any previously substantial origin (at least 100 records) by more than 10% is refused before pruning. Inspect the source/database identity and coverage. Only for a deliberate removal, repeat `receive` with `--allow-shrink true`. Already committed new chunks remain visible; the prior completed snapshot is preserved and finalization cannot bypass the size guard.
+
+Each finite embedding run stops after 32 input-class provider failures across all batches and partitions, including bisect requests. This bounds extra paid requests for a systemic input problem. Fix the cause before explicitly restarting; `retry-failed` uses a UUID cursor to clear failure markers in batches of 500. Status aggregation has a separate five-minute read-only statement limit.
+
+The explicit archive opt-in applies to `memory_search`. Authorized `memory_list`, graph and transfer-export operations retain their existing namespace defaults; request namespaces explicitly when using those operations. No client gains additional permissions. Existing sensitive enrichment jobs are retired on the next corrected full snapshot; the state job is also retired at snapshot start. Existing deleted/quarantined leftovers require a scoped operator cleanup.

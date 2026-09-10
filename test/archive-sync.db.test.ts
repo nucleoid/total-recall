@@ -68,7 +68,7 @@ test('real RLS: private copy, retries, tombstones, stale streams and detached em
     assert.equal((await owner.query("select count(*)::int n from memories where source='my-life' and deleted_at is null")).rows[0].n,501,'partial writes do not prune old records');
     await assert.rejects(receiveArchive(app,fixtureStream(m4,[b]),key,m4.archive_id),/stale_snapshot/,'an interrupted newer snapshot also prevents rollback');
     const m6=fixtureManifest('2026-01-06T00:00:00.000Z');
-    const done=await receiveArchive(app,fixtureStream(m6,[b]),key,m6.archive_id);assert.equal(done.removed,500);
+    const done=await receiveArchive(app,fixtureStream(m6,[b]),key,m6.archive_id,()=>{},{allowShrink:true});assert.equal(done.removed,500);
     const m7=fixtureManifest('2026-01-07T00:00:00.000Z');await receiveArchive(app,fixtureStream(m7,[b,many[0]]),key,m7.archive_id);
     assert.equal((await archiveSyncStatus(app,key,m7.archive_id)).chunks,2,'sync removals can return on the next completed snapshot');
     const lock=await app.connect();try{
@@ -94,10 +94,14 @@ test('real RLS: private copy, retries, tombstones, stale streams and detached em
     const m10=fixtureManifest('2026-01-10T00:00:00.000Z');
     const prunable=Array.from({length:1200},(_,i)=>fixtureRecord('prunable-'+i,'Synthetic prune '+i));
     await receiveArchive(app,fixtureStream(m10,prunable),key,m10.archive_id);
+    await owner.query(`update memories set metadata=jsonb_set(metadata,'{my_life,embedding_failure}','{"code":"synthetic"}') where source='my-life' and deleted_at is null`);
+    assert.equal((await retryArchiveFailures(app,key,m10.archive_id)).records,1200,'failure reset crosses multiple cursor batches');
     const m11=fixtureManifest('2026-01-11T00:00:00.000Z');
+    await assert.rejects(receiveArchive(app,fixtureStream(m11,[]),key,m11.archive_id),/shrink_requires_override/);
+    assert.equal((await archiveSyncStatus(app,key,m11.archive_id)).chunks,1200,'wrong empty source cannot prune');
     await assert.rejects(receiveArchive(app,fixtureStream(m11,[]),key,m11.archive_id,value=>{
       if(value.event==='archive_sync.prune_progress')throw new Error('synthetic_finalization_interruption');
-    }),/synthetic_finalization_interruption/);
+    },{allowShrink:true}),/synthetic_finalization_interruption/);
     const interrupted=await archiveSyncStatus(app,key,m11.archive_id);
     assert.equal(interrupted.chunks,700);assert.equal(interrupted.sync.copy_in_progress,true);
     assert.equal(interrupted.sync.pending_finalization.removed,500);
@@ -124,6 +128,11 @@ test('real RLS: private copy, retries, tombstones, stale streams and detached em
     await runEmbeddingWorker(app,key,m12.archive_id,64,1,embed,()=>{},0);
     assert.equal((await archiveSyncStatus(app,key,m12.archive_id)).failed,0);
     assert.equal((await owner.query("select count(*)::int n from entity_enrichment_queue where namespace='my-life' and status in ('pending','retry','processing')")).rows[0].n,0);
+    const m13=fixtureManifest('2026-01-13T00:00:00.000Z');
+    await receiveArchive(app,fixtureStream(m13,Array.from({length:40},(_,i)=>fixtureRecord('budget-'+i,'Rejected synthetic '+i))),key,m13.archive_id);
+    let requests=0;
+    await assert.rejects(runEmbeddingWorker(app,key,m13.archive_id,1,1,async()=>{requests++;throw new Error('Gemini batchEmbedContents failed (400): PRIVATE');},()=>{},0),/embedding_input_failure_budget/);
+    assert.equal(requests,32,'systemic failures stop across separate batches');
     await owner.query('update api_keys set revoked_at=now() where id=$1',[key]);
     await assert.rejects(embedArchiveBatch(app,key,m7.archive_id,64,embed),/identity_denied/);
     await assert.rejects(provisionArchiveSync(app,'synthetic-archive',[home]),/identity_requires_operator_recovery/);

@@ -19,6 +19,15 @@ export function safeFailureDetails(error:unknown):{http_status?:number;database_
     ...typeof code==='string'&&/^[0-9A-Z]{5}$/.test(code)?{database_code:code}:{}};
 }
 
+/** Shared across partitions and batches; bound billed bisect amplification for this finite run. */
+export function createEmbeddingFailureBudget(limit=32){
+  let failures=0;
+  return (error:unknown)=>{
+    if([400,413,422].includes(safeFailureDetails(error).http_status??0)&&++failures>=limit)
+      throw new Error('archive_sync.embedding_input_failure_budget');
+  };
+}
+
 /** Serialize request starts across partitions, including retries already waiting. */
 export function createEmbeddingPacer(intervalMs:number,now:()=>number=()=>performance.now(),sleep:(ms:number)=>Promise<unknown>=delay){
   if(!Number.isInteger(intervalMs)||intervalMs<0||intervalMs>120000)throw new Error('archive_sync.embedding_interval_limit');
@@ -60,7 +69,7 @@ export function parseSyncArgs(args:string[]){
   if(!['provision','receive','finalize','embed','retry-failed','status'].includes(command))throw new Error('archive_sync.command_required');
   const options=new Map<string,string>();
   const allowed=command==='provision'?['--archive-id','--reader-keys']:command==='embed'
-    ?['--archive-id','--key-id','--batch-size','--concurrency','--request-interval-ms']:['--archive-id','--key-id'];
+    ?['--archive-id','--key-id','--batch-size','--concurrency','--request-interval-ms']:command==='receive'?['--archive-id','--key-id','--allow-shrink']:['--archive-id','--key-id'];
   for(let i=0;i<rest.length;i+=2){
     if(!allowed.includes(rest[i])||!rest[i+1]||rest[i+1].startsWith('--')||options.has(rest[i]))throw new Error('archive_sync.invalid_option');
     options.set(rest[i],rest[i+1]);
@@ -72,7 +81,8 @@ export function parseSyncArgs(args:string[]){
   if(!Number.isInteger(batchSize)||batchSize<1||batchSize>100)throw new Error('archive_sync.embedding_batch_limit');
   const concurrency=Number(options.get('--concurrency')??1);embeddingRanges(concurrency);
   const requestIntervalMs=Number(options.get('--request-interval-ms')??1000);createEmbeddingPacer(requestIntervalMs);
-  return {command,archiveId,keyId,batchSize,concurrency,requestIntervalMs,readerIds:(options.get('--reader-keys')??'').split(',').filter(Boolean)};
+  if(options.has('--allow-shrink')&&options.get('--allow-shrink')!=='true')throw new Error('archive_sync.invalid_option');
+  return {command,archiveId,keyId,batchSize,concurrency,requestIntervalMs,allowShrink:options.get('--allow-shrink')==='true',readerIds:(options.get('--reader-keys')??'').split(',').filter(Boolean)};
 }
 
 export function embeddingRanges(concurrency:number){
@@ -85,6 +95,7 @@ export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:str
   embedder:(texts:string[])=>Promise<EmbeddingResult[]>=embedBatchWithProfile,progress:(value:unknown)=>void=log,requestIntervalMs=1000){
   const ranges=embeddingRanges(concurrency);
   const pacer=createEmbeddingPacer(requestIntervalMs);
+  const recordInputFailure=createEmbeddingFailureBudget();
   // A separate session lock prevents duplicate provider charges from two workers.
   const lockClient=await pool.connect();let locked=false;
   let authTail:Promise<unknown>=Promise.resolve();
@@ -108,7 +119,8 @@ export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:str
               if(stopped)throw new Error('archive_sync.embedding_stopped');
               // A cooldown may last minutes. Recheck revocation immediately before sending.
               const authCheck=authTail.then(()=>syncAuth(lockClient,keyId));authTail=authCheck.catch(()=>{});await authCheck;
-              const result=await embedder(texts);
+              let result:EmbeddingResult[];
+              try{result=await embedder(texts);}catch(error){recordInputFailure(error);throw error;}
               const recovered=pacer.succeeded(requestGeneration);
               if(recovered)progress({event:'archive_sync.embedding_rate_recovery',...recovered});
               return result;
@@ -154,7 +166,7 @@ async function main(){
   const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,max:Math.max(3,options.concurrency+1)});
   try{
     if(options.command==='provision')log(await provisionArchiveSync(pool,options.archiveId,options.readerIds));
-    else if(options.command==='receive')await receiveArchive(pool,process.stdin,options.keyId,options.archiveId,log);
+    else if(options.command==='receive')await receiveArchive(pool,process.stdin,options.keyId,options.archiveId,log,{allowShrink:options.allowShrink});
     else if(options.command==='finalize')log(await finalizeArchive(pool,options.keyId,options.archiveId,log));
     else if(options.command==='retry-failed')log(await retryArchiveFailures(pool,options.keyId,options.archiveId));
     else if(options.command==='status')log(await archiveSyncStatus(pool,options.keyId,options.archiveId));
