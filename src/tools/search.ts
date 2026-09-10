@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { SYNC_NAMESPACE } from '../archive/sync-format.js';
 import { hybridSearch } from '../search.js';
 import { dbScopeFromAuth } from '../db.js';
 import type { AuthContext, SearchResult } from '../types.js';
@@ -18,7 +19,7 @@ const offsetDateTime = z.string().datetime({ offset: true });
 
 export const searchSchema = z.object({
   query: z.string().min(1).max(MEMORY_CONTENT_MAX_CHARS),
-  namespaces: z.array(boundedText).max(TAG_MAX_COUNT).optional(),
+  namespaces: z.array(boundedText).max(TAG_MAX_COUNT).optional().describe('Namespaces to search. Include my-life explicitly for historical archive evidence; default searches exclude my-life.'),
   limit: z.number().int().min(1).max(50).default(10),
   threshold: z.number().min(0).max(1).default(0.3),
   tags: z.array(z.string().min(1).max(TAG_MAX_CHARS)).max(TAG_MAX_COUNT).optional(),
@@ -38,12 +39,16 @@ export const searchSchema = z.object({
   }
 });
 
+export function searchNamespaces(requested:string[]|undefined,allowed:string[]):string[]{
+  return filterNamespaces(requested,allowed).filter(namespace=>namespace!==SYNC_NAMESPACE||requested?.includes(SYNC_NAMESPACE));
+}
+
 export async function memorySearch(
   params: z.infer<typeof searchSchema>,
   auth: AuthContext
 ): Promise<SearchResult[]> {
   checkPermission(auth, 'read');
-  const namespaces = filterNamespaces(params.namespaces, auth.namespaces);
+  const namespaces = searchNamespaces(params.namespaces, auth.namespaces);
   if (namespaces.length === 0) {
     await logAudit({ clientId: auth.keyId, action: 'memory.search', resourceType: 'search', resultCount: 0 }, dbScopeFromAuth(auth));
     return [];

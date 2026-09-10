@@ -465,12 +465,8 @@ export async function executeHybridSearch(
       text_scores AS (
         SELECT id,
           ts_rank_cd(to_tsvector('english', content), plainto_tsquery(${pQuery})) AS text_score
-        FROM memories m
-        WHERE namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
-          AND m.deleted_at IS NULL
-          AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
-          ${consolidationVisibility}
-          AND to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
+        FROM combined
+        WHERE to_tsvector('english', content) @@ plainto_tsquery(${pQuery})
       ),
       scored AS MATERIALIZED (
         SELECT c.*,
