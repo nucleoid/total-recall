@@ -27,16 +27,21 @@ export async function syncAuth(client:PoolClient,keyId:string):Promise<AuthConte
 async function startSnapshot(client:PoolClient,keyId:string,manifest:SyncManifest):Promise<void>{
   if(Date.parse(manifest.as_of)>Date.now()+300000)throw new Error('archive_sync.future_snapshot');
   await scoped(client,keyId,async()=>{
-    const state=(await client.query(`select metadata from memories where client_id=$1 and source_key=$2`,
-      [keyId,`mylife:state:${manifest.archive_id}`])).rows[0]?.metadata;
+    const stateRow=(await client.query(`select access_level,source,namespace,deleted_at,
+      case when access_level='sensitive' and source='my-life:sync-state' and namespace='my-life' then metadata else null end metadata
+      from memories where client_id=$1 and source_key=$2`,[keyId,`mylife:state:${manifest.archive_id}`])).rows[0];
+    if(stateRow&&(stateRow.access_level!=='sensitive'||stateRow.source!=='my-life:sync-state'||stateRow.namespace!=='my-life'||stateRow.deleted_at))throw new Error('archive_sync.state_protected');
+    const state=stateRow?.metadata;
     const prior=state?.started_manifest??state?.manifest;
+    if(state?.pending_finalization)throw new Error('archive_sync.finalization_required');
     if(prior&&(Date.parse(prior.as_of)>Date.parse(manifest.as_of)||
       (prior.as_of===manifest.as_of&&prior.snapshot_id!==manifest.snapshot_id)))throw new Error('archive_sync.stale_snapshot');
-    await client.query(`insert into memories(content,source,namespace,tags,metadata,access_level,client_id,source_key,memory_kind,valid_from,decay_rate)
+    const saved=await client.query(`insert into memories(content,source,namespace,tags,metadata,access_level,client_id,source_key,memory_kind,valid_from,decay_rate)
       values('My Life archive synchronization status','my-life:sync-state','my-life',array['my-life','sync-status'],$1,'sensitive',$2,$3,'synced',statement_timestamp(),0)
       on conflict(client_id,source_key) do update set metadata=memories.metadata||excluded.metadata,updated_at=statement_timestamp()
-      where memories.namespace='my-life' and memories.source='my-life:sync-state'`,
+      where memories.namespace='my-life' and memories.source='my-life:sync-state' and memories.access_level='sensitive' and memories.deleted_at is null`,
       [JSON.stringify({started_manifest:manifest,copy_in_progress:true}),keyId,`mylife:state:${manifest.archive_id}`]);
+    if(saved.rowCount!==1)throw new Error('archive_sync.state_protected');
   });
 }
 async function scoped<T>(client:PoolClient,keyId:string,work:()=>Promise<T>):Promise<T>{
@@ -47,7 +52,15 @@ async function scoped<T>(client:PoolClient,keyId:string,work:()=>Promise<T>):Pro
     await client.query("select set_config('app.current_key_id',$1,true)",[keyId]);
     await client.query("set local lock_timeout='5s'");await client.query("set local statement_timeout='60s'");
     const result=await work();await client.query('commit');return result;
-  }catch(error){await client.query('rollback');throw error;}
+  }catch(error){await client.query('rollback').catch(()=>{});throw error;}
+}
+
+async function retirePrivateEnrichment(client:PoolClient,keyId:string,keys:string[]){
+  // Resolve trigger-created jobs without exposing sensitive sources to a normal-only worker.
+  await client.query(`update entity_enrichment_queue q set status='done',locked_at=null,completed_at=statement_timestamp(),
+    last_error_code='archive_sync.sensitive_source_excluded',updated_at=statement_timestamp()
+    from memories m where q.memory_id=m.id and q.namespace='my-life' and m.namespace='my-life' and m.client_id=$1
+      and m.access_level='sensitive' and m.source_key=any($2::text[]) and q.status in ('pending','retry','processing')`,[keyId,keys]);
 }
 
 export async function ingestBatch(client:PoolClient,keyId:string,manifest:SyncManifest,rows:SyncRecord[]):Promise<number>{
@@ -79,31 +92,69 @@ export async function ingestBatch(client:PoolClient,keyId:string,manifest:SyncMa
         and (memories.deleted_at is null or memories.metadata->'my_life'->>'removed_by_sync'='true')`,
       [keyId,rows.map(row=>row.content),rows.map(row=>recordKey(manifest,row)),metadata,rows.map(row=>row.event_at),rows.map(row=>row.kind),
         profile.provider,profile.model,profile.dimensions]);
+    await retirePrivateEnrichment(client,keyId,rows.map(row=>recordKey(manifest,row)));
     return result.rowCount??0;
   });
 }
 
-async function finishSnapshot(client:PoolClient,keyId:string,manifest:SyncManifest,complete:SyncComplete):Promise<number>{
+async function commitSnapshot(client:PoolClient,keyId:string,manifest:SyncManifest,complete:SyncComplete,removed:number):Promise<number>{
   return scoped(client,keyId,async()=>{
-    // Only a verified whole snapshot can remove prior managed copies. Explicit
-    // user tombstones and superseded records never become active via sync.
-    const removed=await client.query(`update memories set deleted_at=statement_timestamp(),updated_at=statement_timestamp(),
-      metadata=jsonb_set(metadata,'{my_life,removed_by_sync}','true')
-      where client_id=$1 and namespace='my-life' and source='my-life' and access_level='sensitive'
-        and source_key like $2 and metadata->'my_life'->>'archive_id'=$3
-        and metadata->'my_life'->>'snapshot_id' is distinct from $4
-        and deleted_at is null and superseded_at is null and consolidated_into_id is null`,
-      [keyId,archivePrefix(manifest.archive_id)+'%',manifest.archive_id,manifest.snapshot_id]);
-    await client.query(`insert into memories(content,source,namespace,tags,metadata,access_level,client_id,source_key,memory_kind,valid_from,decay_rate)
+    const saved=await client.query(`insert into memories(content,source,namespace,tags,metadata,access_level,client_id,source_key,memory_kind,valid_from,decay_rate)
       values('My Life archive synchronization status','my-life:sync-state','my-life',array['my-life','sync-status'],$1,'sensitive',$2,$3,'synced',statement_timestamp(),0)
       on conflict(client_id,source_key) do update set metadata=excluded.metadata,updated_at=statement_timestamp()
-      where memories.namespace='my-life' and memories.source='my-life:sync-state'`,
-      [JSON.stringify({manifest,started_manifest:manifest,complete,copy_in_progress:false,finished_at:new Date().toISOString()}),keyId,`mylife:state:${manifest.archive_id}`]);
+      where memories.namespace='my-life' and memories.source='my-life:sync-state' and memories.access_level='sensitive' and memories.deleted_at is null`,
+      [JSON.stringify({manifest,started_manifest:manifest,complete,removed,copy_in_progress:false,finished_at:new Date().toISOString()}),keyId,`mylife:state:${manifest.archive_id}`]);
+    if(saved.rowCount!==1)throw new Error('archive_sync.state_protected');
     await client.query(`insert into audit_log(client_id,action,namespace,resource_type,resource_id,details)
       values($1,'archive.sync_complete','my-life','archive',$2,$3)`,[keyId,manifest.archive_id,
-      JSON.stringify({snapshot_id:manifest.snapshot_id,records:complete.records,chunks:complete.chunks,removed:removed.rowCount??0})]);
-    return removed.rowCount??0;
+      JSON.stringify({snapshot_id:manifest.snapshot_id,records:complete.records,chunks:complete.chunks,removed})]);
+    await retirePrivateEnrichment(client,keyId,[`mylife:state:${manifest.archive_id}`]);
+    return removed;
   });
+}
+
+async function finishSnapshot(client:PoolClient,keyId:string,archiveId:string,progress:Progress):Promise<number>{
+  for(;;){
+    const batch=await scoped(client,keyId,async()=>{
+      const key=`mylife:state:${archiveId}`;
+      const state=(await client.query("select metadata from memories where client_id=$1 and source_key=$2 and namespace='my-life' and source='my-life:sync-state' and access_level='sensitive' and deleted_at is null for update",[keyId,key])).rows[0]?.metadata;
+      const pending=state?.pending_finalization;
+      if(!pending&&state?.copy_in_progress===false&&state.manifest?.archive_id===archiveId){
+        return {manifest:manifestSchema.parse(state.manifest),complete:completeSchema.parse(state.complete),removed:Number(state.removed??0),count:0,alreadyComplete:true};
+      }
+      if(!pending)throw new Error('archive_sync.verified_trailer_required');
+      const manifest=manifestSchema.parse(pending.manifest),complete=completeSchema.parse(pending.complete);
+      if(manifest.archive_id!==archiveId||state.started_manifest?.snapshot_id!==manifest.snapshot_id)throw new Error('archive_sync.finalization_state_mismatch');
+      const rows=(await client.query(`select id,source_key from memories where client_id=$1 and namespace='my-life' and source='my-life' and access_level='sensitive'
+        and source_key like $2 and metadata->'my_life'->>'archive_id'=$3 and metadata->'my_life'->>'snapshot_id' is distinct from $4
+        and deleted_at is null and superseded_at is null and consolidated_into_id is null
+        and (expires_at is null or expires_at>statement_timestamp()) and ($5::uuid is null or id>$5::uuid)
+        order by id limit 500 for update`,[keyId,archivePrefix(archiveId)+'%',archiveId,manifest.snapshot_id,pending.cursor??null])).rows;
+      if(rows.length){
+        await client.query(`update memories set deleted_at=statement_timestamp(),updated_at=statement_timestamp(),
+          metadata=jsonb_set(metadata,'{my_life,removed_by_sync}','true') where id=any($1::uuid[])`,[rows.map(row=>row.id)]);
+        await retirePrivateEnrichment(client,keyId,rows.map(row=>row.source_key));
+        pending.cursor=rows.at(-1)!.id;pending.removed+=rows.length;
+        await client.query("update memories set metadata=jsonb_set(metadata,'{pending_finalization}',$3::jsonb) where client_id=$1 and source_key=$2",[keyId,key,JSON.stringify(pending)]);
+      }
+      return {manifest,complete,removed:pending.removed as number,count:rows.length,alreadyComplete:false};
+    });
+    if(batch.alreadyComplete)return batch.removed;
+    if(!batch.count)return commitSnapshot(client,keyId,batch.manifest,batch.complete,batch.removed);
+    progress({event:'archive_sync.prune_progress',removed:batch.removed});
+  }
+}
+
+/** Resume a hash-verified trailer without the source drive or another stream. */
+export async function finalizeArchive(pool:Pool,keyId:string,archiveId:string,progress:Progress=()=>{}){
+  const client=await pool.connect();let locked=false;const lockName=`my-life-sync:${keyId}:${archiveId}`;
+  try{
+    await assertSafeSyncRole(client);await syncAuth(client,keyId);
+    locked=(await client.query('select pg_try_advisory_lock(hashtextextended($1,0)) acquired',[lockName])).rows[0].acquired;
+    if(!locked)throw new Error('archive_sync.already_running');
+    const removed=await finishSnapshot(client,keyId,archiveId,progress);
+    return {event:'archive_sync.finalized',archive_id:archiveId,removed};
+  }finally{if(locked)await client.query('select pg_advisory_unlock(hashtextextended($1,0))',[lockName]).catch(()=>{});client.release();}
 }
 
 export async function receiveArchive(pool:Pool,input:Readable,keyId:string,archiveId:string,progress:Progress=()=>{}):Promise<Record<string,unknown>>{
@@ -142,7 +193,13 @@ export async function receiveArchive(pool:Pool,input:Readable,keyId:string,archi
     if(Object.values(complete.coverage).reduce((sum,value)=>sum+value.records,0)!==records||
       Object.entries(complete.coverage).some(([origin,value])=>value.records!==(origins[origin]??0)))throw new Error('archive_sync.coverage_mismatch');
     if(rows.length)written+=await ingestBatch(client,keyId,manifest,rows);
-    const removed=await finishSnapshot(client,keyId,manifest,complete);
+    await scoped(client,keyId,async()=>{
+      const saved=await client.query(`update memories set metadata=jsonb_set(metadata,'{pending_finalization}',$3::jsonb)
+        where client_id=$1 and source_key=$2 and namespace='my-life' and source='my-life:sync-state' and access_level='sensitive'`,
+        [keyId,`mylife:state:${archiveId}`,JSON.stringify({manifest,complete,cursor:null,removed:0})]);
+      if(saved.rowCount!==1)throw new Error('archive_sync.state_protected');
+    });
+    const removed=await finishSnapshot(client,keyId,archiveId,progress);
     const result={event:'archive_sync.copy_complete',archive_id:archiveId,snapshot_id:manifest.snapshot_id,records,received,written,
       protected:received-written,removed,coverage:complete.coverage};progress(result);return result;
   }finally{
@@ -153,7 +210,7 @@ export async function receiveArchive(pool:Pool,input:Readable,keyId:string,archi
 
 export async function embedArchiveBatch(pool:Pool,keyId:string,archiveId:string,limit=64,
   embedder:(texts:string[])=>Promise<EmbeddingResult[]>=embedBatchWithProfile,afterId:string|null=null,
-  range:{lower:string|null;upper:string|null}={lower:null,upper:null}):Promise<{selected:number;written:number;cursor:string|null}>{
+  range:{lower:string|null;upper:string|null}={lower:null,upper:null}):Promise<{selected:number;written:number;failed:number;cursor:string|null}>{
   if(!Number.isInteger(limit)||limit<1||limit>100)throw new Error('archive_sync.embedding_batch_limit');
   const client=await pool.connect();
   try{
@@ -162,20 +219,42 @@ export async function embedArchiveBatch(pool:Pool,keyId:string,archiveId:string,
       from memories where client_id=$1 and namespace='my-life' and source='my-life' and access_level='sensitive'
         and source_key like $2 and embedding is null and deleted_at is null and superseded_at is null and consolidated_into_id is null
         and (expires_at is null or expires_at>statement_timestamp())
+        and metadata->'my_life'->'embedding_failure' is null
         and ($4::uuid is null or id>$4::uuid)
         and ($5::uuid is null or id>=$5::uuid) and ($6::uuid is null or id<$6::uuid)
       order by id limit $3`,[keyId,archivePrefix(archiveId)+'%',limit,afterId,range.lower,range.upper])).rows);
-    if(!rows.length)return {selected:0,written:0,cursor:afterId};
+    if(!rows.length)return {selected:0,written:0,failed:0,cursor:afterId};
+    let written=0,failed=0;
     // External provider work never holds a database transaction or source-drive connection.
-    const embedded=await embedder(rows.map(row=>row.content));
-    if(embedded.length!==rows.length)throw new Error('archive_sync.embedding_count');
+    const processRows=async(group:typeof rows):Promise<void>=>{
+    let embedded:EmbeddingResult[];
+    try{embedded=await embedder(group.map(row=>row.content));}
+    catch(error){
+      const code=error instanceof Error?/^(?:Gemini (?:batchEmbedContents|embedContent)|Ollama embed) failed \((400|413|422)\):/.exec(error.message)?.[1]:undefined;
+      if(!code)throw error; // Authentication, quotas and service failures are never poison records.
+      if(group.length>1){const middle=Math.ceil(group.length/2);await processRows(group.slice(0,middle));await processRows(group.slice(middle));return;}
+      const row=group[0];
+      failed+=await scoped(client,keyId,async()=>{
+        const result=await client.query(`update memories set metadata=jsonb_set(metadata,'{my_life,embedding_failure}',$5::jsonb)
+          where id=$1 and client_id=$2 and namespace='my-life' and source='my-life' and access_level='sensitive'
+            and content=$3 and metadata->'my_life'->>'content_sha256'=$4 and embedding is null
+            and deleted_at is null and superseded_at is null and consolidated_into_id is null
+            and (expires_at is null or expires_at>statement_timestamp())`,
+          [row.id,keyId,row.content,row.content_sha256,JSON.stringify({code:`http_${code}`,model:ACTIVE_EMBEDDING_PROFILE.model})]);
+        return result.rowCount??0;
+      });
+      // A widespread request/configuration problem must not generate a whole-corpus bisect storm.
+      if(failed>=8)throw new Error('archive_sync.embedding_records_failed');
+      return;
+    }
+    if(embedded.length!==group.length)throw new Error('archive_sync.embedding_count');
     const profile=ACTIVE_EMBEDDING_PROFILE;
     const vectors=embedded.map(result=>{
       if(result.provider!==profile.provider||result.model!==profile.model||result.dimensions!==profile.dimensions)
         throw new Error('archive_sync.embedding_profile');
       return serializeEmbeddingVector(result.vector);
     });
-    return scoped(client,keyId,async()=>{
+    written+=await scoped(client,keyId,async()=>{
       const result=await client.query(`update memories m set embedding=u.vector::vector,
         embedding_provider=$5,embedding_model=$6,embedding_dimensions=$7
         from unnest($2::uuid[],$3::text[],$4::text[],$8::text[]) u(id,vector,content_sha256,content)
@@ -184,17 +263,43 @@ export async function embedArchiveBatch(pool:Pool,keyId:string,archiveId:string,
           and m.deleted_at is null and m.superseded_at is null and m.consolidated_into_id is null
           and (m.expires_at is null or m.expires_at>statement_timestamp())
           and m.embedding_provider is null and m.embedding_model is null and m.embedding_dimensions is null`,
-        [keyId,rows.map(row=>row.id),vectors,rows.map(row=>row.content_sha256),profile.provider,profile.model,profile.dimensions,rows.map(row=>row.content)]);
-      return {selected:rows.length,written:result.rowCount??0,cursor:rows.at(-1)!.id};
+        [keyId,group.map(row=>row.id),vectors,group.map(row=>row.content_sha256),profile.provider,profile.model,profile.dimensions,group.map(row=>row.content)]);
+      return result.rowCount??0;
     });
+    };
+    await processRows(rows);
+    return {selected:rows.length,written,failed,cursor:rows.at(-1)!.id};
   }finally{client.release();}
+}
+
+/** Explicit operator retry after correcting a provider/input problem; no source drive needed. */
+export async function retryArchiveFailures(pool:Pool,keyId:string,archiveId:string){
+  const client=await pool.connect();const lockName=`my-life-embed:${keyId}:${archiveId}`;let locked=false,total=0;
+  try{
+    await assertSafeSyncRole(client);await syncAuth(client,keyId);
+    locked=(await client.query('select pg_try_advisory_lock(hashtextextended($1,0)) acquired',[lockName])).rows[0].acquired;
+    if(!locked)throw new Error('archive_sync.embedding_already_running');
+    for(;;){
+      const n=await scoped(client,keyId,async()=>{
+        const result=await client.query(`with targets as (select id from memories where client_id=$1 and namespace='my-life'
+          and source='my-life' and source_key like $2 and access_level='sensitive' and embedding is null
+          and deleted_at is null and superseded_at is null and consolidated_into_id is null
+          and (expires_at is null or expires_at>statement_timestamp()) and metadata->'my_life'->'embedding_failure' is not null
+          order by id limit 500 for update)
+          update memories m set metadata=m.metadata #- '{my_life,embedding_failure}' from targets t where m.id=t.id`,
+          [keyId,archivePrefix(archiveId)+'%']);return result.rowCount??0;
+      });
+      total+=n;if(!n)return {event:'archive_sync.failures_reset',records:total};
+    }
+  }finally{if(locked)await client.query('select pg_advisory_unlock(hashtextextended($1,0))',[lockName]).catch(()=>{});client.release();}
 }
 
 export async function archiveSyncStatus(pool:Pool,keyId:string,archiveId:string){
   const client=await pool.connect();
   try{await assertSafeSyncRole(client);return await scoped(client,keyId,async()=>({archive_id:archiveId,...(await client.query(`select count(*)::int chunks,
     count(*) filter(where embedding is not null)::int embedded,
-    count(*) filter(where embedding is null and access_level='sensitive')::int pending,
+    count(*) filter(where embedding is null and access_level='sensitive' and metadata->'my_life'->'embedding_failure' is null)::int pending,
+    count(*) filter(where embedding is null and access_level='sensitive' and metadata->'my_life'->'embedding_failure' is not null)::int failed,
     count(*) filter(where access_level<>'sensitive')::int protected,
     case when bool_or(access_level='normal') then 'normal' when bool_or(access_level='sensitive') then 'sensitive'
       when bool_or(access_level='secret') then 'secret' end minimum_access_level,

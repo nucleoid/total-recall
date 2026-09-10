@@ -4,7 +4,7 @@ import {pathToFileURL} from 'node:url';
 import {setTimeout as delay} from 'node:timers/promises';
 import {archiveIdSchema} from './sync-format.js';
 import {embedBatchWithProfile,type EmbeddingResult} from '../embedding.js';
-import {archiveSyncStatus,assertSafeSyncRole,embedArchiveBatch,receiveArchive,syncAuth} from './sync-store.js';
+import {archiveSyncStatus,assertSafeSyncRole,embedArchiveBatch,receiveArchive,finalizeArchive,retryArchiveFailures,syncAuth} from './sync-store.js';
 import {provisionArchiveSync} from './sync-admin.js';
 
 dotenv.config({quiet:true} as dotenv.DotenvConfigOptions);
@@ -22,30 +22,42 @@ export function safeFailureDetails(error:unknown):{http_status?:number;database_
 /** Serialize request starts across partitions, including retries already waiting. */
 export function createEmbeddingPacer(intervalMs:number,now:()=>number=()=>performance.now(),sleep:(ms:number)=>Promise<unknown>=delay){
   if(!Number.isInteger(intervalMs)||intervalMs<0||intervalMs>120000)throw new Error('archive_sync.embedding_interval_limit');
-  let nextStart=0,interval=intervalMs,cooldownUntil=0,tail=Promise.resolve();
+  let nextStart=0,interval=intervalMs,cooldownUntil=0,tail=Promise.resolve(0),generation=0,successes=0,lastChange=0;
   return {
     wait(){
       const pending=tail.then(async()=>{
         // A throttled in-flight request can extend the deadline during this wait.
         while(nextStart>now())await sleep(nextStart-now());
         nextStart=now()+interval;
+        return generation;
       });
-      tail=pending.catch(()=>{});return pending;
+      tail=pending.catch(()=>generation);return pending;
     },
     throttle(waitMs:number){
       const time=now();
       // One burst can produce several 429s. Reduce the rate once per cooldown.
-      if(time>=cooldownUntil)interval=Math.min(120000,Math.ceil(Math.max(1000,interval)*1.5));
+      if(time>=cooldownUntil){interval=Math.min(120000,Math.ceil(Math.max(1000,interval)*1.5));generation++;}
+      successes=0;lastChange=time;
       cooldownUntil=Math.max(cooldownUntil,time+Math.max(60000,waitMs));
       nextStart=Math.max(nextStart,cooldownUntil);
       return {request_interval_ms:interval,cooldown_ms:Math.ceil(cooldownUntil-time)};
     },
+    succeeded(requestGeneration:number){
+      const time=now();
+      if(requestGeneration!==generation||time<cooldownUntil)return;
+      successes++;
+      if(successes>=8&&time-lastChange>=60000&&interval>intervalMs){
+        interval=Math.max(intervalMs,Math.floor(interval*0.8));successes=0;lastChange=time;
+        return {request_interval_ms:interval};
+      }
+    },
+    intervalMs:()=>interval,
   };
 }
 
 export function parseSyncArgs(args:string[]){
   const [command,...rest]=args;
-  if(!['provision','receive','embed','status'].includes(command))throw new Error('archive_sync.command_required');
+  if(!['provision','receive','finalize','embed','retry-failed','status'].includes(command))throw new Error('archive_sync.command_required');
   const options=new Map<string,string>();
   const allowed=command==='provision'?['--archive-id','--reader-keys']:command==='embed'
     ?['--archive-id','--key-id','--batch-size','--concurrency','--request-interval-ms']:['--archive-id','--key-id'];
@@ -75,6 +87,7 @@ export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:str
   const pacer=createEmbeddingPacer(requestIntervalMs);
   // A separate session lock prevents duplicate provider charges from two workers.
   const lockClient=await pool.connect();let locked=false;
+  let authTail:Promise<unknown>=Promise.resolve();
   const lockName=`my-life-embed:${keyId}:${archiveId}`;
   try{
     await assertSafeSyncRole(lockClient);await syncAuth(lockClient,keyId);
@@ -91,14 +104,19 @@ export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:str
         while(!stopped){
           try{
             const batch=await embedArchiveBatch(pool,keyId,archiveId,batchSize,async texts=>{
-              await pacer.wait();
+              const requestGeneration=await pacer.wait();
               if(stopped)throw new Error('archive_sync.embedding_stopped');
-              return embedder(texts);
+              // A cooldown may last minutes. Recheck revocation immediately before sending.
+              const authCheck=authTail.then(()=>syncAuth(lockClient,keyId));authTail=authCheck.catch(()=>{});await authCheck;
+              const result=await embedder(texts);
+              const recovered=pacer.succeeded(requestGeneration);
+              if(recovered)progress({event:'archive_sync.embedding_rate_recovery',...recovered});
+              return result;
             },cursor,range);
             attempt=0;
             if(!batch.selected)return;
             cursor=batch.cursor;processed+=batch.written;
-            progress({event:'archive_sync.embedding_progress',processed,partition,cursor});
+            progress({event:'archive_sync.embedding_progress',processed,partition,cursor,failed:batch.failed,request_interval_ms:pacer.intervalMs()});
           }catch(error){
             // Never log provider response bodies, SQL parameters or source text.
             const details=safeFailureDetails(error);
@@ -118,7 +136,10 @@ export async function runEmbeddingWorker(pool:pg.Pool,keyId:string,archiveId:str
       if(failure)throw failure.reason;
       const status=await archiveSyncStatus(pool,keyId,archiveId);
       if(!status.sync?.manifest||status.sync.copy_in_progress)throw new Error('archive_sync.completed_copy_required');
-      if(status.pending===0){progress({event:'archive_sync.embedding_complete',...status});return;}
+      if(status.pending===0){
+        if(status.failed>0){progress({event:'archive_sync.embedding_incomplete',...status});throw new Error('archive_sync.embedding_records_failed');}
+        progress({event:'archive_sync.embedding_complete',...status});return;
+      }
       if(pass===3)throw new Error('archive_sync.embedding_nonconvergent');
     }
   }finally{
@@ -134,6 +155,8 @@ async function main(){
   try{
     if(options.command==='provision')log(await provisionArchiveSync(pool,options.archiveId,options.readerIds));
     else if(options.command==='receive')await receiveArchive(pool,process.stdin,options.keyId,options.archiveId,log);
+    else if(options.command==='finalize')log(await finalizeArchive(pool,options.keyId,options.archiveId,log));
+    else if(options.command==='retry-failed')log(await retryArchiveFailures(pool,options.keyId,options.archiveId));
     else if(options.command==='status')log(await archiveSyncStatus(pool,options.keyId,options.archiveId));
     else await runEmbeddingWorker(pool,options.keyId,options.archiveId,options.batchSize,options.concurrency,embedBatchWithProfile,log,options.requestIntervalMs);
   }finally{await pool.end();}

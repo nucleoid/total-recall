@@ -4,6 +4,7 @@ import {Readable} from 'node:stream';
 import {randomUUID} from 'node:crypto';
 import {protocolLines,recordSchema,manifestSchema,digest,recordKey,type SyncRecord,type SyncManifest} from '../src/archive/sync-format.js';
 import {parseSyncArgs,embeddingRanges,safeFailureDetails,createEmbeddingPacer} from '../src/archive/sync-cli.js';
+import {searchNamespaces} from '../src/tools/search.js';
 
 export const fixtureRecord=(id='one',content='Synthetic historical evidence'):SyncRecord=>({
   type:'record',record_id:digest(id),chunk_index:0,origin:'evidence',kind:'email',title:'Synthetic email',content,
@@ -28,6 +29,13 @@ test('wire format rejects raw locators, invalid hashes and overlong UTF-8 payloa
     fixtureRecord('big','🌏'.repeat(1501)),{...row,source_ids:['raw/path']}])assert.ok(!recordSchema.safeParse(bad).success);
   assert.ok(!manifestSchema.safeParse({...fixtureManifest(),raw_exports_included:true}).success);
   assert.notEqual(recordKey(fixtureManifest(),row),recordKey({...fixtureManifest(),archive_id:'different'},row));
+});
+
+test('archive search is explicit and cannot add an unauthorized namespace',()=>{
+  assert.deepEqual(searchNamespaces(undefined,['personal','my-life']),['personal']);
+  assert.deepEqual(searchNamespaces([],['personal','my-life']),['personal']);
+  assert.deepEqual(searchNamespaces(['personal','my-life'],['personal','my-life']),['personal','my-life']);
+  assert.deepEqual(searchNamespaces(['my-life'],['work']),[]);
 });
 test('bounded parser preserves multi-byte boundaries and rejects incomplete lines',async()=>{
   const bytes=Buffer.from('{"text":"🌏"}\n');const parts=[bytes.subarray(0,11),bytes.subarray(11,12),bytes.subarray(12)];
@@ -76,4 +84,19 @@ test('a cooldown extends requests that were already queued',async()=>{
   });
   await pacer.wait();await pacer.wait();
   assert.deepEqual(waits,[1000,59000]);assert.equal(time,60000);
+});
+
+test('pacing recovers after sustained success but ignores stale requests and never exceeds configured rate',async()=>{
+  let time=0;const pacer=createEmbeddingPacer(4000,()=>time,async ms=>{time+=ms;});
+  const oldGeneration=await pacer.wait();pacer.throttle(2000);
+  time=60000;
+  for(let i=0;i<20;i++)pacer.succeeded(oldGeneration);
+  assert.equal(pacer.intervalMs(),6000,'pre-throttle requests cannot prove recovery');
+  for(let i=0;i<8;i++)pacer.succeeded(await pacer.wait());
+  assert.equal(pacer.intervalMs(),4800);
+  time+=60000;
+  for(let i=0;i<8;i++)pacer.succeeded(await pacer.wait());
+  assert.equal(pacer.intervalMs(),4000);
+  for(let i=0;i<40;i++)pacer.succeeded(await pacer.wait());
+  assert.equal(pacer.intervalMs(),4000);
 });
