@@ -61,3 +61,8 @@ test('dashboard client keeps bearer keys out of durable and injectable surfaces'
   assert.doesNotMatch(html, /<script(?![^>]+src=)/i);
   assert.doesNotMatch(html, /tr_[A-Za-z0-9_-]+/);
 });
+
+test('dashboard stylesheet preserves the hidden state against authored display rules', async () => {
+  const styles = await readFile(new URL('../dashboard/styles.css', import.meta.url), 'utf8');
+  assert.match(styles, /\[hidden\]\s*\{\s*display:\s*none\s*!important;\s*\}/);
+});
