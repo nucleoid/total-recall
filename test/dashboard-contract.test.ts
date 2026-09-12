@@ -66,3 +66,26 @@ test('dashboard stylesheet preserves the hidden state against authored display r
   const styles = await readFile(new URL('../dashboard/styles.css', import.meta.url), 'utf8');
   assert.match(styles, /\[hidden\]\s*\{\s*display:\s*none\s*!important;\s*\}/);
 });
+
+test('dashboard exposes readable agent provenance, stable GUIDs, and bounded navigation', async () => {
+  const [app, types, memories, indexScript, server] = await Promise.all([
+    readFile(new URL('../dashboard/app.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../dashboard/types.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/memories.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../scripts/create-memory-browse-index.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/server.ts', import.meta.url), 'utf8'),
+  ]);
+  assert.match(types, /agent_name:\s*string/);
+  assert.match(app, /memory\.provenance\?\.agent_name/);
+  assert.match(app, /\['id', 'name', 'type', 'model', 'runtime'/);
+  assert.match(app, /function pager\(/);
+  assert.match(app, /function sequencePager\(/);
+  assert.doesNotMatch(app, /input\.addEventListener\('input'.*run/);
+  assert.match(memories, /CROSS JOIN LATERAL/);
+  assert.match(memories, /set_config\('statement_timeout', '12000', true\)/);
+  assert.doesNotMatch(memories, /to_jsonb\(m\)->>'consolidated_into_id' IS NULL/);
+  assert.match(indexScript, /CREATE INDEX CONCURRENTLY IF NOT EXISTS/);
+  assert.match(indexScript, /WHERE deleted_at IS NULL AND superseded_at IS NULL AND consolidated_into_id IS NULL/);
+  assert.match(server, /existsSync\(resolve\(releaseDashboardDirectory, 'index\.html'\)\)/);
+  assert.match(server, /\? releaseDashboardDirectory\s*:\s*builtDashboardDirectory/);
+});

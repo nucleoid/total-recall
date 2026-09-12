@@ -15,6 +15,14 @@ export interface MemoryRecord {
   access_level: string;
   client_id: string;
   agent_id: string | null;
+  provenance?: {
+    agent_id: string;
+    agent_name: string;
+    agent_type: string | null;
+    agent_model: string | null;
+    agent_runtime: string | null;
+    same_key_as_requester: boolean;
+  } | null;
   session_id: string | null;
   created_at: string;
   updated_at: string;
@@ -30,6 +38,17 @@ export interface PagedMemories {
   total: number;
   limit: number;
   offset: number;
+}
+
+export interface AgentRecord {
+  id: string;
+  name: string;
+  type: string | null;
+  model: string | null;
+  runtime: string | null;
+  memory_count: number;
+  last_memory_at: string | null;
+  last_seen_at: string | null;
 }
 
 export interface TraceRecord {

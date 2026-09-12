@@ -8,6 +8,8 @@ export class ApiError extends Error {
   }
 }
 
+const REQUEST_TIMEOUT_MS = 25_000;
+
 export function toApiDateTime(value: string): string {
   return new Date(value).toISOString();
 }
@@ -44,7 +46,22 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set('Authorization', `Bearer ${apiKey}`);
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
-  const response = await fetch(path, { ...init, headers, credentials: 'same-origin' });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort('timeout'), REQUEST_TIMEOUT_MS);
+  const abort = () => controller.abort(init.signal?.reason);
+  init.signal?.addEventListener('abort', abort, { once: true });
+  let response: Response;
+  try {
+    response = await fetch(path, { ...init, headers, credentials: 'same-origin', signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted && !init.signal?.aborted) {
+      throw new ApiError(408, 'This request took too long. Try again or narrow the filters.');
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+    init.signal?.removeEventListener('abort', abort);
+  }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {
@@ -53,6 +70,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       // The status is still safe and useful when an upstream returned non-JSON.
     }
+    if (response.status === 524) message = 'The edge timed out waiting for Total Recall. Try again or narrow the filters.';
     if (response.status === 401 || response.status === 403) clearKey();
     throw new ApiError(response.status, message);
   }

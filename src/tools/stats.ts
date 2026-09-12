@@ -25,10 +25,6 @@ export async function memoryStats(
 
   const ns = auth.namespaces;
   const scope = dbScopeFromAuth(auth);
-  const accessWhere = `deleted_at IS NULL
-    AND (expires_at IS NULL OR expires_at > statement_timestamp())
-    AND consolidated_into_id IS NULL
-    AND (access_level IS NULL OR access_level = ANY($2::text[]))`;
   const values = [ns, visibleAccessLevels(auth.maxAccessLevel)];
 
   return withScopedClient(scope, async (client) => {
@@ -40,6 +36,22 @@ export async function memoryStats(
     // covering index; without it the statement timeout fails closed.
     await client.query("SELECT set_config('enable_seqscan', 'off', true)");
     await client.query("SELECT set_config('enable_bitmapscan', 'off', true)");
+    const consolidationCapability = await client.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM pg_attribute
+         WHERE attrelid = 'memories'::regclass
+           AND attname = 'consolidated_into_id'
+           AND NOT attisdropped
+       ) AS present`
+    );
+    const consolidationWhere = consolidationCapability.rows[0]?.present
+      ? 'consolidated_into_id IS NULL'
+      : "to_jsonb(memories)->>'consolidated_into_id' IS NULL";
+    const accessWhere = `deleted_at IS NULL
+      AND (expires_at IS NULL OR expires_at > statement_timestamp())
+      AND ${consolidationWhere}
+      AND (access_level IS NULL OR access_level = ANY($2::text[]))`;
     const result = await client.query<{
       total: string;
       by_namespace: Array<{ namespace: string; count: number }>;

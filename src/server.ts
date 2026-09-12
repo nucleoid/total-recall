@@ -870,10 +870,11 @@ registerRestRoute(app, 'post', '/api/media/rollup', async (req, res) => {
 });
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+const releaseDashboardDirectory = resolve(moduleDirectory, 'dashboard');
 const builtDashboardDirectory = resolve(process.cwd(), 'dist', 'dashboard');
-const dashboardDirectory = existsSync(resolve(builtDashboardDirectory, 'index.html'))
-  ? builtDashboardDirectory
-  : resolve(moduleDirectory, 'dashboard');
+const dashboardDirectory = existsSync(resolve(releaseDashboardDirectory, 'index.html'))
+  ? releaseDashboardDirectory
+  : builtDashboardDirectory;
 const dashboardSecurity: express.RequestHandler = (_req, res, next) => {
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
   res.setHeader('X-Content-Type-Options', 'nosniff');

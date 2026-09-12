@@ -29,6 +29,9 @@ class StatsPool {
     return {
       query: async (text: string, params?: unknown[]) => {
         this.calls.push({ text, params });
+        if (text.includes("attname = 'consolidated_into_id'")) {
+          return rows([{ present: true }]);
+        }
         if (text.includes('WITH grouped AS')) {
           return rows([{
             total: '7',
@@ -93,6 +96,7 @@ test('memoryStats preserves its response while using one scoped checkout and agg
   ));
   assert.ok(pool.calls.some(call => call.text.includes("set_config('enable_seqscan', 'off'")));
   assert.ok(pool.calls.some(call => call.text.includes("set_config('enable_bitmapscan', 'off'")));
+  assert.equal(pool.calls.filter(call => call.text.includes("attname = 'consolidated_into_id'")).length, 1);
   assert.equal(pool.calls.filter(call => call.text.includes('INSERT INTO audit_log')).length, 1);
 });
 
