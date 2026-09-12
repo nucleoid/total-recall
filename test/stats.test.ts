@@ -84,10 +84,32 @@ test('memoryStats preserves its response while using one scoped checkout and agg
   assert.match(aggregateCalls[0].text, /GROUP BY GROUPING SETS \(\(\), \(namespace\), \(source\), \(document_id\)\)/);
   assert.match(aggregateCalls[0].text, /deleted_at IS NULL/);
   assert.match(aggregateCalls[0].text, /expires_at IS NULL OR expires_at > statement_timestamp\(\)/);
-  assert.match(aggregateCalls[0].text, /consolidated_into_id/);
-  assert.match(aggregateCalls[0].text, /access_level/);
-  assert.deepEqual(aggregateCalls[0].params, [auth.namespaces, auth.maxAccessLevel]);
+  assert.match(aggregateCalls[0].text, /consolidated_into_id IS NULL/);
+  assert.doesNotMatch(aggregateCalls[0].text, /to_jsonb\(memories\)/);
+  assert.match(aggregateCalls[0].text, /access_level IS NULL OR access_level = ANY\(\$2::text\[\]\)/);
+  assert.deepEqual(aggregateCalls[0].params, [auth.namespaces, ['normal', 'sensitive']]);
+  assert.ok(pool.calls.some(call =>
+    call.text.includes("set_config('statement_timeout'") && call.params?.[0] === '10000'
+  ));
+  assert.ok(pool.calls.some(call => call.text.includes("set_config('enable_seqscan', 'off'")));
+  assert.ok(pool.calls.some(call => call.text.includes("set_config('enable_bitmapscan', 'off'")));
   assert.equal(pool.calls.filter(call => call.text.includes('INSERT INTO audit_log')).length, 1);
+});
+
+test('memoryStats maps every access ceiling to only its permitted levels', async () => {
+  const cases: Array<[AuthContext['maxAccessLevel'], string[]]> = [
+    ['normal', ['normal']],
+    ['sensitive', ['normal', 'sensitive']],
+    ['secret', ['normal', 'sensitive', 'secret']],
+  ];
+
+  for (const [maxAccessLevel, expected] of cases) {
+    const pool = new StatsPool();
+    setPoolForTesting(pool as unknown as pg.Pool);
+    await memoryStats({}, { ...auth, maxAccessLevel });
+    const aggregate = pool.calls.find(call => call.text.includes('WITH grouped AS'));
+    assert.deepEqual(aggregate?.params, [auth.namespaces, expected]);
+  }
 });
 
 test('memoryStats checks both admin and read permissions before checking out a connection', async () => {
@@ -97,4 +119,17 @@ test('memoryStats checks both admin and read permissions before checking out a c
   await assert.rejects(memoryStats({}, { ...auth, permissions: ['read'] }), /requires 'admin'/);
   await assert.rejects(memoryStats({}, { ...auth, permissions: ['admin'] }), /requires 'read'/);
   assert.equal(pool.connectCount, 0);
+});
+
+test('concurrent memoryStats requests each use one checkout and one aggregate', async () => {
+  const pool = new StatsPool();
+  setPoolForTesting(pool as unknown as pg.Pool);
+
+  const results = await Promise.all(Array.from({ length: 12 }, () => memoryStats({}, auth)));
+
+  assert.equal(results.length, 12);
+  assert.equal(pool.connectCount, 12);
+  assert.equal(pool.releaseCount, 12);
+  assert.equal(pool.calls.filter(call => call.text.includes('WITH grouped AS')).length, 12);
+  assert.equal(pool.calls.filter(call => call.text.includes('INSERT INTO audit_log')).length, 12);
 });

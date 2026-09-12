@@ -60,6 +60,7 @@
     "repair:watcher-orphans": "tsx scripts/repair-watcher-orphans.ts",
     "index:media-event-at": "tsx scripts/create-media-event-at-index.ts",
     "index:document-idempotency": "tsx scripts/create-document-idempotency-index.ts",
+    "index:stats": "tsx scripts/create-stats-index.ts",
     "finalize:memory-lifecycle": "tsx scripts/finalize-memory-lifecycle.ts",
     "backfill:memory-validity": "tsx scripts/backfill-memory-validity.ts",
     "finalize:memory-validity": "tsx scripts/finalize-memory-validity.ts",

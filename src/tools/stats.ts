@@ -1,10 +1,20 @@
 import { z } from 'zod';
 import { dbScopeFromAuth, withScopedClient } from '../db.js';
 import type { AuthContext } from '../types.js';
-import { accessLevelSql, checkPermission } from '../auth.js';
+import { checkPermission } from '../auth.js';
 import { logAudit } from '../audit.js';
 
 export const statsSchema = z.object({});
+
+const STATS_QUERY_STATEMENT_TIMEOUT_MS = 10_000;
+
+function visibleAccessLevels(maxAccessLevel: AuthContext['maxAccessLevel']): string[] {
+  switch (maxAccessLevel) {
+    case 'normal': return ['normal'];
+    case 'sensitive': return ['normal', 'sensitive'];
+    case 'secret': return ['normal', 'sensitive', 'secret'];
+  }
+}
 
 export async function memoryStats(
   _params: z.infer<typeof statsSchema>,
@@ -17,10 +27,19 @@ export async function memoryStats(
   const scope = dbScopeFromAuth(auth);
   const accessWhere = `deleted_at IS NULL
     AND (expires_at IS NULL OR expires_at > statement_timestamp())
-    AND to_jsonb(memories)->>'consolidated_into_id' IS NULL AND ${accessLevelSql('access_level', '$2')}`;
-  const values = [ns, auth.maxAccessLevel];
+    AND consolidated_into_id IS NULL
+    AND (access_level IS NULL OR access_level = ANY($2::text[]))`;
+  const values = [ns, visibleAccessLevels(auth.maxAccessLevel)];
 
   return withScopedClient(scope, async (client) => {
+    await client.query("SELECT set_config('statement_timeout', $1, true)", [
+      String(STATS_QUERY_STATEMENT_TIMEOUT_MS),
+    ]);
+    // PostgreSQL heavily overprices the RLS-aware index-only path on the large,
+    // vector-backed memories heap. Keep this transaction on the purpose-built
+    // covering index; without it the statement timeout fails closed.
+    await client.query("SELECT set_config('enable_seqscan', 'off', true)");
+    await client.query("SELECT set_config('enable_bitmapscan', 'off', true)");
     const result = await client.query<{
       total: string;
       by_namespace: Array<{ namespace: string; count: number }>;
