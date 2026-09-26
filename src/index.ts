@@ -1,14 +1,13 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import dotenv from 'dotenv';
-import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
 import { shutdownContradictionRuntime } from './contradictions.js';
 import { shutdown } from './db.js';
 import { validateKey } from './auth.js';
 import { consumeRateLimit } from './security.js';
 import type { AuthContext } from './types.js';
 import { registerTools } from './tools/register.js';
+import { isDirectExecution } from './entrypoint.js';
 
 dotenv.config();
 
@@ -41,12 +40,7 @@ async function main(): Promise<void> {
   console.error('[total-recall] MCP server running on stdio');
 }
 
-function isEntrypoint(): boolean {
-  return typeof process.argv[1] === 'string' &&
-    resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-}
-
-if (isEntrypoint()) {
+if (isDirectExecution(import.meta.url, process.argv[1])) {
   process.on('SIGINT', async () => {
     console.error('[total-recall] Shutting down...');
     await shutdownContradictionRuntime();
