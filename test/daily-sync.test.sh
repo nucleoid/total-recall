@@ -207,6 +207,20 @@ rm -f -- "$pidfile"
 pass "one exact absolute or project-scoped legacy watcher is adopted across Node upgrades"
 
 : >"$TMP/starts"
+ln -s "$PROJECT" "$TMP/current"
+WATCHER_COUNT_FILE="$TMP/starts" "$old_node" "$TMP/current/dist/watcher.js" & symlink_pid=$!
+PIDS+=("$symlink_pid")
+for _ in {1..20}; do [[ -s $TMP/starts ]] && break; sleep 0.05; done
+run_sync >"$TMP/adopt-symlink.out"
+[[ $(<"$pidfile") == "$symlink_pid" ]] || fail "watcher launched through current symlink was not adopted"
+[[ $(wc -l <"$TMP/starts") -eq 1 ]] || fail "release symlink caused a duplicate watcher"
+kill "$symlink_pid" 2>/dev/null || true
+wait "$symlink_pid" 2>/dev/null || true
+PIDS=()
+rm -f -- "$pidfile"
+pass "an absolute watcher path through the current release symlink is adopted"
+
+: >"$TMP/starts"
 WATCHER_COUNT_FILE="$TMP/starts" "$old_node" "$PROJECT/dist/watcher.js" & duplicate_one=$!
 WATCHER_COUNT_FILE="$TMP/starts" "$TMP/node" "$PROJECT/dist/watcher.js" & duplicate_two=$!
 PIDS+=("$duplicate_one" "$duplicate_two")

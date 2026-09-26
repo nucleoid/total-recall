@@ -98,13 +98,15 @@ observed_node() {
 
 # Exact absolute invocation, or the one legacy relative invocation in this project cwd.
 watcher_invocation() {
-  local pid=$1 cwd
+  local pid=$1 cwd entry
   process_state "$pid" || return 1
   [[ $(stat -c %u -- "/proc/$pid" 2>/dev/null) == "$uid" ]] || return 1
   read_argv "$pid" || return 1
   ((${#PROC_ARGV[@]} == 2)) || return 1
-  if [[ ${PROC_ARGV[1]} == "$WATCHER_ENTRY" ]]; then
-    return 0
+  if [[ ${PROC_ARGV[1]} == /* ]]; then
+    entry=$(realpath -e -- "${PROC_ARGV[1]}" 2>/dev/null) || return 1
+    [[ $entry == "$WATCHER_ENTRY" ]]
+    return
   fi
   [[ ${PROC_ARGV[1]} == 'dist/watcher.js' ]] || return 1
   cwd=$(realpath -e -- "/proc/$pid/cwd" 2>/dev/null) || return 1

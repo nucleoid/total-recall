@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -48,6 +48,7 @@ import {
   memoriesQuerySchema,
   tracesQuerySchema,
 } from './http-schemas.js';
+import { isDirectExecution } from './entrypoint.js';
 
 dotenv.config();
 
@@ -930,10 +931,7 @@ async function closeAllSessions(): Promise<void> {
   await shutdown();
 }
 
-const isDirectExecution = process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(process.argv[1]).href;
-
-if (isDirectExecution) {
+if (isDirectExecution(import.meta.url, process.argv[1])) {
   const httpServer = app.listen(PORT, () => {
     console.error(`[total-recall] HTTP server listening on port ${PORT}`);
   });
