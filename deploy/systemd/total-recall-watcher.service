@@ -1,0 +1,14 @@
+[Unit]
+Description=Total Recall File Sync Watcher
+After=postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/total-recall/current
+ExecStart=/usr/bin/node %h/.local/share/total-recall/current/dist/watcher.js
+EnvironmentFile=%h/projects/total-recall/.env
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

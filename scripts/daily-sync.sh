@@ -28,6 +28,8 @@ timeout=${STARTUP_TIMEOUT_SECONDS:-5}
 [[ $timeout =~ ^[1-9][0-9]*$ ]] || die 'STARTUP_TIMEOUT_SECONDS must be a positive integer'
 lock_timeout=${LOCK_TIMEOUT_SECONDS:-10}
 [[ $lock_timeout =~ ^[1-9][0-9]*$ ]] || die 'LOCK_TIMEOUT_SECONDS must be a positive integer'
+stats_timeout=${STATS_TIMEOUT_SECONDS:-15}
+[[ $stats_timeout =~ ^[1-9][0-9]*$ ]] || die 'STATS_TIMEOUT_SECONDS must be a positive integer'
 
 uid=$(id -u)
 validate_private_dir() {
@@ -203,7 +205,12 @@ fi
 log 'Memory stats:'
 if [[ -n ${MCPORTER_BIN:-} && $MCPORTER_BIN == /* && -x $MCPORTER_BIN &&
       -n ${PYTHON3_BIN:-} && $PYTHON3_BIN == /* && -x $PYTHON3_BIN ]]; then
-  if stats_json=$("$MCPORTER_BIN" call total-recall.memory_stats 2>/dev/null) &&
+  if [[ -z ${MCPORTER_CONFIG:-} || $MCPORTER_CONFIG != /* || ! -r $MCPORTER_CONFIG ]]; then
+    echo '  (stats unavailable: MCPORTER_CONFIG must be an absolute readable file)'
+  elif ! command -v timeout >/dev/null 2>&1; then
+    echo '  (stats unavailable: timeout is required)'
+  elif stats_json=$(timeout --signal=TERM --kill-after=5s "${stats_timeout}s" \
+       "$MCPORTER_BIN" --config "$MCPORTER_CONFIG" call total-recall.memory_stats 2>/dev/null) &&
      stats_out=$(printf '%s' "$stats_json" | "$PYTHON3_BIN" -c '
 import json, sys
 d = json.load(sys.stdin)
