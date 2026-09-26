@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "total-recall": {
+      "description": "Canonical local Total Recall HTTP service",
+      "baseUrl": "http://127.0.0.1:3003/mcp",
+      "headers": {
+        "Authorization": "Bearer $env:TOTAL_RECALL_API_KEY"
+      }
+    }
+  },
+  "imports": []
+}

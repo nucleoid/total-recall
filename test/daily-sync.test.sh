@@ -42,7 +42,8 @@ run_sync() {
   env PROJECT_DIR="$PROJECT" NODE_BIN="$TMP/node" XDG_RUNTIME_DIR="$RUNTIME" \
     WATCHER_COUNT_FILE="$TMP/starts" STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-2}" \
     LOCK_TIMEOUT_SECONDS="${LOCK_TIMEOUT_SECONDS:-2}" \
-    MCPORTER_BIN="${MCPORTER_BIN:-}" PYTHON3_BIN="${PYTHON3_BIN:-}" \
+    MCPORTER_BIN="${MCPORTER_BIN:-}" MCPORTER_CONFIG="${MCPORTER_CONFIG:-}" \
+    PYTHON3_BIN="${PYTHON3_BIN:-}" STATS_TIMEOUT_SECONDS="${STATS_TIMEOUT_SECONDS:-2}" \
     bash "$ROOT/scripts/daily-sync.sh"
 }
 
@@ -147,13 +148,31 @@ stats_pid=$(<"$pidfile")
 PIDS+=("$stats_pid")
 cat >"$TMP/mcporter" <<'SH'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >"$MCPORTER_ARGS_FILE"
 printf '%s\n' '{"total_memories":3,"by_namespace":[{"namespace":"shared","count":2}],"newest_memory":"today"}'
 SH
 chmod 0700 "$TMP/mcporter"
-MCPORTER_BIN="$TMP/mcporter" PYTHON3_BIN="$(command -v python3)" run_sync >"$TMP/stats.out"
+: >"$TMP/mcporter.json"
+MCPORTER_ARGS_FILE="$TMP/mcporter.args" MCPORTER_BIN="$TMP/mcporter" \
+  MCPORTER_CONFIG="$TMP/mcporter.json" PYTHON3_BIN="$(command -v python3)" run_sync >"$TMP/stats.out"
 grep -q 'Total: 3 memories' "$TMP/stats.out" || fail "valid optional stats output was not rendered"
 grep -q 'shared: 2' "$TMP/stats.out" || fail "valid namespace stats output was not rendered"
+grep -q -- "--config $TMP/mcporter.json call total-recall.memory_stats" "$TMP/mcporter.args" ||
+  fail "stats did not use the explicit deployment config"
 pass "valid optional stats tools render memory statistics"
+
+cat >"$TMP/mcporter" <<'SH'
+#!/usr/bin/env bash
+sleep 10
+SH
+chmod 0700 "$TMP/mcporter"
+started_at=$SECONDS
+MCPORTER_BIN="$TMP/mcporter" MCPORTER_CONFIG="$TMP/mcporter.json" \
+  PYTHON3_BIN="$(command -v python3)" STATS_TIMEOUT_SECONDS=1 run_sync >"$TMP/stats-timeout.out"
+elapsed=$((SECONDS - started_at))
+(( elapsed < 6 )) || fail "stats timeout did not bound a hung mcporter call"
+grep -q '(stats unavailable)' "$TMP/stats-timeout.out" || fail "timed out stats were not reported unavailable"
+pass "hung optional stats calls are bounded"
 
 kill "$stats_pid" 2>/dev/null || true
 wait "$stats_pid" 2>/dev/null || true
@@ -251,6 +270,8 @@ grep -qi 'Windows' "$ROOT/README.md" || fail "README does not document Windows n
 grep -qi 'old bare.*cron\|bare.*crontab' "$ROOT/README.md" || fail "README does not warn that the old bare cron invocation must be replaced"
 grep -q '/tmp/total-recall-watcher.log' "$ROOT/README.md" || fail "README does not identify the legacy log path during upgrade"
 grep -q '^NODE_BIN=/' "$ENV_EXAMPLE" || fail "environment example does not use an absolute NODE_BIN"
+grep -q '^MCPORTER_CONFIG=/' "$ENV_EXAMPLE" || fail "environment example does not use an explicit mcporter config"
+grep -q '^STATS_TIMEOUT_SECONDS=' "$ENV_EXAMPLE" || fail "environment example does not bound stats runtime"
 grep -q '"test:daily-sync"' "$ROOT/package.json" || fail "daily sync test command is missing"
 grep -q '"test:daily-sync": "node scripts/run-daily-sync-tests.mjs"' "$ROOT/package.json" || fail "daily sync test command is not portable to hosts without Bash"
 [[ -f "$ROOT/scripts/run-daily-sync-tests.mjs" ]] || fail "portable daily sync test runner is missing"
