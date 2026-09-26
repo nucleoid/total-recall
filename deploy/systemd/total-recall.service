@@ -1,6 +1,8 @@
 [Unit]
 Description=Total Recall MCP Memory Server (HTTP)
 After=postgresql.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -10,8 +12,6 @@ EnvironmentFile=%h/projects/total-recall/.env
 Environment=PORT=3003
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 [Install]
 WantedBy=default.target
