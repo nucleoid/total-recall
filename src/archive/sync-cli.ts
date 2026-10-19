@@ -19,6 +19,12 @@ export function safeFailureDetails(error:unknown):{http_status?:number;database_
     ...typeof code==='string'&&/^[0-9A-Z]{5}$/.test(code)?{database_code:code}:{}};
 }
 
+export function safeCliFailure(error:unknown):{event:string;http_status?:number;database_code?:string}{
+  const event=error instanceof Error&&/^archive_sync\.[a-z_]+$/.test(error.message)
+    ?error.message:'archive_sync.failed';
+  return {event,...safeFailureDetails(error)};
+}
+
 /** Shared across partitions and batches; bound billed bisect amplification for this finite run. */
 export function createEmbeddingFailureBudget(limit=32){
   let failures=0;
@@ -174,6 +180,5 @@ async function main(){
   }finally{await pool.end();}
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)main().catch(error=>{
-  const code=error instanceof Error&&/^archive_sync\.[a-z_]+$/.test(error.message)?error.message:'archive_sync.failed';
-  process.stderr.write(JSON.stringify({event:code})+'\n');process.exitCode=1;
+  process.stderr.write(JSON.stringify(safeCliFailure(error))+'\n');process.exitCode=1;
 });

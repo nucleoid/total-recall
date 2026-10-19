@@ -49,6 +49,7 @@ export interface ReembedOptions {
 
 export interface RunReembedOptions extends ReembedOptions {
   onIdentity?: (identity: MaintenanceIdentity, source: MaintenanceDatabaseSource) => void;
+  embedderForClient?: (client: QueryClient) => Embedder;
 }
 
 export interface ReembedError {
@@ -222,7 +223,7 @@ export async function reembedWithClient(
   const namespaces = [...new Set(options.namespaces ?? [])].sort();
   const fullRepair = options.fullRepair ?? false;
   const maxErrors = options.maxErrors ?? Number.POSITIVE_INFINITY;
-  if (!Number.isInteger(batchSize) || batchSize < 1) throw new Error('batchSize must be a positive integer');
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1000) throw new Error('batchSize must be an integer from 1 to 1000');
   if (!Number.isInteger(profile.dimensions) || profile.dimensions < 1) throw new Error('dimensions must be a positive integer');
   if (!Number.isFinite(delayMs) || delayMs < 0) throw new Error('delayMs must be nonnegative');
   if (!(maxErrors === Number.POSITIVE_INFINITY || (Number.isInteger(maxErrors) && maxErrors >= 0))) {
@@ -271,7 +272,8 @@ export async function reembedWithClient(
     try {
       embeddings = await embedder(batch.map(row => row.content));
       batchFailure = embeddingCategory(embeddings, batch.length, profile.dimensions);
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && /^embedding\.(?:rollback_|serving_contract_|unknown_serving_contract)/.test(error.message)) throw error;
       batchFailure = 'provider_error';
     }
 
@@ -328,7 +330,7 @@ export async function runReembedAgainstEnvironment(
 ): Promise<{ identity: MaintenanceIdentity; source: MaintenanceDatabaseSource; summary: ReembedSummary }> {
   return withMaintenanceClient(env, async (client, identity, source) => {
     options.onIdentity?.(identity, source);
-    const summary = await reembedWithClient(client, embedder, options);
+    const summary = await reembedWithClient(client, options.embedderForClient?.(client) ?? embedder, options);
     return { identity, source, summary };
   }, createClient, { allowReembedOverride: true });
 }
@@ -409,7 +411,7 @@ async function main(): Promise<void> {
     : validateMaintenanceEmbeddingProfile(maintenanceEnvironment(process.env, target.name));
   const embedder = args.dryRun
     ? async (_texts: string[]) => { throw new Error('dry-run must not call the embedding provider'); }
-    : createMaintenanceEmbedder(profile);
+    : async (_texts: string[]) => { throw new Error('maintenance embedder must be bound to its database'); };
   const namespaces = args.namespaces.length ? args.namespaces : (process.env.REEMBED_NAMESPACES ?? '').split(',').map(value => value.trim()).filter(Boolean);
   const { summary } = await runReembedAgainstEnvironment(process.env, embedder, {
     provider: profile.provider,
@@ -421,6 +423,7 @@ async function main(): Promise<void> {
     batchSize: args.batchSize ?? integerEnvironment('REEMBED_BATCH_SIZE', 10, 1),
     delayMs: args.delayMs ?? integerEnvironment('REEMBED_DELAY_MS', 50, 0),
     maxErrors: args.maxErrors ?? integerEnvironment('REEMBED_MAX_ERRORS', 0, 0),
+    embedderForClient: args.dryRun ? undefined : client => createMaintenanceEmbedder(profile, fetch, client),
     onIdentity: (identity, source) => {
       console.log('[reembed] Maintenance database', { ...identity, source });
       console.log('[reembed] All-row capability preflight passed; provider work starts now.');

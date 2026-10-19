@@ -1,8 +1,14 @@
 import dotenv from 'dotenv';
+import { reserveLegacyRollbackEmbeddingInputs } from './embedding-rollback-budget.js';
+import { getPool } from './db.js';
+import { planEmbeddingChunks } from './embedding-chunks.js';
+import { QWEN_CONTRACT_ID } from './local-embedding-contract.js';
+import { getLocalServingClient, localServingEnabled } from './local-embedding-runtime.js';
 import {
   ACTIVE_EMBEDDING_DESCRIPTOR,
   CANONICAL_EMBEDDING_DESCRIPTOR,
   embeddingDescriptorParams,
+  resolveActiveEmbeddingDescriptor,
   type EmbeddingDescriptor,
 } from './embedding-descriptor.js';
 
@@ -22,12 +28,14 @@ export interface EmbeddingEnvironment {
   GEMINI_API_KEY?: string;
   EMBEDDING_MODEL?: string;
   EMBEDDING_DIMENSIONS?: string;
+  SHADOW_EMBEDDING_CURRENT_CONTRACT?: string;
+  SHADOW_EMBEDDING_ROLLBACK_WRITES?: string;
   [name: string]: string | undefined;
 }
 
 export interface EmbeddingProfile {
   name: string;
-  provider: 'gemini' | 'ollama';
+  provider: 'gemini' | 'ollama' | 'llama.cpp';
   model: string;
   dimensions: 768;
   apiKey?: string;
@@ -99,8 +107,8 @@ export function parseEmbeddingProfiles(env: EmbeddingEnvironment): {
     const allowed = new Set(['provider', 'model', 'dimensions', 'apiKeyEnv', 'baseUrlEnv']);
     const unknown = Object.keys(value).filter(key => !allowed.has(key));
     if (unknown.length) throw new Error(`Embedding profile ${name} has unsupported fields: ${unknown.join(', ')}`);
-    if (raw.provider !== 'gemini' && raw.provider !== 'ollama') {
-      throw new Error(`Embedding profile ${name} has unsupported provider; expected gemini or ollama`);
+    if (raw.provider !== 'gemini' && raw.provider !== 'ollama' && raw.provider !== 'llama.cpp') {
+      throw new Error(`Embedding profile ${name} has unsupported provider; expected gemini, ollama, or llama.cpp`);
     }
     if (typeof raw.model !== 'string' || !raw.model.trim()) throw new Error(`Embedding profile ${name} requires a nonblank model`);
     if (raw.dimensions !== PHYSICAL_VECTOR_DIMENSIONS) {
@@ -112,6 +120,11 @@ export function parseEmbeddingProfiles(env: EmbeddingEnvironment): {
       const apiKey = env[keyName];
       if (!apiKey?.trim()) throw new Error(`Embedding profile ${name} requires nonblank credential environment variable ${keyName}`);
       profiles.push({ name, provider: 'gemini', model: raw.model, dimensions: 768, apiKey });
+    } else if (raw.provider === 'llama.cpp') {
+      if (raw.model !== QWEN_CONTRACT_ID || raw.apiKeyEnv !== undefined || raw.baseUrlEnv !== undefined) {
+        throw new Error(`Embedding profile ${name} must use the pinned llama.cpp Qwen contract without profile-local credentials or endpoints`);
+      }
+      profiles.push({ name, provider: 'llama.cpp', model: QWEN_CONTRACT_ID, dimensions: 768 });
     } else {
       const urlName = environmentReference(raw.baseUrlEnv, `${name}.baseUrlEnv`);
       const baseUrl = env[urlName];
@@ -125,10 +138,9 @@ export function parseEmbeddingProfiles(env: EmbeddingEnvironment): {
 
   const current = profiles.find(profile => profile.name === currentName);
   if (!current) throw new Error(`EMBEDDING_CURRENT_PROFILE ${JSON.stringify(currentName)} is not defined`);
-  if (current.provider !== CANONICAL_EMBEDDING_DESCRIPTOR.provider ||
-      current.model !== CANONICAL_EMBEDDING_DESCRIPTOR.model ||
-      current.dimensions !== CANONICAL_EMBEDDING_DESCRIPTOR.dimensions) {
-    throw new Error(`Current embedding profile must be gemini/${CANONICAL_EMBEDDING_DESCRIPTOR.model}/${CANONICAL_EMBEDDING_DESCRIPTOR.dimensions}`);
+  const expected = resolveActiveEmbeddingDescriptor(env as NodeJS.ProcessEnv);
+  if (current.provider !== expected.provider || current.model !== expected.model || current.dimensions !== expected.dimensions) {
+    throw new Error(`Current embedding profile must be ${expected.provider}/${expected.model}/${expected.dimensions}`);
   }
   return { current, profiles: Object.freeze(profiles) };
 }
@@ -146,6 +158,11 @@ function environmentReference(value: unknown, field: string): string {
 
 /** Upgrade bridge for migration-023 deployments; pure named parsing remains strict. */
 export function resolveEmbeddingProfiles(env: EmbeddingEnvironment): ReturnType<typeof parseEmbeddingProfiles> {
+  const descriptor = resolveActiveEmbeddingDescriptor(env as NodeJS.ProcessEnv);
+  if (descriptor.provider === 'llama.cpp' && !env.EMBEDDING_CURRENT_PROFILE?.trim() && !env.EMBEDDING_PROFILES_JSON?.trim()) {
+    const current: EmbeddingProfile = { name: 'current', ...descriptor };
+    return { current, profiles: Object.freeze([current]) };
+  }
   if (!env.EMBEDDING_CURRENT_PROFILE?.trim() && !env.EMBEDDING_PROFILES_JSON?.trim()) {
     const legacy = validateEmbeddingProfile(env);
     const current: EmbeddingProfile = { name: 'current', ...legacy };
@@ -203,6 +220,7 @@ async function requestProfile(profile: EmbeddingProfile, texts: string[], signal
   if (texts.length === 0) return [];
   return withRequestTimeout(signal, async requestSignal => {
     if (profile.provider === 'gemini') {
+      await reserveLegacyRollbackEmbeddingInputs(texts.length);
       const batch = forceBatch || texts.length > 1;
       const path = batch ? 'batchEmbedContents' : 'embedContent';
       const body = batch ? {
@@ -219,30 +237,68 @@ async function requestProfile(profile: EmbeddingProfile, texts: string[], signal
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${profile.model}:${path}?key=${profile.apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: requestSignal,
       });
-      if (!response.ok) throw new Error(`Gemini ${path} failed (${response.status}): ${await response.text()}`);
+      if (!response.ok) throw new Error(`Gemini ${path} failed (${response.status})`);
       const data = await response.json() as { embedding?: { values?: unknown }; embeddings?: Array<{ values?: unknown }> };
       if (!batch) return [validateEmbeddingVector(data.embedding?.values, 'Gemini scalar', profile.dimensions)];
       return validateEmbeddingBatch(data.embeddings?.map(item => item.values), texts.length, profile.dimensions);
     }
 
+    if (profile.provider === 'llama.cpp') throw new Error('embedding.local_role_required');
     const response = await fetch(`${profile.baseUrl}/api/embed`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: profile.model, input: texts }), signal: requestSignal,
     });
-    if (!response.ok) throw new Error(`Ollama embed failed (${response.status}): ${await response.text()}`);
+    if (!response.ok) throw new Error(`Ollama embed failed (${response.status})`);
     const data = await response.json() as { embeddings?: unknown };
     return validateEmbeddingBatch(data.embeddings, texts.length, profile.dimensions);
   });
 }
 
-export async function embedWithProfile(text: string, profile: EmbeddingProfile = ACTIVE_EMBEDDING_PROFILE, signal?: AbortSignal): Promise<EmbeddingResult> {
-  const [vector] = await requestProfile(profile, [text], signal);
+let servingVerifier: (() => Promise<void>) | undefined;
+async function verifyLocalServingTarget(): Promise<void> {
+  if (servingVerifier) return servingVerifier();
+  const result = await getPool().query('SELECT contract_id FROM embedding_serving_settings WHERE singleton=true');
+  if (result.rows[0]?.contract_id !== QWEN_CONTRACT_ID) throw new Error('embedding.serving_contract_mismatch');
+}
+export function setEmbeddingServingVerifierForTesting(verifier: (() => Promise<void>) | undefined): void {
+  if (process.env.NODE_ENV !== 'test') throw new Error('embedding.test_injection_forbidden');
+  servingVerifier = verifier;
+}
+
+async function embedLocal(text: string, role: 'document' | 'query', signal?: AbortSignal): Promise<number[]> {
+  signal = signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000);
+  if (!localServingEnabled()) throw new Error('embedding.local_serving_disabled');
+  await verifyLocalServingTarget();
+  const client = getLocalServingClient();
+  if (role === 'query') return (await client.embed([text], 'query', signal)).vectors[0];
+  const plan = await planEmbeddingChunks(text, value => client.countFormattedTokens(value, signal));
+  if (plan.chunks.length > 4096) throw new Error('embedding.parent_chunk_limit');
+  let first: number[] | undefined;
+  for (let i = 0; i < plan.chunks.length; i += 4) {
+    const result = await client.embed(plan.chunks.slice(i, i + 4).map(chunk => chunk.text), 'document', signal);
+    first ??= result.vectors[0];
+  }
+  if (!first) throw new Error('embedding.local_empty_result');
+  return first;
+}
+
+export async function embedWithProfile(text: string, profile: EmbeddingProfile = ACTIVE_EMBEDDING_PROFILE,
+  signal?: AbortSignal, role: 'document' | 'query' = 'document'): Promise<EmbeddingResult> {
+  const vector = profile.provider === 'llama.cpp' ? await embedLocal(text, role, signal) : (await requestProfile(profile, [text], signal))[0];
   return { vector, provider: profile.provider, model: profile.model, dimensions: profile.dimensions };
 }
 
 export async function embedBatchWithProfile(texts: string[], profile: EmbeddingProfile = ACTIVE_EMBEDDING_PROFILE, signal?: AbortSignal): Promise<EmbeddingResult[]> {
-  const vectors = await requestProfile(profile, texts, signal, true);
-  return vectors.map(vector => ({ vector, provider: profile.provider, model: profile.model, dimensions: profile.dimensions }));
+  if (profile.provider === 'llama.cpp') {
+    const results: EmbeddingResult[] = [];
+    for (const text of texts) results.push(await embedWithProfile(text, profile, signal, 'document'));
+    return results;
+  }
+  return (await requestProfile(profile, texts, signal, true)).map(vector => ({ vector, provider: profile.provider, model: profile.model, dimensions: profile.dimensions }));
+}
+
+export async function embedQuery(text: string, signal?: AbortSignal): Promise<number[]> {
+  return (await embedWithProfile(text, resolveEmbeddingProfiles(process.env).current, signal, 'query')).vector;
 }
 
 /** Backward-compatible vector-only wrappers. New writers should keep EmbeddingResult intact. */

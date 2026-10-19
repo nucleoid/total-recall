@@ -7,6 +7,7 @@ import {
   baselineMismatches,
   evaluationReportSchema,
   parseEvaluationDataset,
+  resolveEvaluationProfile,
   runEvaluation,
   type EvaluationReport,
 } from '../src/evaluation.js';
@@ -17,7 +18,7 @@ import type { AccessLevel, SearchRankingConfig } from '../src/types.js';
 type Cli = {
   dataset?: string; checkOnly: boolean; json: boolean; output?: string; baseline?: string;
   asOf?: string; threshold?: number; k?: number; ranking?: string; concurrency: number;
-  showContent: boolean; allowUnresolved: boolean; force: boolean;
+  showContent: boolean; allowUnresolved: boolean; allowEmbeddingChange: boolean; force:boolean;profile?:string;
   minRecall?: number; minMrr?: number; maxRecallRegression?: number; maxMrrRegression?: number;
 };
 
@@ -43,13 +44,17 @@ async function main(): Promise<void> {
     scope, maxAccessLevel, asOf, ranking, k: cli.k, threshold: cli.threshold,
     allowUnresolved: cli.allowUnresolved, checkOnly: cli.checkOnly,
     showContent: cli.showContent, codeCommit: gitCommit(), efSearch: hnswEfSearchFromEnv(),
-    databaseLabel: process.env.EVAL_DATABASE_LABEL, concurrency: cli.concurrency,
+    databaseLabel: process.env.EVAL_DATABASE_LABEL, concurrency: cli.concurrency,evaluationProfile:resolveEvaluationProfile(cli.profile),
   });
 
   if (baseline && !cli.checkOnly) {
     const mismatches = baselineMismatches(report, baseline);
-    if (mismatches.length && !cli.force) throw new Error(`Baseline is incompatible: ${mismatches.join(', ')} (use --force to report an observational comparison)`);
-    if (mismatches.length) report.warnings.push(`Forced incompatible baseline comparison: ${mismatches.join(', ')}`);
+    const gates=[cli.minRecall,cli.minMrr,cli.maxRecallRegression,cli.maxMrrRegression].some(value=>value!==undefined);
+    if(cli.force&&gates)throw new Error('--force is observational only and cannot be combined with acceptance gates');
+    const allowed=cli.force?mismatches:(cli.allowEmbeddingChange?mismatches.filter(value=>value.startsWith('embedding ')):[]);
+    const blocked=mismatches.filter(value=>!allowed.includes(value));
+    if(blocked.length)throw new Error(`Baseline is incompatible: ${blocked.join(', ')}`);
+    if(allowed.length)report.warnings.push(cli.force?`Forced observational-only incompatible comparison: ${allowed.join(', ')}`:`Explicit cross-embedding comparison: ${allowed.join(', ')}`);
     applyRegressionGate('recall@k', report.metrics.recall_at_k, baseline.metrics.recall_at_k, cli.maxRecallRegression);
     applyRegressionGate('MRR', report.metrics.mrr, baseline.metrics.mrr, cli.maxMrrRegression);
   }
@@ -65,9 +70,9 @@ async function main(): Promise<void> {
 }
 
 function parseArgs(args: string[]): Cli {
-  const result: Cli = { checkOnly: false, json: false, concurrency: 1, showContent: false, allowUnresolved: false, force: false };
-  const values = new Set(['--dataset', '--output', '--baseline', '--as-of', '--threshold', '--k', '--ranking', '--concurrency', '--min-recall', '--min-mrr', '--max-recall-regression', '--max-mrr-regression']);
-  const booleans = new Set(['--check-only', '--json', '--show-content', '--allow-unresolved', '--force']);
+  const result: Cli = { checkOnly: false, json: false, concurrency: 1, showContent: false, allowUnresolved: false, allowEmbeddingChange:false,force:false };
+  const values = new Set(['--dataset','--profile', '--output', '--baseline', '--as-of', '--threshold', '--k', '--ranking', '--concurrency', '--min-recall', '--min-mrr', '--max-recall-regression', '--max-mrr-regression']);
+  const booleans = new Set(['--check-only', '--json', '--show-content', '--allow-unresolved','--allow-embedding-change','--force']);
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index];
     if (booleans.has(flag)) {
@@ -75,13 +80,14 @@ function parseArgs(args: string[]): Cli {
       else if (flag === '--json') result.json = true;
       else if (flag === '--show-content') result.showContent = true;
       else if (flag === '--allow-unresolved') result.allowUnresolved = true;
-      else result.force = true;
+      else if(flag==='--allow-embedding-change')result.allowEmbeddingChange=true;else result.force=true;
       continue;
     }
     if (!values.has(flag)) throw new Error(`Unknown argument: ${flag}`);
     const value = args[++index];
     if (value === undefined || value.startsWith('--')) throw new Error(`${flag} requires a value`);
     if (flag === '--dataset') result.dataset = value;
+    else if(flag==='--profile')result.profile=value;
     else if (flag === '--output') result.output = value;
     else if (flag === '--baseline') result.baseline = value;
     else if (flag === '--as-of') result.asOf = value;

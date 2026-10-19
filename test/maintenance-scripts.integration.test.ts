@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { updateDecayWithClient } from '../scripts/decay-update.js';
 import { validateMaintenanceEmbeddingProfile } from '../scripts/lib/maintenance-embedding.js';
-import { reembedWithClient } from '../scripts/reembed-all.js';
+import { reembedWithClient, runReembedAgainstEnvironment } from '../scripts/reembed-all.js';
 
 test('decay reports actual returned totals for personal, media, and future namespaces', async () => {
   const client = { async query(sql: string) {
@@ -107,6 +107,55 @@ test('provider mismatch falls back safely, counts each selected row once, and sa
   assert.equal(result.succeeded + result.failed, 2);
   assert.equal(result.failed, 1);
   assert.ok(result.errors.every(error => !JSON.stringify(error).includes('TOP SECRET')));
+});
+
+test('reembed rejects oversized batches before inventory or inference', async () => {
+  let queries = 0, embeddings = 0;
+  const client = { async query() { queries++; return { rows: [] }; } };
+  await assert.rejects(reembedWithClient(client as never, async () => { embeddings++; return []; }, {
+    batchSize: 1001,
+  }), /1 to 1000/);
+  assert.equal(queries, 0);
+  assert.equal(embeddings, 0);
+});
+
+test('rollback policy denial aborts a batch without per-row fallback', async () => {
+  let selectCalls = 0, embeddingCalls = 0;
+  const client = { async query(sql: string) {
+    if (/GROUP BY namespace/i.test(sql)) return { rows: [{ namespace: 'personal', count: '2' }] };
+    if (/SELECT id, content, namespace/i.test(sql)) return { rows: selectCalls++ === 0 ? [
+      { id: 'a', content: 'first', namespace: 'personal', updated_at: '2026-01-01 00:00:00+00', revision: 0 },
+      { id: 'b', content: 'second', namespace: 'personal', updated_at: '2026-01-01 00:00:00+00', revision: 0 },
+    ] : [] };
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql.trim())) return { rows: [] };
+    throw new Error('unexpected SQL');
+  } };
+  await assert.rejects(reembedWithClient(client as never, async () => {
+    embeddingCalls++;
+    throw new Error('embedding.rollback_not_approved');
+  }, { batchSize: 2, delayMs: 0 }), /rollback_not_approved/);
+  assert.equal(embeddingCalls, 1);
+});
+
+test('environment runner binds its embedder to the identity-checked write client', async () => {
+  const client = { async connect() {}, async end() {}, async query(sql: string) {
+    if (/current_database\(\)/i.test(sql)) return { rows: [{ database: 'selected', user: 'owner', server: 'db:5432' }] };
+    if (/SELECT count\(\*\)::text AS count FROM public\.memories/i.test(sql)) return { rows: [{ count: '0' }] };
+    if (/GROUP BY namespace/i.test(sql)) return { rows: [] };
+    if (/SELECT id, content, namespace/i.test(sql)) return { rows: [] };
+    if (/COUNT\(\*\) FILTER/i.test(sql)) return { rows: [{ unknown_count: '0', legacy_count: '0' }] };
+    if (/SET row_security/i.test(sql)) return { rows: [] };
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql.trim())) return { rows: [] };
+    throw new Error(`unexpected SQL: ${sql}`);
+  } };
+  let bound: unknown;
+  await runReembedAgainstEnvironment(
+    { REEMBED_DATABASE_URL: 'postgres://selected' },
+    async () => [],
+    { embedderForClient: candidate => { bound = candidate; return async () => []; } },
+    (() => client) as never,
+  );
+  assert.equal(bound, client);
 });
 
 test('live embedding import preserves process environment precedence over dotenv', async () => {

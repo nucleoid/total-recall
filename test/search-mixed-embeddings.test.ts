@@ -17,7 +17,16 @@ class Client {
   }
   release(): void {}
 }
-class Pool { constructor(private client: Client) {} async connect() { return this.client; } }
+class Pool {
+  constructor(private client: Client) {}
+  async connect() { return this.client; }
+  async query(text: string, values?: unknown[]) {
+    const normalized=text.replace(/\s+/g,' ').trim();
+    assert.equal(normalized,"SELECT to_regclass('public.embedding_serving_settings')::text AS serving_table, to_regprocedure('public.reserve_embedding_rollback_inputs(integer)')::text AS reservation_function");
+    assert.deepEqual(values,undefined);
+    return result([{ serving_table: null, reservation_function: null }]);
+  }
+}
 function result<T extends pg.QueryResultRow>(rows: T[]): pg.QueryResult<T> {
   return { command: 'SELECT', rowCount: rows.length, oid: 0, fields: [], rows };
 }
