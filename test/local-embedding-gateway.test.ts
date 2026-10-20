@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { QWEN_CHUNK_CONTRACT,QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
-import { LocalEmbeddingGateway,verifyGatewayReceipt,type GatewayReceipt } from '../src/local-embedding-gateway.js';
+import { LocalEmbeddingGateway,listRuntimeFiles,verifyGatewayReceipt,type GatewayReceipt } from '../src/local-embedding-gateway.js';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp,readFile,rm,symlink,writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { platform } from 'node:os';
@@ -18,7 +22,50 @@ const base=(mode:'gpu'|'cpu'='gpu'):GatewayReceipt=>({contractId:QWEN_CONTRACT_I
     {platform:'linux',diskPath:'/',minimumAvailableBytes:2*1024**3,minimumDiskFreeBytes:100*1024**3,maximumSwapUsedBytes:0,maximumLoad1:1},
   cpu:mode==='cpu'?{maximumMemoryPsiAvg10:0}:undefined,
   gpu:mode==='gpu'?{deviceUuid:'GPU-test-1',minimumFreeVramMiB:512}:undefined});
+const healthyCpuTelemetry=(receipt:GatewayReceipt)=>({hostId:receipt.hostId,mode:'cpu' as const,timestamp:Date.now(),availableBytes:3*1024**3,
+  diskFreeBytes:101*1024**3,swapUsedBytes:0,memoryPsiAvg10:0,...(receipt.host.platform==='win32'?{cpuUtilizationPercent:0}:{load1:0})});
 
+test('runtime receipt inventories the complete closure and rejects set drift',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'gateway-runtime-')),modelRoot=await mkdtemp(join(tmpdir(),'gateway-model-'));
+  try{
+    const modelPath=join(modelRoot,'model.gguf');await writeFile(modelPath,Buffer.from('model'));
+    const names=['LICENSE','llama-server',...Array.from({length:19},(_,i)=>'llama-tool-'+i),...Array.from({length:39},(_,i)=>'lib-runtime-'+i+'.so')];
+    const files=new Map(names.map(name=>[name,Buffer.from('runtime:'+name)]));
+    for(const [name,bytes] of files)await writeFile(join(root,name),bytes);
+    const runtimeFiles=[...files].map(([path,bytes])=>({path,sha256:createHash('sha256').update(bytes).digest('hex')}));
+    const binaryHash=runtimeFiles.find(file=>file.path==='llama-server')!.sha256;
+    const receipt={...base('cpu'),binaryPath:join(root,'llama-server'),runtimeRoot:root,ggufPath:modelPath,binarySha256:binaryHash,runtimeFiles};
+    const hashFile=async(file:string)=>file===modelPath?receipt.artifactSha256:createHash('sha256').update(await readFile(file)).digest('hex');
+    const deps={hashFile,verifyPathSecurity:async()=>{}};
+    const inventory=await listRuntimeFiles(root);assert.equal(inventory.length,60);assert.ok(inventory.includes('LICENSE'));assert.ok(inventory.includes('llama-tool-18'));assert.ok(inventory.includes('lib-runtime-38.so'));
+    await verifyGatewayReceipt(receipt,deps);
+    await assert.rejects(verifyGatewayReceipt({...receipt,runtimeFiles:runtimeFiles.filter(file=>file.path!=='LICENSE')},deps),/runtime_unlisted_file/);
+    await assert.rejects(verifyGatewayReceipt({...receipt,runtimeFiles:[...runtimeFiles,{path:'unexpected-tool',sha256:'f'.repeat(64)}]},deps),/runtime_unlisted_file/);
+  }finally{await rm(root,{recursive:true,force:true});await rm(modelRoot,{recursive:true,force:true});}
+});
+
+test('runtime inventory accepts confined symlinks and rejects escapes and unsupported entries',{skip:platform()==='win32'},async()=>{
+  const root=await mkdtemp(join(tmpdir(),'gateway-runtime-')),outside=await mkdtemp(join(tmpdir(),'gateway-outside-'));
+  try{
+    const modelPath=join(outside,'model.gguf');await writeFile(modelPath,Buffer.from('model'));
+    await writeFile(join(root,'llama-server'),Buffer.from('server'));
+    await writeFile(join(root,'LICENSE'),Buffer.from('license'));
+    await symlink('LICENSE',join(root,'LICENSE.link'));
+    const serverHash=createHash('sha256').update('server').digest('hex'),licenseHash=createHash('sha256').update('license').digest('hex');
+    const receipt={...base('cpu'),binaryPath:join(root,'llama-server'),runtimeRoot:root,ggufPath:modelPath,binarySha256:serverHash,runtimeFiles:[
+      {path:'LICENSE',sha256:licenseHash},{path:'LICENSE.link',sha256:licenseHash},{path:'llama-server',sha256:serverHash}]};
+    const hashFile=async(file:string)=>file===modelPath?receipt.artifactSha256:createHash('sha256').update(await readFile(file)).digest('hex');
+    await verifyGatewayReceipt(receipt,{hashFile,verifyPathSecurity:async()=>{}});
+    await rm(join(root,'LICENSE.link'));
+    await writeFile(join(outside,'secret'),Buffer.from('outside'));
+    await symlink(join(outside,'secret'),join(root,'escape'));
+    const escaped={...receipt,runtimeFiles:[...receipt.runtimeFiles.filter(file=>file.path!=='LICENSE.link'),{path:'escape',sha256:createHash('sha256').update('outside').digest('hex')}]};
+    await assert.rejects(verifyGatewayReceipt(escaped,{hashFile,verifyPathSecurity:async()=>{}}),/runtime_symlink/);
+    await rm(join(root,'escape'));
+    execFileSync('/usr/bin/mkfifo',[join(root,'unsupported')]);
+    await assert.rejects(listRuntimeFiles(root),/runtime_entry_type/);
+  }finally{await rm(root,{recursive:true,force:true});await rm(outside,{recursive:true,force:true});}
+});
 test('receipt pins contract, files, build, authorization and remote TLS',async()=>{
   const receipt=base();receipt.artifactSha256=QWEN_CHUNK_CONTRACT.artifactSha256;
   const hashFile=async(path:string)=>path.includes('server')?receipt.binarySha256:receipt.artifactSha256;
@@ -54,7 +101,7 @@ test('long CPU authority leases rearm without timer overflow and close at exact 
   now=until;scheduled.shift()!.callback();assert.equal(closed,1);assert.equal(scheduled.length,0);assert.equal(cleared,0);
 });
 
-test('authenticated health owns the sole slot and rejected requests cannot release it',async()=>{
+test('authenticated requests get one bounded waiter while unauthorized and excess requests cannot queue or release',async()=>{
   const receipt=base();let release!:()=>void;
   const telemetryWait=new Promise<void>(resolve=>{release=resolve;});
   let first=true;
@@ -69,8 +116,101 @@ test('authenticated health owns the sole slot and rejected requests cannot relea
   };
   const active=invoke(`Bearer ${'s'.repeat(32)}`);await new Promise(resolve=>setImmediate(resolve));
   assert.equal((await invoke('Bearer wrong')).status,401);
+  const queued=invoke(`Bearer ${'s'.repeat(32)}`);await new Promise(resolve=>setImmediate(resolve));
   assert.equal((await invoke(`Bearer ${'s'.repeat(32)}`)).status,429);
-  release();const health=await active;assert.equal(health.status,200);assert.equal(health.body.status,'ok');assert.equal(health.body.verifiedLaunch,true);
+  release();const [health,next]=await Promise.all([active,queued]);
+  for(const result of [health,next]){assert.equal(result.status,200);assert.equal(result.body.status,'ok');assert.equal(result.body.verifiedLaunch,true);}
+});
+
+test('admission handoff is owner-only and timeout, abort, close, and authority expiry drain the waiter',async()=>{
+  const make=()=>{const req=Readable.from([]) as any;req.socket=new EventEmitter();const res=new EventEmitter() as any;res.status=0;res.body='';
+    res.writeHead=(status:number)=>{res.status=status;};res.end=(body:string)=>{res.body=body;};return{req,res};};
+  let admissionDeadline!:()=>void,admissionDelay=0;
+  const gateway=new LocalEmbeddingGateway(base('cpu'),Buffer.from('s'.repeat(32)),19000,{setAdmissionTimer:(callback,delay)=>{
+    admissionDeadline=callback;admissionDelay=delay;return{unref(){}} as NodeJS.Timeout;},clearAdmissionTimer:()=>{}});
+  const first=make(),owner=await(gateway as any).acquireAdmission(first.req,first.res);assert.equal(typeof owner,'symbol');
+  const second=make(),waiting=(gateway as any).acquireAdmission(second.req,second.res);await new Promise(resolve=>setImmediate(resolve));
+  (gateway as any).releaseAdmission(Symbol('non-owner'));assert.equal((gateway as any).activeAdmission,owner);
+  (gateway as any).releaseAdmission(owner);const handed=await waiting;assert.equal(typeof handed,'symbol');assert.equal((gateway as any).activeAdmission,handed);
+  (gateway as any).releaseAdmission(handed);
+
+  const timeoutActive=make(),timeoutOwner=await(gateway as any).acquireAdmission(timeoutActive.req,timeoutActive.res),timed=make(),timedWait=(gateway as any).acquireAdmission(timed.req,timed.res);
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(admissionDelay,5000);admissionDeadline();assert.equal(await timedWait,undefined);
+  assert.equal(timed.res.status,429);assert.deepEqual(JSON.parse(timed.res.body),{error:'busy'});(gateway as any).releaseAdmission(timeoutOwner);
+
+  const abortActive=make(),abortOwner=await(gateway as any).acquireAdmission(abortActive.req,abortActive.res),aborted=make(),abortWait=(gateway as any).acquireAdmission(aborted.req,aborted.res);
+  await new Promise(resolve=>setImmediate(resolve));aborted.req.emit('aborted');assert.equal(await abortWait,undefined);assert.equal(aborted.res.status,0);
+  (gateway as any).releaseAdmission(abortOwner);
+
+  const closeActive=make(),closeOwner=await(gateway as any).acquireAdmission(closeActive.req,closeActive.res),closing=make(),closeWait=(gateway as any).acquireAdmission(closing.req,closing.res);
+  await new Promise(resolve=>setImmediate(resolve));await gateway.close();assert.equal(await closeWait,undefined);assert.equal((gateway as any).activeAdmission,undefined);
+  (gateway as any).releaseAdmission(closeOwner);const afterClose=make();assert.equal(await(gateway as any).acquireAdmission(afterClose.req,afterClose.res),undefined);assert.equal(afterClose.res.status,503);
+
+  const expiredReceipt={...base('cpu'),authorizedUntil:new Date(Date.now()-1).toISOString()};
+  const expiring=new LocalEmbeddingGateway(expiredReceipt,Buffer.from('s'.repeat(32)),19000,{now:()=>new Date()});
+  const expiryOwner=await(expiring as any).acquireAdmission(make().req,make().res),expiryWait=(expiring as any).acquireAdmission(make().req,make().res);
+  (expiring as any).authorityTimerActive=true;(expiring as any).armAuthorityExpiry();assert.equal(await expiryWait,undefined);
+  assert.equal((expiring as any).activeAdmission,undefined);(expiring as any).releaseAdmission(expiryOwner);
+});
+
+test('admission rechecks abandonment, close state, and monotonic deadline across handoff races',async()=>{
+  const make=()=>{const req=Readable.from([]) as any;req.socket=new EventEmitter();const res=new EventEmitter() as any;res.status=0;res.body='';
+    res.writeHead=(status:number)=>{res.status=status;};res.end=(body:string)=>{res.body=body;};return{req,res};};
+  let now=0,timerCallback=()=>{};const deps={admissionNow:()=>now,setAdmissionTimer:(callback:()=>void,delay:number)=>{
+    assert.equal(delay,5000);timerCallback=callback;return{unref(){}} as NodeJS.Timeout;},clearAdmissionTimer:()=>{}};
+
+  const preAbortedGateway=new LocalEmbeddingGateway(base('cpu'),Buffer.from('s'.repeat(32)),19000,deps),preAborted=make();
+  preAborted.req.aborted=true;assert.equal(await(preAbortedGateway as any).acquireAdmission(preAborted.req,preAborted.res),undefined);
+  assert.equal((preAbortedGateway as any).activeAdmission,undefined);assert.equal(preAborted.res.status,0);
+
+  const abortGateway=new LocalEmbeddingGateway(base('cpu'),Buffer.from('s'.repeat(32)),19000,deps),abortActive=make();
+  const abortOwner=await(abortGateway as any).acquireAdmission(abortActive.req,abortActive.res),abortQueued=make();
+  const abortWait=(abortGateway as any).acquireAdmission(abortQueued.req,abortQueued.res);await new Promise(resolve=>setImmediate(resolve));
+  (abortGateway as any).releaseAdmission(abortOwner);const abortToken=await abortWait;abortQueued.req.aborted=true;
+  assert.equal((abortGateway as any).validateGrantedAdmission(abortToken,abortQueued.req,abortQueued.res,5000),false);
+  assert.equal((abortGateway as any).activeAdmission,undefined);assert.equal(abortQueued.res.status,0);
+
+  const closeGateway=new LocalEmbeddingGateway(base('cpu'),Buffer.from('s'.repeat(32)),19000,deps),closeActive=make();
+  const closeOwner=await(closeGateway as any).acquireAdmission(closeActive.req,closeActive.res),closeQueued=make();
+  const closeWait=(closeGateway as any).acquireAdmission(closeQueued.req,closeQueued.res);await new Promise(resolve=>setImmediate(resolve));
+  (closeGateway as any).releaseAdmission(closeOwner);const closeToken=await closeWait;await closeGateway.close();
+  assert.equal((closeGateway as any).validateGrantedAdmission(closeToken,closeQueued.req,closeQueued.res,5000),false);
+  assert.equal((closeGateway as any).activeAdmission,undefined);assert.equal(closeQueued.res.status,0);
+
+  const deadlineGateway=new LocalEmbeddingGateway(base('cpu'),Buffer.from('s'.repeat(32)),19000,deps),deadlineActive=make();
+  const deadlineOwner=await(deadlineGateway as any).acquireAdmission(deadlineActive.req,deadlineActive.res),expired=make();
+  const expiredWait=(deadlineGateway as any).acquireAdmission(expired.req,expired.res);await new Promise(resolve=>setImmediate(resolve));
+  now=5000;(deadlineGateway as any).releaseAdmission(deadlineOwner);assert.equal(await expiredWait,undefined);
+  assert.equal(expired.res.status,429);assert.deepEqual(JSON.parse(expired.res.body),{error:'busy'});
+  assert.equal((deadlineGateway as any).activeAdmission,undefined);assert.equal(typeof timerCallback,'function');
+
+  now=0;const postDeadlineGateway=new LocalEmbeddingGateway(base('cpu'),Buffer.from('s'.repeat(32)),19000,deps),postActive=make();
+  const postOwner=await(postDeadlineGateway as any).acquireAdmission(postActive.req,postActive.res),postExpired=make();
+  const postWait=(postDeadlineGateway as any).acquireAdmission(postExpired.req,postExpired.res);await new Promise(resolve=>setImmediate(resolve));
+  (postDeadlineGateway as any).releaseAdmission(postOwner);now=5000;const postToken=await postWait;
+  assert.equal((postDeadlineGateway as any).validateGrantedAdmission(postToken,postExpired.req,postExpired.res,5000),false);
+  assert.equal(postExpired.res.status,429);assert.equal((postDeadlineGateway as any).activeAdmission,undefined);
+});
+
+test('abandonment or close after synchronous grant never reads the queued body or reaches upstream',async()=>{
+  const run=async(race:'abort'|'close')=>{
+    const receipt=base('cpu');let upstream=0;
+    const gateway=new LocalEmbeddingGateway(receipt,Buffer.from('s'.repeat(32)),19000,{telemetry:async()=>healthyCpuTelemetry(receipt),
+      fetch:(async()=>{upstream++;return Response.json({tokens:[1]});}) as typeof fetch});
+    (gateway as any).backendSecret=Buffer.from('b'.repeat(32));
+    const ownerReq=Readable.from([]) as any,ownerRes=new EventEmitter() as any,owner=await(gateway as any).acquireAdmission(ownerReq,ownerRes);
+    const raw=JSON.stringify({content:'must-not-be-read',add_special:true}),req=Readable.from([raw]) as any;req.method='POST';req.url='/tokenize';
+    req.headers={authorization:`Bearer ${'s'.repeat(32)}`,'content-length':String(Buffer.byteLength(raw))};req.socket=new EventEmitter();
+    let status=0,body='';const res=new EventEmitter() as any;res.writeHead=(value:number)=>{status=value;};res.end=(value='')=>{body=String(value);};
+    const original=(gateway as any).validateGrantedAdmission.bind(gateway);
+    (gateway as any).validateGrantedAdmission=(token:symbol,request:any,response:any,deadline:number|undefined)=>{
+      if(race==='abort')request.aborted=true;else{(gateway as any).admissionClosed=true;(gateway as any).activeAdmission=undefined;}
+      return original(token,request,response,deadline);
+    };
+    const pending=(gateway as any).handle(req,res);await new Promise(resolve=>setImmediate(resolve));(gateway as any).releaseAdmission(owner);await pending;
+    assert.equal(status,0);assert.equal(body,'');assert.equal(upstream,0);
+  };
+  await run('abort');await run('close');
 });
 
 test('startup failure after child launch closes the owned child',async()=>{
@@ -168,7 +308,7 @@ test('health uses the full GPU guard and expired authority blocks all routes bef
   assert.equal((await invokeGateway(gateway,'/health')).status,200);assert.equal(full,1);assert.equal(common,0);
   const expired={...receipt,authorizedUntil:new Date(Date.now()-1).toISOString()},blocked=new LocalEmbeddingGateway(expired,Buffer.from('s'.repeat(32)),19000,{commonTelemetry:async()=>{common++;return healthyGpuTelemetry(expired);},telemetry:async()=>{full++;return healthyGpuTelemetry(expired);},fetch:(async()=>{backend++;return Response.json({});}) as typeof fetch});
   assert.equal((await invokeGateway(blocked,'/tokenize',{content:'x',add_special:true})).status,403);
-  assert.equal((await invokeGateway(blocked,'/health')).status,403);assert.equal(common,0);assert.equal(full,1);assert.equal(backend,0);
+  assert.equal((await invokeGateway(blocked,'/health')).status,503);assert.equal(common,0);assert.equal(full,1);assert.equal(backend,0);
 });
 
 test('GPU common admission rejects negative swap, load and CPU utilization before upstream work',async()=>{
