@@ -249,6 +249,8 @@ node --import tsx scripts/shadow-embedding-index.ts attest-cutover --database <e
 node --import tsx scripts/shadow-embedding-index.ts activate --database <expected-db> --run-id <uuid> --apply --manifest <manifest.json> --manifest-sha256 <hash> --cutover-plan <cutover.json> --cutover-plan-sha256 <hash>
 ```
 
+Automatic search checks database serving mode before provider work. After inference it takes a shared transaction advisory lock, rechecks the mode, and holds that lock through ranking. Supported activation and rollback take the matching exclusive lock before their run/settings row locks. A missing or inconsistent target environment fails closed; explicit evaluator vectors bypass automatic provider and serving-mode selection. All writers and readers must still be drained for cutover.
+
 Emergency rollback is supported only inside the approved dual-write window. Hard-stop and drain every process, job, scheduler, and direct database client that can write memories before running SQL. The separately reviewed, content-free rollback evidence receipt must attest that all writers were stopped and drained and that the current Gemini rollback plane was verified; possessing a receipt hash alone is not proof of either condition. Then run the exact approved cutover plan:
 
 ```bash

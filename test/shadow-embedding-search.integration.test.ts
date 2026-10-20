@@ -51,6 +51,7 @@ test('local search aggregates chunks and excludes unauthorized, stale, incomplet
     [ids.incomplete,'incomplete parent','personal','normal',null,null],
   ];
   const oldFetch = globalThis.fetch;
+  const previousContract=process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
   let providerCalls = 0;
   globalThis.fetch = async () => { providerCalls++; throw new Error('provider forbidden'); };
   try {
@@ -93,7 +94,13 @@ test('local search aggregates chunks and excludes unauthorized, stale, incomplet
     await add(ids.expired,sha('expired parent'),[vec(1)]);
 
     setPoolForTesting(new SavepointPool(client) as unknown as pg.Pool);
-    const {rankMemories}=await import(`../src/search.js?shadow-pg=${Date.now()}`);
+    delete process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+    const {hybridSearch,rankMemories}=await import(`../src/search.js?shadow-pg=${Date.now()}`);
+    await assert.rejects(()=>hybridSearch({query:'must-not-call-provider'},['personal'],
+      {namespaces:['personal'],keyId:owner,isAdmin:false},'normal'),/serving_contract_mismatch/);
+    assert.equal(providerCalls,0,'a real Qwen serving row rejects missing process identity before provider access');
+    if(previousContract===undefined)delete process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+    else process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT=previousContract;
     const found=await rankMemories({query:'zz-no-text-match',threshold:0,limit:20},['personal'],
       {namespaces:['personal'],keyId:owner,isAdmin:false},'normal',{queryVectors:[{
         profile:{name:'qwen',provider:'llama.cpp',model:QWEN_CONTRACT_ID,dimensions:768},vector:[1,...Array(767).fill(0)],
@@ -118,6 +125,8 @@ test('local search aggregates chunks and excludes unauthorized, stale, incomplet
   } finally {
     setPoolForTesting(null);
     globalThis.fetch=oldFetch;
+    if(previousContract===undefined)delete process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+    else process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT=previousContract;
     try { await client.query('ROLLBACK'); } catch {}
     client.release();
     await pool.end();

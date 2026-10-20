@@ -75,6 +75,7 @@ export async function activateCutover(client:pg.PoolClient,expectedDatabase:stri
   await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
   try {
     await client.query("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='30min'; SET LOCAL work_mem='8MB'; SET LOCAL max_parallel_workers_per_gather=0");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('total-recall.embedding-serving',0))");
     await lockBoundRun(client,expectedDatabase,operational,cutover);
     const index=await inspectShadowIndex(client,expectedDatabase);if(!index.valid||!index.ready)throw new Error('embedding.index_not_ready');
     const clock=await client.query(`SELECT statement_timestamp() AS now,EXISTS(SELECT 1 FROM embedding_serving_settings WHERE singleton) AS active`);
@@ -137,6 +138,7 @@ export async function rollbackCutover(client:pg.PoolClient,expectedDatabase:stri
   await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
   try {
     await client.query("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='30min'");
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('total-recall.embedding-serving',0))");
     const a=cutover.plan.activation;
     // Global order is run -> serving settings/contract -> queue rows. Steady
     // claims and controls use the same order, avoiding a run/settings cycle.

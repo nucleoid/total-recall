@@ -2,11 +2,16 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type pg from 'pg';
 import { setPoolForTesting, type DbScope } from '../src/db.js';
+import {QWEN_CONTRACT_ID} from '../src/local-embedding-contract.js';
 
 class Client {
   calls: Array<{ text: string; values?: unknown[] }> = [];
+  servingTable: string|null = null;
+  servingContract: string|undefined;
   async query<T extends pg.QueryResultRow = pg.QueryResultRow>(text: string, values?: unknown[]): Promise<pg.QueryResult<T>> {
     this.calls.push({ text, values });
+    if (text.includes("to_regclass('public.embedding_serving_settings')")) return result([{ serving_table: this.servingTable } as unknown as T]);
+    if (text.includes('FROM embedding_serving_settings')) return result(this.servingContract ? [{contract_id:this.servingContract} as unknown as T] : []);
     if (text.includes('FROM pg_attribute') && text.includes('belief_schema')) return result([{
       belief_schema: false, supersession_schema: false, revision_schema: false,
       validity_finalized: false, consolidation_schema: false,
@@ -70,5 +75,33 @@ test('mixed search calls only eligible configured identities and emits separate 
     delete process.env.EMBEDDING_PROFILES_JSON;
     delete process.env.MIXED_GEMINI_KEY;
     delete process.env.MIXED_OLLAMA_URL;
+  }
+});
+
+test('automatic legacy search rejects a database cutover during the secondary provider before ranking', async () => {
+  process.env.EMBEDDING_CURRENT_PROFILE = 'production';
+  process.env.EMBEDDING_PROFILES_JSON = JSON.stringify({
+    production: { provider: 'gemini', model: 'gemini-embedding-2-preview', dimensions: 768, apiKeyEnv: 'MIXED_GEMINI_KEY' },
+    legacy: { provider: 'ollama', model: 'nomic-embed-text', dimensions: 768, baseUrlEnv: 'MIXED_OLLAMA_URL' },
+  });
+  process.env.MIXED_GEMINI_KEY='test-key';process.env.MIXED_OLLAMA_URL='http://legacy.invalid';
+  delete process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+  const client=new Client();let requests=0;
+  const originalFetch=globalThis.fetch;
+  globalThis.fetch=async input=>{requests++;if(requests===2){client.servingTable='embedding_serving_settings';client.servingContract=QWEN_CONTRACT_ID;}
+    const body=String(input).includes('legacy.invalid')?{embeddings:[Array(768).fill(0.2)]}:{embedding:{values:Array(768).fill(0.1)}};
+    return new Response(JSON.stringify(body),{status:200,headers:{'Content-Type':'application/json'}});};
+  try{
+    setPoolForTesting(new Pool(client) as unknown as pg.Pool);
+    const {hybridSearch}=await import(`../src/search.js?cutover-race=${Date.now()}`);
+    await assert.rejects(()=>hybridSearch({query:'migration query'},['shared'],scope,'normal'),/serving_contract_mismatch/);
+    assert.equal(requests,2);
+    const lock=client.calls.findIndex(call=>call.text.includes('pg_advisory_xact_lock_shared'));
+    assert.ok(lock>client.calls.findIndex(call=>call.text.startsWith('SELECT EXISTS')),'shared mode lock follows secondary-provider eligibility and inference');
+    assert.equal(client.calls.some(call=>call.text.includes('WITH vector_results')),false);
+  }finally{
+    globalThis.fetch=originalFetch;
+    delete process.env.EMBEDDING_CURRENT_PROFILE;delete process.env.EMBEDDING_PROFILES_JSON;
+    delete process.env.MIXED_GEMINI_KEY;delete process.env.MIXED_OLLAMA_URL;
   }
 });

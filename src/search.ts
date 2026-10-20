@@ -275,7 +275,10 @@ export async function executeHybridSearch(
   const ranking = validateSearchRankingConfig(options.ranking ?? DEFAULT_SEARCH_RANKING_CONFIG);
   const trackAccess = options.trackAccess !== false;
   const asOf = options.asOf === undefined ? undefined : normalizedInstant(options.asOf, 'asOf');
-  const useLocalServing = !options.queryVectors && localServingEnabled();
+  const configuredLocalServing = !options.queryVectors && localServingEnabled();
+  const useLocalServing = options.queryVectors ? false : await withScopedClient(scope, async client => {
+    return resolveAutomaticReadMode(client, configuredLocalServing);
+  }, { readOnly: true });
   let localQueryVector: string | undefined;
   // queryVectors supersedes the old single vectorAvailable flag.
   const queryVectors: Array<{ profile: SearchQueryVector['profile']; vector: string }> = [];
@@ -331,8 +334,10 @@ export async function executeHybridSearch(
       throw new Error('Invalid valid_at: temporal search is unavailable until memory validity finalization completes');
     }
 
-    if (useLocalServing) {
-      await verifyLocalServingContract(client);
+    if (!options.queryVectors && !useLocalServing) {
+      // The provider call runs outside a transaction. Recheck automatic legacy
+      // mode before ranking so a concurrent cutover cannot score the old space.
+      await resolveAutomaticReadMode(client, false);
     }
     // Canonicalize aliases that describe the same space. A legacy provider is
     // never called merely because credentials exist: at least one fully labelled,
@@ -349,6 +354,14 @@ export async function executeHybridSearch(
       } catch (error) {
         console.warn(`[search] Legacy embedding profile ${profile.name} (${profile.provider}/${profile.model}/${profile.dimensions}) unavailable; continuing without that vector space`);
       }
+    }
+    if (!options.queryVectors) {
+      // Provider work is complete. Hold a shared transaction lock across the
+      // final serving fence and ranking so supported cutover/rollback cannot
+      // commit a mode change between them. Never hold this lock during inference.
+      await client.query("SELECT pg_advisory_xact_lock_shared(hashtextextended('total-recall.embedding-serving',0))");
+      if (useLocalServing) await verifyLocalServingContract(client);
+      else await resolveAutomaticReadMode(client, false);
     }
 
     const values: unknown[] = [];
@@ -644,4 +657,29 @@ async function verifyLocalServingContract(client: ScopedClient): Promise<void> {
   if (serving.rows.length !== 1 || serving.rows[0].contract_id !== QWEN_CONTRACT_ID) {
     throw new Error('shadow_embedding.serving_contract_mismatch');
   }
+}
+
+async function resolveAutomaticReadMode(client: ScopedClient, configuredLocalServing: boolean): Promise<boolean> {
+  const schema = await client.query<{ serving_table: string | null }>(`
+    SELECT to_regclass('public.embedding_serving_settings')::text AS serving_table
+  `);
+  if (schema.rows.length !== 1 || !Object.prototype.hasOwnProperty.call(schema.rows[0], 'serving_table')
+    || (schema.rows[0].serving_table !== null && typeof schema.rows[0].serving_table !== 'string')) {
+    throw new Error('shadow_embedding.serving_catalog_mismatch');
+  }
+  if (schema.rows[0].serving_table === null) {
+    if (configuredLocalServing) throw new Error('shadow_embedding.serving_contract_mismatch');
+    return false;
+  }
+  const serving = await client.query<{ contract_id: string }>(`
+    SELECT contract_id FROM embedding_serving_settings WHERE singleton = true
+  `);
+  if (serving.rows.length === 0) {
+    if (configuredLocalServing) throw new Error('shadow_embedding.serving_contract_mismatch');
+    return false;
+  }
+  if (serving.rows.length !== 1 || serving.rows[0].contract_id !== QWEN_CONTRACT_ID || !configuredLocalServing) {
+    throw new Error('shadow_embedding.serving_contract_mismatch');
+  }
+  return true;
 }

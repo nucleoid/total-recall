@@ -67,7 +67,14 @@ test('real HNSW build, planner use and completion guards', {skip:!url}, async()=
     await client.query(`INSERT INTO embedding_work_items(contract_id,parent_type,parent_id,state) VALUES($1,'subscription',$2,'pending')`,[QWEN_CONTRACT_ID,queuedId]);
     await assert.rejects(activateCutover(client,database,envelope,cutover),/cutover_readiness/);
     await client.query(`DELETE FROM embedding_work_items WHERE contract_id=$1 AND parent_type='subscription' AND parent_id=$2`,[QWEN_CONTRACT_ID,queuedId]);
-    assert.equal((await activateCutover(client,database,envelope,cutover)).cutover_attestation_run_id,runId);
+    const reader=new pg.Client({connectionString:url});await reader.connect();await reader.query('BEGIN');
+    await reader.query("SELECT pg_advisory_xact_lock_shared(hashtextextended('total-recall.embedding-serving',0))");
+    let activationSettled=false;
+    const activation=activateCutover(client,database,envelope,cutover).then(value=>{activationSettled=true;return value;});
+    await new Promise(resolve=>setTimeout(resolve,100));
+    assert.equal(activationSettled,false,'activation waits for an in-flight automatic reader mode lock');
+    await reader.query('COMMIT');await reader.end();
+    assert.equal((await activation).cutover_attestation_run_id,runId);
     await assert.rejects(activateCutover(client,database,envelope,cutover),/serving_already_active/);
     const lateValue={...cutoverValue,activation:{...cutoverValue.activation,rollbackUntil:new Date(Date.now()-10_000).toISOString()}};
     const late=validateCutoverPlan(lateValue,hashOperationalManifest(lateValue),envelope);
