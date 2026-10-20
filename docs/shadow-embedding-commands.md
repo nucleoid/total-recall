@@ -58,11 +58,48 @@ All mutations require `--apply`, `--manifest <path>`, and `--manifest-sha256 <ca
       "caSha256": "<approved private CA file SHA-256>",
       "spkiSha256": "<approved server public-key SPKI SHA-256>"
     }
+  },
+  "steadyState": {
+    "resources": {
+      "maxParentsPerBatch": 5,
+      "maxSourceBytesPerBatch": 1000000,
+      "maxTokensPerBatch": 100000,
+      "maxElapsedMsPerBatch": 900000,
+      "maxAttempts": 3,
+      "indexBuild": {
+        "maintenanceWorkMemMb": 256,
+        "maxParallelMaintenanceWorkers": 1,
+        "lockTimeoutMs": 2000,
+        "statementTimeoutMs": 600000
+      },
+      "host": {
+        "deploymentProfile": "linux-worker",
+        "expectedHostname": "<exact steady-worker Linux hostname>",
+        "diskPath": "<reviewed persistent disk path>",
+        "minAvailableMemoryBytes": 2147483648,
+        "minAvailableDiskBytes": 107374182400,
+        "maxLoadPerCpu": 1,
+        "maxSwapUsedBytes": 12884901888,
+        "maxMemoryPsiAvg10": 1,
+        "maxCpuPsiAvg10": 5
+      }
+    },
+    "runtime": {
+      "acceptanceReceiptSha256": "<real CPU serving acceptance receipt SHA-256>",
+      "artifactSha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
+      "runtimeContract": "llama.cpp/b11669/last-pool/tokenize-special/native1024",
+      "expectedRuntimeHost": "<actual accepted CPU serving hostname>",
+      "expectedRuntimeMode": "cpu",
+      "tls": {
+        "caSha256": "<approved CPU serving private CA file SHA-256>",
+        "spkiSha256": "<approved CPU serving public-key SPKI SHA-256>"
+      }
+    }
   }
 }
 ```
 
-Do not create the manifest until its approval, runtime acceptance, source release, resource bounds, and eligibility have been reviewed. The command validates these pins but cannot prove that an external approval artifact exists.
+`steadyState` is optional for preparation and backfill compatibility, but activation and completion fail closed without it. It repeats the full resource/runtime schemas so the same immutable manifest independently pins the GPU backfill and CPU steady planes. It contains no second approval object. Its runtime mode must be `cpu`; arbitrary local runtime/model identities are rejected by the same validator. Do not create the manifest until its approval, both runtime acceptances, source release, resource bounds, and eligibility have been reviewed. The command validates these pins but cannot prove that an external approval artifact exists.
 
 ## Inference gateway installation
 
@@ -155,6 +192,22 @@ node --import tsx scripts/shadow-embeddings.ts worker --database <expected-db> -
 ```
 
 Before work and again before model inference, the worker verifies the exact Linux hostname, available RAM and disk, one-minute load per CPU, swap use, memory PSI, CPU PSI, and an authenticated `/health` response carrying the pinned runtime identity. Missing `/proc` PSI or other unknown metrics fail closed. `linux-worker` is the normal deployment profile. `linux-transient-laptop` must be explicitly approved in the immutable manifest and is additionally capped at 100 parents and 15 minutes per invocation; it does not authorize a stable serving deployment. The example thresholds are illustrative and must be replaced by reviewed host-specific limits.
+
+## Steady-state repair worker
+
+Capture continues after initial convergence. Future-valid parents, asynchronous writers and later source/lifecycle mutations therefore need a durable CPU worker during observation and after run completion. The steady commands use the immutable `steadyState` CPU runtime/resources from the original run manifest; they never substitute the GPU backfill plan or rewrite the manifest.
+
+After cutover activation, explicitly enable the steady fence. One invocation processes exactly one finite batch. The illustrative plan above permits 5 parents, 1 MiB source, 100,000 tokens, 15 minutes and 3 retryable attempts. Validate its duration against representative long parents on the accepted CPU runtime before approval; this is a finite process lifetime, not a service-wide deadline:
+
+```powershell
+node --import tsx scripts/shadow-embeddings.ts steady-enable --database <expected-db> --run-id <uuid> --apply --manifest <manifest.json> --manifest-sha256 <hash>
+node --import tsx scripts/shadow-embeddings.ts steady-worker --database <expected-db> --run-id <uuid> --apply --manifest <manifest.json> --manifest-sha256 <hash>
+node --import tsx scripts/shadow-embeddings.ts steady-pause --database <expected-db> --run-id <uuid> --apply --manifest <manifest.json> --manifest-sha256 <hash>
+```
+
+Enable and pause lock the same attested serving/run binding. A steady invocation requires run state `paused` or `complete`, the serving singleton to reference the same immutable cutover attestation/run, capture enabled, and `steady_worker_enabled=true`. The store repeats these fences during claims and publication. Missing serving state, a rollback, a disabled flag, wrong runtime receipt/TLS identity, or a systemic/fatal resource error stops work; there is no fallback to backfill/GPU settings.
+
+The permanent worker supervisor invokes only this finite command against the accepted CPU serving gateway. It must prevent overlap, poll no faster than every 5 seconds while actionable work exists, back off to at least 30 seconds when idle, and preserve process/receipt visibility. Before the five-minute cutover or observation-end drain, stop the timer and run `steady-pause`; after activation or the final target-only canaries, re-enable it. Following guarded run completion it remains enabled for future mutations. Installation must use the reviewed immutable release, explicit operator database URL, manifest/hash/run ID and protected CPU runtime environment; dotenv and `DATABASE_URL` fallback remain forbidden.
 
 ## Index build and completion attestation
 

@@ -117,7 +117,8 @@ export async function runShadowBatch(store: ShadowEmbeddingStore, client: LocalE
       if (committed) receipt.completeParents++;
       else {
         receipt.staleParents++;
-        if (!await store.settle(claim, 'retry', 'embedding.source_changed')) break;
+        // A source race or control fence is sound resumable work, not a provider failure.
+        if (!await store.defer(claim, 'embedding.source_changed')) break;
       }
     } catch (error) {
       const classified = error instanceof LocalEmbeddingError ? error

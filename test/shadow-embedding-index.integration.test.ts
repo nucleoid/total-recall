@@ -7,6 +7,7 @@ import { hashOperationalManifest, validateOperationalManifest } from '../src/sha
 import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID, sha256 } from '../src/local-embedding-contract.js';
 import { CURRENT_PARENT_ELIGIBILITY } from '../src/shadow-embedding-store.js';
 import { activateCutover, attestCutover, rollbackCutover, validateCutoverPlan } from '../src/shadow-embedding-cutover.js';
+import { enableSteadyWorker } from '../src/shadow-embedding-steady.js';
 
 const url=process.env.SHADOW_EMBEDDING_TEST_DATABASE_URL;
 const database='total_recall_reembedding_test';
@@ -16,7 +17,11 @@ function manifest(){return {version:1 as const,approval:{reference:'synthetic/in
   resources:{maxParentsPerBatch:1,maxSourceBytesPerBatch:1000,maxTokensPerBatch:1000,maxElapsedMsPerBatch:1000,maxAttempts:1,
     host:{deploymentProfile:'linux-worker' as const,expectedHostname:'test',diskPath:'/tmp',minAvailableMemoryBytes:268435456,minAvailableDiskBytes:1073741824,maxLoadPerCpu:1,maxSwapUsedBytes:0,maxMemoryPsiAvg10:1,maxCpuPsiAvg10:5},indexBuild:indexPlan},
   runtime:{acceptanceReceiptSha256:'c'.repeat(64),artifactSha256:QWEN_CHUNK_CONTRACT.artifactSha256,runtimeContract:QWEN_CHUNK_CONTRACT.runtimeContract,
-    expectedRuntimeHost:'test',expectedRuntimeMode:'cpu' as const}}}
+    expectedRuntimeHost:'test',expectedRuntimeMode:'cpu' as const},
+  steadyState:{resources:{maxParentsPerBatch:1,maxSourceBytesPerBatch:1000,maxTokensPerBatch:1000,maxElapsedMsPerBatch:1000,maxAttempts:1,
+    host:{deploymentProfile:'linux-worker' as const,expectedHostname:'test',diskPath:'/tmp',minAvailableMemoryBytes:268435456,minAvailableDiskBytes:1073741824,maxLoadPerCpu:1,maxSwapUsedBytes:0,maxMemoryPsiAvg10:1,maxCpuPsiAvg10:5},indexBuild:indexPlan},
+    runtime:{acceptanceReceiptSha256:'c'.repeat(64),artifactSha256:QWEN_CHUNK_CONTRACT.artifactSha256,runtimeContract:QWEN_CHUNK_CONTRACT.runtimeContract,
+      expectedRuntimeHost:'test',expectedRuntimeMode:'cpu' as const}}}}
 
 test('real HNSW build, planner use and completion guards', {skip:!url}, async()=>{
   assert.equal(new URL(url!).pathname,`/${database}`);
@@ -166,6 +171,8 @@ test('real HNSW build, planner use and completion guards', {skip:!url}, async()=
     await client.query(`UPDATE embedding_work_items SET state='complete',source_sha256=$3,source_revision=(SELECT revision FROM memories WHERE id=$2)
       WHERE contract_id=$1 AND parent_id=$2`,[QWEN_CONTRACT_ID,parent,sha256(text)]);
     await assert.rejects(completeShadowRun(client,database,runId,envelope,receipts,new Date(Date.now()-1000).toISOString()),/completion_cutover_mismatch/);
+    await assert.rejects(completeShadowRun(client,database,runId,envelope,receipts,cutoverValue.watermark),/steady_plan_required/);
+    await enableSteadyWorker(client,database,runId,envelope);
     assert.equal((await completeShadowRun(client,database,runId,envelope,receipts,cutoverValue.watermark)).status,'complete');
     await assert.rejects(client.query(`UPDATE embedding_runs SET completion_attestation=$2::jsonb WHERE id=$1`,[runId,JSON.stringify({...receipts,qualityReceiptSha256:'9'.repeat(64)})]),/immutable_completion_attestation/);
     await assert.rejects(client.query(`UPDATE embedding_runs SET status='paused' WHERE id=$1`,[runId]),/complete_run_immutable/);

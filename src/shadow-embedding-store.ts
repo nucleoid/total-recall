@@ -29,8 +29,21 @@ export interface ClaimedSource {
 /** Operator-only connection; never the application's scoped pool or GPU worker. */
 export class ShadowEmbeddingStore {
   readonly owner = randomUUID();
-  constructor(private readonly pool: pg.Pool, readonly runId: string, private readonly leaseSeconds = 120) {
+  constructor(private readonly pool: pg.Pool, readonly runId: string, private readonly leaseSeconds = 120,
+    readonly mode: 'backfill' | 'steady' = 'backfill') {
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 10 || leaseSeconds > 300) throw new Error('embedding.lease_limit');
+    if (mode !== 'backfill' && mode !== 'steady') throw new Error('embedding.worker_mode');
+  }
+
+  private runFence(runAlias = 'r'): string {
+    if (this.mode === 'backfill') return `${runAlias}.status='running'`;
+    return `${runAlias}.status IN ('paused','complete')
+      AND ${runAlias}.manifest ? 'steadyState' AND ${runAlias}.manifest#>>'{steadyState,runtime,expectedRuntimeMode}'='cpu'
+      AND EXISTS (SELECT 1 FROM embedding_serving_settings s
+        JOIN embedding_contracts c ON c.id=s.contract_id
+        JOIN embedding_cutover_attestations a ON a.contract_id=s.contract_id AND a.run_id=s.cutover_attestation_run_id
+        WHERE s.singleton AND s.contract_id=${runAlias}.contract_id AND s.cutover_attestation_run_id=${runAlias}.id
+          AND s.capture_required AND c.capture_enabled AND s.steady_worker_enabled)`;
   }
 
   async verifyDatabase(expectedDatabase: string): Promise<void> {
@@ -44,7 +57,7 @@ export class ShadowEmbeddingStore {
   async claim(): Promise<ShadowClaim | null> {
     const result = await this.pool.query(`WITH picked AS (
       SELECT w.contract_id,w.parent_type,w.parent_id FROM embedding_work_items w
-      JOIN embedding_runs r ON r.contract_id=w.contract_id AND r.id=$1 AND r.status='running'
+      JOIN embedding_runs r ON r.contract_id=w.contract_id AND r.id=$1 AND ${this.runFence()}
       WHERE w.contract_id=$2 AND ((w.state IN ('pending','retry') AND w.next_attempt_at<=statement_timestamp())
         OR (w.state='claimed' AND w.lease_until<statement_timestamp()))
       ORDER BY w.next_attempt_at,w.parent_type,w.parent_id FOR UPDATE OF w SKIP LOCKED LIMIT 1
@@ -81,7 +94,7 @@ export class ShadowEmbeddingStore {
       lease_until=statement_timestamp()+$6*interval '1 second',updated_at=statement_timestamp()
       WHERE contract_id=$1 AND parent_type=$2 AND parent_id=$3 AND generation=$4 AND claimed_by=$5
         AND state='claimed' AND lease_until>statement_timestamp()
-        AND EXISTS (SELECT 1 FROM embedding_runs r WHERE r.id=$7 AND r.contract_id=w.contract_id AND r.status='running')`,
+        AND EXISTS (SELECT 1 FROM embedding_runs r WHERE r.id=$7 AND r.contract_id=w.contract_id AND ${this.runFence()})`,
     [claim.contractId, claim.parentType, claim.parentId, claim.generation, claim.owner, this.leaseSeconds, this.runId]);
     return result.rowCount === 1;
   }
@@ -115,7 +128,16 @@ export class ShadowEmbeddingStore {
 
   async pause(errorCode: string): Promise<void> {
     if (!/^[a-z0-9_.]{1,96}$/u.test(errorCode)) throw new Error('embedding.invalid_error_state');
-    await this.pool.query(`UPDATE embedding_runs SET status='paused',last_error_code=$2,updated_at=statement_timestamp()
+    if (this.mode === 'steady') {
+      const client=await this.pool.connect();try{await client.query('BEGIN');await client.query("SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='10s'");
+        const run=await client.query(`SELECT 1 FROM embedding_runs r WHERE r.id=$1 AND r.contract_id=$2 AND ${this.runFence()} FOR UPDATE`,
+        [this.runId,QWEN_CONTRACT_ID]);
+        if(run.rowCount===1)await client.query(`UPDATE embedding_serving_settings SET steady_worker_enabled=false,steady_worker_last_error=$2,
+          updated_at=statement_timestamp() WHERE singleton AND contract_id=$3 AND cutover_attestation_run_id=$1`,
+        [this.runId,errorCode,QWEN_CONTRACT_ID]);
+        await client.query('COMMIT');
+      }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
+    } else await this.pool.query(`UPDATE embedding_runs SET status='paused',last_error_code=$2,updated_at=statement_timestamp()
       WHERE id=$1 AND contract_id=$3 AND status='running'`, [this.runId, errorCode, QWEN_CONTRACT_ID]);
   }
 
@@ -170,10 +192,26 @@ export class ShadowEmbeddingStore {
       if (!row?.eligible || row.revision !== source.revision || sha256(row.text) !== source.sha256) {
         await client.query('ROLLBACK'); inTransaction = false; return false;
       }
+      if (this.mode === 'steady') {
+        const run=await client.query(`SELECT 1 FROM embedding_runs r WHERE r.id=$1 AND r.contract_id=$2
+          AND r.status IN ('paused','complete') AND r.manifest ? 'steadyState'
+          AND r.manifest#>>'{steadyState,runtime,expectedRuntimeMode}'='cpu' FOR SHARE`,[this.runId,claim.contractId]);
+        if(!run.rowCount){await client.query('ROLLBACK');inTransaction=false;return false;}
+        const control=await client.query(`SELECT 1 FROM embedding_serving_settings s
+          JOIN embedding_contracts c ON c.id=s.contract_id
+          JOIN embedding_cutover_attestations a ON a.contract_id=s.contract_id AND a.run_id=s.cutover_attestation_run_id
+          WHERE s.singleton AND s.contract_id=$1 AND s.cutover_attestation_run_id=$2 AND s.capture_required
+            AND c.capture_enabled AND s.steady_worker_enabled FOR SHARE OF s,c`,[claim.contractId,this.runId]);
+        if(!control.rowCount){await client.query('ROLLBACK');inTransaction=false;return false;}
+      } else {
+        const run=await client.query(`SELECT 1 FROM embedding_runs r WHERE r.id=$1 AND r.contract_id=$2
+          AND r.status='running' FOR SHARE`,[this.runId,claim.contractId]);
+        if(!run.rowCount){await client.query('ROLLBACK');inTransaction=false;return false;}
+      }
       const fence = await client.query(`SELECT 1 FROM embedding_work_items w
         WHERE contract_id=$1 AND parent_type=$2 AND parent_id=$3 AND generation=$4 AND claimed_by=$5
           AND state='claimed' AND lease_until>statement_timestamp()
-          AND EXISTS (SELECT 1 FROM embedding_runs r WHERE r.id=$6 AND r.contract_id=w.contract_id AND r.status='running')
+          AND EXISTS (SELECT 1 FROM embedding_runs r WHERE r.id=$6 AND r.contract_id=w.contract_id AND ${this.runFence()})
         FOR UPDATE`, [claim.contractId, claim.parentType, claim.parentId, claim.generation, claim.owner, this.runId]);
       if (!fence.rowCount) { await client.query('ROLLBACK'); inTransaction = false; return false; }
       await write(client);

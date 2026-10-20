@@ -8,16 +8,23 @@ const SHA256 = /^[a-f0-9]{64}$/u;
 const SHA1 = /^[a-f0-9]{40}$/u;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu;
 
+export interface OperationalResources {
+  maxParentsPerBatch: number; maxSourceBytesPerBatch: number; maxTokensPerBatch: number; maxElapsedMsPerBatch: number; maxAttempts: number;
+  host: ShadowHostPlan; indexBuild: { maintenanceWorkMemMb: number; maxParallelMaintenanceWorkers: number;
+    lockTimeoutMs: number; statementTimeoutMs: number };
+}
+export interface OperationalRuntime {
+  acceptanceReceiptSha256: string; artifactSha256: string; runtimeContract: string;
+  expectedRuntimeHost: string; expectedRuntimeMode: 'gpu' | 'cpu'; tls?: {caSha256:string;spkiSha256:string};
+}
 export interface OperationalManifest {
   version: 1;
   approval: { reference: string; sha256: string; approvedBy: string; approvedAt: string };
   source: { releaseSha: string };
   eligibility: { predicate: string; namespaces: 'all'; includeNullVectors: true; activeSubscriptions: true };
-  resources: { maxParentsPerBatch: number; maxSourceBytesPerBatch: number; maxTokensPerBatch: number; maxElapsedMsPerBatch: number; maxAttempts: number;
-    host: ShadowHostPlan; indexBuild: { maintenanceWorkMemMb: number; maxParallelMaintenanceWorkers: number;
-      lockTimeoutMs: number; statementTimeoutMs: number } };
-  runtime: { acceptanceReceiptSha256: string; artifactSha256: string; runtimeContract: string;
-    expectedRuntimeHost: string; expectedRuntimeMode: 'gpu' | 'cpu'; tls?: {caSha256:string;spkiSha256:string} };
+  resources: OperationalResources;
+  runtime: OperationalRuntime;
+  steadyState?: { resources: OperationalResources; runtime: OperationalRuntime };
 }
 
 export interface ManifestEnvelope { manifest: OperationalManifest; manifestSha256: string }
@@ -37,22 +44,12 @@ export function validateOperationalManifest(value: unknown, expectedHash: string
   if (!SHA256.test(expectedHash)) throw new Error('embedding.manifest_hash');
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('embedding.operational_manifest');
   const m = value as OperationalManifest;
-  exactKeys(m as unknown as Record<string, unknown>, ['version','approval','source','eligibility','resources','runtime']);
+  exactKeys(m as unknown as Record<string, unknown>, m.steadyState===undefined
+    ? ['version','approval','source','eligibility','resources','runtime']
+    : ['version','approval','source','eligibility','resources','runtime','steadyState']);
   exactKeys(m.approval as unknown as Record<string, unknown>, ['reference','sha256','approvedBy','approvedAt']);
   exactKeys(m.source as unknown as Record<string, unknown>, ['releaseSha']);
   exactKeys(m.eligibility as unknown as Record<string, unknown>, ['predicate','namespaces','includeNullVectors','activeSubscriptions']);
-  exactKeys(m.resources as unknown as Record<string, unknown>, ['maxParentsPerBatch','maxSourceBytesPerBatch','maxTokensPerBatch','maxElapsedMsPerBatch','maxAttempts','host','indexBuild']);
-  exactKeys(m.runtime as unknown as Record<string, unknown>,
-    m.runtime.tls===undefined?['acceptanceReceiptSha256','artifactSha256','runtimeContract','expectedRuntimeHost','expectedRuntimeMode']:
-      ['acceptanceReceiptSha256','artifactSha256','runtimeContract','expectedRuntimeHost','expectedRuntimeMode','tls']);
-  if(m.runtime.tls!==undefined){if(!m.runtime.tls||typeof m.runtime.tls!=='object'||Array.isArray(m.runtime.tls))throw new Error('embedding.runtime_contract');
-    exactKeys(m.runtime.tls as unknown as Record<string,unknown>,['caSha256','spkiSha256']);}
-  if (!m.resources.host || typeof m.resources.host !== 'object' || Array.isArray(m.resources.host)) throw new Error('embedding.operational_manifest');
-  exactKeys(m.resources.host as unknown as Record<string, unknown>, ['deploymentProfile','expectedHostname','diskPath','minAvailableMemoryBytes',
-    'minAvailableDiskBytes','maxLoadPerCpu','maxSwapUsedBytes','maxMemoryPsiAvg10','maxCpuPsiAvg10']);
-  if (!m.resources.indexBuild || typeof m.resources.indexBuild !== 'object' || Array.isArray(m.resources.indexBuild)) throw new Error('embedding.operational_manifest');
-  exactKeys(m.resources.indexBuild as unknown as Record<string, unknown>,
-    ['maintenanceWorkMemMb','maxParallelMaintenanceWorkers','lockTimeoutMs','statementTimeoutMs']);
   if (m.version !== 1 || !m.approval || !m.source || !m.eligibility || !m.resources || !m.runtime) throw new Error('embedding.operational_manifest');
   if (typeof m.approval.reference !== 'string' || !m.approval.reference.trim()
     || typeof m.approval.sha256 !== 'string' || !SHA256.test(m.approval.sha256)
@@ -61,27 +58,56 @@ export function validateOperationalManifest(value: unknown, expectedHash: string
   if (typeof m.source.releaseSha !== 'string' || !SHA1.test(m.source.releaseSha)) throw new Error('embedding.release_sha');
   if (m.eligibility.predicate !== CURRENT_PARENT_ELIGIBILITY || m.eligibility.namespaces !== 'all'
     || m.eligibility.includeNullVectors !== true || m.eligibility.activeSubscriptions !== true) throw new Error('embedding.eligibility_contract');
-  for (const [key, min, max] of [['maxParentsPerBatch', 1, 1000], ['maxSourceBytesPerBatch', 1, 100_000_000],
-    ['maxTokensPerBatch', 1, 1_000_000], ['maxElapsedMsPerBatch', 1000, 3_600_000], ['maxAttempts', 1, 10]] as const) {
-    const n = m.resources[key];
-    if (!Number.isSafeInteger(n) || n < min || n > max) throw new Error(`embedding.limit_${key}`);
+  validateOperationalResources(m.resources);
+  validateOperationalRuntime(m.runtime);
+  if (m.steadyState !== undefined) {
+    if (!m.steadyState || typeof m.steadyState !== 'object' || Array.isArray(m.steadyState)) throw new Error('embedding.operational_manifest');
+    exactKeys(m.steadyState as unknown as Record<string, unknown>, ['resources','runtime']);
+    validateOperationalResources(m.steadyState.resources);
+    validateOperationalRuntime(m.steadyState.runtime);
+    if (m.steadyState.runtime.expectedRuntimeMode !== 'cpu') throw new Error('embedding.steady_runtime_mode');
   }
-  validateShadowHostPlan(m.resources.host, m.resources.maxElapsedMsPerBatch, m.resources.maxParentsPerBatch);
-  for (const [key, min, max] of [['maintenanceWorkMemMb',64,4096], ['maxParallelMaintenanceWorkers',0,4],
-    ['lockTimeoutMs',100,30_000], ['statementTimeoutMs',60_000,3_600_000]] as const) {
-    const n = m.resources.indexBuild[key];
-    if (!Number.isSafeInteger(n) || n < min || n > max) throw new Error(`embedding.index_plan_${key}`);
-  }
-  if (!SHA256.test(m.runtime.acceptanceReceiptSha256)
-    || m.runtime.artifactSha256 !== QWEN_CHUNK_CONTRACT.artifactSha256
-    || m.runtime.runtimeContract !== QWEN_CHUNK_CONTRACT.runtimeContract
-    || typeof m.runtime.expectedRuntimeHost !== 'string' || !m.runtime.expectedRuntimeHost.trim()
-    || m.runtime.expectedRuntimeHost !== m.runtime.expectedRuntimeHost.trim()
-    || !['gpu','cpu'].includes(m.runtime.expectedRuntimeMode)
-    || m.runtime.tls!==undefined&&(!SHA256.test(m.runtime.tls.caSha256)||!SHA256.test(m.runtime.tls.spkiSha256))) throw new Error('embedding.runtime_contract');
   const actual = hashOperationalManifest(m);
   if (actual !== expectedHash) throw new Error('embedding.manifest_hash_mismatch');
   return { manifest: m, manifestSha256: actual };
+}
+
+function validateOperationalResources(resources: OperationalResources): void {
+  if (!resources || typeof resources !== 'object' || Array.isArray(resources)) throw new Error('embedding.operational_manifest');
+  exactKeys(resources as unknown as Record<string, unknown>, ['maxParentsPerBatch','maxSourceBytesPerBatch','maxTokensPerBatch','maxElapsedMsPerBatch','maxAttempts','host','indexBuild']);
+  if (!resources.host || typeof resources.host !== 'object' || Array.isArray(resources.host)) throw new Error('embedding.operational_manifest');
+  exactKeys(resources.host as unknown as Record<string, unknown>, ['deploymentProfile','expectedHostname','diskPath','minAvailableMemoryBytes',
+    'minAvailableDiskBytes','maxLoadPerCpu','maxSwapUsedBytes','maxMemoryPsiAvg10','maxCpuPsiAvg10']);
+  if (!resources.indexBuild || typeof resources.indexBuild !== 'object' || Array.isArray(resources.indexBuild)) throw new Error('embedding.operational_manifest');
+  exactKeys(resources.indexBuild as unknown as Record<string, unknown>,
+    ['maintenanceWorkMemMb','maxParallelMaintenanceWorkers','lockTimeoutMs','statementTimeoutMs']);
+  for (const [key, min, max] of [['maxParentsPerBatch', 1, 1000], ['maxSourceBytesPerBatch', 1, 100_000_000],
+    ['maxTokensPerBatch', 1, 1_000_000], ['maxElapsedMsPerBatch', 1000, 3_600_000], ['maxAttempts', 1, 10]] as const) {
+    const n = resources[key];
+    if (!Number.isSafeInteger(n) || n < min || n > max) throw new Error(`embedding.limit_${key}`);
+  }
+  validateShadowHostPlan(resources.host, resources.maxElapsedMsPerBatch, resources.maxParentsPerBatch);
+  for (const [key, min, max] of [['maintenanceWorkMemMb',64,4096], ['maxParallelMaintenanceWorkers',0,4],
+    ['lockTimeoutMs',100,30_000], ['statementTimeoutMs',60_000,3_600_000]] as const) {
+    const n = resources.indexBuild[key];
+    if (!Number.isSafeInteger(n) || n < min || n > max) throw new Error(`embedding.index_plan_${key}`);
+  }
+}
+
+function validateOperationalRuntime(runtime: OperationalRuntime): void {
+  if (!runtime || typeof runtime !== 'object' || Array.isArray(runtime)) throw new Error('embedding.runtime_contract');
+  exactKeys(runtime as unknown as Record<string, unknown>,
+    runtime.tls===undefined?['acceptanceReceiptSha256','artifactSha256','runtimeContract','expectedRuntimeHost','expectedRuntimeMode']:
+      ['acceptanceReceiptSha256','artifactSha256','runtimeContract','expectedRuntimeHost','expectedRuntimeMode','tls']);
+  if(runtime.tls!==undefined){if(!runtime.tls||typeof runtime.tls!=='object'||Array.isArray(runtime.tls))throw new Error('embedding.runtime_contract');
+    exactKeys(runtime.tls as unknown as Record<string,unknown>,['caSha256','spkiSha256']);}
+  if (!SHA256.test(runtime.acceptanceReceiptSha256)
+    || runtime.artifactSha256 !== QWEN_CHUNK_CONTRACT.artifactSha256
+    || runtime.runtimeContract !== QWEN_CHUNK_CONTRACT.runtimeContract
+    || typeof runtime.expectedRuntimeHost !== 'string' || !runtime.expectedRuntimeHost.trim()
+    || runtime.expectedRuntimeHost !== runtime.expectedRuntimeHost.trim()
+    || !['gpu','cpu'].includes(runtime.expectedRuntimeMode)
+    || runtime.tls!==undefined&&(!SHA256.test(runtime.tls.caSha256)||!SHA256.test(runtime.tls.spkiSha256))) throw new Error('embedding.runtime_contract');
 }
 
 function exactKeys(value: Record<string, unknown>, expected: string[]): void {

@@ -10,8 +10,10 @@ import { QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
 import { ShadowEmbeddingStore } from '../src/shadow-embedding-store.js';
 import { runShadowBatch } from '../src/shadow-embedding-worker.js';
 import { createShadowResourceGuard, validateShadowHostPlan, type ShadowHostPlan } from '../src/shadow-embedding-resource-guard.js';
+import { enableSteadyWorker, pauseSteadyWorker } from '../src/shadow-embedding-steady.js';
 
-type Command = 'prepare' | 'inventory-page' | 'start' | 'pause' | 'resume' | 'requeue' | 'status' | 'audit-page' | 'worker';
+type Command = 'prepare' | 'inventory-page' | 'start' | 'pause' | 'resume' | 'requeue' | 'status' | 'audit-page' | 'worker'
+  | 'steady-enable' | 'steady-pause' | 'steady-worker';
 export interface ShadowCliArguments {
   command: Command; database: string; apply: boolean; runId?: string; manifestPath?: string; manifestSha256?: string;
   limit: number; cursor: string | null; parentType?: 'memory' | 'subscription'; parentIds: string[];
@@ -19,7 +21,8 @@ export interface ShadowCliArguments {
 
 export function parseShadowEmbeddingArguments(argv: string[]): ShadowCliArguments {
   const command = argv.shift() as Command | undefined;
-  if (!command || !['prepare', 'inventory-page', 'start', 'pause', 'resume', 'requeue', 'status', 'audit-page', 'worker'].includes(command)) {
+  if (!command || !['prepare', 'inventory-page', 'start', 'pause', 'resume', 'requeue', 'status', 'audit-page', 'worker',
+    'steady-enable', 'steady-pause', 'steady-worker'].includes(command)) {
     throw new Error('embedding.command_required');
   }
   let database: string | undefined, apply = false, runId: string | undefined, manifestPath: string | undefined;
@@ -55,7 +58,7 @@ export function parseShadowEmbeddingArguments(argv: string[]): ShadowCliArgument
   if (command === 'requeue' && (!parentType || parentIds.length === 0)) throw new Error('embedding.requeue_ids');
   if (command !== 'requeue' && (parentType || parentIds.length)) throw new Error('embedding.requeue_arguments');
   if (command !== 'audit-page' && cursor !== null) throw new Error('embedding.audit_flag_required');
-  if (command === 'worker' && seen.has('--limit')) throw new Error('embedding.worker_manifest_limits_only');
+  if (['worker','steady-worker'].includes(command) && seen.has('--limit')) throw new Error('embedding.worker_manifest_limits_only');
   return { command, database, apply, runId, manifestPath, manifestSha256, limit, cursor, parentType, parentIds };
 }
 
@@ -84,29 +87,47 @@ function runtimeEnvironment(): { baseUrl: string; bearerToken: string; runtime: 
 }
 
 export async function runWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, envelope: ManifestEnvelope) {
+  return runBoundedWorkerCommand(pool,args,envelope,'backfill');
+}
+
+export async function runSteadyWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, envelope: ManifestEnvelope) {
+  return runBoundedWorkerCommand(pool,args,envelope,'steady');
+}
+
+async function runBoundedWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, envelope: ManifestEnvelope,
+  mode: 'backfill'|'steady') {
   const identity = await pool.query(`SELECT r.status,r.release_sha,r.manifest,current_database() AS database,
-    role.rolsuper OR role.rolbypassrls AS operator FROM embedding_runs r
-    JOIN pg_roles role ON role.rolname=current_user WHERE r.id=$1 AND r.contract_id=$2`, [args.runId, QWEN_CONTRACT_ID]);
+    role.rolsuper OR role.rolbypassrls AS operator,s.contract_id AS serving_contract_id,
+    s.cutover_attestation_run_id,s.steady_worker_enabled
+    FROM embedding_runs r JOIN pg_roles role ON role.rolname=current_user
+    LEFT JOIN embedding_serving_settings s ON s.singleton
+    WHERE r.id=$1 AND r.contract_id=$2`, [args.runId, QWEN_CONTRACT_ID]);
   const run = identity.rows[0];
   if (!run || run.database !== args.database || run.operator !== true) throw new Error('embedding.database_identity');
-  if (run.status !== 'running' || run.release_sha !== envelope.manifest.source.releaseSha
+  const allowedState=mode==='backfill'?run.status==='running':['paused','complete'].includes(run.status);
+  if (!allowedState || run.release_sha !== envelope.manifest.source.releaseSha
     || hashOperationalManifest(run.manifest) !== envelope.manifestSha256) throw new Error('embedding.run_manifest_identity');
+  if(mode==='steady'&&(run.serving_contract_id!==QWEN_CONTRACT_ID||run.cutover_attestation_run_id!==args.runId
+    ||run.steady_worker_enabled!==true))throw new Error('embedding.steady_fence');
+  const plan=mode==='steady'?envelope.manifest.steadyState:undefined;
+  if(mode==='steady'&&(!plan||plan.runtime.expectedRuntimeMode!=='cpu'))throw new Error('embedding.steady_plan_required');
   const environment = runtimeEnvironment();
-  if (environment.runtime.acceptanceReceiptSha256 !== envelope.manifest.runtime.acceptanceReceiptSha256) {
+  const approvedRuntime=plan?.runtime??envelope.manifest.runtime;
+  if (environment.runtime.acceptanceReceiptSha256 !== approvedRuntime.acceptanceReceiptSha256) {
     throw new Error('embedding.runtime_acceptance_receipt');
   }
-  const approvedTls=envelope.manifest.runtime.tls,actualTls=environment.runtime.tls;
+  const approvedTls=approvedRuntime.tls,actualTls=environment.runtime.tls;
   if(Boolean(approvedTls)!==Boolean(actualTls)||approvedTls&&(approvedTls.caSha256!==actualTls!.caSha256||approvedTls.spkiSha256!==actualTls!.spkiSha256)) {
     throw new Error('embedding.runtime_tls_identity');
   }
-  const resources = envelope.manifest.resources;
+  const resources = plan?.resources??envelope.manifest.resources;
   const hostPlan = validateShadowHostPlan(resources.host,
     resources.maxElapsedMsPerBatch, resources.maxParentsPerBatch);
   const guard = createShadowResourceGuard({ plan: hostPlan, ...environment,
-    expectedRuntimeHost: envelope.manifest.runtime.expectedRuntimeHost,
-    expectedRuntimeMode: envelope.manifest.runtime.expectedRuntimeMode });
+    expectedRuntimeHost: approvedRuntime.expectedRuntimeHost,
+    expectedRuntimeMode: approvedRuntime.expectedRuntimeMode });
   const local = new LocalEmbeddingClient({ ...environment, beforeInference: guard });
-  const store = new ShadowEmbeddingStore(pool, args.runId!);
+  const store = new ShadowEmbeddingStore(pool, args.runId!,120,mode);
   await store.verifyDatabase(args.database);
   return runShadowBatch(store, local, {
     maxParents: resources.maxParentsPerBatch, maxSourceBytes: resources.maxSourceBytesPerBatch,
@@ -121,8 +142,12 @@ async function main() {
   const pool = new pg.Pool({ connectionString, max: 1, connectionTimeoutMillis: 5000, statement_timeout: 30_000,
     query_timeout: 35_000, application_name: 'total-recall-shadow-control' });
   try {
-    if (args.command === 'worker') {
-      console.log(JSON.stringify(await runWorkerCommand(pool, args, await loadEnvelope(args)), null, 2));
+    if (args.command === 'worker' || args.command === 'steady-worker') {
+      const envelope=await loadEnvelope(args);
+      const receipt=args.command==='worker'?await runWorkerCommand(pool,args,envelope)
+        :await runSteadyWorkerCommand(pool,args,envelope);
+      console.log(JSON.stringify(receipt, null, 2));
+      if(args.command==='steady-worker'&&receipt.state==='paused')process.exitCode=2;
       return;
     }
     const client = await pool.connect();
@@ -135,6 +160,8 @@ async function main() {
         if (args.command === 'prepare') receipt = await prepareShadowRun(client, args.database, envelope);
         else if (args.command === 'inventory-page') receipt = await inventoryShadowPage(client, args.database, args.runId!, envelope, args.limit);
         else if (args.command === 'requeue') receipt = await requeueShadowItems(client, args.database, args.runId!, envelope, args.parentType!, args.parentIds);
+        else if (args.command === 'steady-enable') receipt = await enableSteadyWorker(client,args.database,args.runId!,envelope);
+        else if (args.command === 'steady-pause') receipt = await pauseSteadyWorker(client,args.database,args.runId!,envelope);
         else receipt = await setShadowRunState(client, args.database, args.runId!, envelope, args.command);
       }
       console.log(JSON.stringify(receipt, null, 2));

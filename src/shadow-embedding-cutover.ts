@@ -69,6 +69,9 @@ export async function attestCutover(client:pg.PoolClient,expectedDatabase:string
 }
 
 export async function activateCutover(client:pg.PoolClient,expectedDatabase:string,operational:ManifestEnvelope,cutover:CutoverEnvelope){
+  if(!operational.manifest.steadyState||operational.manifest.steadyState.runtime.expectedRuntimeMode!=='cpu') {
+    throw new Error('embedding.steady_plan_required');
+  }
   await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
   try {
     await client.query("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='30min'; SET LOCAL work_mem='8MB'; SET LOCAL max_parallel_workers_per_gather=0");
@@ -135,13 +138,15 @@ export async function rollbackCutover(client:pg.PoolClient,expectedDatabase:stri
   try {
     await client.query("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='30min'");
     const a=cutover.plan.activation;
+    // Global order is run -> serving settings/contract -> queue rows. Steady
+    // claims and controls use the same order, avoiding a run/settings cycle.
+    await lockBoundRun(client,expectedDatabase,operational,cutover);
     const setting=await client.query(`SELECT *,statement_timestamp() AS database_now FROM embedding_serving_settings WHERE singleton FOR UPDATE`);
     const s=setting.rows[0];
     if(!s||s.contract_id!==QWEN_CONTRACT_ID||s.cutover_attestation_run_id!==cutover.plan.runId||s.rollback_writes_enabled!==true
       ||Number(s.rollback_inputs_per_minute)!==a.rollbackInputsPerMinute||new Date(s.rollback_until).getTime()!==Date.parse(rollbackUntil)
       ||new Date(s.observation_ends_at).getTime()!==Date.parse(a.observationEndsAt))throw new Error('embedding.rollback_setting_mismatch');
     if(new Date(s.database_now).getTime()>=Date.parse(rollbackUntil))throw new Error('embedding.rollback_window_expired');
-    await lockBoundRun(client,expectedDatabase,operational,cutover);
     const proof=await client.query(`SELECT count(*)::bigint AS mutation_count,
       encode(digest(convert_to(COALESCE(string_agg(l.parent_id::text||':'||l.source_sha256||':'||COALESCE(l.vector_sha256,''),E'\\n' ORDER BY l.parent_id),''),'UTF8'),'sha256'),'hex') AS mutation_digest_sha256,
       count(*) FILTER(WHERE NOT l.verified OR l.source_sha256<>encode(digest(convert_to(m.content,'UTF8'),'sha256'),'hex')
