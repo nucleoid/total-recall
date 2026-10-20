@@ -212,6 +212,16 @@ node --import tsx scripts/shadow-embedding-index.ts complete --database <expecte
 
 This guard cannot prove the evidence represented by those hashes is substantively adequate. Operators must retain and independently review the referenced receipts.
 
+## Frozen quality pilot duration
+
+The quality pilot keeps a 120-second whole-run operational deadline by default. That deadline includes deterministic token planning, document inference, and the frozen 48-query evaluation. An operator may supply `--max-duration-ms <120000..900000>` only when a longer finite duration has been justified by measured, content-free sizing and approved for this pilot before execution. The configured maximum and actual elapsed milliseconds are recorded in the pilot report.
+
+```powershell
+node --import tsx scripts/eval-shadow-pilot.ts --input <frozen-pilot.json> --output <new-report.json> --expected-corpus-hash <sha256> --expected-judgments-hash <sha256> --baseline-receipt-sha256 <sha256> --approval-reference <reference> --pseudonym-key-file <restricted-key-file> --max-duration-ms 600000
+```
+
+The option changes only the operational deadline. Corpus, judgment, baseline receipt, token and vector limits, categories, recall/MRR thresholds, negative gates, and runtime token verification remain unchanged. `pilot.operational_time_budget` is an operational failure, separate from a completed quality evaluation whose report has `passed: false`. Never automatically retry a timed-out pilot or increase its duration after the timeout. Review the measurement and obtain the required approval first. Select the actual budget only after the content-free sizing receipt is available; the example value above is illustrative.
+
 For local verification, never point tests at `DATABASE_URL` or a production database. Use the isolated integration helper and `SHADOW_EMBEDDING_TEST_DATABASE_URL` where available. Type-check with:
 
 ```powershell

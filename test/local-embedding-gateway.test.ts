@@ -100,10 +100,18 @@ function healthyGpuTelemetry(receipt:GatewayReceipt){return{hostId:receipt.hostI
   availableBytes:3*1024**3,diskFreeBytes:101*1024**3,swapUsedBytes:0,...(receipt.host.platform==='win32'?{cpuUtilizationPercent:20}:{load1:0.5})};}
 
 test('GPU admission fails closed when common host telemetry is missing or malformed',async()=>{
-  const receipt=base(),invoke=async(telemetry:any)=>{const gateway=new LocalEmbeddingGateway(receipt,Buffer.from('s'.repeat(32)),19000,{telemetry:async()=>telemetry});
+  const receipt=base();let upstreamCalls=0;const invoke=async(telemetry:any)=>{const gateway=new LocalEmbeddingGateway(receipt,Buffer.from('s'.repeat(32)),19000,{telemetry:async()=>telemetry,fetch:(async()=>{upstreamCalls++;return Response.json({});}) as typeof fetch});
     const req=Readable.from([]) as any;req.method='GET';req.url='/health';req.headers={authorization:`Bearer ${'s'.repeat(32)}`};let status=0,value='';
     const res={writeHead:(n:number)=>{status=n;},end:(v:string)=>{value=v;}} as any;await(gateway as any).handle(req,res);return{status,body:JSON.parse(value)};};
   const missing=healthyGpuTelemetry(receipt);delete (missing as any).availableBytes;
-  assert.deepEqual(await invoke(missing),{status:400,body:{error:'gateway.host_guard'}});
-  assert.deepEqual(await invoke({...healthyGpuTelemetry(receipt),swapUsedBytes:Number.NaN}),{status:400,body:{error:'gateway.host_guard'}});
+  assert.deepEqual(await invoke(missing),{status:503,body:{error:'gateway.host_guard'}});
+  assert.deepEqual(await invoke({...healthyGpuTelemetry(receipt),swapUsedBytes:Number.NaN}),{status:503,body:{error:'gateway.host_guard'}});
+  assert.equal(upstreamCalls,0);
+});
+
+test('malformed embedding payload remains a bounded client error before upstream inference',async()=>{
+  const receipt=base();let upstreamCalls=0;const gateway=new LocalEmbeddingGateway(receipt,Buffer.from('s'.repeat(32)),19000,{telemetry:async()=>healthyGpuTelemetry(receipt),fetch:(async()=>{upstreamCalls++;return Response.json({});}) as typeof fetch});
+  const raw=JSON.stringify({input:'not-an-array',truncate:false}),req=Readable.from([raw]) as any;req.method='POST';req.url='/v1/embeddings';req.headers={authorization:`Bearer ${'s'.repeat(32)}`,'content-length':String(Buffer.byteLength(raw))};let status=0,value='';
+  const res={writeHead:(n:number)=>{status=n;},end:(v:string)=>{value=v;}} as any;await(gateway as any).handle(req,res);
+  assert.equal(status,400);assert.deepEqual(JSON.parse(value),{error:'gateway.embedding_shape'});assert.equal(upstreamCalls,0);
 });

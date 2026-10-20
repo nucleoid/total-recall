@@ -69,7 +69,7 @@ export class LocalEmbeddingClient {
       throw new LocalEmbeddingError(signal?.aborted ? 'embedding.cancelled' : 'embedding.transport', 'retryable');
     }
     if (!response.ok) {
-      const classification = response.status === 429 || response.status >= 500 ? 'retryable'
+      const classification = response.status === 429 || response.status === 503 || response.status === 504 ? 'retryable'
         : response.status === 400 || response.status === 413 || response.status === 422 ? 'input' : 'systemic';
       const raw = response.headers.get('retry-after');
       let delay: number | undefined;

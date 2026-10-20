@@ -69,7 +69,7 @@ test('runtime drift and insecure transport are rejected at construction', () => 
 });
 
 test('provider errors are classified, Retry-After bounded and secret response bodies omitted', async () => {
-  for (const [status, classification] of [[400, 'input'], [401, 'systemic'], [429, 'retryable'], [503, 'retryable']] as const) {
+  for (const [status, classification] of [[400, 'input'], [401, 'systemic'], [429, 'retryable'], [502, 'systemic'], [503, 'retryable']] as const) {
     const f = new LocalEmbeddingClient({ baseUrl: 'http://localhost:1234', bearerToken: 'fixture', runtime,
       beforeInference: async () => {}, fetch: (async () => new Response('private corpus and token', { status,
         headers: { 'Retry-After': '600' } })) as typeof fetch });

@@ -148,14 +148,14 @@ export class LocalEmbeddingGateway {
       if(!Array.isArray(data.data)||data.data.length!==body.input.length||data.usage?.prompt_tokens!==total)throw new Error('gateway.upstream_shape');
       data.data.forEach((x:any,i:number)=>{if(x?.index!==i)throw new Error('gateway.upstream_order');projectQwenVector(x.embedding);});
       return respond(res,200,data);
-    }catch(error){const code=error instanceof Error&&/^gateway\.[a-z0-9_]+$/.test(error.message)?error.message:'gateway.failure';return respond(res,400,{error:code});}finally{if(admitted)this.busy=false;}
+    }catch(error){const failure=gatewayHttpFailure(error);return respond(res,failure.status,{error:failure.code});}finally{if(admitted)this.busy=false;}
   }
   private async upstream(path:string,body:unknown):Promise<any>{
     await this.guard();
-    const fetcher=this.deps.fetch??fetch;const response=await fetcher(`http://127.0.0.1:${this.backendPort}${path}`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${this.backendToken()}`},body:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(30_000)});
-    if(!response.ok){await response.body?.cancel();throw new Error(`gateway.upstream_${response.status}`);}return JSON.parse(await boundedResponseText(response,path==='/tokenize'?MAX_TOKENIZER_RESPONSE:MAX_BODY));
+    const fetcher=this.deps.fetch??fetch;let response:Response;try{response=await fetcher(`http://127.0.0.1:${this.backendPort}${path}`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${this.backendToken()}`},body:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(30_000)});}catch{throw new Error('gateway.backend_unavailable');}
+    if(!response.ok){await response.body?.cancel();throw new Error(`gateway.upstream_${response.status}`);}try{return JSON.parse(await boundedResponseText(response,path==='/tokenize'?MAX_TOKENIZER_RESPONSE:MAX_BODY));}catch(error){if(error instanceof Error&&error.message==='gateway.upstream_body_limit')throw error;throw new Error('gateway.upstream_shape');}
   }
-  private async guard():Promise<GatewayTelemetry>{const now=this.deps.now?.()??new Date();if(now.getTime()>=new Date(this.receipt.authorizedUntil).getTime()){void this.close();throw new Error('gateway.authorization_expired');}const telemetry=await(this.deps.telemetry??collectHostTelemetry)(this.receipt);validateTelemetry(this.receipt,telemetry,now);return telemetry;}
+  private async guard():Promise<GatewayTelemetry>{const now=this.deps.now?.()??new Date();if(now.getTime()>=new Date(this.receipt.authorizedUntil).getTime()){void this.close();throw new Error('gateway.authorization_expired');}let telemetry:GatewayTelemetry;try{telemetry=await(this.deps.telemetry??collectHostTelemetry)(this.receipt);}catch{throw new Error('gateway.resource_unavailable');}validateTelemetry(this.receipt,telemetry,now);return telemetry;}
   private backendToken():string{if(!this.backendSecret)throw new Error('gateway.backend_secret');return this.backendSecret.toString('hex');}
   private async waitForBackend():Promise<void>{
     const fetcher=this.deps.fetch??fetch,deadline=performance.now()+120_000;
@@ -171,9 +171,15 @@ export class LocalEmbeddingGateway {
   private async warmBackend():Promise<void>{await this.guard();const response=await(this.deps.fetch??fetch)(`http://127.0.0.1:${this.backendPort}/v1/embeddings`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${this.backendToken()}`},body:JSON.stringify({input:['warmup'],truncate:false}),redirect:'error',signal:AbortSignal.timeout(120_000)});if(!response.ok)throw new Error('gateway.backend_warmup');const data=JSON.parse(await boundedResponseText(response));if(!Array.isArray(data.data)||data.data.length!==1)throw new Error('gateway.backend_warmup');projectQwenVector(data.data[0]?.embedding);}
 }
 
-async function readJson(req:IncomingMessage):Promise<any>{let size=0;const chunks:Buffer[]=[];const timer=setTimeout(()=>req.destroy(new Error('gateway.body_timeout')),10_000);timer.unref();try{for await(const chunk of req){const b=Buffer.from(chunk);size+=b.length;if(size>MAX_BODY)throw new Error('gateway.body_limit');chunks.push(b);}return JSON.parse(Buffer.concat(chunks).toString('utf8'));}finally{clearTimeout(timer);}}
+async function readJson(req:IncomingMessage):Promise<any>{let size=0;const chunks:Buffer[]=[];const timer=setTimeout(()=>req.destroy(new Error('gateway.body_timeout')),10_000);timer.unref();try{for await(const chunk of req){const b=Buffer.from(chunk);size+=b.length;if(size>MAX_BODY)throw new Error('gateway.body_limit');chunks.push(b);}try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw new Error('gateway.request_json');}}finally{clearTimeout(timer);}}
 function validateTokens(data:any,max=1_048_576):number{if(!Array.isArray(data?.tokens)||data.tokens.some((x:unknown)=>!Number.isSafeInteger(x)||Number(x)<0))throw new Error('gateway.tokenizer_shape');if(data.tokens.length>max)throw new Error('gateway.token_limit');return data.tokens.length;}
 function respond(res:ServerResponse,status:number,value:unknown){res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify(value));}
+function gatewayHttpFailure(error:unknown):{status:number;code:string}{const code=error instanceof Error&&/^gateway\.[a-z0-9_]+$/.test(error.message)?error.message:'gateway.failure';
+  if(code==='gateway.body_limit')return{status:413,code};
+  if(['gateway.request_json','gateway.tokenize_shape','gateway.embedding_shape','gateway.token_limit'].includes(code))return{status:400,code};
+  if(code==='gateway.authorization_expired')return{status:403,code};
+  if(['gateway.telemetry_stale','gateway.host_guard','gateway.gpu_guard','gateway.cpu_guard','gateway.resource_unavailable','gateway.backend_unavailable'].includes(code)||/^gateway\.upstream_(?:429|5\d\d)$/.test(code))return{status:503,code};
+  return{status:502,code};}
 function validateTelemetry(r:GatewayReceipt,t:GatewayTelemetry,now:Date){const stamp=t.timestamp;if(t.hostId!==r.hostId||t.mode!==r.mode||!Number.isFinite(stamp)||Math.abs(now.getTime()-stamp)>5000)throw new Error('gateway.telemetry_stale');
   if(!Number.isFinite(t.availableBytes)||!Number.isFinite(t.diskFreeBytes)||!Number.isFinite(t.swapUsedBytes)||(t.availableBytes??-1)<r.host.minimumAvailableBytes||(t.diskFreeBytes??-1)<r.host.minimumDiskFreeBytes||(t.swapUsedBytes??Infinity)>r.host.maximumSwapUsedBytes||
     (r.host.platform==='linux'&&(!Number.isFinite(t.load1)||(t.load1??Infinity)>r.host.maximumLoad1!))||
