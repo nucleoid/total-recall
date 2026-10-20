@@ -38,9 +38,12 @@ export interface GatewayDependencies {
   verifyPathSecurity?:(paths:string[])=>Promise<void>;
   revalidateLaunchFiles?:(receipt:GatewayReceipt)=>Promise<void>;
   probeBackendPort?:(port:number)=>Promise<void>;
+  setAuthorityTimer?:(callback:()=>void,delayMs:number)=>NodeJS.Timeout;
+  clearAuthorityTimer?:(timer:NodeJS.Timeout)=>void;
 }
 
 const MAX_BODY=8*1024*1024,MAX_TOKENIZER_RESPONSE=16*1024*1024;
+const MAX_AUTHORITY_TIMER_DELAY_MS=24*60*60_000;
 const FIXED_ARGS=(model:string,port:number,mode:'gpu'|'cpu')=>['--model',model,'--host','127.0.0.1','--port',String(port),
   '--ctx-size','4096','--batch-size','2048','--ubatch-size','2048','--parallel','1','--threads','2','--pooling','last','--embedding',
   '--n-gpu-layers',mode==='gpu'?'999':'0'];
@@ -91,6 +94,7 @@ export async function verifyGatewayReceipt(raw:unknown,deps:GatewayDependencies=
 
 export class LocalEmbeddingGateway {
   private child?:ChildProcess; private server?:http.Server|https.Server; private busy=false; private timer?:NodeJS.Timeout;
+  private authorityTimerActive=false;
   private sockets=new Set<Socket>();private backendKeyDir?:string;private backendKeyPath?:string;private backendSecret?:Buffer;
   constructor(readonly receipt:GatewayReceipt,private readonly secret:Buffer,private readonly backendPort:number,
     private readonly deps:GatewayDependencies={}){if(secret.length<32)throw new Error('gateway.secret');}
@@ -115,10 +119,10 @@ export class LocalEmbeddingGateway {
       this.server.requestTimeout=35_000;this.server.headersTimeout=10_000;this.server.on('connection',socket=>{this.sockets.add(socket);socket.once('close',()=>this.sockets.delete(socket));});
       await this.waitForBackend();await this.warmBackend();if(this.child.exitCode!==null)throw new Error('gateway.backend_exited');await new Promise<void>((resolve,reject)=>{this.server!.once('error',reject);this.server!.listen(this.receipt.port??18089,this.receipt.listen??'127.0.0.1',()=>resolve());});
     }catch(error){await this.close();throw error;}
-    const delay=new Date(this.receipt.authorizedUntil).getTime()-(this.deps.now??(()=>new Date()))().getTime();
-    this.timer=setTimeout(()=>void this.close(),Math.max(1,delay));this.timer.unref();
+    this.authorityTimerActive=true;this.armAuthorityExpiry();
   }
-  async close():Promise<void>{if(this.timer)clearTimeout(this.timer);for(const socket of this.sockets)socket.destroy();this.sockets.clear();if(this.server)await new Promise<void>(r=>this.server!.close(()=>r()));this.server=undefined;const child=this.child;this.child=undefined;if(child&&child.exitCode===null){child.kill('SIGTERM');await Promise.race([new Promise<void>(r=>child.once('exit',()=>r())),new Promise<void>(r=>setTimeout(r,2000))]);if(child.exitCode===null){child.kill('SIGKILL');await Promise.race([new Promise<void>(r=>child.once('exit',()=>r())),new Promise<void>(r=>setTimeout(r,1000))]);}}if(this.backendKeyDir)await rm(this.backendKeyDir,{recursive:true,force:true});this.backendKeyDir=undefined;this.backendKeyPath=undefined;this.backendSecret=undefined;}
+  async close():Promise<void>{this.authorityTimerActive=false;if(this.timer)(this.deps.clearAuthorityTimer??clearTimeout)(this.timer);this.timer=undefined;for(const socket of this.sockets)socket.destroy();this.sockets.clear();if(this.server)await new Promise<void>(r=>this.server!.close(()=>r()));this.server=undefined;const child=this.child;this.child=undefined;if(child&&child.exitCode===null){child.kill('SIGTERM');await Promise.race([new Promise<void>(r=>child.once('exit',()=>r())),new Promise<void>(r=>setTimeout(r,2000))]);if(child.exitCode===null){child.kill('SIGKILL');await Promise.race([new Promise<void>(r=>child.once('exit',()=>r())),new Promise<void>(r=>setTimeout(r,1000))]);}}if(this.backendKeyDir)await rm(this.backendKeyDir,{recursive:true,force:true});this.backendKeyDir=undefined;this.backendKeyPath=undefined;this.backendSecret=undefined;}
+  private armAuthorityExpiry():void{if(!this.authorityTimerActive)return;const remaining=new Date(this.receipt.authorizedUntil).getTime()-(this.deps.now??(()=>new Date()))().getTime();if(remaining<=0){void this.close();return;}const schedule=this.deps.setAuthorityTimer??setTimeout;this.timer=schedule(()=>{this.timer=undefined;this.armAuthorityExpiry();},Math.min(remaining,MAX_AUTHORITY_TIMER_DELAY_MS));this.timer.unref?.();}
   private authorized(req:IncomingMessage):boolean{
     const value=req.headers.authorization,expected=`Bearer ${this.secret.toString('utf8')}`;
     const a=createHash('sha256').update(typeof value==='string'?value:'').digest(),b=createHash('sha256').update(expected).digest();

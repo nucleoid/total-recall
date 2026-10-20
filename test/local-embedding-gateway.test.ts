@@ -41,6 +41,19 @@ test('CPU mode requires explicit approval and GPU receipt is transient',async()=
   await assert.rejects(verifyGatewayReceipt({...base(),authorizedUntil:new Date(Date.now()-1).toISOString()},{hashFile,...runtimeDeps}),/authorization_expired/);
 });
 
+test('long CPU authority leases rearm without timer overflow and close at exact expiry',async()=>{
+  let now=Date.parse('2026-10-20T00:00:00.000Z');const until=now+30*24*60*60_000;
+  const scheduled:Array<{callback:()=>void;delay:number}>=[];let cleared=0,closed=0;
+  const receipt={...base('cpu'),authorizedUntil:new Date(until).toISOString(),persistentCpuApproved:true};
+  const gateway=new LocalEmbeddingGateway(receipt,Buffer.from('s'.repeat(32)),19000,{now:()=>new Date(now),
+    setAuthorityTimer:(callback,delay)=>{scheduled.push({callback,delay});return{unref(){}} as NodeJS.Timeout;},
+    clearAuthorityTimer:()=>{cleared++;}});
+  (gateway as any).close=async()=>{closed++;};(gateway as any).authorityTimerActive=true;(gateway as any).armAuthorityExpiry();
+  assert.equal(scheduled[0].delay,24*60*60_000);assert.equal(closed,0);
+  now=until-1;scheduled.shift()!.callback();assert.equal(scheduled[0].delay,1);assert.equal(closed,0);
+  now=until;scheduled.shift()!.callback();assert.equal(closed,1);assert.equal(scheduled.length,0);assert.equal(cleared,0);
+});
+
 test('authenticated health owns the sole slot and rejected requests cannot release it',async()=>{
   const receipt=base();let release!:()=>void;
   const telemetryWait=new Promise<void>(resolve=>{release=resolve;});
