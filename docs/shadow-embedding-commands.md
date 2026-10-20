@@ -222,6 +222,10 @@ node --import tsx scripts/eval-shadow-pilot.ts --input <frozen-pilot.json> --out
 
 The option changes only the operational deadline. Corpus, judgment, baseline receipt, token and vector limits, categories, recall/MRR thresholds, negative gates, and runtime token verification remain unchanged. `pilot.operational_time_budget` is an operational failure, separate from a completed quality evaluation whose report has `passed: false`. Never automatically retry a timed-out pilot or increase its duration after the timeout. Review the measurement and obtain the required approval first. Select the actual budget only after the content-free sizing receipt is available; the example value above is illustrative.
 
+In the frozen quality judgments, `forbiddenParentIds` names semantic distractors for hard-negative cases. A hard-negative ordering violation occurs only when the highest-ranked labeled distractor outranks the highest-ranked expected positive. The existing rank order resolves equal scores deterministically by parent ID; there is no additional score-margin threshold. The pilot requires zero such ordering violations alongside the unchanged recall, MRR, regression, critical, and boundary gates. This definition was fixed before any real judgments or model rankings existed and must not be retuned after results.
+
+Semantic distractors are not an ACL or lifecycle mechanism. The separate ACL/lifecycle acceptance evidence must prove that unauthorized and ineligible rows never appear in results; a distractor may legitimately appear below the correct result when it is itself authorized and lifecycle eligible.
+
 For local verification, never point tests at `DATABASE_URL` or a production database. Use the isolated integration helper and `SHADOW_EMBEDDING_TEST_DATABASE_URL` where available. Type-check with:
 
 ```powershell

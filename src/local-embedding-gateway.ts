@@ -28,6 +28,7 @@ export interface GatewayDependencies {
   now?:()=>Date; read?:typeof readFile; fetch?:typeof fetch;
   spawnChild?:(file:string,args:string[])=>ChildProcess;
   telemetry?:(receipt:GatewayReceipt)=>Promise<GatewayTelemetry>;
+  commonTelemetry?:(receipt:GatewayReceipt)=>Promise<GatewayTelemetry>;
   hashFile?:(path:string)=>Promise<string>;
   hostname?:()=>string;
   verifyBuild?:(path:string)=>Promise<string>;
@@ -130,7 +131,7 @@ export class LocalEmbeddingGateway {
       const declared=Number(req.headers['content-length']??0);if(!Number.isFinite(declared)||declared<0||declared>MAX_BODY)return respond(res,413,{error:'body_limit'});
       if(!this.authorized(req))return respond(res,401,{error:'unauthorized'});
       if(this.busy)return respond(res,429,{error:'busy'});this.busy=true;admitted=true;
-      const telemetry=await this.guard();
+      const telemetry=req.url==='/health'?await this.guard():await this.commonGuard();
       if(req.method==='GET'&&req.url==='/health')return respond(res,200,{contractId:this.receipt.contractId,artifactSha256:this.receipt.artifactSha256,
         status:'ok',runtimeContract:this.receipt.runtimeContract,acceptanceReceiptSha256:this.receipt.acceptanceReceiptSha256,build:this.receipt.build,
         binarySha256:this.receipt.binarySha256,hostId:this.receipt.hostId,verifiedLaunch:true,telemetry});
@@ -151,17 +152,25 @@ export class LocalEmbeddingGateway {
     }catch(error){const failure=gatewayHttpFailure(error);return respond(res,failure.status,{error:failure.code});}finally{if(admitted)this.busy=false;}
   }
   private async upstream(path:string,body:unknown):Promise<any>{
-    await this.guard();
+    if(path==='/v1/embeddings')await this.guard();else await this.commonGuard();
     const fetcher=this.deps.fetch??fetch;let response:Response;try{response=await fetcher(`http://127.0.0.1:${this.backendPort}${path}`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${this.backendToken()}`},body:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(30_000)});}catch{throw new Error('gateway.backend_unavailable');}
     if(!response.ok){await response.body?.cancel();throw new Error(`gateway.upstream_${response.status}`);}try{return JSON.parse(await boundedResponseText(response,path==='/tokenize'?MAX_TOKENIZER_RESPONSE:MAX_BODY));}catch(error){if(error instanceof Error&&error.message==='gateway.upstream_body_limit')throw error;throw new Error('gateway.upstream_shape');}
   }
   private async guard():Promise<GatewayTelemetry>{const now=this.deps.now?.()??new Date();if(now.getTime()>=new Date(this.receipt.authorizedUntil).getTime()){void this.close();throw new Error('gateway.authorization_expired');}let telemetry:GatewayTelemetry;try{telemetry=await(this.deps.telemetry??collectHostTelemetry)(this.receipt);}catch{throw new Error('gateway.resource_unavailable');}validateTelemetry(this.receipt,telemetry,now);return telemetry;}
+  private async commonGuard():Promise<GatewayTelemetry>{
+    if(this.receipt.mode==='cpu')return this.guard();
+    const now=this.deps.now?.()??new Date();this.checkAuthority(now);let telemetry:GatewayTelemetry;
+    try{telemetry=this.deps.commonTelemetry?await this.deps.commonTelemetry(this.receipt):{hostId:hostname(),mode:'gpu',...await collectCommonHostTelemetry(this.receipt)};}
+    catch{throw new Error('gateway.resource_unavailable');}
+    validateCommonTelemetry(this.receipt,telemetry,now);return telemetry;
+  }
+  private checkAuthority(now:Date):void{if(now.getTime()>=new Date(this.receipt.authorizedUntil).getTime()){void this.close();throw new Error('gateway.authorization_expired');}}
   private backendToken():string{if(!this.backendSecret)throw new Error('gateway.backend_secret');return this.backendSecret.toString('hex');}
   private async waitForBackend():Promise<void>{
     const fetcher=this.deps.fetch??fetch,deadline=performance.now()+120_000;
     while(performance.now()<deadline){
       if(!this.child||this.child.exitCode!==null||this.child.signalCode)throw new Error('gateway.backend_exited');
-      await this.guard();
+      await this.commonGuard();
       try{const response=await fetcher(`http://127.0.0.1:${this.backendPort}/health`,{headers:{authorization:`Bearer ${this.backendToken()}`},redirect:'error',signal:AbortSignal.timeout(1000)});
         if(response.ok){await response.body?.cancel();return;}await response.body?.cancel();}catch{}
       await new Promise(r=>setTimeout(r,100));
@@ -180,12 +189,13 @@ function gatewayHttpFailure(error:unknown):{status:number;code:string}{const cod
   if(code==='gateway.authorization_expired')return{status:403,code};
   if(['gateway.telemetry_stale','gateway.host_guard','gateway.gpu_guard','gateway.cpu_guard','gateway.resource_unavailable','gateway.backend_unavailable'].includes(code)||/^gateway\.upstream_(?:429|5\d\d)$/.test(code))return{status:503,code};
   return{status:502,code};}
-function validateTelemetry(r:GatewayReceipt,t:GatewayTelemetry,now:Date){const stamp=t.timestamp;if(t.hostId!==r.hostId||t.mode!==r.mode||!Number.isFinite(stamp)||Math.abs(now.getTime()-stamp)>5000)throw new Error('gateway.telemetry_stale');
-  if(!Number.isFinite(t.availableBytes)||!Number.isFinite(t.diskFreeBytes)||!Number.isFinite(t.swapUsedBytes)||(t.availableBytes??-1)<r.host.minimumAvailableBytes||(t.diskFreeBytes??-1)<r.host.minimumDiskFreeBytes||(t.swapUsedBytes??Infinity)>r.host.maximumSwapUsedBytes||
-    (r.host.platform==='linux'&&(!Number.isFinite(t.load1)||(t.load1??Infinity)>r.host.maximumLoad1!))||
-    (r.host.platform==='win32'&&(!Number.isFinite(t.cpuUtilizationPercent)||(t.cpuUtilizationPercent??Infinity)>r.host.maximumCpuUtilizationPercent!)))throw new Error('gateway.host_guard');
+function validateCommonTelemetry(r:GatewayReceipt,t:GatewayTelemetry,now:Date){const stamp=t.timestamp;if(t.hostId!==r.hostId||t.mode!==r.mode||!Number.isFinite(stamp)||Math.abs(now.getTime()-stamp)>5000)throw new Error('gateway.telemetry_stale');
+  if(!Number.isFinite(t.availableBytes)||!Number.isFinite(t.diskFreeBytes)||!Number.isFinite(t.swapUsedBytes)||(t.availableBytes??-1)<r.host.minimumAvailableBytes||(t.diskFreeBytes??-1)<r.host.minimumDiskFreeBytes||(t.swapUsedBytes??-1)<0||(t.swapUsedBytes??Infinity)>r.host.maximumSwapUsedBytes||
+    (r.host.platform==='linux'&&(!Number.isFinite(t.load1)||(t.load1??-1)<0||(t.load1??Infinity)>r.host.maximumLoad1!))||
+    (r.host.platform==='win32'&&(!Number.isFinite(t.cpuUtilizationPercent)||(t.cpuUtilizationPercent??-1)<0||(t.cpuUtilizationPercent??Infinity)>100||(t.cpuUtilizationPercent??Infinity)>r.host.maximumCpuUtilizationPercent!)))throw new Error('gateway.host_guard');}
+function validateTelemetry(r:GatewayReceipt,t:GatewayTelemetry,now:Date){validateCommonTelemetry(r,t,now);
   if(r.mode==='gpu'&&r.gpu&&(t.gpuDeviceUuid!==r.gpu.deviceUuid||!Number.isFinite(t.gpuTempC)||t.gpuTempC!<0||t.gpuTempC!>=85||!Number.isFinite(t.vramUsedMiB)||!Number.isFinite(t.vramTotalMiB)||t.vramUsedMiB!<0||t.vramTotalMiB!<=0||t.vramUsedMiB!>t.vramTotalMiB!||(t.vramTotalMiB!-t.vramUsedMiB!)<r.gpu.minimumFreeVramMiB))throw new Error('gateway.gpu_guard');
-  if(r.mode==='cpu'&&r.cpu&&(!Number.isFinite(t.memoryPsiAvg10)||(t.memoryPsiAvg10??Infinity)>r.cpu.maximumMemoryPsiAvg10))throw new Error('gateway.cpu_guard');}
+  if(r.mode==='cpu'&&r.cpu&&(!Number.isFinite(t.memoryPsiAvg10)||(t.memoryPsiAvg10??-1)<0||(t.memoryPsiAvg10??Infinity)>r.cpu.maximumMemoryPsiAvg10))throw new Error('gateway.cpu_guard');}
 export async function collectHostTelemetry(r:GatewayReceipt):Promise<GatewayTelemetry>{
   const common=await collectCommonHostTelemetry(r);
   if(r.mode==='gpu'){
