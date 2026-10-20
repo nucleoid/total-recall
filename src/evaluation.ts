@@ -4,6 +4,7 @@ import { accessLevelSql } from './auth.js';
 import { withScopedClient, type DbScope, type ScopedClient } from './db.js';
 import {
   ACTIVE_EMBEDDING_PROFILE,
+  EMBEDDING_PROFILES,
   embedWithProfile,
   type EmbeddingProfile,
 } from './embedding.js';
@@ -18,6 +19,8 @@ import type {
   SearchRankingConfig,
   SearchResult,
 } from './types.js';
+import { localServingEnabled } from './local-embedding-runtime.js';
+import { QWEN_CONTRACT_ID } from './local-embedding-contract.js';
 
 const instant = z.string().datetime({ offset: true });
 const identitySchema = z.union([
@@ -138,7 +141,8 @@ export interface EvaluationRunOptions {
   efSearch: number;
   databaseLabel?: string;
   concurrency?: number;
-  embed?: (query: string, profile: EmbeddingProfile) => Promise<{ vector: number[] }>;
+  evaluationProfile?: EmbeddingProfile;
+  embed?: (query: string, profile: EmbeddingProfile, role?: 'document'|'query') => Promise<{ vector: number[] }>;
   search?: typeof rankMemories;
 }
 
@@ -265,14 +269,26 @@ export function baselineMismatches(current: EvaluationReport, baseline: Evaluati
   if (current.execution.as_of !== baseline.execution.as_of) mismatches.push('as_of');
   if (current.execution.database_label !== baseline.execution.database_label) mismatches.push('database label');
   if (current.execution.ef_search !== baseline.execution.ef_search) mismatches.push('ef_search');
-  for (const field of ['provider', 'model', 'dimensions'] as const) {
+  for (const field of ['provider', 'model', 'dimensions', 'profile'] as const) {
     if (current.embedding[field] !== baseline.embedding[field]) mismatches.push(`embedding ${field}`);
   }
   return mismatches;
 }
 
+export function resolveEvaluationProfile(name?:string):EmbeddingProfile {
+  if(name==='target'||(!name&&localServingEnabled())) {
+    if(!localServingEnabled()) throw new Error('Evaluation target profile requires active local serving');
+    return{name:'target',provider:'llama.cpp',model:QWEN_CONTRACT_ID,dimensions:768};
+  }
+  if(!name||name==='current') return ACTIVE_EMBEDDING_PROFILE;
+  const profile=EMBEDDING_PROFILES.find(item=>item.name===name);
+  if(!profile) throw new Error(`Unknown evaluation profile: ${name}`);
+  return profile;
+}
+
 export async function runEvaluation(datasetInput: unknown, options: EvaluationRunOptions): Promise<EvaluationReport> {
   const dataset = parseEvaluationDataset(datasetInput);
+  const evaluationProfile=options.evaluationProfile??resolveEvaluationProfile();
   if (!dataset.namespaces.every(namespace => options.scope.namespaces.includes(namespace))) {
     throw new Error('Dataset namespaces exceed the evaluation credential scope');
   }
@@ -301,10 +317,8 @@ export async function runEvaluation(datasetInput: unknown, options: EvaluationRu
     dataset: { name: dataset.name, hash: stableHash(dataset), schema_version: 1 },
     code: { commit: options.codeCommit ?? null },
     embedding: {
-      provider: ACTIVE_EMBEDDING_PROFILE.provider,
-      model: ACTIVE_EMBEDDING_PROFILE.model,
-      dimensions: ACTIVE_EMBEDDING_PROFILE.dimensions,
-      profile: ACTIVE_EMBEDDING_PROFILE.name,
+      provider:evaluationProfile.provider,model:evaluationProfile.model,
+      dimensions:evaluationProfile.dimensions,profile:evaluationProfile.name,
     },
     execution: {
       as_of: asOf,
@@ -325,7 +339,7 @@ export async function runEvaluation(datasetInput: unknown, options: EvaluationRu
   };
 
   if (options.checkOnly) return report;
-  const embed = options.embed ?? embedWithProfile;
+  const embed:NonNullable<EvaluationRunOptions['embed']>=options.embed??((query,profile,role)=>embedWithProfile(query,profile,undefined,role));
   const search = options.search ?? rankMemories;
   const caseReports = new Array<EvaluationCaseReport>(dataset.cases.length);
   let nextIndex = 0;
@@ -336,7 +350,7 @@ export async function runEvaluation(datasetInput: unknown, options: EvaluationRu
       const identityResolution = resolved[index];
       const k = options.k ?? item.k ?? dataset.defaults.k;
       const threshold = options.threshold ?? item.threshold ?? dataset.defaults.threshold;
-      const embedding = await embed(item.query, ACTIVE_EMBEDDING_PROFILE);
+      const embedding = await embed(item.query,evaluationProfile,'query');
       const results = await search(
         toSearchParams(item, k, threshold),
         dataset.namespaces,
@@ -345,7 +359,7 @@ export async function runEvaluation(datasetInput: unknown, options: EvaluationRu
         {
           asOf,
           ranking,
-          queryVectors: [{ profile: ACTIVE_EMBEDDING_PROFILE, vector: embedding.vector }],
+          queryVectors: [{ profile:evaluationProfile, vector:embedding.vector }],
         },
       );
       assertFiniteResults(results, item.id);

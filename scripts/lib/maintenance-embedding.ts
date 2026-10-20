@@ -1,3 +1,5 @@
+import { reserveLegacyRollbackEmbeddingInputs, type RollbackBudgetQueryable } from '../../src/embedding-rollback-budget.js';
+
 export const MAINTENANCE_EMBEDDING_MODEL = 'gemini-embedding-2-preview';
 export const MAINTENANCE_EMBEDDING_DIMENSIONS = 768;
 
@@ -47,8 +49,10 @@ export function validateMaintenanceEmbeddingProfile(
 export function createMaintenanceEmbedder(
   profile: MaintenanceEmbeddingProfile,
   request: typeof fetch = fetch,
+  reservationDatabase?: RollbackBudgetQueryable,
 ): (texts: string[]) => Promise<number[][]> {
   return async texts => {
+    await reserveLegacyRollbackEmbeddingInputs(texts.length, reservationDatabase);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${profile.model}:batchEmbedContents?key=${profile.apiKey}`;
     const response = await request(url, {
       method: 'POST',

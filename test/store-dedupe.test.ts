@@ -65,7 +65,11 @@ class DedupePool {
     };
   }
 
-  async query(): Promise<never> {
+  async query(text: string, params: unknown[] = []) {
+    const sql = text.replace(/\s+/g, ' ').trim();
+    if (sql === "SELECT to_regclass('public.embedding_serving_settings')::text AS serving_table, to_regprocedure('public.reserve_embedding_rollback_inputs(integer)')::text AS reservation_function" && params.length === 0) {
+      return result([{ serving_table: null, reservation_function: null }]);
+    }
     throw new Error('memory_store must use request-scoped clients');
   }
 }

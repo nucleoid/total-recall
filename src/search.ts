@@ -8,6 +8,8 @@ import {
   type EmbeddingProfile,
 } from './embedding.js';
 import { accessLevelSql } from './auth.js';
+import { QWEN_CONTRACT_ID } from './local-embedding-contract.js';
+import { getLocalServingClient, localServingEnabled } from './local-embedding-runtime.js';
 import {
   hnswEfSearchFromEnv,
   supersededScoreFactorFromEnv,
@@ -17,6 +19,7 @@ import type {
   AccessLevel,
   SearchExecutionOptions,
   SearchParams,
+  SearchQueryVector,
   SearchRankingConfig,
   SearchResult,
 } from './types.js';
@@ -29,6 +32,9 @@ const SUPERSEDED_SCORE_FACTOR = SUPERSEDED_SEARCH_DEMOTION_ENABLED
   ? supersededScoreFactorFromEnv()
   : 1;
 const SEARCH_SCHEMA_CAPABILITY_TTL_MS = boundedSchemaTtl(process.env.SEARCH_SCHEMA_CAPABILITY_TTL_MS);
+const LOCAL_EXACT_PARENT_LIMIT = 10_000;
+const LOCAL_EXACT_CHUNK_LIMIT = 50_000;
+const LOCAL_ANN_CHUNK_OVERFETCH = 1_000;
 
 /** Exact pre-evaluation ranking behavior, including the intentionally inconsistent diagnostic bonus. */
 export const DEFAULT_SEARCH_RANKING_CONFIG: Readonly<SearchRankingConfig> = Object.freeze({
@@ -269,12 +275,30 @@ export async function executeHybridSearch(
   const ranking = validateSearchRankingConfig(options.ranking ?? DEFAULT_SEARCH_RANKING_CONFIG);
   const trackAccess = options.trackAccess !== false;
   const asOf = options.asOf === undefined ? undefined : normalizedInstant(options.asOf, 'asOf');
+  const configuredLocalServing = !options.queryVectors && localServingEnabled();
+  const useLocalServing = options.queryVectors ? false : await withScopedClient(scope, async client => {
+    return resolveAutomaticReadMode(client, configuredLocalServing);
+  }, { readOnly: true });
+  let localQueryVector: string | undefined;
   // queryVectors supersedes the old single vectorAvailable flag.
-  const queryVectors: Array<{ profile: EmbeddingProfile; vector: string }> = [];
+  const queryVectors: Array<{ profile: SearchQueryVector['profile']; vector: string }> = [];
   if (options.queryVectors) {
     for (const item of options.queryVectors) {
-      queryVectors.push({ profile: item.profile as EmbeddingProfile, vector: serializeEmbeddingVector(item.vector) });
+      if (item.profile.provider === 'llama.cpp') {
+        if (item.profile.model !== QWEN_CONTRACT_ID || item.profile.dimensions !== 768 || localQueryVector) {
+          throw new Error('shadow_embedding.explicit_vector_identity');
+        }
+        // Current manifests cannot support a historical snapshot. Keep valid_at
+        // explicitly text-only rather than scoring today's chunks against the past.
+        if (!params.valid_at) localQueryVector = serializeEmbeddingVector(item.vector);
+      } else {
+        queryVectors.push({ profile: item.profile, vector: serializeEmbeddingVector(item.vector) });
+      }
     }
+  } else if (useLocalServing) {
+    // Historical manifests deliberately describe only the current parent revision.
+    // Temporal retrieval therefore remains text-only rather than resurrecting a
+    // current chunk vector into a historical result set.
   } else {
     try {
       const result = await embedWithProfile(params.query, ACTIVE_EMBEDDING_PROFILE);
@@ -288,6 +312,17 @@ export async function executeHybridSearch(
   if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Search limit must be a positive integer');
   if (!Number.isFinite(threshold) || threshold < -1 || threshold > 1) throw new Error('Search threshold must be between -1 and 1');
 
+  if (useLocalServing) {
+    await withScopedClient(scope, async client => verifyLocalServingContract(client), { readOnly: true });
+    const localClient = getLocalServingClient();
+    if (!params.valid_at) try {
+      const result = await localClient.embed([params.query], 'query');
+      localQueryVector = serializeEmbeddingVector(result.vectors[0]);
+    } catch {
+      console.warn('[search] Local embedding runtime unavailable; using text-only search fallback');
+    }
+  }
+
   return withScopedClient(scope, async (client) => {
     await client.query("SELECT set_config('hnsw.ef_search', $1, true)", [String(EF_SEARCH)]);
 
@@ -299,11 +334,16 @@ export async function executeHybridSearch(
       throw new Error('Invalid valid_at: temporal search is unavailable until memory validity finalization completes');
     }
 
+    if (!options.queryVectors && !useLocalServing) {
+      // The provider call runs outside a transaction. Recheck automatic legacy
+      // mode before ranking so a concurrent cutover cannot score the old space.
+      await resolveAutomaticReadMode(client, false);
+    }
     // Canonicalize aliases that describe the same space. A legacy provider is
     // never called merely because credentials exist: at least one fully labelled,
     // filtered, visible row must be present.
     const queriedIdentities = new Set([embeddingIdentity(ACTIVE_EMBEDDING_PROFILE)]);
-    if (!options.queryVectors) for (const profile of LEGACY_EMBEDDING_PROFILES) {
+    if (!options.queryVectors && !useLocalServing) for (const profile of LEGACY_EMBEDDING_PROFILES) {
       const identity = embeddingIdentity(profile);
       if (queriedIdentities.has(identity)) continue;
       if (!await hasEligibleRowsForProfile(client, profile, params, namespaces, maxAccessLevel, capabilities)) continue;
@@ -314,6 +354,14 @@ export async function executeHybridSearch(
       } catch (error) {
         console.warn(`[search] Legacy embedding profile ${profile.name} (${profile.provider}/${profile.model}/${profile.dimensions}) unavailable; continuing without that vector space`);
       }
+    }
+    if (!options.queryVectors) {
+      // Provider work is complete. Hold a shared transaction lock across the
+      // final serving fence and ranking so supported cutover/rollback cannot
+      // commit a mode change between them. Never hold this lock during inference.
+      await client.query("SELECT pg_advisory_xact_lock_shared(hashtextextended('total-recall.embedding-serving',0))");
+      if (useLocalServing) await verifyLocalServingContract(client);
+      else await resolveAutomaticReadMode(client, false);
     }
 
     const values: unknown[] = [];
@@ -408,6 +456,74 @@ export async function executeHybridSearch(
       (SELECT ${selectedColumns}, NULL::double precision AS vec_score
        FROM memories m WHERE FALSE)`;
 
+    const localVectorBranch = localQueryVector ? (() => {
+      const pVec = p(localQueryVector);
+      const pContract = p(QWEN_CONTRACT_ID);
+      const pReadinessNamespaces=p(namespaces),pReadinessAccess=p(maxAccessLevel);
+      // Exact scoring is bounded to selective scopes. Large scopes use a correlated
+      // membership filter so pgvector can retain HNSW ordering while applying the
+      // eligible parent ACL, revision and lifecycle set before LIMIT. Per-parent MAX and
+      // one-row aggregation prevent multi-chunk parents from occupying result slots.
+      return `
+        local_scope_readiness AS MATERIALIZED (
+          SELECT shadow_embedding_scope_ready(${pReadinessNamespaces}::text[],${pReadinessAccess}) AS ready
+        ),
+        eligible_local_parents AS NOT MATERIALIZED (
+          SELECT m.*, mf.chunk_count AS shadow_chunk_count
+          FROM memories m
+          JOIN memory_embedding_manifests mf
+            ON mf.contract_id = ${pContract} AND mf.parent_id = m.id
+           AND mf.is_current AND mf.source_revision = m.revision
+          WHERE (SELECT ready FROM local_scope_readiness)
+            AND m.namespace = ANY(${pNs}) ${accessWhere} ${extraWhere}
+            AND m.deleted_at IS NULL
+            AND m.superseded_at IS NULL
+            AND m.consolidated_into_id IS NULL
+            AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+            AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
+            AND (m.valid_to IS NULL OR m.valid_to > statement_timestamp())
+        ),
+        local_scope_size AS (
+          SELECT count(*) AS parents, COALESCE(sum(shadow_chunk_count), 0) AS chunks
+          FROM (
+            SELECT shadow_chunk_count FROM eligible_local_parents
+            LIMIT ${LOCAL_EXACT_PARENT_LIMIT + 1}
+          ) bounded_scope
+        ),
+        local_exact_chunks AS MATERIALIZED (
+          SELECT c.parent_id, 1 - (c.embedding <=> ${pVec}::vector) AS vec_score
+          FROM memory_embedding_chunks c
+          JOIN eligible_local_parents ep ON ep.id = c.parent_id
+          WHERE c.contract_id = ${pContract}
+            AND (SELECT parents <= ${LOCAL_EXACT_PARENT_LIMIT} AND chunks <= ${LOCAL_EXACT_CHUNK_LIMIT} FROM local_scope_size)
+        ),
+        local_ann_head AS MATERIALIZED (
+          SELECT c.parent_id, 1 - (c.embedding <=> ${pVec}::vector) AS vec_score
+          FROM memory_embedding_chunks c
+          WHERE c.contract_id = ${pContract}
+            AND NOT (SELECT parents <= ${LOCAL_EXACT_PARENT_LIMIT} AND chunks <= ${LOCAL_EXACT_CHUNK_LIMIT} FROM local_scope_size)
+            AND (SELECT true FROM eligible_local_parents ep WHERE ep.id = c.parent_id)
+          ORDER BY c.embedding <=> ${pVec}::vector
+          LIMIT ${LOCAL_ANN_CHUNK_OVERFETCH}
+        ),
+        local_parent_scores AS MATERIALIZED (
+          SELECT candidate.parent_id, max(candidate.vec_score) AS vec_score
+          FROM (
+            SELECT * FROM local_exact_chunks
+            UNION ALL
+            SELECT * FROM local_ann_head
+          ) candidate
+          GROUP BY candidate.parent_id
+          ORDER BY max(candidate.vec_score) DESC, candidate.parent_id
+          LIMIT ${ranking.vectorCandidateLimit}
+        ),
+        local_vector_results AS (
+          SELECT ${selectedColumns}, ps.vec_score
+          FROM local_parent_scores ps
+          JOIN eligible_local_parents m ON m.id = ps.parent_id
+        ),`;
+    })() : '';
+
     const textBranches = lifecyclePredicates.map(lifecycle => `
       (SELECT ${selectedColumns}, NULL::double precision AS vec_score
        FROM memories m
@@ -451,8 +567,10 @@ export async function executeHybridSearch(
 
     const pRequesterKeyId = p(scope.keyId);
     const sql = `
-      WITH vector_results AS (
-        ${vectorBranches}
+      WITH ${localVectorBranch}vector_results AS (
+        ${localQueryVector
+          ? `SELECT * FROM local_vector_results${queryVectors.length ? `\nUNION ALL\n${vectorBranches}` : ''}`
+          : vectorBranches}
       ),
       text_only_results AS (
         ${textBranches}
@@ -530,4 +648,38 @@ function normalizedInstant(value: string, field: string): string {
     throw new Error(`${field} must be an ISO-8601 instant`);
   }
   return date.toISOString();
+}
+
+async function verifyLocalServingContract(client: ScopedClient): Promise<void> {
+  const serving = await client.query<{ contract_id: string }>(`
+    SELECT contract_id FROM embedding_serving_settings WHERE singleton = true
+  `);
+  if (serving.rows.length !== 1 || serving.rows[0].contract_id !== QWEN_CONTRACT_ID) {
+    throw new Error('shadow_embedding.serving_contract_mismatch');
+  }
+}
+
+async function resolveAutomaticReadMode(client: ScopedClient, configuredLocalServing: boolean): Promise<boolean> {
+  const schema = await client.query<{ serving_table: string | null }>(`
+    SELECT to_regclass('public.embedding_serving_settings')::text AS serving_table
+  `);
+  if (schema.rows.length !== 1 || !Object.prototype.hasOwnProperty.call(schema.rows[0], 'serving_table')
+    || (schema.rows[0].serving_table !== null && typeof schema.rows[0].serving_table !== 'string')) {
+    throw new Error('shadow_embedding.serving_catalog_mismatch');
+  }
+  if (schema.rows[0].serving_table === null) {
+    if (configuredLocalServing) throw new Error('shadow_embedding.serving_contract_mismatch');
+    return false;
+  }
+  const serving = await client.query<{ contract_id: string }>(`
+    SELECT contract_id FROM embedding_serving_settings WHERE singleton = true
+  `);
+  if (serving.rows.length === 0) {
+    if (configuredLocalServing) throw new Error('shadow_embedding.serving_contract_mismatch');
+    return false;
+  }
+  if (serving.rows.length !== 1 || serving.rows[0].contract_id !== QWEN_CONTRACT_ID || !configuredLocalServing) {
+    throw new Error('shadow_embedding.serving_contract_mismatch');
+  }
+  return true;
 }

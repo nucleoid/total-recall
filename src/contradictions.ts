@@ -4,6 +4,9 @@ import { accessLevelSql } from './auth.js';
 import { logAudit } from './audit.js';
 import { dbScopeFromAuth, withScopedClient } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR } from './embedding.js';
+import { localServingEnabled } from './local-embedding-runtime.js';
+import { QWEN_CONTRACT_ID, validateLocalStoredVector } from './local-embedding-contract.js';
+import { assertLocalContradictionScopeComplete, publishPreparedLocalDocument, type PreparedLocalDocument } from './local-embedding-consumers.js';
 import {
   GenerationLimitError,
   GenerationTimeoutError,
@@ -102,6 +105,7 @@ export type ContradictionReason =
 export interface SemanticMemoryInsert {
   content: string;
   vector: string;
+  localPrepared?: PreparedLocalDocument;
   source: string;
   namespace: string;
   tags: string[];
@@ -424,7 +428,37 @@ export async function findContradictionCandidates(
   auth: AuthContext,
   excludeMemoryId: string | null = null,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  localPrepared?: PreparedLocalDocument,
 ): Promise<ContradictionCandidate[]> {
+  if (localServingEnabled()) {
+    if (!localPrepared) throw new Error('shadow_embedding.contradiction_vectors_required');
+    const vectors = localPrepared.vectors.map(value => { validateLocalStoredVector(value); return `[${value.join(',')}]`; });
+    return withScopedClient(dbScopeFromAuth(auth), async client => {
+      await client.query("SELECT set_config('statement_timeout',$1,true)", [String(timeoutMs)]);
+      await assertLocalContradictionScopeComplete(client, namespace, auth.maxAccessLevel);
+      const result = await client.query<ContradictionCandidate>(`SELECT m.id,m.content,
+        max(1-(c.embedding<=>q.vector))::double precision AS similarity
+        FROM memories m JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$5
+          AND f.is_current AND f.source_revision=m.revision
+          AND f.source_sha256=encode(digest(convert_to(m.content,'UTF8'),'sha256'),'hex')
+          AND f.source_bytes=octet_length(convert_to(m.content,'UTF8'))
+          AND f.chunk_count=(SELECT count(*) FROM memory_embedding_chunks valid_chunk
+            WHERE valid_chunk.parent_id=m.id AND valid_chunk.contract_id=$5)
+          AND COALESCE((SELECT min(valid_chunk.ordinal)=0 AND max(valid_chunk.ordinal)=f.chunk_count-1
+            FROM memory_embedding_chunks valid_chunk WHERE valid_chunk.parent_id=m.id AND valid_chunk.contract_id=$5),false)
+        JOIN memory_embedding_chunks c ON c.parent_id=m.id AND c.contract_id=f.contract_id
+        CROSS JOIN unnest($1::vector[]) q(vector)
+        WHERE m.namespace=$2 AND m.namespace=ANY($3::text[]) AND ${accessLevelSql('m.access_level', '$4')}
+          AND m.access_level='normal' AND m.memory_kind='semantic' AND m.deleted_at IS NULL
+          AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp()) AND m.superseded_at IS NULL
+          AND m.valid_to IS NULL AND m.valid_from<=statement_timestamp() AND m.consolidated_into_id IS NULL
+          AND ($6::uuid IS NULL OR m.id<>$6::uuid)
+        GROUP BY m.id HAVING max(1-(c.embedding<=>q.vector)) >= $7
+        ORDER BY similarity DESC,m.id LIMIT $8`,
+      [vectors, namespace, auth.namespaces, auth.maxAccessLevel, QWEN_CONTRACT_ID, excludeMemoryId, CANDIDATE_SIMILARITY, CANDIDATE_LIMIT]);
+      return result.rows;
+    });
+  }
   const result = await withScopedClient(dbScopeFromAuth(auth), async client => {
     await client.query("SELECT set_config('statement_timeout', $1, true)", [String(timeoutMs)]);
     return client.query<ContradictionCandidate>(
@@ -572,6 +606,7 @@ export async function maybeReviseBelief(
       auth,
       options.excludeCandidateId ?? null,
       policy.timeoutMs,
+      memory.localPrepared,
     );
   } catch (error) {
     metric(databaseErrorCode(error) === '57014' ? 'candidate_timeout' : 'candidate_query_error');
@@ -730,6 +765,7 @@ export async function commitAutomaticRevision(
       ],
     );
     const successor = inserted.rows[0];
+    await publishPreparedLocalDocument(client, successor.id, memory.localPrepared);
     await logAudit({
       clientId: auth.keyId,
       action: 'belief.supersede',

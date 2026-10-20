@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { dbScopeFromAuth, withScopedClient } from '../db.js';
-import { embedWithProfile, serializeEmbeddingVector } from '../embedding.js';
+import { ACTIVE_EMBEDDING_PROFILE, embedWithProfile, serializeEmbeddingVector } from '../embedding.js';
+import { prepareLocalDocument, publishPreparedLocalDocument, findLocalDocumentDuplicate } from '../local-embedding-consumers.js';
 import type { AuthContext, StoreResult } from '../types.js';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from '../auth.js';
 import { resolveAgent } from '../agents.js';
@@ -121,7 +122,11 @@ export async function memoryStore(
   );
 
   // EmbeddingResult atomically carries the ACTIVE_EMBEDDING_DESCRIPTOR identity.
-  const embedding = await embedWithProfile(params.content);
+  const localPrepared = await prepareLocalDocument(params.content);
+  const embedding = localPrepared && ACTIVE_EMBEDDING_PROFILE.provider === 'llama.cpp'
+    ? { vector: localPrepared.vectors[0], provider: ACTIVE_EMBEDDING_PROFILE.provider,
+      model: ACTIVE_EMBEDDING_PROFILE.model, dimensions: ACTIVE_EMBEDDING_PROFILE.dimensions }
+    : await embedWithProfile(params.content);
   const vecStr = serializeEmbeddingVector(embedding.vector);
   const descriptor: [string, string, number] = [embedding.provider, embedding.model, embedding.dimensions];
 
@@ -144,6 +149,7 @@ export async function memoryStore(
   const semanticMemory: SemanticMemoryInsert = {
     content: params.content,
     vector: vecStr,
+    localPrepared,
     source,
     namespace: ns,
     tags: params.tags,
@@ -192,7 +198,9 @@ export async function memoryStore(
           [`memory-store-dedupe:${JSON.stringify([ns, params.access_level])}`],
         );
 
-        const candidate = await client.query<{ id: string; namespace: string; similarity: number | string | null }>(
+        const localCandidate = localPrepared ? await findLocalDocumentDuplicate(client, localPrepared, ns, params.access_level) : undefined;
+        const candidate = localPrepared ? { rows: localCandidate ? [localCandidate] : [] }
+          : await client.query<{ id: string; namespace: string; similarity: number | string | null }>(
           `SELECT m.id, m.namespace,
                   1 - (m.embedding <=> $1::vector) AS similarity
            FROM memories m
@@ -275,6 +283,7 @@ export async function memoryStore(
         ...inserted.rows[0], expires_at: inserted.rows[0].expires_at ?? null,
         created: true, deduplicated: false,
       };
+      await publishPreparedLocalDocument(client, result.id, localPrepared);
       await logAudit({
         clientId: auth.keyId, action: 'memory.store', namespace: ns,
         memoryId: result.id, resourceType: 'memory', resourceId: result.id,
@@ -329,6 +338,7 @@ export async function memoryStore(
       );
       if (upsert.rows.length > 0) {
         const stored = upsert.rows[0] as { id: string; created?: boolean };
+        await publishPreparedLocalDocument(client, stored.id, localPrepared);
         await logAudit({
           clientId: auth.keyId, action: 'memory.store', namespace: ns,
           memoryId: stored.id, resourceType: 'memory', resourceId: stored.id,
