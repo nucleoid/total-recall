@@ -78,6 +78,14 @@ test('provider errors are classified, Retry-After bounded and secret response bo
   }
 });
 
+test('only exact 429 busy has the no-attempt-charge gateway code',async()=>{
+  for(const [body,code] of [[{error:'busy'},'embedding.gateway_busy'],[{error:'busy',extra:true},'embedding.http_429'],[{error:'other'},'embedding.http_429']] as const){
+    const client=new LocalEmbeddingClient({baseUrl:'http://localhost:1234',bearerToken:'fixture',runtime,beforeInference:async()=>{},
+      fetch:(async()=>Response.json(body,{status:429})) as typeof fetch});
+    await assert.rejects(client.countFormattedTokens('x'),error=>error instanceof LocalEmbeddingError&&error.code===code);
+  }
+});
+
 test('failed guard prevents any inference request', async () => {
   let calls = 0;
   const client = new LocalEmbeddingClient({ baseUrl: 'http://localhost:1234', bearerToken: 'fixture', runtime,

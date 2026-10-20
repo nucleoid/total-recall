@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { statfs } from 'node:fs/promises';
 import { cpus, hostname, platform } from 'node:os';
 import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID } from './local-embedding-contract.js';
-import type { VerifiedLocalRuntime } from './local-embedding-client.js';
+import { isExactGatewayBusy, LocalEmbeddingError, type VerifiedLocalRuntime } from './local-embedding-client.js';
 import { createPinnedTlsFetch } from './local-embedding-transport.js';
 
 export interface ShadowHostPlan {
@@ -107,7 +107,10 @@ export function createShadowResourceGuard(options: ShadowResourceGuardOptions): 
     let response: Response;
     try { response = await fetcher(new URL('/health', url).toString(), { headers: { Authorization: `Bearer ${options.bearerToken}` }, signal: AbortSignal.timeout(5000), redirect: 'error' }); }
     catch { throw new Error('embedding.runtime_health'); }
-    if (!response.ok) { await response.body?.cancel(); throw new Error('embedding.runtime_health'); }
+    if (!response.ok) {
+      if(await isExactGatewayBusy(response))throw new LocalEmbeddingError('embedding.gateway_busy','retryable',1000);
+      throw new Error('embedding.runtime_health');
+    }
     let body: unknown;
     try { body = await response.json(); } catch { throw new Error('embedding.runtime_health'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('embedding.runtime_health');

@@ -5,7 +5,7 @@ import pg from 'pg';
 import { ShadowEmbeddingStore } from '../src/shadow-embedding-store.js';
 import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
 import { planEmbeddingChunks } from '../src/embedding-chunks.js';
-import { LocalEmbeddingClient } from '../src/local-embedding-client.js';
+import { LocalEmbeddingClient,LocalEmbeddingError } from '../src/local-embedding-client.js';
 import { runShadowBatch } from '../src/shadow-embedding-worker.js';
 import { auditShadowPage } from '../src/shadow-embedding-audit.js';
 import { readShadowEmbeddingStatus } from '../src/shadow-embedding-status.js';
@@ -170,6 +170,22 @@ test('worker pauses before claiming on resource failure and before inference on 
     assert.equal((await pool.query('SELECT count(*)::int n FROM memory_embedding_manifests WHERE parent_id=$1', [parent])).rows[0].n, 0);
     assert.equal((await pool.query('SELECT attempts FROM embedding_work_items WHERE parent_id=$1', [parent])).rows[0].attempts, 0,
       'planned batch boundaries do not consume a processing attempt');
+  });
+});
+
+test('gateway contention ends a finite invocation without pausing or charging an attempt', {skip:!url},async()=>{
+  await fixture(async({pool,store,parent,runId})=>{
+    const preclaim=await runShadowBatch(store,fakeClient(),limits,async()=>{throw new LocalEmbeddingError('embedding.gateway_busy','retryable',1000);});
+    assert.equal(preclaim.state,'bounded_batch_finished');assert.equal(preclaim.stopCode,'embedding.gateway_busy');
+    assert.deepEqual((await pool.query('SELECT state,attempts FROM embedding_work_items WHERE parent_id=$1',[parent])).rows[0],{state:'pending',attempts:0});
+    const busy=new LocalEmbeddingClient({baseUrl:'http://localhost:1234',bearerToken:'synthetic',runtime:{contractId:QWEN_CONTRACT_ID,
+      artifactSha256:QWEN_CHUNK_CONTRACT.artifactSha256,runtimeContract:QWEN_CHUNK_CONTRACT.runtimeContract,acceptanceReceiptSha256:'b'.repeat(64)},
+      beforeInference:async()=>{},fetch:(async()=>Response.json({error:'busy'},{status:429})) as typeof fetch});
+    const claimed=await runShadowBatch(store,busy,limits,async()=>{});
+    assert.equal(claimed.state,'bounded_batch_finished');assert.equal(claimed.stopCode,'embedding.gateway_busy');
+    const row=(await pool.query('SELECT state,attempts,error_code,next_attempt_at>statement_timestamp() AS delayed FROM embedding_work_items WHERE parent_id=$1',[parent])).rows[0];
+    assert.deepEqual(row,{state:'retry',attempts:0,error_code:'embedding.gateway_busy',delayed:true});
+    assert.equal((await pool.query('SELECT status FROM embedding_runs WHERE id=$1',[runId])).rows[0].status,'running');
   });
 });
 

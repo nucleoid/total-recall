@@ -26,6 +26,19 @@ export interface LocalEmbeddingClientOptions {
   beforeInference: () => Promise<void>;
 }
 
+/** Consume and recognize only the gateway's current bounded contention response. */
+export async function isExactGatewayBusy(response: Response): Promise<boolean> {
+  if (response.status !== 429 || !response.body) { await response.body?.cancel(); return false; }
+  const reader=response.body.getReader();const chunks:Uint8Array[]=[];let bytes=0;
+  try {
+    while(true){const next=await reader.read();if(next.done)break;bytes+=next.value.byteLength;if(bytes>128){await reader.cancel();return false;}chunks.push(next.value);}
+    const raw=new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks));
+    const value=JSON.parse(raw) as unknown;
+    return !!value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===1
+      && (value as Record<string,unknown>).error==='busy';
+  } catch { try{await reader.cancel();}catch{} return false; }
+}
+
 /** Pinned llama.cpp contract. Ollama is not silently substituted for a tokenizer-compatible runtime. */
 export class LocalEmbeddingClient {
   private readonly baseUrl: string;
@@ -69,6 +82,8 @@ export class LocalEmbeddingClient {
       throw new LocalEmbeddingError(signal?.aborted ? 'embedding.cancelled' : 'embedding.transport', 'retryable');
     }
     if (!response.ok) {
+      const checkedBusy=response.status===429;
+      if (checkedBusy&&await isExactGatewayBusy(response)) throw new LocalEmbeddingError('embedding.gateway_busy', 'retryable', 1000);
       const classification = response.status === 429 || response.status === 503 || response.status === 504 ? 'retryable'
         : response.status === 400 || response.status === 413 || response.status === 422 ? 'input' : 'systemic';
       const raw = response.headers.get('retry-after');
@@ -77,7 +92,7 @@ export class LocalEmbeddingClient {
         const parsed = /^\d+$/u.test(raw) ? Number(raw) * 1000 : Date.parse(raw) - Date.now();
         if (Number.isFinite(parsed) && parsed >= 0) delay = Math.min(parsed, 300_000);
       }
-      await response.body?.cancel();
+      if(!checkedBusy)await response.body?.cancel();
       throw new LocalEmbeddingError(`embedding.http_${response.status}`, classification, delay);
     }
     let parsed: unknown;

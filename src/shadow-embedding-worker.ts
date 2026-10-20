@@ -50,7 +50,10 @@ export async function runShadowBatch(store: ShadowEmbeddingStore, client: LocalE
   };
   while (examined < limits.maxParents && performance.now() - started < limits.maxElapsedMs) {
     if (batchSignal.aborted) { await pause(signal?.aborted ? 'embedding.cancelled' : 'embedding.batch_stopped'); break; }
-    try { await resourceGuard(); } catch { await pause('embedding.resource_guard'); break; }
+    try { await resourceGuard(); } catch(error) {
+      if(error instanceof LocalEmbeddingError&&error.code==='embedding.gateway_busy'){receipt.stopCode=error.code;break;}
+      await pause('embedding.resource_guard'); break;
+    }
     const claim = await store.claim();
     if (!claim) break;
     examined++;
@@ -64,7 +67,10 @@ export async function runShadowBatch(store: ShadowEmbeddingStore, client: LocalE
       if (batchSignal.aborted || performance.now() - started >= limits.maxElapsedMs) {
         throw new LocalEmbeddingError(signal?.aborted ? 'embedding.cancelled' : 'embedding.batch_stopped', 'retryable');
       }
-      try { await resourceGuard(); } catch { throw new LocalEmbeddingError('embedding.resource_guard', 'retryable'); }
+      try { await resourceGuard(); } catch(error) {
+        if(error instanceof LocalEmbeddingError&&error.code==='embedding.gateway_busy')throw error;
+        throw new LocalEmbeddingError('embedding.resource_guard', 'retryable');
+      }
       if (performance.now() - lastRenewal >= 10_000) {
         if (!await store.renew(claim)) throw new LocalEmbeddingError('embedding.claim_lost', 'retryable');
         lastRenewal = performance.now();
@@ -128,6 +134,12 @@ export async function runShadowBatch(store: ShadowEmbeddingStore, client: LocalE
         if (await store.settle(claim, 'failed', classified.code)) receipt.failedParents++;
         else { receipt.staleParents++; break; }
       } else if (classified.classification === 'retryable') {
+        if(classified.code==='embedding.gateway_busy'){
+          const settled=await store.defer(claim,classified.code,new Date(Date.now()+(classified.retryAfterMs??1000)));
+          if(!settled)receipt.staleParents++;
+          receipt.stopCode=classified.code;
+          break;
+        }
         const controlStop = ['embedding.batch_stopped', 'embedding.cancelled', 'embedding.resource_guard'].includes(classified.code);
         const exhausted = !controlStop && claim.attempts + 1 >= limits.maxAttempts;
         const settled = controlStop
