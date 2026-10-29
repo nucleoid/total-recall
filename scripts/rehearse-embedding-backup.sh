@@ -169,7 +169,7 @@ printf "%s\n" "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_i
 IFS='|' read -r snapshot_database snapshot_id <&"${SNAPSHOT_HOLDER[0]}"
 [[ $snapshot_database == "$database" && $snapshot_id =~ ^[0-9A-Fa-f]+-[0-9A-Fa-f]+-[0-9]+$ ]] || { echo backup.snapshot_identity >&2; exit 1; }
 { printf "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '%s';\n" "$snapshot_id"; cat "$receipt_sql"; printf 'COMMIT;\n'; } |
- sudo -n -u postgres env PGAPPNAME="$receipt_application_name" psql -XAtq --no-password -d "$database" -v ON_ERROR_STOP=1 >"$before_file" &
+ nice -n 10 ionice -c2 -n7 sudo -n -u postgres env PGAPPNAME="$receipt_application_name" psql -XAtq --no-password -d "$database" -v ON_ERROR_STOP=1 >"$before_file" &
 receipt_pid=$!; pressure_failures=0
 while kill -0 "$receipt_pid" 2>/dev/null; do if pressure_trip; then kill -TERM "$receipt_pid" 2>/dev/null || true; cancel_owned_receipt; echo backup.host_pressure_guard >&2; exit 1; fi; sleep 5; done
 wait "$receipt_pid"
