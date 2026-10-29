@@ -9,7 +9,7 @@ $repoRoot=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $scratch=Join-Path $repoRoot ('.reembedding/runtime/'+[Guid]::NewGuid().ToString('N'))
 $model=(Resolve-Path -LiteralPath $ModelPath).Path
 $executable=(Resolve-Path -LiteralPath (Join-Path $RuntimeDirectory 'llama-server.exe')).Path
-if ((Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash.ToLowerInvariant() -ne '06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439') { throw 'Model identity mismatch' }
+if ((Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d') { throw 'Model identity mismatch' }
 $version=(& $executable --version 2>&1 | Out-String)
 if ($version -notmatch 'build 11669, commit 620d2225c') { throw 'Runtime build mismatch' }
 $runtimeFiles=@(Get-ChildItem -LiteralPath $RuntimeDirectory -File -Recurse | Sort-Object FullName | ForEach-Object {
@@ -66,7 +66,7 @@ try {
   }
   Push-Location $repoRoot
   try {
-    $identity=@{schema=1;contractId='4340ee2917358817a4fe69234f137eb29580dd799266b783725f13c5a66d5f9e';runtimeContract='llama.cpp/b11669/last-pool/tokenize-special/native1024';disableVulkanFp16=[bool]$DisableVulkanFp16;disableVulkanQuantizedMatVec=[bool]$DisableVulkanQuantizedMatVec;disableVulkanIntegerDot=[bool]$DisableVulkanIntegerDot;
+    $identity=@{schema=1;contractId='87be2d301c14d57be33df1646b0b96d95a7dc8c56e1ef352c2a8f11cf35ba59e';runtimeContract='llama.cpp/b11669/last-pool/tokenize-special/native2560';disableVulkanFp16=[bool]$DisableVulkanFp16;disableVulkanQuantizedMatVec=[bool]$DisableVulkanQuantizedMatVec;disableVulkanIntegerDot=[bool]$DisableVulkanIntegerDot;
       artifactSha256=(Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash.ToLowerInvariant();
       binarySha256=(Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant();
       runtimeFilesSha256=$runtimeFilesSha256;runtimeFiles=$runtimeFiles;runtimeVersion=$version.Trim();

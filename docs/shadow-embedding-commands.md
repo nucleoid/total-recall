@@ -10,7 +10,7 @@ All mutations require `--apply`, `--manifest <path>`, and `--manifest-sha256 <ca
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "approval": {
     "reference": "ops/change-record-actual-reference.json",
     "sha256": "<sha256 of the retained approved record>",
@@ -50,14 +50,21 @@ All mutations require `--apply`, `--manifest <path>`, and `--manifest-sha256 <ca
   },
   "runtime": {
     "acceptanceReceiptSha256": "<real runtime acceptance receipt SHA-256>",
-    "artifactSha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
-    "runtimeContract": "llama.cpp/b11669/last-pool/tokenize-special/native1024",
+    "artifactSha256": "b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d",
+    "runtimeContract": "llama.cpp/b11669/last-pool/tokenize-special/native2560",
     "expectedRuntimeHost": "<actual accepted inference hostname>",
-    "expectedRuntimeMode": "gpu",
+    "expectedRuntimeMode": "cpu",
     "tls": {
       "caSha256": "<approved private CA file SHA-256>",
       "spkiSha256": "<approved server public-key SPKI SHA-256>"
     }
+  },
+  "backfill": {
+    "provider": "openrouter",
+    "model": "qwen/qwen3-embedding-4b",
+    "providerName": "DeepInfra",
+    "endpoint": "https://openrouter.ai/api/v1/embeddings",
+    "maxConcurrency": 1
   },
   "steadyState": {
     "resources": {
@@ -76,7 +83,7 @@ All mutations require `--apply`, `--manifest <path>`, and `--manifest-sha256 <ca
         "deploymentProfile": "linux-worker",
         "expectedHostname": "<exact steady-worker Linux hostname>",
         "diskPath": "<reviewed persistent disk path>",
-        "minAvailableMemoryBytes": 2147483648,
+        "minAvailableMemoryBytes": 8589934592,
         "minAvailableDiskBytes": 107374182400,
         "maxLoadPerCpu": 1,
         "maxSwapUsedBytes": 12884901888,
@@ -86,8 +93,8 @@ All mutations require `--apply`, `--manifest <path>`, and `--manifest-sha256 <ca
     },
     "runtime": {
       "acceptanceReceiptSha256": "<real CPU serving acceptance receipt SHA-256>",
-      "artifactSha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
-      "runtimeContract": "llama.cpp/b11669/last-pool/tokenize-special/native1024",
+      "artifactSha256": "b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d",
+      "runtimeContract": "llama.cpp/b11669/last-pool/tokenize-special/native2560",
       "expectedRuntimeHost": "<actual accepted CPU serving hostname>",
       "expectedRuntimeMode": "cpu",
       "tls": {
@@ -99,7 +106,7 @@ All mutations require `--apply`, `--manifest <path>`, and `--manifest-sha256 <ca
 }
 ```
 
-`steadyState` is optional for preparation and backfill compatibility, but activation and completion fail closed without it. It repeats the full resource/runtime schemas so the same immutable manifest independently pins the GPU backfill and CPU steady planes. It contains no second approval object. Its runtime mode must be `cpu`; arbitrary local runtime/model identities are rejected by the same validator. Do not create the manifest until its approval, both runtime acceptances, source release, resource bounds, and eligibility have been reviewed. The command validates these pins but cannot prove that an external approval artifact exists.
+Version 2 requires the pinned `backfill` block. The worker reads `OPENROUTER_API_KEY` only from its protected environment, fixes routing to DeepInfra, disables provider fallback, and uses the accepted local runtime only for exact tokenization during cloud backfill. `steadyState` is optional for preparation and backfill compatibility, but activation and completion fail closed without it. It repeats the full resource/runtime schemas so the same immutable manifest independently pins cloud backfill, matching local tokenization, and CPU steady serving. It contains no second approval object. Its runtime mode must be `cpu`; arbitrary local runtime/model identities are rejected by the same validator. Do not create the manifest until its approval, both runtime acceptances, source release, resource bounds, and eligibility have been reviewed. The command validates these pins but cannot prove that an external approval artifact exists.
 
 ## Inference gateway installation
 
@@ -195,7 +202,7 @@ Before work and again before model inference, the worker verifies the exact Linu
 
 ## Steady-state repair worker
 
-Capture continues after initial convergence. Future-valid parents, asynchronous writers and later source/lifecycle mutations therefore need a durable CPU worker during observation and after run completion. The steady commands use the immutable `steadyState` CPU runtime/resources from the original run manifest; they never substitute the GPU backfill plan or rewrite the manifest.
+Capture continues after initial convergence. Future-valid parents, asynchronous writers and later source/lifecycle mutations therefore need a durable CPU worker during observation and after run completion. The steady commands use the immutable `steadyState` CPU runtime/resources from the original run manifest; they never substitute the cloud backfill plan or rewrite the manifest.
 
 After cutover activation, explicitly enable the steady fence. One invocation processes exactly one finite batch. The illustrative plan above permits 5 parents, 1 MiB source, 100,000 tokens, 15 minutes and 3 retryable attempts. Validate its duration against representative long parents on the accepted CPU runtime before approval; this is a finite process lifetime, not a service-wide deadline:
 
@@ -207,7 +214,7 @@ node --import tsx scripts/shadow-embeddings.ts steady-pause --database <expected
 
 The gateway's exact authenticated HTTP 429 `{"error":"busy"}` response represents single-slot contention. A worker ends the finite invocation without pausing the run; an already claimed item is deferred with its attempt count unchanged. Supervisors retain their bounded idle/backoff cadence. Other health, resource and identity failures keep the existing fail-closed pause behavior.
 
-Enable and pause lock the same attested serving/run binding. A steady invocation requires run state `paused` or `complete`, the serving singleton to reference the same immutable cutover attestation/run, capture enabled, and `steady_worker_enabled=true`. The store repeats these fences during claims and publication. Missing serving state, a rollback, a disabled flag, wrong runtime receipt/TLS identity, or a systemic/fatal resource error stops work; there is no fallback to backfill/GPU settings.
+Enable and pause lock the same attested serving/run binding. A steady invocation requires run state `paused` or `complete`, the serving singleton to reference the same immutable cutover attestation/run, capture enabled, and `steady_worker_enabled=true`. The store repeats these fences during claims and publication. Missing serving state, a rollback, a disabled flag, wrong runtime receipt/TLS identity, or a systemic/fatal resource error stops work; there is no fallback to cloud-backfill settings.
 
 The permanent worker supervisor invokes only this finite command against the accepted CPU serving gateway. It must prevent overlap, poll no faster than every 5 seconds while actionable work exists, back off to at least 30 seconds when idle, and preserve process/receipt visibility. Before the five-minute cutover or observation-end drain, stop the timer and run `steady-pause`; after activation or the final target-only canaries, re-enable it. Following guarded run completion it remains enabled for future mutations. Installation must use the reviewed immutable release, explicit operator database URL, manifest/hash/run ID and protected CPU runtime environment; dotenv and `DATABASE_URL` fallback remain forbidden.
 
@@ -224,8 +231,8 @@ Initial cutover uses a second, independently hashed JSON file so its exact audit
 
 ```json
 {
-  "version": 1,
-  "contractId": "4340ee2917358817a4fe69234f137eb29580dd799266b783725f13c5a66d5f9e",
+  "version": 2,
+  "contractId": "87be2d301c14d57be33df1646b0b96d95a7dc8c56e1ef352c2a8f11cf35ba59e",
   "runId": "<run UUID>",
   "operationalManifestSha256": "<operational manifest hash>",
   "watermark": "<coordinated audited ISO-8601 instant>",

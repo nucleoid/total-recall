@@ -4,13 +4,18 @@ export const QWEN_QUERY_PREFIX = 'Instruct: Given a web search query, retrieve r
 
 /** Semantic fields only: endpoints, credentials and mutable model tags are not identity. */
 export const QWEN_CHUNK_CONTRACT = Object.freeze({
-  version: 'total-recall/qwen3-0.6b-q8/paragraph256-utf8/v1',
-  artifactSha256: '06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439',
-  upstreamRevision: '370f27d7550e0def9b39c1f16d3fbaa13aa67728',
+  version: 'total-recall/qwen3-4b-q8/paragraph256-utf8/v1',
+  model: 'Qwen/Qwen3-Embedding-4B',
+  upstreamRevision: '5cf2132abc99cad020ac570b19d031efec650f2b',
+  localArtifact: 'Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q8_0.gguf',
+  localArtifactRevision: 'f4602530db1d980e16da9d7d3a70294cf5c190be',
+  artifactSha256: 'b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d',
   quantization: 'Q8_0',
+  hostedModel: 'qwen/qwen3-embedding-4b',
+  hostedProvider: 'DeepInfra',
   tokenizer: 'artifact-tokenizer/add_special=true',
   pooling: 'last-token',
-  nativeDimensions: 1024,
+  nativeDimensions: 2560,
   storedDimensions: 768,
   projection: 'first-768-then-l2',
   documentPrefix: '',
@@ -28,7 +33,7 @@ export const QWEN_CHUNK_CONTRACT = Object.freeze({
   requestMaxTokens: 2000,
   queryMaxTokens: 2000,
   // Additional runtimes require recorded compatibility acceptance before use.
-  runtimeContract: 'llama.cpp/b11669/last-pool/tokenize-special/native1024',
+  runtimeContract: 'llama.cpp/b11669/last-pool/tokenize-special/native2560',
 });
 
 export function sha256(value: string | Buffer): string {

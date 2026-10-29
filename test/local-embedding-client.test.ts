@@ -12,7 +12,7 @@ function fixture(mutator?: (body: Record<string, any>) => void, tokenize = (s: s
     const body = JSON.parse(init?.body as string);
     calls.push({ url: String(url), body, init: init! });
     if (String(url).endsWith('/tokenize')) return Response.json({ tokens: Array(tokenize(body.content)).fill(1) });
-    const response = { data: body.input.map((_: string, i: number) => ({ index: i, embedding: Array(1024).fill(i + 1) })),
+    const response = { data: body.input.map((_: string, i: number) => ({ index: i, embedding: Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(i + 1) })),
       usage: { prompt_tokens: body.input.reduce((n: number, s: string) => n + tokenize(s), 0) } };
     mutator?.(response);
     return Response.json(response);
@@ -49,7 +49,7 @@ test('wrong count, ordering, shape, dimensions and token usage are systemic fail
   for (const mutate of [
     (b: any) => { b.data = []; }, (b: any) => { b.data[0].index = 1; },
     (b: any) => { b.data[0].embedding = Array(768).fill(1); },
-    (b: any) => { b.data[0].embedding = Array(1024).fill(0); },
+    (b: any) => { b.data[0].embedding = Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(0); },
     (b: any) => { b.usage.prompt_tokens++; }, (b: any) => { delete b.usage; },
   ]) {
     await assert.rejects(fixture(mutate).client.embed(['x'], 'document'),

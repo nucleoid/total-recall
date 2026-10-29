@@ -71,6 +71,7 @@
     "embedding:shadow-status": "tsx scripts/shadow-embedding-status.ts",
     "embedding:shadow": "tsx scripts/shadow-embeddings.ts",
     "embedding:shadow-index": "tsx scripts/shadow-embedding-index.ts",
+    "embedding:compatibility": "tsx scripts/check-openrouter-local-compatibility.ts",
     "embedding:gateway": "tsx scripts/local-embedding-gateway.ts",
     "embedding:label": "tsx scripts/label-embeddings.ts",
     "spotify:auth": "tsx scripts/spotify-auth.ts",

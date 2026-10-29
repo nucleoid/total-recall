@@ -73,14 +73,14 @@ test('manifest rejects missing ordinals, gaps, hash changes and partial reconstr
 });
 
 test('native projection crops before normalization and rejects malformed responses', () => {
-  const native = Array.from({ length: 1024 }, (_, i) => i < 768 ? 2 : 10_000);
+  const native = Array.from({ length: QWEN_CHUNK_CONTRACT.nativeDimensions }, (_, i) => i < 768 ? 2 : 10_000);
   const stored = projectQwenVector(native);
   validateLocalStoredVector(stored);
   assert.equal(stored.length, 768);
   assert.ok(Math.abs(stored[0] - 1 / Math.sqrt(768)) < 1e-12);
-  for (const bad of [null, [], Array(768).fill(1), Array(1024).fill(0),
+  for (const bad of [null, [], Array(768).fill(1), Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(0),
     [NaN, ...native.slice(1)], [Infinity, ...native.slice(1)], [true, ...native.slice(1)],
-    [...Array(768).fill(0), ...Array(256).fill(1)]]) assert.throws(() => projectQwenVector(bad));
+    [...Array(768).fill(0), ...Array(QWEN_CHUNK_CONTRACT.nativeDimensions - 768).fill(1)]]) assert.throws(() => projectQwenVector(bad));
   assert.throws(() => validateLocalStoredVector(Array(768).fill(1)), /stored_norm/);
   assert.throws(() => validateLocalStoredVector(Array(768).fill(NaN)), /stored_vector/);
 });

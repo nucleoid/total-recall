@@ -249,7 +249,7 @@ test('frontend does not listen until authenticated backend health and warmup suc
   await gateway.start();try{assert.equal(calls.length,2);assert.match(calls[0],/\/health Bearer [a-f0-9]{64}/);assert.match(calls[1],/\/v1\/embeddings Bearer [a-f0-9]{64}/);assert.equal(commonGuards,1);assert.equal(fullGuards,1);assert.doesNotMatch(calls.join(' '),new RegExp(`Bearer ${'s'.repeat(32)}`));}finally{await gateway.close();}
 });
 
-function nativeVector(axis:number):number[]{return Array.from({length:1024},(_,i)=>i===axis?1:0);}
+function nativeVector(axis:number):number[]{return Array.from({length:QWEN_CHUNK_CONTRACT.nativeDimensions},(_,i)=>i===axis?1:0);}
 function healthyGpuTelemetry(receipt:GatewayReceipt){return{hostId:receipt.hostId,timestamp:Date.now(),mode:'gpu' as const,gpuDeviceUuid:'GPU-test-1',gpuTempC:50,vramUsedMiB:1,vramTotalMiB:1024,
   availableBytes:3*1024**3,diskFreeBytes:101*1024**3,swapUsedBytes:0,...(receipt.host.platform==='win32'?{cpuUtilizationPercent:20}:{load1:0.5})};}
 

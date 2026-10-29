@@ -42,7 +42,7 @@ test('local document compatibility returns first lossless chunk while queries re
       const body = JSON.parse(String(init?.body)); requests.push({ url: String(url), body });
       if (String(url).endsWith('/tokenize')) return Response.json({ tokens: Array(Math.max(1, Math.ceil(body.content.length / 2))).fill(1) });
       return Response.json({ data: body.input.map((_: string, index: number) => ({ index,
-        embedding: Array.from({ length: 1024 }, (_v, i) => i === index ? 2 : 1) })),
+        embedding: Array.from({ length: QWEN_CHUNK_CONTRACT.nativeDimensions }, (_v, i) => i === index ? 2 : 1) })),
         usage: { prompt_tokens: body.input.reduce((sum: number, input: string) => sum + Math.max(1, Math.ceil(input.length / 2)), 0) } });
     }) as typeof fetch });
   setLocalServingClientForTesting(client); setEmbeddingServingVerifierForTesting(async () => {});
