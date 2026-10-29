@@ -20,6 +20,7 @@
     "scripts/shadow-embedding-index.ts",
     "scripts/local-embedding-gateway.ts",
     "scripts/check-local-embedding-runtime.ts",
+    "scripts/check-openrouter-local-compatibility.ts",
     "scripts/check-validator-embedding-runtime.ts",
     "scripts/lib/key-policy.ts",
     "scripts/consolidate-memories.ts",

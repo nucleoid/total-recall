@@ -44,9 +44,13 @@ export function compatibilityMetrics(
     ...hostedDocuments.map((vector, index) => cosine(vector, localDocuments[index])),
     ...hostedQueries.map((vector, index) => cosine(vector, localQueries[index])),
   ];
-  let topOneMatches = 0;
+  let topOneMatches = 0, localQueriesHostedMatches = 0, hostedQueriesLocalMatches = 0;
   for (let index = 0; index < hostedQueries.length; index++) {
-    if (topDocument(hostedQueries[index], hostedDocuments) === topDocument(localQueries[index], localDocuments)) {
+    const hostedTop = topDocument(hostedQueries[index], hostedDocuments);
+    const localTop = topDocument(localQueries[index], localDocuments);
+    if (topDocument(localQueries[index], hostedDocuments) === hostedTop) localQueriesHostedMatches++;
+    if (topDocument(hostedQueries[index], localDocuments) === localTop) hostedQueriesLocalMatches++;
+    if (hostedTop === localTop) {
       topOneMatches++;
     }
   }
@@ -54,6 +58,8 @@ export function compatibilityMetrics(
     minimumSameInputCosine: Math.min(...sameInputCosines),
     meanSameInputCosine: sameInputCosines.reduce((sum, value) => sum + value, 0) / sameInputCosines.length,
     topOneAgreement: topOneMatches / hostedQueries.length,
+    localQueriesHostedAgreement: localQueriesHostedMatches / hostedQueries.length,
+    hostedQueriesLocalAgreement: hostedQueriesLocalMatches / hostedQueries.length,
     comparisons: sameInputCosines.length,
     queries: hostedQueries.length,
   };
@@ -65,5 +71,7 @@ export function compatibilityAccepted(
 ): boolean {
   return metrics.minimumSameInputCosine >= thresholds.minimumSameInputCosine
     && metrics.meanSameInputCosine >= thresholds.minimumMeanSameInputCosine
-    && metrics.topOneAgreement >= thresholds.minimumTopOneAgreement;
+    && metrics.topOneAgreement >= thresholds.minimumTopOneAgreement
+    && metrics.localQueriesHostedAgreement >= thresholds.minimumTopOneAgreement
+    && metrics.hostedQueriesLocalAgreement >= thresholds.minimumTopOneAgreement;
 }

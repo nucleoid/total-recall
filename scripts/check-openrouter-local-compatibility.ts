@@ -5,19 +5,20 @@ import { OpenRouterEmbeddingClient } from '../src/openrouter-embedding-client.js
 import { compatibilityAccepted, compatibilityMetrics, OPENROUTER_LOCAL_THRESHOLDS } from '../src/embedding-compatibility.js';
 import { QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
 
+// Public, invented inputs only; never send personal facts as compatibility fixtures.
 const documents = [
-  'The pMhutukawa is a coastal tree native to Aotearoa New Zealand.',
+  'The p\u014dhutukawa is a coastal tree native to Aotearoa New Zealand.',
   'PostgreSQL advisory locks coordinate application work without changing rows.',
   'Ethereum validators attest to beacon-chain state and may propose blocks.',
-  'A ginger cat called Fred moved from Costa Rica to New Zealand.',
-  'Unicode fixture: �������� ��ü�  S�kaoL  E1-(' ('D9'DE.',
+  'A fictional orange cat called Pixel travelled from Canada to New Zealand.',
+  'Unicode fixture: caf\u00e9, \u65e5\u672c\u8a9e, \u0645\u0631\u062d\u0628\u0627, \ud83c\udf0a.',
   'Long fixture: ' + 'bounded retrieval context '.repeat(80),
 ];
 const queries = [
   'Which tree is native to coastal New Zealand?',
   'How can PostgreSQL coordinate work without row updates?',
   'What does an Ethereum validator do?',
-  'Where did the ginger cat move from?',
+  'Where did the fictional orange cat travel from?',
   'Find the multilingual Unicode passage.',
 ];
 

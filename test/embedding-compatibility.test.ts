@@ -25,3 +25,13 @@ test('compatibility gate rejects vector drift and ranking disagreement', () => {
   assert.throws(() => cosine([1], [1, 2]), /dimensions/);
   assert.throws(() => cosine([0, 0], [1, 0]), /norm/);
 });
+
+
+test('gate checks both mixed-provider retrieval directions, not just within-provider rankings', () => {
+  // Both within-provider rankings agree, but rotating both spaces reverses mixed retrieval.
+  const metrics = compatibilityMetrics([[1, 0], [0, 1]], [[-1, 0], [0, -1]], [[1, 0]], [[-1, 0]]);
+  assert.equal(metrics.topOneAgreement, 1);
+  assert.equal(metrics.localQueriesHostedAgreement, 0);
+  assert.equal(metrics.hostedQueriesLocalAgreement, 0);
+  assert.equal(compatibilityAccepted({ ...metrics, minimumSameInputCosine: 1, meanSameInputCosine: 1 }), false);
+});
