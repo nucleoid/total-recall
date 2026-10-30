@@ -9,6 +9,8 @@ export interface OpenRouterEmbeddingClientOptions {
   baseUrl?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
+  /** Cloud transport bounds; never changes per-input formatting, chunking or local serving limits. */
+  hostedBatch?: { maxInputs: number; maxTokens: number; maxRequestBytes: number; maxResponseBytes: number };
 }
 
 function retryAfterMs(response: Response): number | undefined {
@@ -20,9 +22,9 @@ function retryAfterMs(response: Response): number | undefined {
 
 const MAX_OPENROUTER_RESPONSE_BYTES = 2 * 1024 * 1024;
 
-async function readJsonBounded(response: Response): Promise<unknown> {
+async function readJsonBounded(response: Response, maximumBytes = MAX_OPENROUTER_RESPONSE_BYTES): Promise<unknown> {
   const rawLength = response.headers.get('content-length');
-  if (rawLength && /^\d+$/u.test(rawLength) && Number(rawLength) > MAX_OPENROUTER_RESPONSE_BYTES) {
+  if (rawLength && /^\d+$/u.test(rawLength) && Number(rawLength) > maximumBytes) {
     await response.body?.cancel();
     throw new LocalEmbeddingError('embedding.openrouter_response_limit', 'systemic');
   }
@@ -35,7 +37,7 @@ async function readJsonBounded(response: Response): Promise<unknown> {
       const { done, value } = await reader.read();
       if (done) break;
       bytes += value.byteLength;
-      if (bytes > MAX_OPENROUTER_RESPONSE_BYTES) {
+      if (bytes > maximumBytes) {
         await reader.cancel();
         throw new LocalEmbeddingError('embedding.openrouter_response_limit', 'systemic');
       }
@@ -58,6 +60,7 @@ export class OpenRouterEmbeddingClient implements EmbeddingClient {
   private readonly endpoint: string;
   private readonly timeoutMs: number;
   private readonly fetcher: typeof fetch;
+  private readonly batch: NonNullable<OpenRouterEmbeddingClientOptions['hostedBatch']>;
 
   constructor(options: OpenRouterEmbeddingClientOptions) {
     if (!options.apiKey.trim() || /[\r\n]/u.test(options.apiKey)) throw new Error('embedding.credential');
@@ -67,6 +70,12 @@ export class OpenRouterEmbeddingClient implements EmbeddingClient {
     this.timeoutMs = options.timeoutMs ?? 120_000;
     if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1000 || this.timeoutMs > 300_000) {
       throw new Error('embedding.timeout_limit');
+    }
+    this.batch = Object.freeze({ ...(options.hostedBatch ?? { maxInputs: QWEN_CHUNK_CONTRACT.requestMaxInputs,
+      maxTokens: QWEN_CHUNK_CONTRACT.requestMaxTokens, maxRequestBytes: 1_048_576, maxResponseBytes: MAX_OPENROUTER_RESPONSE_BYTES }) });
+    for (const [key, min, max] of [['maxInputs',1,128], ['maxTokens',1,32768],
+      ['maxRequestBytes',1024,1_048_576], ['maxResponseBytes',1024,16_777_216]] as const) {
+      if (!Number.isSafeInteger(this.batch[key]) || this.batch[key] < min || this.batch[key] > max) throw new Error('embedding.hosted_batch_limit');
     }
     this.apiKey = options.apiKey;
     this.countTokens = options.countFormattedTokens;
@@ -80,7 +89,7 @@ export class OpenRouterEmbeddingClient implements EmbeddingClient {
   }
 
   async embed(texts: string[], role: 'document' | 'query', signal?: AbortSignal): Promise<EmbeddingResult> {
-    if (!Array.isArray(texts) || texts.length < 1 || texts.length > QWEN_CHUNK_CONTRACT.requestMaxInputs) {
+    if (!Array.isArray(texts) || texts.length < 1 || texts.length > this.batch.maxInputs) {
       throw new LocalEmbeddingError('embedding.batch_input_limit', 'input');
     }
     const formatted = texts.map(text => formatLocalEmbeddingInput(text, role));
@@ -88,9 +97,12 @@ export class OpenRouterEmbeddingClient implements EmbeddingClient {
     for (const input of formatted) tokens.push(await this.countTokens(input, signal));
     const maxInput = role === 'document' ? QWEN_CHUNK_CONTRACT.chunkTokens : QWEN_CHUNK_CONTRACT.queryMaxTokens;
     if (tokens.some(count => count > maxInput)
-      || tokens.reduce((sum, count) => sum + count, 0) > QWEN_CHUNK_CONTRACT.requestMaxTokens) {
+      || tokens.reduce((sum, count) => sum + count, 0) > this.batch.maxTokens) {
       throw new LocalEmbeddingError('embedding.request_token_limit', 'input');
     }
+    const body = JSON.stringify({ model: QWEN_CHUNK_CONTRACT.hostedModel, input: formatted, encoding_format: 'float',
+      provider: { order: [QWEN_CHUNK_CONTRACT.hostedProvider], allow_fallbacks: false } });
+    if (Buffer.byteLength(body, 'utf8') > this.batch.maxRequestBytes) throw new LocalEmbeddingError('embedding.hosted_request_bytes', 'input');
     await this.guard();
     const timeout = AbortSignal.timeout(this.timeoutMs);
     let response: Response;
@@ -103,12 +115,7 @@ export class OpenRouterEmbeddingClient implements EmbeddingClient {
           'HTTP-Referer': 'https://recall.stakewatch.dev',
           'X-Title': 'Total Recall re-embedding',
         },
-        body: JSON.stringify({
-          model: QWEN_CHUNK_CONTRACT.hostedModel,
-          input: formatted,
-          encoding_format: 'float',
-          provider: { order: [QWEN_CHUNK_CONTRACT.hostedProvider], allow_fallbacks: false },
-        }),
+        body,
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
         redirect: 'error',
       });
@@ -116,13 +123,13 @@ export class OpenRouterEmbeddingClient implements EmbeddingClient {
       throw new LocalEmbeddingError(signal?.aborted ? 'embedding.cancelled' : 'embedding.transport', 'retryable');
     }
     if (!response.ok) {
-      const classification = [408, 409, 429, 500, 502, 503, 504].includes(response.status) ? 'retryable'
+      const classification = [408, 409, 429, 500, 502, 503, 504, 529].includes(response.status) ? 'retryable'
         : [400, 413, 422].includes(response.status) ? 'input' : 'systemic';
       const delay = retryAfterMs(response);
       await response.body?.cancel();
       throw new LocalEmbeddingError(`embedding.openrouter_http_${response.status}`, classification, delay);
     }
-    const parsed = await readJsonBounded(response);
+    const parsed = await readJsonBounded(response, this.batch.maxResponseBytes);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new LocalEmbeddingError('embedding.openrouter_response_shape', 'systemic');
     }

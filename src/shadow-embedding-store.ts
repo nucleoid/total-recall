@@ -58,7 +58,8 @@ export class ShadowEmbeddingStore {
     const result = await this.pool.query(`WITH picked AS (
       SELECT w.contract_id,w.parent_type,w.parent_id FROM embedding_work_items w
       JOIN embedding_runs r ON r.contract_id=w.contract_id AND r.id=$1 AND ${this.runFence()}
-      WHERE w.contract_id=$2 AND ((w.state IN ('pending','retry') AND w.next_attempt_at<=statement_timestamp())
+      WHERE w.contract_id=$2 AND w.state IN ('pending','retry','claimed')
+        AND ((w.state IN ('pending','retry') AND w.next_attempt_at<=statement_timestamp())
         OR (w.state='claimed' AND w.lease_until<statement_timestamp()))
       ORDER BY w.next_attempt_at,w.parent_type,w.parent_id FOR UPDATE OF w SKIP LOCKED LIMIT 1
     ) UPDATE embedding_work_items w SET state='claimed',claimed_by=$3,lease_until=statement_timestamp()+$4*interval '1 second',

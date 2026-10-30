@@ -10,6 +10,7 @@ import { OpenRouterEmbeddingClient } from '../src/openrouter-embedding-client.js
 import { QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
 import { ShadowEmbeddingStore } from '../src/shadow-embedding-store.js';
 import { runShadowBatch } from '../src/shadow-embedding-worker.js';
+import { runHostedPackedBatch, type HostedPacking } from '../src/hosted-shadow-batch.js';
 import { createShadowResourceGuard, validateShadowHostPlan, type ShadowHostPlan } from '../src/shadow-embedding-resource-guard.js';
 import { enableSteadyWorker, pauseSteadyWorker } from '../src/shadow-embedding-steady.js';
 
@@ -101,8 +102,12 @@ export async function runSteadyWorkerCommand(pool: pg.Pool, args: ShadowCliArgum
   return runBoundedWorkerCommand(pool,args,envelope,'steady');
 }
 
+export async function runPackedWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, envelope: ManifestEnvelope, packing: HostedPacking) {
+  return runBoundedWorkerCommand(pool,args,envelope,'backfill',packing);
+}
+
 async function runBoundedWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, envelope: ManifestEnvelope,
-  mode: 'backfill'|'steady') {
+  mode: 'backfill'|'steady', packing?: HostedPacking) {
   const identity = await pool.query(`SELECT r.status,r.release_sha,r.manifest,current_database() AS database,
     role.rolsuper OR role.rolbypassrls AS operator,s.contract_id AS serving_contract_id,
     s.cutover_attestation_run_id,s.steady_worker_enabled
@@ -139,6 +144,7 @@ async function runBoundedWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, 
       apiKey: openRouterApiKey(),
       countFormattedTokens: local.countFormattedTokens.bind(local),
       beforeInference: guard,
+      ...(packing ? { hostedBatch: { ...packing, maxResponseBytes: 16_777_216 } } : {}),
     })
     : local;
   if (mode === 'backfill' && envelope.manifest.version === 2 && embedding === local) {
@@ -146,10 +152,14 @@ async function runBoundedWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, 
   }
   const store = new ShadowEmbeddingStore(pool, args.runId!,120,mode);
   await store.verifyDatabase(args.database);
-  return runShadowBatch(store, embedding, {
-    maxParents: resources.maxParentsPerBatch, maxSourceBytes: resources.maxSourceBytesPerBatch,
-    maxTokens: resources.maxTokensPerBatch, maxElapsedMs: resources.maxElapsedMsPerBatch, maxAttempts: resources.maxAttempts,
-  }, guard);
+  const limits = { maxParents: resources.maxParentsPerBatch, maxSourceBytes: resources.maxSourceBytesPerBatch,
+    maxTokens: resources.maxTokensPerBatch, maxElapsedMs: resources.maxElapsedMsPerBatch, maxAttempts: resources.maxAttempts };
+  if (packing) {
+    if (mode!=='backfill' || envelope.manifest.backfill?.provider!=='openrouter' || envelope.manifest.backfill.maxConcurrency!==1)
+      throw new Error('embedding.hosted_packing_provider');
+    return runHostedPackedBatch(store,embedding,limits,packing,guard);
+  }
+  return runShadowBatch(store, embedding, limits, guard);
 }
 
 async function main() {

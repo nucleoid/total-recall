@@ -127,3 +127,30 @@ test('failed guard prevents the hosted inference request', async () => {
   await assert.rejects(client.embed(['x'], 'document'), /resource guard/);
   assert.equal(calls, 0);
 });
+
+test('explicit cloud packing accepts 128 inputs and responses larger than the legacy 2MiB bound',async()=>{
+  let calls=0;
+  const client=new OpenRouterEmbeddingClient({apiKey:'fixture',countFormattedTokens:async()=>1,beforeInference:async()=>{},
+    hostedBatch:{maxInputs:128,maxTokens:32768,maxRequestBytes:1048576,maxResponseBytes:16777216},
+    fetch:(async(_url,init)=>{calls++;const input=JSON.parse(init!.body as string).input;
+      return Response.json({model:QWEN_CHUNK_CONTRACT.hostedModel,provider:'DeepInfra',
+        data:input.map((_:string,index:number)=>({index,embedding:Array(2560).fill(0.1234567890123456)})),
+        usage:{prompt_tokens:input.length}});}) as typeof fetch});
+  const result=await client.embed(Array.from({length:128},(_,i)=>`public ${i}`),'document');
+  assert.equal(calls,1);assert.equal(result.vectors.length,128);assert.ok(result.vectors.every(v=>v.length===768));
+  assert.equal(QWEN_CHUNK_CONTRACT.requestMaxInputs,4);assert.equal(QWEN_CHUNK_CONTRACT.requestMaxTokens,2000);
+  await assert.rejects(client.embed(Array(129).fill('x'),'document'),/batch_input_limit/);
+});
+test('cloud byte and aggregate-token limits reject before paid inference',async()=>{
+  let calls=0;const options={apiKey:'fixture',beforeInference:async()=>{},
+    hostedBatch:{maxInputs:128,maxTokens:100,maxRequestBytes:1024,maxResponseBytes:16777216},
+    fetch:(async()=>{calls++;throw Error('must not send');}) as typeof fetch};
+  await assert.rejects(new OpenRouterEmbeddingClient({...options,countFormattedTokens:async()=>1}).embed(['x'.repeat(2000)],'document'),/hosted_request_bytes/);
+  await assert.rejects(new OpenRouterEmbeddingClient({...options,countFormattedTokens:async()=>60}).embed(['a','b'],'document'),/request_token_limit/);
+  assert.equal(calls,0);
+});
+test('provider overload 529 is retryable with bounded Retry-After',async()=>{
+ const c=new OpenRouterEmbeddingClient({apiKey:'fixture',countFormattedTokens:async()=>1,beforeInference:async()=>{},
+  fetch:(async()=>new Response('',{status:529,headers:{'Retry-After':'7'}})) as typeof fetch});
+ await assert.rejects(c.embed(['x'],'document'),e=>e instanceof LocalEmbeddingError&&e.classification==='retryable'&&e.retryAfterMs===7000);
+});
