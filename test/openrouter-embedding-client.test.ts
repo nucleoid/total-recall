@@ -12,6 +12,7 @@ function fixture(mutate?: (body: Record<string, any>) => void) {
     const request = JSON.parse(init?.body as string);
     calls.push({ url: String(url), body: request, init: init! });
     const response: Record<string, any> = {
+      model: QWEN_CHUNK_CONTRACT.model, provider: QWEN_CHUNK_CONTRACT.hostedProvider,
       data: request.input.map((_: string, index: number) => ({
         index,
         embedding: Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(index + 1),
@@ -58,6 +59,10 @@ test('rejects alternate endpoints, credentials and oversized batches before infe
 
 test('response identity, vector shape and tokenizer accounting fail closed', async () => {
   for (const mutate of [
+    (body: any) => { body.model = "qwen/qwen3-embedding-8b"; },
+    (body: any) => { body.provider = "other"; },
+    (body: any) => { delete body.model; },
+    (body: any) => { delete body.provider; },
     (body: any) => { body.data = []; },
     (body: any) => { body.data[0].index = 4; },
     (body: any) => { body.data[0].embedding = Array(768).fill(1); },

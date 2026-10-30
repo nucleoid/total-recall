@@ -126,7 +126,12 @@ export class OpenRouterEmbeddingClient implements EmbeddingClient {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new LocalEmbeddingError('embedding.openrouter_response_shape', 'systemic');
     }
-    const data = (parsed as Record<string, unknown>).data;
+    const identity = parsed as Record<string, unknown>;
+    if (typeof identity.model !== 'string' || identity.model.toLowerCase() !== QWEN_CHUNK_CONTRACT.hostedModel
+      || identity.provider !== QWEN_CHUNK_CONTRACT.hostedProvider) {
+      throw new LocalEmbeddingError('embedding.openrouter_response_identity', 'systemic');
+    }
+    const data = identity.data;
     if (!Array.isArray(data) || data.length !== texts.length) {
       throw new LocalEmbeddingError('embedding.openrouter_response_count', 'systemic');
     }

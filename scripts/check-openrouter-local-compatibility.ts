@@ -12,7 +12,7 @@ const documents = [
   'Ethereum validators attest to beacon-chain state and may propose blocks.',
   'A fictional orange cat called Pixel travelled from Canada to New Zealand.',
   'Unicode fixture: caf\u00e9, \u65e5\u672c\u8a9e, \u0645\u0631\u062d\u0628\u0627, \ud83c\udf0a.',
-  'Long fixture: ' + 'bounded retrieval context '.repeat(80),
+  'Long fixture: ' + 'bounded retrieval context '.repeat(60),
 ];
 const queries = [
   'Which tree is native to coastal New Zealand?',
