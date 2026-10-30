@@ -106,6 +106,8 @@ All mutations require `--apply`, `--manifest <path>`, and `--manifest-sha256 <ca
 }
 ```
 
+The semantic target separately uses [the upstream NFC v2 contract](openrouter-nfc-contract.md): canonical source bytes remain raw, while tokenization and inference are NFC. Old raw-profile vectors and runtime receipts cannot be relabeled.
+
 Version 2 requires the pinned `backfill` block. The worker reads `OPENROUTER_API_KEY` only from its protected environment, fixes routing to DeepInfra, disables provider fallback, and uses the accepted local runtime only for exact tokenization during cloud backfill. `steadyState` is optional for preparation and backfill compatibility, but activation and completion fail closed without it. It repeats the full resource/runtime schemas so the same immutable manifest independently pins cloud backfill, matching local tokenization, and CPU steady serving. It contains no second approval object. Its runtime mode must be `cpu`; arbitrary local runtime/model identities are rejected by the same validator. Do not create the manifest until its approval, both runtime acceptances, source release, resource bounds, and eligibility have been reviewed. The command validates these pins but cannot prove that an external approval artifact exists.
 
 ## Inference gateway installation
@@ -232,7 +234,7 @@ Initial cutover uses a second, independently hashed JSON file so its exact audit
 ```json
 {
   "version": 2,
-  "contractId": "87be2d301c14d57be33df1646b0b96d95a7dc8c56e1ef352c2a8f11cf35ba59e",
+  "contractId": "91e3bb787cf8c10c8dcd2e1a724d3b18acfc03a1ea063ee920548e99e7b95d97",
   "runId": "<run UUID>",
   "operationalManifestSha256": "<operational manifest hash>",
   "watermark": "<coordinated audited ISO-8601 instant>",

@@ -1,5 +1,5 @@
 import type { EmbeddingClient, EmbeddingResult } from './embedding-client.js';
-import { formatLocalEmbeddingInput, projectQwenVector, QWEN_CHUNK_CONTRACT } from './local-embedding-contract.js';
+import { formatLocalEmbeddingInput, normalizeEmbeddingInputText, projectQwenVector, QWEN_CHUNK_CONTRACT } from './local-embedding-contract.js';
 import { LocalEmbeddingError } from './local-embedding-client.js';
 
 export interface OpenRouterEmbeddingClientOptions {
@@ -76,7 +76,7 @@ export class OpenRouterEmbeddingClient implements EmbeddingClient {
   }
 
   countFormattedTokens(formatted: string, signal?: AbortSignal): Promise<number> {
-    return this.countTokens(formatted, signal);
+    return this.countTokens(normalizeEmbeddingInputText(formatted), signal);
   }
 
   async embed(texts: string[], role: 'document' | 'query', signal?: AbortSignal): Promise<EmbeddingResult> {

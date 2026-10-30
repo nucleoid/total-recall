@@ -1,4 +1,4 @@
-import { formatLocalEmbeddingInput, projectQwenVector, QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID } from './local-embedding-contract.js';
+import { formatLocalEmbeddingInput, normalizeEmbeddingInputText, projectQwenVector, QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID } from './local-embedding-contract.js';
 import { createPinnedTlsFetch, type PinnedTlsTransport } from './local-embedding-transport.js';
 
 export type EmbeddingFailureClass = 'input' | 'retryable' | 'systemic';
@@ -102,7 +102,7 @@ export class LocalEmbeddingClient {
   }
 
   async countFormattedTokens(formatted: string, signal?: AbortSignal): Promise<number> {
-    const data = await this.post('/tokenize', { content: formatted, add_special: true }, signal);
+    const data = await this.post('/tokenize', { content: normalizeEmbeddingInputText(formatted), add_special: true }, signal);
     if (!Array.isArray(data.tokens) || data.tokens.some(x => !Number.isSafeInteger(x) || x < 0)) {
       throw new LocalEmbeddingError('embedding.tokenizer_shape', 'systemic');
     }

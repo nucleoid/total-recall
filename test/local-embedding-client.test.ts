@@ -45,6 +45,19 @@ test('input and aggregate budgets reject before inference without truncation', a
   assert.equal(f.guards(), 0);
 });
 
+test('NFC tokenization is identical for raw chunk planning and document/query inference', async () => {
+  const text = 'cafe\u0301\r\n'; const normalized = text.normalize('NFC');
+  const f = fixture(); await f.client.countFormattedTokens(text);
+  assert.equal(f.calls[0].body.content, normalized);
+  const doc = fixture(); const result = await doc.client.embed([text], 'document');
+  assert.equal(doc.calls[0].body.content, normalized);
+  assert.deepEqual(doc.calls[1].body.input, [normalized]);
+  assert.deepEqual(result.tokens, [normalized.length + 2]);
+  const query = fixture(); await query.client.embed([text], 'query');
+  assert.equal(query.calls[0].body.content, QWEN_QUERY_PREFIX + normalized);
+  assert.deepEqual(query.calls[1].body.input, [QWEN_QUERY_PREFIX + normalized]);
+});
+
 test('wrong count, ordering, shape, dimensions and token usage are systemic failures', async () => {
   for (const mutate of [
     (b: any) => { b.data = []; }, (b: any) => { b.data[0].index = 1; },

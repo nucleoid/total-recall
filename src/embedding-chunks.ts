@@ -1,4 +1,4 @@
-import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID, sha256, validateEmbeddingText } from './local-embedding-contract.js';
+import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID, formatLocalEmbeddingInput, sha256, validateEmbeddingText } from './local-embedding-contract.js';
 
 /** Must count exact formatted input including model-added tokens. Never estimate from characters. */
 export type MeasuredTokenizer = (text: string) => Promise<number>;
@@ -28,7 +28,10 @@ export async function planEmbeddingChunks(text: string, tokenize: MeasuredTokeni
   const cap = QWEN_CHUNK_CONTRACT.chunkTokens;
   const spans: Array<{ start: number; end: number; tokens: number }> = [];
   const count = async (input: string): Promise<number> => {
-    const n = await tokenize(input);
+    const formatted = formatLocalEmbeddingInput(input, 'document');
+    // Oversized normalized requests signal a split, never a persisted token count.
+    if (Buffer.byteLength(formatted, 'utf8') > 1_048_576) return cap + 1;
+    const n = await tokenize(formatted);
     if (!Number.isSafeInteger(n) || n < 0) throw new Error('embedding.invalid_token_count');
     return n;
   };

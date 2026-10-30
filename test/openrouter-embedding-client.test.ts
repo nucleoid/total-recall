@@ -57,6 +57,21 @@ test('rejects alternate endpoints, credentials and oversized batches before infe
   assert.equal(f.calls.length, 0);
 });
 
+test('hosted planning and inference use the same upstream NFC representation', async () => {
+  const raw = 'cafe\u0301\r\n'; const normalized = raw.normalize('NFC');
+  const observed: string[] = [];
+  const client = new OpenRouterEmbeddingClient({apiKey: 'fixture', beforeInference: async () => {},
+    countFormattedTokens: async text => { observed.push(text); return 2; },
+    fetch: (async (_url, init) => {
+      assert.deepEqual(JSON.parse(init!.body as string).input, [normalized]);
+      return Response.json({model: QWEN_CHUNK_CONTRACT.model, provider: 'DeepInfra',
+        data: [{index: 0, embedding: Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(1)}], usage: {prompt_tokens: 2}});
+    }) as typeof fetch});
+  assert.equal(await client.countFormattedTokens(raw), 2);
+  await client.embed([raw], 'document');
+  assert.deepEqual(observed, [normalized, normalized]);
+});
+
 test('response identity, vector shape and tokenizer accounting fail closed', async () => {
   for (const mutate of [
     (body: any) => { body.model = "qwen/qwen3-embedding-8b"; },
