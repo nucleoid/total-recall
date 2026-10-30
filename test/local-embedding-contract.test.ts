@@ -6,6 +6,21 @@ import { planEmbeddingChunks, validateParentChunkPlan } from '../src/embedding-c
 
 const count = async (text: string) => Array.from(text).length + 2;
 
+test('formats only an empty document with a pinned representation while retaining raw empty source', async () => {
+  assert.equal(formatLocalEmbeddingInput('', 'document'), '[Blank document]');
+  assert.equal(formatLocalEmbeddingInput(' \t\r\n', 'document'), ' \t\r\n');
+  assert.equal(formatLocalEmbeddingInput('', 'query'), QWEN_QUERY_PREFIX);
+  assert.equal((QWEN_CHUNK_CONTRACT as unknown as Record<string, unknown>).emptyDocumentInput, '[Blank document]');
+  const plan = await planEmbeddingChunks('', count);
+  assert.equal(plan.sourceSha256, sha256(''));
+  assert.equal(plan.chunks.length, 1);
+  assert.equal(plan.chunks[0].text, '');
+  assert.equal(plan.chunks[0].coreStart, 0);
+  assert.equal(plan.chunks[0].coreEnd, 0);
+  assert.equal(plan.chunks[0].tokens, await count('[Blank document]'));
+  validateParentChunkPlan('', plan);
+});
+
 test('pins upstream NFC preprocessing without normalizing canonical source bytes', async () => {
   const source = ' cafe\u0301\r\n\r\n\u0958 '; const normalized = source.normalize('NFC');
   assert.notEqual(source, normalized);

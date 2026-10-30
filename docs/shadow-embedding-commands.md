@@ -106,7 +106,7 @@ All mutations require `--apply`, `--manifest <path>`, and `--manifest-sha256 <ca
 }
 ```
 
-The semantic target separately uses [the upstream NFC v2 contract](openrouter-nfc-contract.md): canonical source bytes remain raw, while tokenization and inference are NFC. Old raw-profile vectors and runtime receipts cannot be relabeled.
+The semantic target separately uses [the upstream NFC and empty-document v3 contract](openrouter-nfc-contract.md): canonical source bytes remain raw, while tokenization and inference are NFC. Old raw-profile vectors and runtime receipts cannot be relabeled.
 
 Version 2 requires the pinned `backfill` block. The worker reads `OPENROUTER_API_KEY` only from its protected environment, fixes routing to DeepInfra, disables provider fallback, and uses the accepted local runtime only for exact tokenization during cloud backfill. `steadyState` is optional for preparation and backfill compatibility, but activation and completion fail closed without it. It repeats the full resource/runtime schemas so the same immutable manifest independently pins cloud backfill, matching local tokenization, and CPU steady serving. It contains no second approval object. Its runtime mode must be `cpu`; arbitrary local runtime/model identities are rejected by the same validator. Do not create the manifest until its approval, both runtime acceptances, source release, resource bounds, and eligibility have been reviewed. The command validates these pins but cannot prove that an external approval artifact exists.
 

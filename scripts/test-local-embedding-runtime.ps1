@@ -66,7 +66,7 @@ try {
   }
   Push-Location $repoRoot
   try {
-    $identity=@{schema=1;contractId='91e3bb787cf8c10c8dcd2e1a724d3b18acfc03a1ea063ee920548e99e7b95d97';runtimeContract='llama.cpp/b11669/last-pool/tokenize-special/native2560';disableVulkanFp16=[bool]$DisableVulkanFp16;disableVulkanQuantizedMatVec=[bool]$DisableVulkanQuantizedMatVec;disableVulkanIntegerDot=[bool]$DisableVulkanIntegerDot;
+    $identity=@{schema=1;contractId='d38fb12a30cbd3a47a4f683b714779353d9dff6c6954f3c66e910909fbd1803d';runtimeContract='llama.cpp/b11669/last-pool/tokenize-special/native2560';disableVulkanFp16=[bool]$DisableVulkanFp16;disableVulkanQuantizedMatVec=[bool]$DisableVulkanQuantizedMatVec;disableVulkanIntegerDot=[bool]$DisableVulkanIntegerDot;
       artifactSha256=(Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash.ToLowerInvariant();
       binarySha256=(Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant();
       runtimeFilesSha256=$runtimeFilesSha256;runtimeFiles=$runtimeFiles;runtimeVersion=$version.Trim();

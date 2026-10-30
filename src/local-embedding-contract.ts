@@ -4,7 +4,7 @@ export const QWEN_QUERY_PREFIX = 'Instruct: Given a web search query, retrieve r
 
 /** Semantic fields only: endpoints, credentials and mutable model tags are not identity. */
 export const QWEN_CHUNK_CONTRACT = Object.freeze({
-  version: 'total-recall/qwen3-4b-q8/paragraph256-utf8/v2',
+  version: 'total-recall/qwen3-4b-q8/paragraph256-utf8/v3',
   model: 'Qwen/Qwen3-Embedding-4B',
   upstreamRevision: '5cf2132abc99cad020ac570b19d031efec650f2b',
   localArtifact: 'Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q8_0.gguf',
@@ -21,6 +21,7 @@ export const QWEN_CHUNK_CONTRACT = Object.freeze({
   storedDimensions: 768,
   projection: 'first-768-then-l2',
   documentPrefix: '',
+  emptyDocumentInput: '[Blank document]',
   queryPrefix: QWEN_QUERY_PREFIX,
   queryPrefixSha256: '9fab7feb99edb69f560d85cf1bb849dd556c37f383d0336574f78f1303e90740',
   allocatedContextTokens: 4096,
@@ -67,7 +68,8 @@ export function formatLocalEmbeddingInput(text: string, role: 'query' | 'documen
   validateEmbeddingText(text);
   if (role !== 'query' && role !== 'document') throw new Error('embedding.invalid_role');
   const normalized = normalizeEmbeddingInputText(text);
-  return role === 'query' ? QWEN_QUERY_PREFIX + normalized : normalized;
+  return role === 'query' ? QWEN_QUERY_PREFIX + normalized
+    : normalized === '' ? QWEN_CHUNK_CONTRACT.emptyDocumentInput : normalized;
 }
 
 /** Accept native vectors only; an already-cropped vector cannot masquerade as native. */
