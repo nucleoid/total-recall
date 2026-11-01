@@ -5,6 +5,52 @@ export interface Capabilities {
   capabilities: { read: boolean; write: boolean; delete: boolean; admin: boolean; export: boolean; import: boolean };
 }
 
+export type MemoryIngestionState = 'queued' | 'ready' | 'deduplicated' | 'embedding_failed' | 'cancelled';
+
+/**
+ * Content-free durable-ingestion status. Present only while the server runs
+ * the ingestion queue; owners see every field, other readers see state only.
+ */
+export interface MemoryIngestion {
+  state: MemoryIngestionState;
+  accepted_at?: string;
+  ready_at?: string | null;
+  attempts?: number;
+  next_retry_at?: string | null;
+  failure_category?: string | null;
+  canonical_memory_id?: string | null;
+  similarity?: number | null;
+}
+
+export type IngestionJobStatus = 'pending' | 'processing' | 'retry_wait' | 'ready' | 'deduplicated' | 'embedding_failed' | 'cancelled';
+export type IngestionFailureCategory = 'transient' | 'rate_limited' | 'provider_auth' | 'input_rejected' | 'space_mismatch' | 'expired';
+
+/** GET /api/ingestion/stats: content-free queue aggregates for admins. */
+export interface IngestionStats {
+  enabled: boolean;
+  depth: Record<IngestionJobStatus, number>;
+  queued: number;
+  oldest_pending_age_seconds: number | null;
+  next_retry_at: string | null;
+  attempts_histogram: Array<{ attempts: number; count: number }>;
+  failure_categories: Record<IngestionFailureCategory, number>;
+  inline: { attempted: number; ready: number; deduplicated: number; queued: number };
+  worker: { paused: boolean; last_seen_at: string | null };
+}
+
+export interface IngestionRequeueResult {
+  memory_id: string;
+  namespace: string;
+  status: 'pending';
+  previous_status: 'embedding_failed' | 'cancelled';
+  previous_attempts: number;
+  requeued_at: string;
+}
+
+export interface IngestionPauseState {
+  paused: boolean;
+}
+
 export interface MemoryRecord {
   id: string;
   content: string;
@@ -31,6 +77,7 @@ export interface MemoryRecord {
   relevance_score: number;
   superseded_at: string | null;
   expires_at: string | null;
+  ingestion?: MemoryIngestion | null;
 }
 
 export interface PagedMemories {

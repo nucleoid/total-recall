@@ -1,3 +1,5 @@
+import type { IngestionPauseState, IngestionRequeueResult, IngestionStats } from './types.js';
+
 const TAB_KEY = 'total-recall.dashboard.api-key';
 let apiKey = '';
 let rememberForTab = false;
@@ -75,4 +77,19 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw new ApiError(response.status, message);
   }
   return response.json() as Promise<T>;
+}
+
+// Durable ingestion queue administration. Admin-only on the server; the
+// responses are content-free aggregates and state flags.
+
+export function getIngestionStats(signal?: AbortSignal): Promise<IngestionStats> {
+  return api<IngestionStats>('/api/ingestion/stats', { signal });
+}
+
+export function setIngestionPaused(paused: boolean): Promise<IngestionPauseState> {
+  return api<IngestionPauseState>(paused ? '/api/ingestion/pause' : '/api/ingestion/resume', { method: 'POST' });
+}
+
+export function requeueIngestionJob(memoryId: string): Promise<IngestionRequeueResult> {
+  return api<IngestionRequeueResult>(`/api/ingestion/jobs/${encodeURIComponent(memoryId)}/requeue`, { method: 'POST' });
 }

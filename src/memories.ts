@@ -2,6 +2,7 @@ import { accessLevelSql, checkPermission, filterNamespaces } from './auth.js';
 import { dbScopeFromAuth, queryScoped, withScopedClient, type DbScope, type ScopedClient } from './db.js';
 import type { AuthContext } from './types.js';
 import { logAudit } from './audit.js';
+import { ingestionQueueEnabled, ingestionStatusJoinSql, ingestionStatusSelectSql } from './ingestion.js';
 
 export type MemorySort = 'created_at' | 'updated_at' | 'accessed_at' | 'access_count' | 'relevance';
 export type MemoryActivity = 'active' | 'superseded' | 'expired' | 'all';
@@ -48,6 +49,23 @@ const COLUMNS = `m.id, m.content, m.source, m.namespace, m.tags, m.metadata,
     'agent_model', a.model, 'agent_runtime', a.runtime,
     'same_key_as_requester', COALESCE(a.api_key_id::text = app_current_key_id(), false)
   ) END AS provenance`;
+
+/**
+ * The browse projection plus, only while the durable ingestion queue is on,
+ * the content-free ingestion status and its LEFT JOIN. Off, both strings are
+ * byte-for-byte the pre-queue statement fragments. RLS hides other owners'
+ * job rows, so a missing row yields NULL (or `{ state: 'queued' }` while the
+ * vector is absent) and never another owner's details.
+ */
+function browseProjection(): { columns: string; joins: string } {
+  const queueEnabled = ingestionQueueEnabled();
+  return {
+    columns: queueEnabled ? `${COLUMNS},\n  ${ingestionStatusSelectSql('m')} AS ingestion` : COLUMNS,
+    joins: queueEnabled
+      ? `LEFT JOIN agents a ON a.id = m.agent_id ${ingestionStatusJoinSql('m')}`
+      : 'LEFT JOIN agents a ON a.id = m.agent_id',
+  };
+}
 
 function baseConditions(auth: AuthContext, namespaces: string[], includeInactive: boolean): { conditions: string[]; values: unknown[] } {
   const conditions = [
@@ -96,6 +114,7 @@ export async function listMemories(auth: AuthContext, filters: MemoryBrowseFilte
   const order = `${SORT_COLUMNS[filters.sort]} ${filters.direction.toUpperCase()}, m.id ${filters.direction.toUpperCase()}`;
   const outerOrder = `${OUTER_SORT_COLUMNS[filters.sort]} ${filters.direction.toUpperCase()}, id ${filters.direction.toUpperCase()}`;
   const scope = dbScopeFromAuth(auth);
+  const projection = browseProjection();
   return withScopedClient(scope, async client => {
     await client.query("SELECT set_config('statement_timeout', '12000', true)");
     const count = await client.query<{ total: string }>(
@@ -107,9 +126,9 @@ export async function listMemories(auth: AuthContext, filters: MemoryBrowseFilte
          SELECT picked.*
          FROM unnest($1::text[]) AS requested_namespace(namespace)
          CROSS JOIN LATERAL (
-           SELECT ${COLUMNS}
+           SELECT ${projection.columns}
            FROM memories m
-           LEFT JOIN agents a ON a.id = m.agent_id
+           ${projection.joins}
            WHERE ${where} AND m.namespace = requested_namespace.namespace
            ORDER BY ${order}
            LIMIT ${pageWindow}
@@ -139,7 +158,8 @@ export async function getMemory(auth: AuthContext, id: string) {
   values.push(id);
   conditions.push(`m.id = $${values.length}::uuid`);
   const scope = dbScopeFromAuth(auth);
-  const result = await queryScoped(scope, `SELECT ${COLUMNS} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id WHERE ${conditions.join(' AND ')} LIMIT 1`, values);
+  const projection = browseProjection();
+  const result = await queryScoped(scope, `SELECT ${projection.columns} FROM memories m ${projection.joins} WHERE ${conditions.join(' AND ')} LIMIT 1`, values);
   if (result.rows[0]) {
     await logAudit({
       clientId: auth.keyId, action: 'memory.recall', resourceType: 'memory',

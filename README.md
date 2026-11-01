@@ -51,6 +51,30 @@ Any proof failure requires human investigation; never weaken the checks or infer
 
 Recall queries set pgvector's transaction-local HNSW search breadth from `HNSW_EF_SEARCH`. The value must be a decimal integer from `1` to `1000`; when unset, empty, or whitespace-only, Total Recall uses `200`. Invalid non-blank values fail during startup before the MCP server or REST API starts accepting traffic.
 
+### Durable ingestion queue and migration 037
+
+Migration 037 adds the content-free `memory_ingestion_jobs` table, the `instance_settings` pause/heartbeat columns, and a disabled `AFTER UPDATE OF embedding` subscription trigger. It is additive (no backfill, no reindex, no downtime) and inert until the fail-closed gate is set on the API processes:
+
+```dotenv
+MEMORY_INGESTION_QUEUE_ENABLED=true   # default off: the synchronous store path, byte for byte
+MEMORY_STORE_INLINE_EMBED_MS=3000     # inline embedding budget in ms; 0 = always async; max 120000
+MEMORY_INGESTION_MAX_ATTEMPTS=12      # worker attempts before embedding_failed; 1..1000
+INGESTION_WORKER_API_KEY=tr_...       # dedicated enabled key with admin, created with npm run create-key
+INGESTION_WORKER_CONCURRENCY=4        # default for the worker's --concurrency flag; 1..32
+```
+
+With the gate on, `memory_store` persists the memory (a real row with a NULL embedding) and its job before acknowledging, tries to embed within the inline budget, and returns `state: 'ready'` or `state: 'queued'` plus `accepted_at`; the separate worker finishes queued jobs with bounded backoff (1m/5m/30m/2h/12h, `Retry-After` honoured) and never discards accepted content. Pending rows stay recallable, listable, full-text searchable and exportable with a content-free `ingestion` state; only semantic ranking waits for the vector. TTL starts at acceptance.
+
+```bash
+npm run create-key -- --name ingestion-worker --namespaces shared,personal --permissions admin,read,write
+npm run ingest:worker -- --concurrency 4
+# canary / drain mode
+npm run ingest:worker -- --once --max-jobs 100
+systemctl --user enable --now total-recall-ingestion.service   # deploy/systemd/total-recall-ingestion.service
+```
+
+Admin routes `GET /api/ingestion/stats`, `POST /api/ingestion/jobs/{id}/requeue`, `POST /api/ingestion/pause` and `POST /api/ingestion/resume` expose depth, oldest pending age, attempts, next retry, failure categories, inline hit rate and worker heartbeat without memory content; the dashboard Overview shows the same panel. If memory subscriptions are live, enable `memories_ingestion_subscription_enqueue` together with `memories_subscription_enqueue`: the pending to ready transition is the creation event. The contract, states and keyed-store semantics are in [`docs/ingestion-queue.md`](docs/ingestion-queue.md); rollout, rollback, draining, backlog recovery, requeue and alert thresholds are in [the migration 037 runbook](docs/rollouts/037-memory-ingestion-queue.md).
+
 ### Retrieval-quality evaluation
 
 `npm run eval` measures a private, owner-judged binary query set with macro recall@k, MRR, and hit-rate@k. Evaluation uses request-scoped read-only transactions, embeds each query once, fixes relevance time with `--as-of`, and never updates access state or creates agents/traces. Start with `npm run eval:check -- --dataset eval/private/golden.json`; see [`eval/README.md`](eval/README.md) for the schema, privacy rules, baseline compatibility, and explicit opt-in gates. The committed example is synthetic and makes no quality claim. Real datasets and reports are gitignored and must not be put in CI artifacts.
@@ -124,6 +148,7 @@ This rotation changes only the PostgreSQL app-role password. Total Recall API ke
         │  • POST /api/agents         │
         │  • GET  /api/traces         │
         │  • GET  /api/audit          │
+        │  • /api/ingestion/* (admin) │
         │                             │
         │  ┌───────────┐  ┌────────┐  │
         │  │ Auth/ACL  │  │ Embed  │  │
@@ -232,6 +257,8 @@ Ordinary stores semantically deduplicate by default. At cosine similarity `>= ME
 
 For ephemeral scratch state, pass `"ttl": <seconds>` (a positive integer up to 2147483647). PostgreSQL computes `expires_at` once from statement time. Expiring stores default to `dedupe:false`, and `ttl` with `dedupe:true` is rejected; exact idempotency-key retries remain supported. At `expires_at` the row is logically absent from reads, search, counts, graph/reflection inputs, updates, and access boosts even before cleanup. `ttl` is available in any authorized namespace, but `working` is recommended and must be explicitly added to the API key namespace ACL. `memory_store_document` does not accept TTL.
 
+When `MEMORY_INGESTION_QUEUE_ENABLED=true`, the result additionally reports `state` and `accepted_at`: `ready` means the embedding landed in this request (the shape above is otherwise unchanged, including a real `deduplicated`/`similarity`); `queued` means the memory was durably accepted under the returned stable `id` (`created: true`, `deduplicated: false`) and the ingestion worker will embed it, retrying provider failures with bounded backoff. A queued memory is immediately recallable by id, listable and full-text searchable, but not semantically ranked until its vector lands. Reusing an `idempotency_key` while a memory is queued, retrying, ready or failed returns the same id and its current state without duplicate effects. See [`docs/ingestion-queue.md`](docs/ingestion-queue.md).
+
 ### Memory-only export and import feed (V1)
 
 Migration 034 adds an instance UUID and changes source-key identity from global to tenant-local `(client_id, source_key)`. Stop watcher, preseed, consolidation, distillation, and transfer writers while applying that migration; old and new source-key writers must not overlap.
@@ -305,10 +332,10 @@ Traverse exact normalized entity names and their co-occurring `person`, `project
 Entity extraction is eventually consistent and disabled until a separate #55 provider/model, terms, one-namespace `normal` scope, and cost policy is approved. See [`docs/entity-graph-rollout-runbook.md`](docs/entity-graph-rollout-runbook.md).
 
 ### `memory_recall`
-Get a specific memory by ID, or all chunks of a document by `document_id`.
+Get a specific memory by ID, or all chunks of a document by `document_id`. With the durable ingestion queue enabled, each memory carries a content-free `ingestion` object (`state`, `accepted_at`, `ready_at`, `attempts`, `next_retry_at`, `failure_category`, `canonical_memory_id`, `similarity` for the owner or an admin; `state` only for other readers) or `null`; recalling the id of a queued memory that deduplicated at finalization returns the canonical memory with `ingestion.state: 'deduplicated'`.
 
 ### `memory_list`
-Browse/paginate memories with optional filters (no vector search).
+Browse/paginate memories with optional filters (no vector search). Rows carry the same `ingestion` object when the durable ingestion queue is enabled.
 
 ### `memory_list_namespaces`
 List available namespaces and their memory counts.
@@ -319,7 +346,7 @@ Soft-delete memories by `ids`, `namespace`, strict `before` (`created_at < befor
 Tombstones disappear from all ordinary recall, search, list, count, access-boost, and maintenance operations. Document chunks can be forgotten independently; the original document ingestion count is immutable, and document recall reports not-found once no active chunks remain. A `source_key` retry cannot restore a tombstone. Deletion reasons are bounded and stored on the tombstone but are never copied to audit/log output.
 
 ### `memory_stats`
-Admin-only statistics: total memories, breakdown by namespace and source, document count, date range.
+Admin-only statistics: total memories, breakdown by namespace and source, document count, date range. When the durable ingestion queue is enabled the result adds a content-free `ingestion` block (queue depth per status, oldest pending age, attempts histogram, next retry, failure categories, inline fast-path counters, worker pause flag and heartbeat).
 
 ### `agent_subscribe` / `agent_list_subscriptions` / `agent_unsubscribe`
 
@@ -393,6 +420,10 @@ All `/api/*` endpoints require `Authorization: Bearer tr_<key>`. `/health` is pu
 | POST | `/api/transfer/import` | Preflight/import the V1 JSONL feed (`import`) |
 | DELETE | `/api/memories` | Soft-delete matching memories (explicit `delete` permission) |
 | GET | `/api/stats` | Memory statistics (admin) |
+| GET | `/api/ingestion/stats` | Content-free durable ingestion queue statistics (`admin` + `read`) |
+| POST | `/api/ingestion/jobs/{id}/requeue` | Requeue a failed or cancelled ingestion job (`admin` + `write`) |
+| POST | `/api/ingestion/pause` | Pause the ingestion worker at its next poll (`admin` + `write`) |
+| POST | `/api/ingestion/resume` | Resume the ingestion worker (`admin` + `write`) |
 | GET | `/api/agents` | List registered agents and counts (`admin` + `read`) |
 | POST | `/api/agents` | Register/update an agent (`admin` + `write`) |
 | GET | `/api/traces` | Paginated recall traces (`admin` + `read`) |
@@ -784,6 +815,10 @@ Media progress is nullable by design: `duration_ms` describes the item's duratio
 
 Historical Spotify rows that asserted `played_ms=duration_ms` and `completed=true` are not automatically rewritten because their ingestion provenance is ambiguous. `npm run spotify:repair-progress` is preview-only by default and writes nothing. For an authorized repair, pause Spotify sync, take and verify a restorable backup, independently prove connector provenance per candidate, and create an approval manifest containing only exact previewed event IDs, client IDs, and fingerprints. Apply requires both `--apply --confirm-backup --approval-manifest <file>`; broad predicates, counts, date ranges, and approval of the command itself are rejected. Unverified rows stay unchanged. See [the Spotify connector guide](docs/connectors/spotify.md#historical-progress-repair) for the full workflow.
 
+### Durable ingestion queue and migration 037
+
+Migration 037 is additive and inert until `MEMORY_INGESTION_QUEUE_ENABLED=true`. Apply it, create the dedicated worker key, canary the worker with `--once`, enable the gate, and enable the subscription trigger pair together if subscriptions are live; roll back by disabling the gate and draining the worker, with no data loss. See [Durable ingestion queue and migration 037](#durable-ingestion-queue-and-migration-037) above and [the migration 037 rollout runbook](docs/rollouts/037-memory-ingestion-queue.md).
+
 ### Activity connector foundation and migration 035
 
 Migration 035 introduces owner/source-scoped connector state and credentials, source/event-key media identity, and the separate private `activity_events` domain. It requires a stopped-writer maintenance window and explicit assignment of legacy credential/state ownership. Follow the [migration 035 rollout runbook](docs/rollouts/035-activity-connector-foundation.md); never overlap pre-035 and post-035 connector binaries.
@@ -926,6 +961,7 @@ Deploy server support for `memory_store.idempotency_key` before deploying the ne
 - [x] YouTube Music connector via `ytmusicapi` ([setup](docs/connectors/ytmusic.md)) (Phase 3)
 - [x] Plex connector via plex.tv account ([setup](docs/connectors/plex.md)) (Phase 2)
 - [x] Browser history connector for explicit Chromium/Firefox profiles ([setup](docs/connectors/browser-history.md))
+- [x] Durable write-ahead ingestion queue for `memory_store` ([contract](docs/ingestion-queue.md), [runbook](docs/rollouts/037-memory-ingestion-queue.md))
 - [ ] GitHub activity, Google Calendar, Steam snapshots, Trakt, and Instapaper export — separate least-privilege follow-up connectors
 - [ ] Netflix quarterly Takeout importer (Phase 4)
 

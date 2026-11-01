@@ -1,6 +1,31 @@
 export type AccessLevel = 'normal' | 'sensitive' | 'secret';
 export type MemoryKind = 'unspecified' | 'semantic' | 'document_chunk' | 'episode_chunk' | 'synced' | 'media_rollup' | 'consolidation' | 'insight';
 
+/** What a reader sees of a durable-ingestion job; `queued` collapses pending, processing and retry_wait. */
+export type MemoryIngestionState = 'queued' | 'ready' | 'deduplicated' | 'embedding_failed' | 'cancelled';
+export type MemoryIngestionFailureCategory =
+  'transient' | 'rate_limited' | 'provider_auth' | 'input_rejected' | 'space_mismatch' | 'expired';
+
+/**
+ * Content-free ingestion status attached to recall, list and search rows while
+ * the durable ingestion queue (MEMORY_INGESTION_QUEUE_ENABLED) is on. The
+ * memory's owner and admins receive every field; another reader in the
+ * namespace receives `state` only. A null value means the row carries a vector
+ * and has no visible queue history.
+ */
+export interface MemoryIngestion {
+  state: MemoryIngestionState;
+  accepted_at?: string;
+  ready_at?: string | null;
+  attempts?: number;
+  next_retry_at?: string | null;
+  failure_category?: MemoryIngestionFailureCategory | null;
+  /** The memory that absorbed this one when the job deduplicated. */
+  canonical_memory_id?: string | null;
+  /** Cosine similarity to canonical_memory_id when the job deduplicated. */
+  similarity?: number | null;
+}
+
 export interface Memory {
   id: string;
   content: string;
@@ -37,6 +62,8 @@ export interface Memory {
   insight_content_hash?: string | null;
   expires_at?: Date | null;
   provenance?: MemoryProvenance | null;
+  /** Present on read paths only while the durable ingestion queue is enabled. */
+  ingestion?: MemoryIngestion | null;
 }
 
 export interface ApiKey {
@@ -145,6 +172,14 @@ export interface StoreResult {
   similarity?: number;
   idempotency_key_honored?: true;
   expires_at: Date | null;
+  /**
+   * Present only when the durable ingestion queue is enabled. `ready` means
+   * the embedding landed in this request; `queued` means the memory was
+   * durably accepted and the ingestion worker will embed it.
+   */
+  state?: 'ready' | 'queued';
+  /** When the memory was durably accepted; present with `state`. */
+  accepted_at?: Date;
 }
 
 export interface UpdateParams {
@@ -180,6 +215,19 @@ export interface ListParams {
   namespace?: string;
   source?: string;
   tags?: string[];
+  limit?: number;
+  offset?: number;
+}
+
+/** One memory_recall / memory_list row: a Memory plus its lifecycle links and provenance. */
+export interface RecalledMemory extends Memory {
+  document_id?: string | null;
+  chunk_index?: number | null;
+}
+
+export interface ListResult {
+  memories: RecalledMemory[];
+  total: number;
   limit?: number;
   offset?: number;
 }

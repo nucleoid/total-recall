@@ -41,3 +41,27 @@ test('daily sync pins one config and bounds mcporter stats calls', async () => {
   assert.match(script, /timeout --signal=TERM/);
   assert.doesNotMatch(script, /"\$MCPORTER_BIN" call total-recall\.memory_stats/);
 });
+
+test('ingestion worker unit runs the tsx entrypoint from the same current release and environment file', async () => {
+  const service = await fs.readFile(path.join(root, 'deploy', 'systemd', 'total-recall.service'), 'utf8');
+  const ingestion = await fs.readFile(path.join(root, 'deploy', 'systemd', 'total-recall-ingestion.service'), 'utf8');
+  const line = (unit: string, key: string) => unit.split('\n').find(entry => entry.startsWith(`${key}=`));
+
+  assert.equal(line(ingestion, 'WorkingDirectory'), line(service, 'WorkingDirectory'));
+  assert.equal(line(ingestion, 'EnvironmentFile'), line(service, 'EnvironmentFile'));
+  assert.equal(line(ingestion, 'Restart'), 'Restart=always');
+  assert.match(ingestion, /^ExecStart=\/usr\/bin\/node --import tsx %h\/\.local\/share\/total-recall\/current\/scripts\/ingestion-worker\.ts\b/m);
+  assert.match(ingestion, /^KillSignal=SIGTERM$/m);
+  assert.doesNotMatch(ingestion, /\.codex-|projects\/total-recall\/dist|dist\/scripts|dist\/ingestion-worker/);
+
+  // Scripts are never compiled by tsc, so the unit must use the same tsx
+  // entrypoint mechanism as the npm script and the webhook worker.
+  const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
+  assert.equal(pkg.scripts['ingest:worker'], 'tsx scripts/ingestion-worker.ts');
+  assert.equal(pkg.scripts['webhooks:deliver'], 'tsx scripts/webhook-delivery.ts');
+  const main = JSON.parse(await fs.readFile(path.join(root, 'tsconfig.json'), 'utf8'));
+  assert.deepEqual(main.include, ['src/**/*']);
+  const scripts = JSON.parse(await fs.readFile(path.join(root, 'tsconfig.scripts.json'), 'utf8'));
+  assert.ok(scripts.include.includes('scripts/ingestion-worker.ts'));
+  await fs.access(path.join(root, 'scripts', 'ingestion-worker.ts'));
+});

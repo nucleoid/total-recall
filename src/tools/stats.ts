@@ -3,6 +3,7 @@ import { dbScopeFromAuth, withScopedClient } from '../db.js';
 import type { AuthContext } from '../types.js';
 import { checkPermission } from '../auth.js';
 import { logAudit } from '../audit.js';
+import { ingestionQueueEnabled, ingestionStats } from '../ingestion.js';
 
 export const statsSchema = z.object({});
 
@@ -109,6 +110,9 @@ export async function memoryStats(
       values
     );
     const stats = result.rows[0];
+    // Content-free queue aggregates ride the same scoped transaction. Only the
+    // gate adds the block, so a gate-off response stays byte-identical.
+    const ingestion = ingestionQueueEnabled() ? await ingestionStats(client) : undefined;
 
     await logAudit({
       clientId: auth.keyId, action: 'memory.stats', resourceType: 'system',
@@ -122,6 +126,7 @@ export async function memoryStats(
       total_documents: parseInt(stats.total_documents, 10),
       oldest_memory: stats.oldest_memory,
       newest_memory: stats.newest_memory,
+      ...(ingestion !== undefined && { ingestion }),
     };
   });
 }

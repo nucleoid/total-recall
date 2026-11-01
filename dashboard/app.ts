@@ -1,6 +1,11 @@
 import './styles.css';
-import { api, ApiError, clearKey, hasKey, isRemembered, restoreKey, setKey, toApiDateTime } from './api.js';
-import type { AgentRecord, Capabilities, MediaStats, MemoryRecord, PagedMemories, TraceRecord } from './types.js';
+import {
+  api, ApiError, clearKey, getIngestionStats, hasKey, isRemembered, requeueIngestionJob, restoreKey, setIngestionPaused, setKey, toApiDateTime,
+} from './api.js';
+import type {
+  AgentRecord, Capabilities, IngestionFailureCategory, IngestionJobStatus, IngestionStats, MediaStats, MemoryIngestion, MemoryIngestionState,
+  MemoryRecord, PagedMemories, TraceRecord,
+} from './types.js';
 
 type View = 'overview' | 'memories' | 'search' | 'traces' | 'media' | 'agents' | 'audit';
 const views: View[] = ['overview', 'memories', 'search', 'traces', 'media', 'agents', 'audit'];
@@ -134,6 +139,8 @@ async function renderOverview(): Promise<void> {
       card('Newest', formatDate(stats.newest_memory)),
     );
     section.append(metrics, el('h3', 'By namespace'), table(stats.by_namespace ?? [], ['namespace', 'count']));
+    main.replaceChildren(section, ingestionQueuePanel());
+    return;
   } else {
     const stats = await api<PagedMemories>('/api/memories?limit=1');
     metrics.append(
@@ -207,9 +214,141 @@ function sequencePager(offset: number, limit: number, received: number, onPage: 
   return controls;
 }
 
+const INGESTION_STATUSES: IngestionJobStatus[] = ['pending', 'processing', 'retry_wait', 'ready', 'deduplicated', 'embedding_failed', 'cancelled'];
+const INGESTION_FAILURE_CATEGORIES: IngestionFailureCategory[] = ['transient', 'rate_limited', 'provider_auth', 'input_rejected', 'space_mismatch', 'expired'];
+const UUID_PATTERN = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$';
+
+function formatAge(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds)) return '—';
+  const whole = Math.max(0, Math.round(seconds));
+  return whole < 60 ? `${whole} s` : formatDuration(whole * 1000);
+}
+
+/** Pause, resume and requeue mutate instance state; the server requires admin and write. */
+function canOperateIngestion(): boolean {
+  return Boolean(capabilities?.capabilities.admin && capabilities.capabilities.write);
+}
+
+/**
+ * Admin-only durable ingestion queue panel. Everything rendered comes from the
+ * content-free stats endpoint; a failure here never hides the rest of the
+ * overview, because a queue that is not deployed yet is an ordinary state.
+ */
+function ingestionQueuePanel(): HTMLElement {
+  const section = panel('Ingestion queue');
+  const body = el('div');
+  const notice = el('p', '', 'muted');
+  notice.setAttribute('role', 'status');
+  section.append(el('p', 'Durable write-ahead embedding queue: accepted memories waiting for a vector, worker health, and recoverable failures. No memory content is shown here.', 'muted'), body, notice);
+  void loadIngestionQueue(body, notice);
+  return section;
+}
+
+async function loadIngestionQueue(body: HTMLElement, notice: HTMLElement): Promise<void> {
+  body.replaceChildren(el('p', 'Loading ingestion queue…', 'state'));
+  let stats: IngestionStats;
+  try {
+    stats = await getIngestionStats();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return;
+    if (error instanceof ApiError && (error.status === 401 || error.status === 403)) { fail(error); return; }
+    body.replaceChildren(el('div', error instanceof Error ? error.message : 'Ingestion queue statistics are unavailable.', 'state error'));
+    return;
+  }
+  const metrics = el('div', undefined, 'metrics');
+  metrics.append(
+    card('Queue gate', stats.enabled ? 'Enabled' : 'Disabled'),
+    card('Queued jobs', formatNumber(stats.queued)),
+    card('Oldest pending', formatAge(stats.oldest_pending_age_seconds)),
+    card('Next retry', formatDate(stats.next_retry_at)),
+    card('Worker', stats.worker.paused ? 'Paused' : 'Running'),
+    card('Worker heartbeat', formatDate(stats.worker.last_seen_at)),
+  );
+  const depth = INGESTION_STATUSES.map((status) => ({ status, count: stats.depth[status] ?? 0 }));
+  const failures = INGESTION_FAILURE_CATEGORIES.map((category) => ({ category, count: stats.failure_categories[category] ?? 0 }));
+  const attempts = stats.attempts_histogram.map((row) => ({ attempts: row.attempts, count: row.count }));
+  const inline = [{ attempted: stats.inline.attempted, ready: stats.inline.ready, deduplicated: stats.inline.deduplicated, queued: stats.inline.queued }];
+  const controls = el('div', undefined, 'actions');
+  if (canOperateIngestion()) {
+    const toggle = el('button', stats.worker.paused ? 'Resume worker' : 'Pause worker', stats.worker.paused ? undefined : 'danger');
+    toggle.type = 'button';
+    toggle.addEventListener('click', () => {
+      toggle.disabled = true;
+      void setIngestionPaused(!stats.worker.paused).then(async (state) => {
+        const message = state.paused ? 'Ingestion worker paused: new claims stop at its next poll; in-flight jobs finish.' : 'Ingestion worker resumed.';
+        notice.textContent = message; notice.className = 'muted'; announce(message);
+        await loadIngestionQueue(body, notice);
+      }).catch((error: unknown) => { toggle.disabled = false; ingestionActionFailed(error, notice); });
+    });
+    const form = el('form', undefined, 'filters compact-filters');
+    const label = el('label'); label.append(document.createTextNode('Requeue a failed or cancelled job by memory ID'));
+    const input = el('input'); input.name = 'memory_id'; input.required = true; input.placeholder = 'Memory UUID'; input.pattern = UUID_PATTERN;
+    input.autocomplete = 'off'; input.spellcheck = false; label.append(input);
+    const submit = el('button', 'Requeue'); submit.type = 'submit';
+    form.append(label, submit);
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void requeueIngestionJob(input.value.trim()).then(async (result) => {
+        const message = `Requeued memory ${shortId(result.memory_id)} (was ${result.previous_status} after ${formatNumber(result.previous_attempts)} attempts).`;
+        notice.textContent = message; notice.className = 'muted'; announce(message);
+        await loadIngestionQueue(body, notice);
+      }).catch((error: unknown) => ingestionActionFailed(error, notice));
+    });
+    controls.append(toggle, form);
+  } else {
+    controls.append(el('span', 'Pause, resume, and requeue require an admin key with write permission.', 'muted'));
+  }
+  body.replaceChildren(
+    metrics,
+    el('h3', 'Depth by status'), table(depth, ['status', 'count']),
+    el('h3', 'Failure categories'), table(failures, ['category', 'count']),
+    el('h3', 'Attempts'), table(attempts, ['attempts', 'count']),
+    el('h3', 'Inline fast path (this API process)'), table(inline, ['attempted', 'ready', 'deduplicated', 'queued']),
+    controls,
+  );
+}
+
+function ingestionActionFailed(error: unknown, notice: HTMLElement): void {
+  if (error instanceof ApiError && (error.status === 401 || error.status === 403)) { fail(error); return; }
+  const message = error instanceof Error ? error.message : 'Ingestion queue action failed';
+  notice.textContent = message; notice.className = 'state error'; announce(message);
+}
+
+async function requeueMemoryIngestion(memory: MemoryRecord, dialog: HTMLDialogElement): Promise<void> {
+  try {
+    const result = await requeueIngestionJob(memory.id);
+    dialog.close();
+    announce(`Embedding requeued for memory ${shortId(result.memory_id)} (was ${result.previous_status}).`);
+    await render();
+  } catch (error) { fail(error); }
+}
+
+const INGESTION_LABELS: Record<MemoryIngestionState, string> = {
+  queued: 'Embedding queued',
+  ready: 'Embedding ready',
+  deduplicated: 'Deduplicated',
+  embedding_failed: 'Embedding failed',
+  cancelled: 'Ingestion cancelled',
+};
+
+/** Content-free state badge; a ready row shows nothing because that is the ordinary case. */
+function ingestionBadge(ingestion: MemoryIngestion | null | undefined): HTMLElement | null {
+  if (!ingestion || ingestion.state === 'ready') return null;
+  const label = INGESTION_LABELS[ingestion.state] ?? ingestion.state;
+  const badge = el('span', label, `badge ingestion-${ingestion.state}`);
+  const hints: string[] = [];
+  if (ingestion.failure_category) hints.push(`Failure: ${ingestion.failure_category}`);
+  if (ingestion.next_retry_at) hints.push(`Next retry ${formatDate(ingestion.next_retry_at)}`);
+  if (typeof ingestion.attempts === 'number') hints.push(`${formatNumber(ingestion.attempts)} attempts`);
+  if (hints.length) badge.title = hints.join(' · ');
+  return badge;
+}
+
 function memoryCard(memory: MemoryRecord): HTMLElement {
   const article = el('article', undefined, 'memory-card');
   const heading = el('h3', `${memory.namespace} · ${memory.source}`);
+  const badge = ingestionBadge(memory.ingestion);
+  if (badge) heading.append(document.createTextNode(' '), badge);
   const content = el('p', memory.content, 'memory-content');
   const provenance = el('p', `Agent: ${agentName(memory)}`, 'memory-agent');
   provenance.title = memory.agent_id ?? 'No agent GUID recorded';
@@ -245,9 +384,29 @@ function showMemory(memory: MemoryRecord): void {
       created_at: memory.created_at,
     }], ['namespace', 'source', 'client_id', 'agent_name', 'agent_id', 'session_id', 'created_at']),
   );
+  if (memory.ingestion) {
+    body.append(
+      el('h3', 'Ingestion'),
+      table([{
+        state: INGESTION_LABELS[memory.ingestion.state] ?? memory.ingestion.state,
+        accepted_at: memory.ingestion.accepted_at,
+        ready_at: memory.ingestion.ready_at,
+        attempts: memory.ingestion.attempts,
+        next_retry_at: memory.ingestion.next_retry_at,
+        failure_category: memory.ingestion.failure_category,
+        canonical_memory_id: memory.ingestion.canonical_memory_id,
+        similarity: memory.ingestion.similarity,
+      }], ['state', 'accepted_at', 'ready_at', 'attempts', 'next_retry_at', 'failure_category', 'canonical_memory_id', 'similarity']),
+    );
+  }
   actions.replaceChildren();
   if (capabilities?.capabilities.write) {
     const edit = el('button', 'Edit'); edit.type = 'button'; edit.addEventListener('click', () => void editMemory(memory, dialog)); actions.append(edit);
+  }
+  const ingestionState = memory.ingestion?.state;
+  if ((ingestionState === 'embedding_failed' || ingestionState === 'cancelled') && canOperateIngestion()) {
+    const requeue = el('button', 'Requeue embedding', 'secondary'); requeue.type = 'button';
+    requeue.addEventListener('click', () => void requeueMemoryIngestion(memory, dialog)); actions.append(requeue);
   }
   if (capabilities?.capabilities.delete) {
     const remove = el('button', 'Delete', 'danger'); remove.type = 'button'; remove.addEventListener('click', () => void deleteMemory(memory, dialog)); actions.append(remove);

@@ -19,6 +19,7 @@ export async function logAudit(params: {
   const allowedDetailKeys = new Set([
     'created', 'deduplicated', 'idempotent', 'chunks', 'records',
     'inserted', 'updated', 'skipped', 'conflicted', 'denied', 'failed',
+    'queued', 'requeued', 'attempts',
   ]);
   const unapprovedDetailKey = Object.keys(details).find(key => !allowedDetailKeys.has(key));
   if (unapprovedDetailKey) throw new Error(`Unapproved audit detail key: ${unapprovedDetailKey}`);

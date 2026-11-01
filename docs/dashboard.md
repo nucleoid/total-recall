@@ -24,14 +24,15 @@ Capabilities come from `GET /api/capabilities` without returning the key ID or s
 - `read`: browse, inspect, and search accessible active memories.
 - `write`: edit memory content. Content edits regenerate the embedding. Every PATCH requires an `If-Match` precondition containing the quoted `updated_at` value.
 - `delete`: soft-delete after typing the full memory ID. Retention and hard-purge behavior remain the server's lifecycle contract.
-- `admin` + `read`: global overview, agents, recall traces, audit records, and media statistics.
+- `admin` + `read`: global overview, agents, recall traces, audit records, media statistics, and the content-free ingestion queue panel.
+- `admin` + `write`: pause/resume the ingestion worker and requeue a failed or cancelled ingestion job.
 
 Memory list/get queries always enforce the key's namespace and access-level ceiling. Tombstones are never disclosed. Trace detail labels scores as recorded retrieval evidence and omits inaccessible, expired, deleted, or superseded memory summaries.
 
 ## Screens
 
-- **Overview** — accessible count/capabilities, or global statistics for an admin.
-- **Memories** — server-paginated filtering and allowlisted sorting; inspect provenance; edit/delete when permitted.
+- **Overview** — accessible count/capabilities, or global statistics for an admin. With the [durable ingestion queue](ingestion-queue.md), admins also see an "Ingestion queue" panel (gate, queued count, oldest pending age, next retry, worker pause state and heartbeat, per-status, per-category and attempts tables, inline fast-path counters) with pause/resume and requeue-by-id controls when the key also has `write`.
+- **Memories** — server-paginated filtering and allowlisted sorting; inspect provenance; edit/delete when permitted. With the ingestion queue on, cards show a state badge for `queued`, `deduplicated`, `embedding_failed` and `cancelled` rows, and the inspect dialog adds an Ingestion table plus a "Requeue embedding" button for failed or cancelled rows.
 - **Search** — debounced hybrid search with stale-request cancellation.
 - **Recall traces** — query, agent/session/timing, result order, stored score components, and accessible result summaries.
 - **Media** — date/service-capable API aggregates for events, listening duration, services, artists, albums, tracks, and UTC days.

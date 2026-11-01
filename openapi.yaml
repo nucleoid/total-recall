@@ -59,6 +59,10 @@ paths:
         document records/topology, retrieval counters, and local foreign keys
         are omitted. Normal rows are the default. Including sensitive or secret
         rows requires both query flags and a key whose access ceiling permits them.
+        When the durable ingestion queue is enabled, rows accepted but not yet
+        embedded are exported like any other row and carry an additive
+        content-free ingestion_state (queued, ready, deduplicated,
+        embedding_failed or cancelled); import re-embeds every record regardless.
       parameters:
         - name: namespace
           in: query
@@ -371,6 +375,99 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalError"
+  /api/ingestion/stats:
+    get:
+      operationId: getIngestionStats
+      summary: Return content-free durable ingestion queue statistics
+      description: >-
+        Requires admin and read permissions. Aggregates the memory_ingestion_jobs
+        rows visible to the key's namespaces: depth per status, oldest pending
+        age, attempts histogram, next retry, failure categories, this API
+        process's inline fast-path counters, and the worker pause flag and
+        heartbeat. Never includes memory content. Available whether or not
+        MEMORY_INGESTION_QUEUE_ENABLED is on so an operator can watch a drain;
+        enabled reports the gate.
+      responses:
+        "200":
+          description: Ingestion queue statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestionStats"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/ingestion/jobs/{id}/requeue:
+    parameters:
+      - $ref: "#/components/parameters/MemoryId"
+    post:
+      operationId: requeueIngestionJob
+      summary: Requeue a failed or cancelled ingestion job
+      description: >-
+        Requires admin and write permissions. Resets the embedding_failed or
+        cancelled job of the given memory id to pending with zero attempts so
+        the worker retries it, and writes a content-free ingestion.requeue audit
+        row in the same transaction. A job that is queued, ready or deduplicated
+        returns 409 with code ingestion_job_state_conflict; a memory with no
+        visible job returns 404 with code ingestion_job_not_found.
+      responses:
+        "200":
+          description: The job was reset to pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestionRequeueResponse"
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/ingestion/pause:
+    post:
+      operationId: pauseIngestion
+      summary: Pause the ingestion worker
+      description: >-
+        Requires admin and write permissions. Sets the instance-wide
+        ingestion_paused flag; a running worker stops claiming jobs at its next
+        poll while in-flight jobs finish. Durable acceptance and the inline fast
+        path in the API are unaffected. Audited as ingestion.pause.
+      responses:
+        "200":
+          description: The new pause state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestionPauseState"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/ingestion/resume:
+    post:
+      operationId: resumeIngestion
+      summary: Resume the ingestion worker
+      description: >-
+        Requires admin and write permissions. Clears the instance-wide
+        ingestion_paused flag so a running worker resumes claiming jobs at its
+        next poll. Audited as ingestion.resume.
+      responses:
+        "200":
+          description: The new pause state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestionPauseState"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /api/agents:
     get:
       operationId: listAgents
@@ -1098,6 +1195,19 @@ components:
           type: [string, "null"]
           format: date-time
           description: Database-computed logical expiry, or null for permanent memory.
+        state:
+          type: string
+          enum: [ready, queued]
+          description: >-
+            Present only when the durable ingestion queue (MEMORY_INGESTION_QUEUE_ENABLED) is on.
+            ready means the embedding landed in this request and created/deduplicated/similarity are
+            final. queued means the memory was durably accepted under the returned id and the ingestion
+            worker will embed it; until then it is recallable, listable and full-text searchable but not
+            semantically ranked, and created is true with deduplicated false.
+        accepted_at:
+          type: string
+          format: date-time
+          description: When the memory was durably accepted; present whenever state is present.
     StoreDocumentRequest:
       type: object
       required: [title, content]
@@ -1241,6 +1351,54 @@ components:
           oneOf:
             - $ref: "#/components/schemas/MemoryProvenance"
             - type: "null"
+        ingestion:
+          oneOf:
+            - $ref: "#/components/schemas/MemoryIngestion"
+            - type: "null"
+    MemoryIngestion:
+      type: object
+      description: >-
+        Content-free durable-ingestion status. Present on recall, list and
+        search rows only while MEMORY_INGESTION_QUEUE_ENABLED is on; absent
+        otherwise. null means the row carries a vector and has no visible queue
+        history. queued collapses pending, processing and retry_wait: the memory
+        is recallable, listable and full-text searchable but not yet
+        semantically ranked. The memory's owner and admins receive every
+        property; another reader in the namespace receives state only. A
+        deduplicated status appears when recalling the id of a queued memory that
+        merged into canonical_memory_id at finalization; the returned row is the
+        canonical memory.
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [queued, ready, deduplicated, embedding_failed, cancelled]
+        accepted_at:
+          type: string
+          format: date-time
+          description: When the memory was durably accepted.
+        ready_at:
+          type: [string, "null"]
+          format: date-time
+          description: When the embedding landed or the job deduplicated.
+        attempts:
+          type: integer
+          minimum: 0
+          description: Worker embedding attempts so far; the inline fast path never counts.
+        next_retry_at:
+          type: [string, "null"]
+          format: date-time
+          description: Scheduled retry while the job waits out a provider failure.
+        failure_category:
+          type: [string, "null"]
+          enum: [transient, rate_limited, provider_auth, input_rejected, space_mismatch, expired, null]
+        canonical_memory_id:
+          type: [string, "null"]
+          format: uuid
+          description: The memory that absorbed this one when the job deduplicated.
+        similarity:
+          type: [number, "null"]
+          description: Cosine similarity to canonical_memory_id when the job deduplicated.
     MemoryProvenance:
       type: object
       description: Verifiable stored origin, not a trust assertion. Agent labels are client supplied.
@@ -1429,6 +1587,10 @@ components:
           oneOf:
             - $ref: "#/components/schemas/MemoryProvenance"
             - type: "null"
+        ingestion:
+          oneOf:
+            - $ref: "#/components/schemas/MemoryIngestion"
+            - type: "null"
     Stats:
       type: object
       required: [total_memories, by_namespace, by_source, total_documents, oldest_memory, newest_memory]
@@ -1467,6 +1629,117 @@ components:
         newest_memory:
           type: [string, "null"]
           format: date-time
+        ingestion:
+          $ref: "#/components/schemas/IngestionQueueStats"
+          description: >-
+            Content-free durable ingestion queue aggregates. Present only while
+            MEMORY_INGESTION_QUEUE_ENABLED is on; absent otherwise.
+    IngestionQueueStats:
+      type: object
+      description: >-
+        Content-free aggregates over the memory_ingestion_jobs rows visible to
+        the caller's namespaces. The job table carries no memory content, so
+        nothing here can leak it.
+      required: [depth, queued, oldest_pending_age_seconds, next_retry_at, attempts_histogram, failure_categories, inline, worker]
+      properties:
+        depth:
+          type: object
+          description: Job count per queue status.
+          required: [pending, processing, retry_wait, ready, deduplicated, embedding_failed, cancelled]
+          properties:
+            pending: { type: integer, minimum: 0 }
+            processing: { type: integer, minimum: 0 }
+            retry_wait: { type: integer, minimum: 0 }
+            ready: { type: integer, minimum: 0 }
+            deduplicated: { type: integer, minimum: 0 }
+            embedding_failed: { type: integer, minimum: 0 }
+            cancelled: { type: integer, minimum: 0 }
+        queued:
+          type: integer
+          minimum: 0
+          description: pending + processing + retry_wait.
+        oldest_pending_age_seconds:
+          type: [number, "null"]
+          minimum: 0
+          description: Age of the oldest accepted job still queued; null when nothing is queued.
+        next_retry_at:
+          type: [string, "null"]
+          format: date-time
+          description: Earliest scheduled retry among retry_wait jobs.
+        attempts_histogram:
+          type: array
+          description: Worker attempt counts over queued and embedding_failed jobs.
+          items:
+            type: object
+            required: [attempts, count]
+            properties:
+              attempts: { type: integer, minimum: 0 }
+              count: { type: integer, minimum: 0 }
+        failure_categories:
+          type: object
+          description: Jobs currently waiting out, failed on, or cancelled for each failure category.
+          required: [transient, rate_limited, provider_auth, input_rejected, space_mismatch, expired]
+          properties:
+            transient: { type: integer, minimum: 0 }
+            rate_limited: { type: integer, minimum: 0 }
+            provider_auth: { type: integer, minimum: 0 }
+            input_rejected: { type: integer, minimum: 0 }
+            space_mismatch: { type: integer, minimum: 0 }
+            expired: { type: integer, minimum: 0 }
+        inline:
+          type: object
+          description: >-
+            Inline fast-path counters for the API process that answered, since
+            it started. Not durable and not summed across instances.
+          required: [attempted, ready, deduplicated, queued]
+          properties:
+            attempted: { type: integer, minimum: 0 }
+            ready: { type: integer, minimum: 0 }
+            deduplicated: { type: integer, minimum: 0 }
+            queued: { type: integer, minimum: 0 }
+        worker:
+          type: object
+          required: [paused, last_seen_at]
+          properties:
+            paused:
+              type: boolean
+              description: The instance-wide pause flag the worker checks before each poll.
+            last_seen_at:
+              type: [string, "null"]
+              format: date-time
+              description: Last worker heartbeat; null when no worker has ever polled.
+    IngestionStats:
+      allOf:
+        - $ref: "#/components/schemas/IngestionQueueStats"
+        - type: object
+          required: [enabled]
+          properties:
+            enabled:
+              type: boolean
+              description: Whether MEMORY_INGESTION_QUEUE_ENABLED is on for the API process that answered.
+    IngestionRequeueResponse:
+      type: object
+      required: [memory_id, namespace, status, previous_status, previous_attempts, requeued_at]
+      properties:
+        memory_id: { type: string, format: uuid }
+        namespace: { type: string }
+        status:
+          type: string
+          const: pending
+          description: The job's state after the reset.
+        previous_status:
+          type: string
+          enum: [embedding_failed, cancelled]
+        previous_attempts:
+          type: integer
+          minimum: 0
+          description: Worker attempts before the reset; the counter restarts at zero.
+        requeued_at: { type: string, format: date-time }
+    IngestionPauseState:
+      type: object
+      required: [paused]
+      properties:
+        paused: { type: boolean }
     AgentRegistration:
       type: object
       required: [name]

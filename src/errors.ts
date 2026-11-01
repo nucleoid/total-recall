@@ -67,6 +67,28 @@ export class MemoryConflictError extends Error {
   }
 }
 
+export class IngestionJobNotFoundError extends Error {
+  readonly statusCode = 404;
+  readonly code = 'ingestion_job_not_found';
+
+  constructor() {
+    super('Ingestion job not found or access denied');
+    this.name = 'IngestionJobNotFoundError';
+  }
+}
+
+export class IngestionJobStateConflictError extends Error {
+  readonly statusCode = 409;
+  readonly code = 'ingestion_job_state_conflict';
+  readonly status: string;
+
+  constructor(status: string) {
+    super(`Ingestion job in state '${status}' cannot be requeued`);
+    this.name = 'IngestionJobStateConflictError';
+    this.status = status;
+  }
+}
+
 export function isPublicApiError(error: unknown): error is Error & { statusCode: number; code: string } {
   if (!(error instanceof Error)) return false;
   const candidate = error as Error & { statusCode?: unknown; code?: unknown };

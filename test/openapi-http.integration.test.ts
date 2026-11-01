@@ -34,6 +34,10 @@ test('health is public while every documented API operation requires bearer auth
     ['post', '/api/transfer/import'],
     ['delete', '/api/memories'],
     ['get', '/api/stats'],
+    ['get', '/api/ingestion/stats'],
+    ['post', '/api/ingestion/jobs/00000000-0000-4000-8000-000000000001/requeue'],
+    ['post', '/api/ingestion/pause'],
+    ['post', '/api/ingestion/resume'],
     ['get', '/api/agents'],
     ['post', '/api/agents'],
     ['get', '/api/traces'],
@@ -54,6 +58,10 @@ test('global observability and media administration require explicit admin permi
   setServerTestOverrides({ validateKey: async () => auth(['read', 'write', 'delete']) });
   const operations: Array<['get' | 'post', string]> = [
     ['get', '/api/stats'],
+    ['get', '/api/ingestion/stats'],
+    ['post', '/api/ingestion/jobs/00000000-0000-4000-8000-000000000001/requeue'],
+    ['post', '/api/ingestion/pause'],
+    ['post', '/api/ingestion/resume'],
     ['get', '/api/agents'],
     ['post', '/api/agents'],
     ['get', '/api/traces'],

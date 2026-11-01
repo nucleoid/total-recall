@@ -103,7 +103,10 @@ test('representative runtime response fixtures satisfy the published schemas', a
   const now = '2026-07-16T00:00:00.000Z';
   const fixtures: Record<string, unknown> = {
     Health: { status: 'ok', version: '1.0.0' },
-    StoreResponse: { id, namespace: 'shared', created: true, deduplicated: false, expires_at: null, idempotency_key_honored: true },
+    StoreResponse: {
+      id, namespace: 'shared', created: true, deduplicated: false, expires_at: null, idempotency_key_honored: true,
+      state: 'queued', accepted_at: now,
+    },
     StoreDocumentResponse: { id, chunks: 2 },
     ForgetResponse: { forgotten: [id], count: 1 },
     Stats: {
@@ -113,7 +116,35 @@ test('representative runtime response fixtures satisfy the published schemas', a
       total_documents: 0,
       oldest_memory: now,
       newest_memory: now,
+      ingestion: {
+        depth: { pending: 2, processing: 1, retry_wait: 1, ready: 40, deduplicated: 3, embedding_failed: 1, cancelled: 0 },
+        queued: 4, oldest_pending_age_seconds: 125.5, next_retry_at: now,
+        attempts_histogram: [{ attempts: 0, count: 2 }, { attempts: 3, count: 2 }],
+        failure_categories: { transient: 1, rate_limited: 0, provider_auth: 0, input_rejected: 1, space_mismatch: 0, expired: 0 },
+        inline: { attempted: 10, ready: 8, deduplicated: 1, queued: 1 },
+        worker: { paused: false, last_seen_at: now },
+      },
     },
+    IngestionQueueStats: {
+      depth: { pending: 0, processing: 0, retry_wait: 0, ready: 0, deduplicated: 0, embedding_failed: 0, cancelled: 0 },
+      queued: 0, oldest_pending_age_seconds: null, next_retry_at: null, attempts_histogram: [],
+      failure_categories: { transient: 0, rate_limited: 0, provider_auth: 0, input_rejected: 0, space_mismatch: 0, expired: 0 },
+      inline: { attempted: 0, ready: 0, deduplicated: 0, queued: 0 },
+      worker: { paused: false, last_seen_at: null },
+    },
+    IngestionStats: {
+      enabled: true,
+      depth: { pending: 2, processing: 1, retry_wait: 1, ready: 40, deduplicated: 3, embedding_failed: 1, cancelled: 0 },
+      queued: 4, oldest_pending_age_seconds: 7200, next_retry_at: now,
+      attempts_histogram: [{ attempts: 0, count: 2 }, { attempts: 1, count: 1 }, { attempts: 12, count: 1 }],
+      failure_categories: { transient: 1, rate_limited: 0, provider_auth: 0, input_rejected: 1, space_mismatch: 0, expired: 0 },
+      inline: { attempted: 10, ready: 8, deduplicated: 1, queued: 1 },
+      worker: { paused: true, last_seen_at: now },
+    },
+    IngestionRequeueResponse: {
+      memory_id: id, namespace: 'shared', status: 'pending', previous_status: 'embedding_failed', previous_attempts: 12, requeued_at: now,
+    },
+    IngestionPauseState: { paused: true },
     Agent: {
       id, name: 'test', type: 'llm', model: null, runtime: null,
       parent_agent_id: null, api_key_id: id, metadata: {}, first_seen_at: now,
@@ -138,6 +169,22 @@ test('representative runtime response fixtures satisfy the published schemas', a
       supersedes_id: null, superseded_at: null, superseded_by_id: null,
       is_superseded: false, revision: 0, vec_score: null, text_score: 0.8,
       base_score: 1.1, relevance: 1, final_score: 1.1,
+      ingestion: { state: 'queued' },
+    },
+    MemoryRecord: {
+      id, content: 'remember this', source: 'test', namespace: 'shared', tags: ['test'], metadata: {},
+      access_level: 'normal', client_id: id, agent_id: null, session_id: null, document_id: null, chunk_index: null,
+      created_at: now, updated_at: now, accessed_at: now, access_count: 0, relevance_score: 1,
+      memory_kind: 'semantic', valid_from: now, valid_to: null, supersedes_id: null, superseded_at: null,
+      revision: 0, expires_at: null, consolidated_into_id: null, provenance: null,
+      ingestion: {
+        state: 'deduplicated', accepted_at: now, ready_at: now, attempts: 1, next_retry_at: null,
+        failure_category: null, canonical_memory_id: id, similarity: 0.97,
+      },
+    },
+    MemoryIngestion: {
+      state: 'embedding_failed', accepted_at: now, ready_at: null, attempts: 12, next_retry_at: null,
+      failure_category: 'transient', canonical_memory_id: null, similarity: null,
     },
     MediaEvent: {
       id, service: 'spotify', source_id: 'default', event_key: 'play:track:1', service_id: 'track:1', event_type: 'play', title: 'Song',
@@ -153,4 +200,15 @@ test('representative runtime response fixtures satisfy the published schemas', a
     const validate = ajv.compile(dereferenced.components.schemas[name]);
     assert.equal(validate(fixture), true, `${name}: ${ajv.errorsText(validate.errors)}`);
   }
+
+  // The gate-off memory_stats shape (no ingestion block) remains valid, and the
+  // queue schemas reject the states a client must never see.
+  const { ingestion: _ingestion, ...gateOffStats } = fixtures.Stats as Record<string, unknown>;
+  assert.equal(ajv.compile(dereferenced.components.schemas.Stats)(gateOffStats), true);
+  const validateRequeue = ajv.compile(dereferenced.components.schemas.IngestionRequeueResponse);
+  assert.equal(validateRequeue({ ...(fixtures.IngestionRequeueResponse as object), previous_status: 'ready' }), false);
+  assert.equal(validateRequeue({ ...(fixtures.IngestionRequeueResponse as object), status: 'ready' }), false);
+  const validateStats = ajv.compile(dereferenced.components.schemas.IngestionStats);
+  const { enabled: _enabled, ...withoutGate } = fixtures.IngestionStats as Record<string, unknown>;
+  assert.equal(validateStats(withoutGate), false, 'the REST response always reports the gate');
 });

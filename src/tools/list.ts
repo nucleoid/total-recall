@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
-import type { AuthContext } from '../types.js';
+import type { AuthContext, ListResult, RecalledMemory } from '../types.js';
 import { accessLevelSql, checkPermission, filterNamespaces } from '../auth.js';
 import { logAudit } from '../audit.js';
+import { ingestionQueueEnabled, ingestionStatusJoinSql, ingestionStatusSelectSql } from '../ingestion.js';
 
 export const listSchema = z.object({
   namespace: z.string().optional(),
@@ -15,7 +16,7 @@ export const listSchema = z.object({
 export async function memoryList(
   params: z.infer<typeof listSchema>,
   auth: AuthContext
-) {
+): Promise<ListResult> {
   checkPermission(auth, 'read');
 
   const allowedNamespaces = filterNamespaces(
@@ -67,7 +68,14 @@ export async function memoryList(
   values.push(params.limit);
   values.push(params.offset);
 
-  const res = await queryScoped(
+  // Only while the durable ingestion queue is on: the content-free status
+  // column and its LEFT JOIN. Off, the page query is byte-for-byte the
+  // pre-queue statement. RLS hides other owners' job rows.
+  const queueEnabled = ingestionQueueEnabled();
+  const ingestionSelect = queueEnabled ? `,\n            ${ingestionStatusSelectSql('m')} AS ingestion` : '';
+  const ingestionJoin = queueEnabled ? `\n     ${ingestionStatusJoinSql('m')}` : '';
+
+  const res = await queryScoped<RecalledMemory>(
     scope,
     `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.document_id,
             m.chunk_index, m.created_at, m.updated_at, m.memory_kind, m.valid_from, m.valid_to,
@@ -95,9 +103,9 @@ export async function memoryList(
                AND successor.namespace = m.namespace
                AND successor.namespace = ANY($1)
                AND ${accessLevelSql('successor.access_level', '$2')}
-             LIMIT 1) AS superseded_by_id
+             LIMIT 1) AS superseded_by_id${ingestionSelect}
      FROM memories m
-     LEFT JOIN agents a ON a.id = m.agent_id
+     LEFT JOIN agents a ON a.id = m.agent_id${ingestionJoin}
      WHERE ${where}
      ORDER BY m.created_at DESC
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,

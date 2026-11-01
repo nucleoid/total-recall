@@ -32,6 +32,21 @@ class StatsPool {
         if (text.includes("attname = 'consolidated_into_id'")) {
           return rows([{ present: true }]);
         }
+        if (text.includes('FROM memory_ingestion_jobs GROUP BY status')) {
+          return rows([{ status: 'pending', count: 2 }, { status: 'embedding_failed', count: '1' }]);
+        }
+        if (text.includes('oldest_pending_age_seconds')) {
+          return rows([{ oldest_pending_age_seconds: '90.25', next_retry_at: null }]);
+        }
+        if (text.includes('GROUP BY attempts')) {
+          return rows([{ attempts: 0, count: 2 }, { attempts: '12', count: 1 }]);
+        }
+        if (text.includes('GROUP BY failure_category')) {
+          return rows([{ failure_category: 'input_rejected', count: 1 }]);
+        }
+        if (text.includes('FROM instance_settings')) {
+          return rows([{ ingestion_paused: false, ingestion_worker_seen_at: new Date('2026-09-12T01:02:03.000Z') }]);
+        }
         if (text.includes('WITH grouped AS')) {
           return rows([{
             total: '7',
@@ -123,6 +138,49 @@ test('memoryStats checks both admin and read permissions before checking out a c
   await assert.rejects(memoryStats({}, { ...auth, permissions: ['read'] }), /requires 'admin'/);
   await assert.rejects(memoryStats({}, { ...auth, permissions: ['admin'] }), /requires 'read'/);
   assert.equal(pool.connectCount, 0);
+});
+
+test('memoryStats adds a content-free ingestion block only while the queue gate is on', async t => {
+  const previousGate = process.env.MEMORY_INGESTION_QUEUE_ENABLED;
+  t.after(() => {
+    if (previousGate === undefined) delete process.env.MEMORY_INGESTION_QUEUE_ENABLED;
+    else process.env.MEMORY_INGESTION_QUEUE_ENABLED = previousGate;
+  });
+
+  delete process.env.MEMORY_INGESTION_QUEUE_ENABLED;
+  const offPool = new StatsPool();
+  setPoolForTesting(offPool as unknown as pg.Pool);
+  const off = await memoryStats({}, auth);
+  assert.equal('ingestion' in off, false, 'gate off: the response shape is unchanged');
+  assert.equal(offPool.calls.some(call => /memory_ingestion_jobs|instance_settings/.test(call.text)), false, 'gate off: no queue table traffic');
+
+  process.env.MEMORY_INGESTION_QUEUE_ENABLED = 'true';
+  const onPool = new StatsPool();
+  setPoolForTesting(onPool as unknown as pg.Pool);
+  const on = await memoryStats({}, auth);
+  assert.deepEqual(Object.keys(on), ['total_memories', 'by_namespace', 'by_source', 'total_documents', 'oldest_memory', 'newest_memory', 'ingestion']);
+  assert.equal(on.total_memories, 7);
+  assert.deepEqual(on.ingestion, {
+    depth: { pending: 2, processing: 0, retry_wait: 0, ready: 0, deduplicated: 0, embedding_failed: 1, cancelled: 0 },
+    queued: 2,
+    oldest_pending_age_seconds: 90.25,
+    next_retry_at: null,
+    attempts_histogram: [{ attempts: 0, count: 2 }, { attempts: 12, count: 1 }],
+    failure_categories: { transient: 0, rate_limited: 0, provider_auth: 0, input_rejected: 1, space_mismatch: 0, expired: 0 },
+    inline: { attempted: 0, ready: 0, deduplicated: 0, queued: 0 },
+    worker: { paused: false, last_seen_at: new Date('2026-09-12T01:02:03.000Z') },
+  });
+  assert.equal(onPool.connectCount, 1, 'the queue aggregates ride the same scoped checkout');
+  assert.equal(onPool.releaseCount, 1);
+  const queueCalls = onPool.calls.filter(call => /memory_ingestion_jobs|instance_settings/.test(call.text));
+  assert.equal(queueCalls.length, 5);
+  for (const call of queueCalls) {
+    assert.doesNotMatch(call.text, /\bcontent\b|\bmemories\b|source_key|lease_token/);
+  }
+  const audits = onPool.calls.filter(call => call.text.includes('INSERT INTO audit_log'));
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].params?.[1], 'memory.stats');
+  assert.ok(onPool.calls.indexOf(queueCalls[0]) < onPool.calls.indexOf(audits[0]), 'aggregates precede the audit row inside the transaction');
 });
 
 test('concurrent memoryStats requests each use one checkout and one aggregate', async () => {

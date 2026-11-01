@@ -22,6 +22,16 @@ const offsetDateTime = z.string().datetime({ offset: true });
 const nullableDateTime = offsetDateTime.nullable();
 const uuid = z.string().uuid();
 
+/**
+ * Additive, optional, content-free hint about the source row's durable
+ * ingestion job. It never carries a vector: an import re-embeds every record
+ * with the destination profile regardless of this value, and it is excluded
+ * from the record fingerprint. The field is absent when the source instance
+ * does not run the ingestion queue.
+ */
+export const TRANSFER_INGESTION_STATES = ['queued', 'ready', 'deduplicated', 'embedding_failed', 'cancelled'] as const;
+export type TransferIngestionState = typeof TRANSFER_INGESTION_STATES[number];
+
 export const transferManifestSchema = z.object({
   type: z.literal('manifest'),
   format: z.literal(TRANSFER_FORMAT_NAME),
@@ -67,6 +77,7 @@ export const transferMemoryRecordSchema = z.object({
   expires_at: nullableDateTime.optional().default(null),
   origin_namespace: z.string().min(1).max(TEXT_FIELD_MAX_CHARS).nullable().optional().default(null),
   insight_content_hash: z.string().regex(/^[0-9a-f]{64}$/).nullable().optional().default(null),
+  ingestion_state: z.enum(TRANSFER_INGESTION_STATES).nullable().optional(),
   provenance: provenanceSchema,
 }).passthrough().superRefine((record, ctx) => {
   for (const field of FORBIDDEN_PORTABILITY_FIELDS) {

@@ -6,6 +6,7 @@ import {
   memoriesQuerySchema,
 } from '../src/http-schemas.js';
 import { toApiDateTime } from '../dashboard/api.js';
+import { INGESTION_FAILURE_CATEGORIES, INGESTION_JOB_STATUSES } from '../src/ingestion.js';
 
 const id = '00000000-0000-4000-8000-000000000001';
 
@@ -65,6 +66,44 @@ test('dashboard client keeps bearer keys out of durable and injectable surfaces'
 test('dashboard stylesheet preserves the hidden state against authored display rules', async () => {
   const styles = await readFile(new URL('../dashboard/styles.css', import.meta.url), 'utf8');
   assert.match(styles, /\[hidden\]\s*\{\s*display:\s*none\s*!important;\s*\}/);
+});
+
+test('dashboard ingestion queue panel is admin-gated, mirrors the server state vocabulary, and uses same-origin typed helpers', async () => {
+  const [api, app, types] = await Promise.all([
+    readFile(new URL('../dashboard/api.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../dashboard/app.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../dashboard/types.ts', import.meta.url), 'utf8'),
+  ]);
+  // Typed helpers are the only way the panel talks to the queue endpoints.
+  assert.match(api, /export function getIngestionStats\(/);
+  assert.match(api, /'\/api\/ingestion\/stats'/);
+  assert.match(api, /paused \? '\/api\/ingestion\/pause' : '\/api\/ingestion\/resume'/);
+  assert.match(api, /`\/api\/ingestion\/jobs\/\$\{encodeURIComponent\(memoryId\)\}\/requeue`/);
+  assert.doesNotMatch(app, /'\/api\/ingestion\//);
+  assert.match(types, /export interface IngestionStats \{/);
+  assert.match(types, /export interface IngestionRequeueResult \{/);
+
+  // The panel renders only inside the admin branch of the overview, and every
+  // mutation is additionally gated on write permission.
+  const overview = app.slice(app.indexOf('async function renderOverview('), app.indexOf('function table('));
+  assert.match(overview, /if \(capabilities\?\.capabilities\.admin\) \{[\s\S]*ingestionQueuePanel\(\)[\s\S]*\} else \{/);
+  assert.match(app, /function canOperateIngestion\(\): boolean \{\s*return Boolean\(capabilities\?\.capabilities\.admin && capabilities\.capabilities\.write\);/);
+  const panel = app.slice(app.indexOf('const INGESTION_STATUSES'), app.indexOf('const INGESTION_LABELS'));
+  assert.ok(panel.includes('function ingestionQueuePanel('), 'the panel code sits between its vocabulary constants and the badge labels');
+  assert.match(panel, /if \(canOperateIngestion\(\)\) \{[\s\S]*setIngestionPaused\(!stats\.worker\.paused\)[\s\S]*requeueIngestionJob\(input\.value\.trim\(\)\)/);
+  assert.match(panel, /Pause, resume, and requeue require an admin key with write permission\./);
+  assert.match(app, /\(ingestionState === 'embedding_failed' \|\| ingestionState === 'cancelled'\) && canOperateIngestion\(\)/);
+
+  // The dashboard vocabulary is the server's, so a new status or category cannot silently vanish from the panel.
+  for (const status of INGESTION_JOB_STATUSES) assert.match(panel, new RegExp(`'${status}'`), status);
+  for (const category of INGESTION_FAILURE_CATEGORIES) assert.match(panel, new RegExp(`'${category}'`), category);
+
+  // Content-free: the panel reads queue aggregates, worker health and the gate, never memory fields.
+  for (const field of ['stats.enabled', 'stats.queued', 'stats.oldest_pending_age_seconds', 'stats.next_retry_at', 'stats.worker.paused', 'stats.worker.last_seen_at', 'stats.depth[', 'stats.failure_categories[']) {
+    assert.ok(panel.includes(field), field);
+  }
+  assert.doesNotMatch(panel, /\.content\b|\.tags\b|\.metadata\b/);
+  assert.doesNotMatch(panel, /innerHTML|insertAdjacentHTML|outerHTML/);
 });
 
 test('dashboard exposes readable agent provenance, stable GUIDs, and bounded navigation', async () => {

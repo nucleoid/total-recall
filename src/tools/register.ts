@@ -68,7 +68,10 @@ const TOOL_DEFINITIONS = [
       'Store a memory with automatic embedding generation. Near-duplicates in the same namespace, ' +
       'access level, and embedding space reuse and boost the canonical memory by default; the result ' +
       'reports created/deduplicated and similarity. Optional ttl is a positive integer lifetime in seconds; ' +
-      'expiring writes bypass semantic dedupe and return their database-computed expires_at. For accurate provenance, pass agent_name identifying ' +
+      'expiring writes bypass semantic dedupe and return their database-computed expires_at. When the durable ingestion queue is enabled, ' +
+      'the result also reports state and accepted_at: "ready" means the embedding landed in this request; "queued" means the memory was ' +
+      'durably accepted under the returned id and the ingestion worker will embed it (recallable and full-text searchable meanwhile, ' +
+      'not semantically ranked until then). For accurate provenance, pass agent_name identifying ' +
       'the agent storing this memory (e.g. "openclaw", "cursor-dev"). When omitted, the API key name is used as a fallback.',
     inputSchema: {
       type: 'object' as const,
@@ -184,7 +187,9 @@ const TOOL_DEFINITIONS = [
     description:
       'Hybrid vector + full-text search across memories. ' +
       'For accurate provenance and recall trace logging, pass agent_name identifying the agent ' +
-      'performing the search. When omitted, the API key name is used as a fallback. Each result includes structured provenance; it reports origin and same-key status, not trust.',
+      'performing the search. When omitted, the API key name is used as a fallback. Each result includes structured provenance; it reports origin and same-key status, not trust. ' +
+      'When the durable ingestion queue is enabled, each result also carries a content-free ingestion object (state queued, ready, deduplicated, embedding_failed or cancelled, with timing and retry details for the owner) or null; ' +
+      'queued memories match full-text only until their embedding lands.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -225,7 +230,9 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_recall',
-    description: 'Recall a specific memory by ID, or all chunks of a document by document_id. Results include structured origin provenance; client-supplied agent labels are not trust assertions.',
+    description: 'Recall a specific memory by ID, or all chunks of a document by document_id. Results include structured origin provenance; client-supplied agent labels are not trust assertions. ' +
+      'When the durable ingestion queue is enabled, each row carries a content-free ingestion object (state, accepted_at, ready_at, attempts, next_retry_at, failure_category, canonical_memory_id, similarity for the owner; state only for other readers) or null. ' +
+      'Recalling the id of a queued memory that deduplicated at finalization returns the canonical memory with ingestion.state deduplicated.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -236,7 +243,8 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_list',
-    description: 'List and browse memories with filters (no vector search). Supports pagination and returns structured origin provenance.',
+    description: 'List and browse memories with filters (no vector search). Supports pagination and returns structured origin provenance. ' +
+      'When the durable ingestion queue is enabled, each memory carries a content-free ingestion object (or null) describing whether its embedding is queued, ready or failed.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -303,7 +311,11 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_stats',
-    description: 'Get statistics about the memory store (admin-only).',
+    description:
+      'Get statistics about the memory store (admin-only). ' +
+      'When the durable ingestion queue is enabled the result adds a content-free ingestion block: ' +
+      'queue depth per status, oldest pending age, attempts histogram, next retry, failure categories, ' +
+      'inline fast-path counters, and the worker pause flag and heartbeat.',
     inputSchema: {
       type: 'object' as const,
       properties: {},

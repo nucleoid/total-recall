@@ -4,6 +4,7 @@ import { accessLevelSql, checkPermission, filterNamespaces } from '../auth.js';
 import { logAudit } from '../audit.js';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
 import { TEXT_FIELD_MAX_CHARS } from '../http-limits.js';
+import { ingestionQueueEnabled, ingestionStateSelectSql, ingestionStatusJoinSql } from '../ingestion.js';
 import type { AuthContext } from '../types.js';
 import {
   createTransferManifest,
@@ -11,6 +12,7 @@ import {
   metadataWithoutTransferProvenance,
   provenanceFromStoredMetadata,
   transferMemoryRecordSchema,
+  type TransferIngestionState,
   type TransferManifest,
   type TransferMemoryRecord,
 } from './format.js';
@@ -56,6 +58,8 @@ type ExportRow = {
   expires_at: Date | string | null;
   origin_namespace: string | null;
   insight_content_hash: string | null;
+  /** Selected only while the durable ingestion queue is on. */
+  ingestion_state?: TransferIngestionState | null;
 };
 
 type CursorPayload = { v: 1; key: string; filter: string; created_at: string; id: string };
@@ -89,12 +93,20 @@ export async function exportMemoryPage(
   }
   values.push(params.limit + 1);
 
+  // Only while the durable ingestion queue is on: accepted-but-unembedded rows
+  // are exported like any other row and labelled with a content-free
+  // ingestion_state so the destination knows why no vector identity exists.
+  // Off, the statement is byte-for-byte the pre-queue query.
+  const queueEnabled = ingestionQueueEnabled();
+  const ingestionSelect = queueEnabled ? `,\n           ${ingestionStateSelectSql('m')} AS ingestion_state` : '';
+  const ingestionJoin = queueEnabled ? `\n    ${ingestionStatusJoinSql('m')}` : '';
+
   const result = await queryScoped<ExportRow>(dbScopeFromAuth(auth), `
     SELECT s.instance_id, m.id, m.source_key, m.content, m.source, m.namespace, m.tags, m.metadata,
            m.access_level, m.created_at, m.updated_at, m.event_at, m.memory_kind,
-           m.valid_from, m.valid_to, m.expires_at, m.origin_namespace, m.insight_content_hash
+           m.valid_from, m.valid_to, m.expires_at, m.origin_namespace, m.insight_content_hash${ingestionSelect}
     FROM memories m
-    CROSS JOIN instance_settings s
+    CROSS JOIN instance_settings s${ingestionJoin}
     WHERE s.singleton = true AND ${conditions.join(' AND ')}
     ORDER BY m.created_at ASC, m.id ASC
     LIMIT $${values.length}
@@ -163,6 +175,7 @@ function rowToTransferRecord(row: ExportRow, instanceId: string): TransferMemory
     expires_at: optionalInstant(row.expires_at),
     origin_namespace: row.origin_namespace,
     insight_content_hash: row.insight_content_hash,
+    ...(row.ingestion_state ? { ingestion_state: row.ingestion_state } : {}),
     provenance: provenanceFromStoredMetadata(storedMetadata, fallbackProvenance),
   });
 }

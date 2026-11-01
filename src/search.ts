@@ -13,6 +13,7 @@ import {
   supersededScoreFactorFromEnv,
   supersededSearchDemotionEnabledFromEnv,
 } from './config.js';
+import { ingestionQueueEnabled, ingestionStatusJoinSql, ingestionStatusSelectSql } from './ingestion.js';
 import type {
   AccessLevel,
   SearchExecutionOptions,
@@ -375,10 +376,16 @@ export async function executeHybridSearch(
       ? 'm.supersedes_id AS linked_supersedes_id, m.superseded_at'
       : 'NULL::uuid AS linked_supersedes_id, NULL::timestamptz AS superseded_at';
     const revisionColumn = capabilities.revision_schema ? 'm.revision' : '0::integer AS revision';
+    // Only while the durable ingestion queue is on: carry a vector-presence
+    // flag through the candidate CTEs so the final projection can attach the
+    // content-free ingestion status without re-reading the vector column.
+    // Off, the statement is byte-for-byte the pre-queue query.
+    const ingestionVisible = ingestionQueueEnabled();
+    const unembeddedColumn = ingestionVisible ? ', (embedding IS NULL) AS unembedded' : '';
     const selectedColumns = `id, content, source_key, metadata, tags, source, namespace, created_at, event_at, expires_at,
       relevance_score, relevance_base_score, decay_rate, updated_at, accessed_at, access_count,
       access_level, client_id, agent_id, embedding_provider, embedding_model, embedding_dimensions,
-      ${beliefColumns}, ${supersessionColumns}, ${revisionColumn}`;
+      ${beliefColumns}, ${supersessionColumns}, ${revisionColumn}${unembeddedColumn}`;
 
     const lifecyclePredicates = capabilities.supersession_schema
       ? ['m.superseded_at IS NULL', 'm.superseded_at IS NOT NULL']
@@ -450,6 +457,10 @@ export async function executeHybridSearch(
       : 'NULL::uuid';
 
     const pRequesterKeyId = p(scope.keyId);
+    const ingestionSelect = ingestionVisible
+      ? `,\n        ${ingestionStatusSelectSql('r', 'ij', 'r.unembedded')} AS ingestion`
+      : '';
+    const ingestionJoin = ingestionVisible ? `\n      ${ingestionStatusJoinSql('r', 'ij')}` : '';
     const sql = `
       WITH vector_results AS (
         ${vectorBranches}
@@ -501,9 +512,9 @@ export async function executeHybridSearch(
           'agent_model', a.model,
           'agent_runtime', a.runtime,
           'same_key_as_requester', COALESCE(a.api_key_id::text = ${pRequesterKeyId}, false)
-        ) END AS provenance
+        ) END AS provenance${ingestionSelect}
       FROM ranked r
-      LEFT JOIN agents a ON a.id = r.agent_id
+      LEFT JOIN agents a ON a.id = r.agent_id${ingestionJoin}
       ORDER BY final_score DESC, r.id
       LIMIT ${pLimit};
     `;

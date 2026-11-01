@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer';
 import { z } from 'zod';
 import { accessLevelSql } from './auth.js';
 import { logAudit } from './audit.js';
-import { dbScopeFromAuth, withScopedClient } from './db.js';
+import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR } from './embedding.js';
 import {
   GenerationLimitError,
@@ -108,11 +108,26 @@ export interface SemanticMemoryInsert {
   metadata: Record<string, unknown>;
   accessLevel: AccessLevel;
   clientId: string;
-  agentId: string;
+  agentId: string | null;
   sessionId: string | null;
 }
 
 export type RevisionResult = { id: string; namespace: string };
+
+export interface RevisionCommitOptions {
+  /**
+   * Finalize this already-accepted row in place (UPDATE embedding, identity,
+   * supersedes_id, memory_kind, valid_from) instead of inserting a successor.
+   * Used by deferred ingestion, where the stable id was issued at acceptance.
+   */
+  finalizeExistingId?: string;
+  /**
+   * Run the revision inside this already-scoped transaction so the predecessor
+   * closes in the same commit as the finalization. A savepoint isolates
+   * constraint conflicts so the enclosing transaction stays usable.
+   */
+  client?: ScopedClient;
+}
 
 type RuntimeState = {
   configKey: string;
@@ -544,6 +559,9 @@ export async function maybeReviseBelief(
     excludeCandidateId?: string;
     metric?: (reason: ContradictionReason) => void;
     findCandidates?: typeof findContradictionCandidates;
+    /** See RevisionCommitOptions; the finalized row is never its own candidate. */
+    finalizeExistingId?: string;
+    client?: ScopedClient;
   } = {},
 ): Promise<RevisionResult | null> {
   const policy = options.policy ?? contradictionPolicyFromEnv();
@@ -570,7 +588,7 @@ export async function maybeReviseBelief(
       memory.vector,
       memory.namespace,
       auth,
-      options.excludeCandidateId ?? null,
+      options.excludeCandidateId ?? options.finalizeExistingId ?? null,
       policy.timeoutMs,
     );
   } catch (error) {
@@ -637,7 +655,10 @@ export async function maybeReviseBelief(
 
   let result: RevisionResult | null;
   try {
-    result = await commitAutomaticRevision(memory, classification.candidate_id!, auth);
+    result = await commitAutomaticRevision(memory, classification.candidate_id!, auth, {
+      finalizeExistingId: options.finalizeExistingId,
+      client: options.client,
+    });
   } catch (error) {
     // Constraint/serialization conflicts are known rolled-back stale outcomes.
     // Do not swallow connection/commit uncertainty, which could duplicate a
@@ -658,49 +679,134 @@ export async function commitAutomaticRevision(
   memory: SemanticMemoryInsert,
   predecessorId: string,
   auth: AuthContext,
+  options: RevisionCommitOptions = {},
 ): Promise<RevisionResult | null> {
-  return withScopedClient(dbScopeFromAuth(auth), async client => {
-    const predecessor = await client.query<{ id: string }>(
+  if (!options.client) {
+    return withScopedClient(dbScopeFromAuth(auth), client =>
+      applyRevision(client, memory, predecessorId, auth, options.finalizeExistingId));
+  }
+  // Inside a caller-owned transaction a failed statement would poison every
+  // later statement, so the revision runs under a savepoint. A null outcome
+  // also rolls the savepoint back so a half-applied revision never commits.
+  const client = options.client;
+  await client.query('SAVEPOINT belief_revision');
+  let result: RevisionResult | null;
+  try {
+    result = await applyRevision(client, memory, predecessorId, auth, options.finalizeExistingId);
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK TO SAVEPOINT belief_revision');
+    } catch {
+      // The original error already describes the broken transaction.
+    }
+    throw error;
+  }
+  await client.query(result ? 'RELEASE SAVEPOINT belief_revision' : 'ROLLBACK TO SAVEPOINT belief_revision');
+  return result;
+}
+
+async function applyRevision(
+  client: ScopedClient,
+  memory: SemanticMemoryInsert,
+  predecessorId: string,
+  auth: AuthContext,
+  finalizeExistingId: string | undefined,
+): Promise<RevisionResult | null> {
+  if (finalizeExistingId !== undefined) {
+    if (finalizeExistingId === predecessorId) return null;
+    // The accepted row must still be an unembedded, unlinked current belief.
+    const pending = await client.query<{ id: string }>(
       `SELECT m.id
        FROM memories m
        WHERE m.id = $1::uuid
          AND m.namespace = $2
-         AND m.namespace = ANY($3::text[])
-         AND m.access_level = 'normal'
-         AND m.memory_kind = 'semantic'
          AND m.deleted_at IS NULL
          AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+         AND m.embedding IS NULL
+         AND m.supersedes_id IS NULL
          AND m.superseded_at IS NULL
          AND m.valid_to IS NULL
-         AND m.valid_from <= statement_timestamp()
          AND m.consolidated_into_id IS NULL
-         AND NOT EXISTS (SELECT 1 FROM memories successor WHERE successor.supersedes_id = m.id)
        FOR UPDATE`,
-      [predecessorId, memory.namespace, auth.namespaces],
+      [finalizeExistingId, memory.namespace],
     );
-    if (predecessor.rows.length !== 1) return null;
+    if (pending.rows.length !== 1) return null;
+  }
 
-    // Preserve PostgreSQL microseconds by transporting the one database clock
-    // value as text rather than through JavaScript Date's millisecond precision.
-    const clock = await client.query<{ revision_at: string }>(
-      'SELECT statement_timestamp()::text AS revision_at',
-    );
-    const revisionAt = clock.rows[0].revision_at;
-    const closed = await client.query(
+  const predecessor = await client.query<{ id: string }>(
+    `SELECT m.id
+     FROM memories m
+     WHERE m.id = $1::uuid
+       AND m.namespace = $2
+       AND m.namespace = ANY($3::text[])
+       AND m.access_level = 'normal'
+       AND m.memory_kind = 'semantic'
+       AND m.deleted_at IS NULL
+       AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+       AND m.superseded_at IS NULL
+       AND m.valid_to IS NULL
+       AND m.valid_from <= statement_timestamp()
+       AND m.consolidated_into_id IS NULL
+       AND NOT EXISTS (SELECT 1 FROM memories successor WHERE successor.supersedes_id = m.id)
+     FOR UPDATE`,
+    [predecessorId, memory.namespace, auth.namespaces],
+  );
+  if (predecessor.rows.length !== 1) return null;
+
+  // Preserve PostgreSQL microseconds by transporting the one database clock
+  // value as text rather than through JavaScript Date's millisecond precision.
+  const clock = await client.query<{ revision_at: string }>(
+    'SELECT statement_timestamp()::text AS revision_at',
+  );
+  const revisionAt = clock.rows[0].revision_at;
+  const closed = await client.query(
+    `UPDATE memories
+     SET superseded_at = $2::timestamptz,
+         valid_to = $2::timestamptz,
+         updated_at = $2::timestamptz
+     WHERE id = $1::uuid
+       AND deleted_at IS NULL
+       AND (expires_at IS NULL OR expires_at > statement_timestamp())
+       AND superseded_at IS NULL
+       AND valid_to IS NULL
+       AND consolidated_into_id IS NULL`,
+    [predecessorId, revisionAt],
+  );
+  if (closed.rowCount !== 1) return null;
+
+  let successor: RevisionResult;
+  if (finalizeExistingId !== undefined) {
+    const finalized = await client.query<RevisionResult>(
       `UPDATE memories
-       SET superseded_at = $2::timestamptz,
-           valid_to = $2::timestamptz,
-           updated_at = $2::timestamptz
+       SET embedding = $2::vector,
+           embedding_provider = $3,
+           embedding_model = $4,
+           embedding_dimensions = $5,
+           memory_kind = 'semantic',
+           valid_from = $6::timestamptz,
+           supersedes_id = $7::uuid,
+           updated_at = $6::timestamptz
        WHERE id = $1::uuid
-         AND deleted_at IS NULL
-         AND (expires_at IS NULL OR expires_at > statement_timestamp())
-         AND superseded_at IS NULL
-         AND valid_to IS NULL
-         AND consolidated_into_id IS NULL`,
-      [predecessorId, revisionAt],
+         AND namespace = $8
+       RETURNING id, namespace`,
+      [
+        finalizeExistingId,
+        memory.vector,
+        ACTIVE_EMBEDDING_DESCRIPTOR.provider,
+        ACTIVE_EMBEDDING_DESCRIPTOR.model,
+        ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
+        revisionAt,
+        predecessorId,
+        memory.namespace,
+      ],
     );
-    if (closed.rowCount !== 1) return null;
-
+    if (finalized.rows.length !== 1) {
+      // The row was locked above, so this can only be a lost connection or a
+      // concurrent lifecycle change; let the transaction roll back.
+      throw new Error('Accepted memory changed while finalizing its belief revision');
+    }
+    successor = finalized.rows[0];
+  } else {
     const inserted = await client.query<RevisionResult>(
       `INSERT INTO memories (
          content, embedding, source, namespace, tags, metadata, access_level,
@@ -729,17 +835,17 @@ export async function commitAutomaticRevision(
         predecessorId,
       ],
     );
-    const successor = inserted.rows[0];
-    await logAudit({
-      clientId: auth.keyId,
-      action: 'belief.supersede',
-      namespace: memory.namespace,
-      memoryId: successor.id,
-      agentId: memory.agentId,
-      sessionId: memory.sessionId ?? undefined,
-    }, dbScopeFromAuth(auth), client);
-    return successor;
-  });
+    successor = inserted.rows[0];
+  }
+  await logAudit({
+    clientId: auth.keyId,
+    action: 'belief.supersede',
+    namespace: memory.namespace,
+    memoryId: successor.id,
+    agentId: memory.agentId ?? undefined,
+    sessionId: memory.sessionId ?? undefined,
+  }, dbScopeFromAuth(auth), client);
+  return successor;
 }
 
 class ContradictionBudgetExhaustedError extends Error {

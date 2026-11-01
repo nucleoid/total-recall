@@ -21,6 +21,7 @@ import {
   storeDocumentSchema,
 } from './tools/store-document.js';
 import { memoryStats } from './tools/stats.js';
+import { getIngestionStats, requeueIngestion, setIngestionPausedByAdmin } from './ingestion-admin.js';
 import { memoryForget } from './tools/forget.js';
 import { memoryUpdate } from './tools/update.js';
 import { isPublicApiError } from './errors.js';
@@ -591,6 +592,7 @@ registerRestRoute(app, 'post', '/api/store', async (req, res) => {
       expires_at: result.expires_at,
       ...(result.similarity !== undefined && { similarity: result.similarity }),
       ...(result.idempotency_key_honored && { idempotency_key_honored: true }),
+      ...(result.state !== undefined && { state: result.state, accepted_at: result.accepted_at }),
     });
   } catch (err: any) {
     sendApiError(res, '/api/store', err);
@@ -681,6 +683,52 @@ registerRestRoute(app, 'get', '/api/stats', async (req, res) => {
     res.json(result);
   } catch (err: any) {
     sendApiError(res, '/api/stats', err);
+  }
+});
+
+// === Durable ingestion queue administration (content-free by construction) ===
+
+registerRestRoute(app, 'get', '/api/ingestion/stats', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'admin');
+    res.json(await getIngestionStats(auth));
+  } catch (err: any) {
+    sendApiError(res, '/api/ingestion/stats', err);
+  }
+});
+
+registerRestRoute(app, 'post', '/api/ingestion/jobs/:id/requeue', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'admin');
+    res.json(await requeueIngestion(auth, parseUuidParam(req.params.id)));
+  } catch (err: any) {
+    sendApiError(res, '/api/ingestion/jobs/:id/requeue', err);
+  }
+});
+
+registerRestRoute(app, 'post', '/api/ingestion/pause', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'admin');
+    res.json(await setIngestionPausedByAdmin(auth, true));
+  } catch (err: any) {
+    sendApiError(res, '/api/ingestion/pause', err);
+  }
+});
+
+registerRestRoute(app, 'post', '/api/ingestion/resume', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, res);
+    if (!auth) return;
+    checkPermission(auth, 'admin');
+    res.json(await setIngestionPausedByAdmin(auth, false));
+  } catch (err: any) {
+    sendApiError(res, '/api/ingestion/resume', err);
   }
 });
 
