@@ -41,6 +41,35 @@ export interface EmbeddingResult {
   dimensions: number;
 }
 
+/**
+ * A non-OK provider response. The message text is unchanged from the plain
+ * Error it replaces so existing message-based classifiers keep working; the
+ * typed fields let durable workers classify without string matching. Timeouts
+ * and aborts are deliberately not wrapped and still propagate as thrown by
+ * fetch/AbortSignal so callers can tell them apart.
+ */
+export class EmbeddingProviderError extends Error {
+  readonly status: number;
+  readonly retryAfter: string | undefined;
+  readonly provider: string;
+
+  constructor(message: string, details: { status: number; retryAfter: string | undefined; provider: string }) {
+    super(message);
+    this.name = 'EmbeddingProviderError';
+    this.status = details.status;
+    this.retryAfter = details.retryAfter;
+    this.provider = details.provider;
+  }
+}
+
+function providerError(message: string, response: Response, provider: string): EmbeddingProviderError {
+  return new EmbeddingProviderError(message, {
+    status: response.status,
+    retryAfter: response.headers.get('retry-after') ?? undefined,
+    provider,
+  });
+}
+
 type RawProfile = {
   provider?: unknown;
   model?: unknown;
@@ -219,7 +248,7 @@ async function requestProfile(profile: EmbeddingProfile, texts: string[], signal
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${profile.model}:${path}?key=${profile.apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: requestSignal,
       });
-      if (!response.ok) throw new Error(`Gemini ${path} failed (${response.status}): ${await response.text()}`);
+      if (!response.ok) throw providerError(`Gemini ${path} failed (${response.status}): ${await response.text()}`, response, 'gemini');
       const data = await response.json() as { embedding?: { values?: unknown }; embeddings?: Array<{ values?: unknown }> };
       if (!batch) return [validateEmbeddingVector(data.embedding?.values, 'Gemini scalar', profile.dimensions)];
       return validateEmbeddingBatch(data.embeddings?.map(item => item.values), texts.length, profile.dimensions);
@@ -229,7 +258,7 @@ async function requestProfile(profile: EmbeddingProfile, texts: string[], signal
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: profile.model, input: texts }), signal: requestSignal,
     });
-    if (!response.ok) throw new Error(`Ollama embed failed (${response.status}): ${await response.text()}`);
+    if (!response.ok) throw providerError(`Ollama embed failed (${response.status}): ${await response.text()}`, response, 'ollama');
     const data = await response.json() as { embeddings?: unknown };
     return validateEmbeddingBatch(data.embeddings, texts.length, profile.dimensions);
   });

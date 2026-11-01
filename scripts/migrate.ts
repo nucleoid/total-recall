@@ -121,6 +121,7 @@ const MIGRATION_OWNED_TABLES = [
   'memory_consolidation_memberships',
   'memory_consolidation_runs',
   'memory_entities',
+  'memory_ingestion_jobs',
   'memory_subscriptions',
   'memory_session_derivations',
   'memory_session_distillation_runs',

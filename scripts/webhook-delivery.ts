@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
 import { validateKeyReadOnly } from '../src/auth.js';
 import { shutdown, withScopedClient } from '../src/db.js';
+import { retryAtForAttempt } from '../src/retry.js';
 import {
   buildWebhookPayload,
   cancelUnauthorizedDelivery,
@@ -28,7 +29,8 @@ import {
 dotenv.config();
 
 export interface WebhookWorkerOptions { once: boolean; maxJobs: number; pollMs: number; concurrency: number }
-const RETRY_DELAYS_SECONDS = [60, 300, 1_800, 7_200, 43_200] as const;
+// The backoff schedule lives in src/retry.ts so other durable workers share it.
+export { retryAtForAttempt, RETRY_DELAYS_SECONDS } from '../src/retry.js';
 
 export function parseWebhookWorkerCli(args: string[], env: NodeJS.ProcessEnv = process.env): WebhookWorkerOptions {
   let once = false;
@@ -44,22 +46,6 @@ export function parseWebhookWorkerCli(args: string[], env: NodeJS.ProcessEnv = p
     else throw new Error(`Unknown webhook delivery option: ${arg}`);
   }
   return { once, maxJobs, pollMs, concurrency };
-}
-
-export function retryAtForAttempt(attempts: number, retryAfter: string | undefined, now = new Date()): Date {
-  const base = RETRY_DELAYS_SECONDS[Math.min(Math.max(attempts - 1, 0), RETRY_DELAYS_SECONDS.length - 1)];
-  let requested = 0;
-  if (retryAfter?.trim()) {
-    if (/^\d+$/.test(retryAfter.trim())) requested = Number(retryAfter.trim());
-    else {
-      const date = Date.parse(retryAfter);
-      if (Number.isFinite(date)) requested = Math.ceil((date - now.getTime()) / 1_000);
-    }
-  }
-  const delay = Math.min(43_200, Math.max(base, Number.isFinite(requested) ? requested : 0));
-  // Positive bounded jitter avoids synchronized retries without making Retry-After early.
-  const jittered = Math.min(43_200, delay + Math.floor(Math.random() * Math.max(1, delay * 0.2)));
-  return new Date(now.getTime() + jittered * 1_000);
 }
 
 export function isRetryableStatus(status: number): boolean {
