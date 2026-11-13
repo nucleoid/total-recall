@@ -537,6 +537,8 @@ export async function classifyContradiction(
 export interface BeliefRevisionOptions {
     /** Per-call execution budget; does not alter the approved runtime configuration. */
     timeoutMs?: number;
+    /** A shorter request deadline must defer mutation work rather than become no-match. */
+    throwOnTimeout?: boolean;
     policy?: ContradictionPolicy;
     provider?: GenerationProvider;
     allowMutation?: boolean;
@@ -602,7 +604,9 @@ export async function prepareBeliefRevision(
       timeoutMs,
     );
   } catch (error) {
-    metric(databaseErrorCode(error) === '57014' ? 'candidate_timeout' : 'candidate_query_error');
+    const timedOut = databaseErrorCode(error) === '57014';
+    metric(timedOut ? 'candidate_timeout' : 'candidate_query_error');
+    if (timedOut && options.throwOnTimeout) throw new DOMException('Inline classifier budget exhausted', 'TimeoutError');
     return null;
   }
   if (candidates.length === 0) {
@@ -617,6 +621,7 @@ export async function prepareBeliefRevision(
   const remainingTimeoutMs = timeoutMs - (Date.now() - classificationStartedAt);
   if (remainingTimeoutMs < 1) {
     metric('provider_timeout');
+    if (options.throwOnTimeout) throw new DOMException('Inline classifier budget exhausted', 'TimeoutError');
     return null;
   }
 
@@ -637,7 +642,10 @@ export async function prepareBeliefRevision(
     );
   } catch (error) {
     if (error instanceof ContradictionBudgetExhaustedError) metric('budget_exhausted');
-    else if (error instanceof GenerationTimeoutError) metric('provider_timeout');
+    else if (error instanceof GenerationTimeoutError) {
+      metric('provider_timeout');
+      if (options.throwOnTimeout) throw new DOMException('Inline classifier budget exhausted', 'TimeoutError');
+    }
     else if (error instanceof GenerationLimitError && error.message.includes('input exceeds')) metric('input_too_large');
     else if (error instanceof GenerationLimitError) metric('output_too_large');
     else if (error instanceof Error &&

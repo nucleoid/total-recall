@@ -52,7 +52,8 @@ export async function runIngestionWorker(options: IngestionWorkerOptions, signal
     const jobs = claims.flatMap(claim => claim.status === 'fulfilled' && claim.value ? [claim.value] : []);
     const claimFailed = claims.some(claim => claim.status === 'rejected');
     processed += jobs.length;
-    const completions = await Promise.allSettled(jobs.map(job => processIngestionJob(job, signal)));
+    // Stop new polls on SIGTERM; claimed work drains within the bounded lease/stop budget.
+    const completions = await Promise.allSettled(jobs.map(job => processIngestionJob(job)));
     if (claimFailed || completions.some(completion => completion.status === 'rejected')) {
       if (options.once) throw new Error('Ingestion poll incomplete; leases recover automatically');
       await pauseAfterFailure(); continue;

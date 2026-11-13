@@ -225,11 +225,12 @@ export async function failIngestionJob(job: IngestionJob, error: unknown): Promi
   const terminal = !job.inline && (failure.terminal || (failure.category !== 'provider_auth' && job.attempts >= max));
   const retry = budgetHandoff ? new Date() : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter);
   await withScopedClient(ownerScope(job), client => client.query(`UPDATE memory_ingestion_jobs SET
-    status = $3, failure_category = $4, last_error_code = $5, next_attempt_at = $6,
+    status = $3, failure_category = $4, last_error_code = $5,
+    next_attempt_at = CASE WHEN $8::boolean THEN statement_timestamp() ELSE $6::timestamptz END,
     finalized_at = CASE WHEN $7 THEN statement_timestamp() ELSE NULL END,
     lease_token = NULL, lease_expires_at = NULL
     WHERE memory_id = $1 AND status = 'processing' AND lease_token = $2::uuid AND lease_expires_at > statement_timestamp()`,
-  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : budgetHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal]).then(() => undefined));
+  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : budgetHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal, budgetHandoff]).then(() => undefined));
 }
 
 /** Lease row lock and token fence cover dedupe, belief mutation, vector, outbox and audit together. */
@@ -245,18 +246,26 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
   if (job.contradiction_eligible && policy.mutationEnabled &&
       embeddingIdentity(target) === embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) &&
       embeddingIdentity(target) === embeddingIdentity(embedding)) {
-    const snapshot = await withScopedClient(scope, async client => (await client.query(`SELECT m.* FROM memories m
+    const probe = await withScopedClient(scope, async client => {
+      const snapshot = (await client.query(`SELECT m.* FROM memories m
       JOIN memory_ingestion_jobs j ON j.memory_id = m.id
       WHERE m.id = $1 AND m.namespace = $2 AND m.content = $3 AND m.access_level = $4
         AND m.embedding IS NULL AND m.deleted_at IS NULL AND m.superseded_at IS NULL
         AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
         AND j.status = 'processing' AND j.lease_token = $5 AND j.lease_expires_at > statement_timestamp()`,
-      [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0]);
-    if (snapshot) {
+      [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0];
+      const match = snapshot && job.dedupe && job.ttl_seconds === null
+        ? await findIngestionDedupeCandidate(client, job, embedding, vector, false) : undefined;
+      const similarity = Number(match?.similarity ?? NaN);
+      return { snapshot, nearDuplicate: !!match && Number.isFinite(similarity) && similarity >= MEMORY_DEDUPE_THRESHOLD };
+    }, { readOnly: true });
+    const snapshot = probe.snapshot;
+    if (snapshot && !probe.nearDuplicate) {
       const remaining = options.deadlineAt === undefined ? policy.timeoutMs : options.deadlineAt - Date.now();
       if (remaining < 1) throw new DOMException('Inline budget exhausted', 'TimeoutError');
       preparedPredecessor = await (options.prepareRevision ?? prepareBeliefRevision)(semanticMemory(job, snapshot, vector), ownerAuth(job), {
-        policy, timeoutMs: Math.min(policy.timeoutMs, remaining), allowMutation: true, excludeCandidateId: job.memory_id,
+        policy, timeoutMs: Math.min(policy.timeoutMs, remaining),
+        throwOnTimeout: options.deadlineAt !== undefined && remaining < policy.timeoutMs, allowMutation: true, excludeCandidateId: job.memory_id,
       });
     }
   }
@@ -283,16 +292,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     }
     if (job.dedupe && job.ttl_seconds === null) {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`memory-store-dedupe:${JSON.stringify([job.namespace, job.access_level])}`]);
-      const match = (await client.query(`SELECT m.id, m.namespace, 1 - (m.embedding <=> $1::vector) AS similarity
-        FROM memories m WHERE m.namespace = $2 AND COALESCE(m.access_level,'normal') = $3
-          AND m.embedding IS NOT NULL AND m.embedding_provider = $4 AND m.embedding_model = $5 AND m.embedding_dimensions = $6
-          AND m.id <> $7 AND m.source_key IS NULL AND m.document_id IS NULL AND m.deleted_at IS NULL
-          AND m.expires_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
-          AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp()) AND m.consolidated_into_id IS NULL
-          AND m.memory_kind NOT IN ('document_chunk','episode_chunk')
-        ORDER BY m.embedding <=> $1::vector ASC,
-          calculate_relevance(m.relevance_base_score,m.decay_rate,m.accessed_at,m.access_count) DESC, m.created_at ASC, m.id ASC
-        LIMIT 1 FOR UPDATE`, [vector, job.namespace, job.access_level, embedding.provider, embedding.model, embedding.dimensions, job.memory_id])).rows[0];
+      const match = await findIngestionDedupeCandidate(client, job, embedding, vector, true);
       const similarity = Number(match?.similarity ?? NaN);
       const threshold = MEMORY_DEDUPE_THRESHOLD;
       if (match && Number.isFinite(similarity) && similarity >= threshold) {
@@ -338,6 +338,18 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
   }));
   if (shadow) scheduleShadowClassification(contradictionPolicyFromEnv(), shadow);
   return result;
+}
+async function findIngestionDedupeCandidate(client: ScopedClient, job: IngestionJob, embedding: EmbeddingResult, vector: string, lock: boolean) {
+  return (await client.query(`SELECT m.id, m.namespace, 1 - (m.embedding <=> $1::vector) AS similarity
+        FROM memories m WHERE m.namespace = $2 AND COALESCE(m.access_level,'normal') = $3
+          AND m.embedding IS NOT NULL AND m.embedding_provider = $4 AND m.embedding_model = $5 AND m.embedding_dimensions = $6
+          AND m.id <> $7 AND m.source_key IS NULL AND m.document_id IS NULL AND m.deleted_at IS NULL
+          AND m.expires_at IS NULL AND m.superseded_at IS NULL AND m.valid_to IS NULL
+          AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp()) AND m.consolidated_into_id IS NULL
+          AND m.memory_kind NOT IN ('document_chunk','episode_chunk')
+        ORDER BY m.embedding <=> $1::vector ASC,
+          calculate_relevance(m.relevance_base_score,m.decay_rate,m.accessed_at,m.access_count) DESC, m.created_at ASC, m.id ASC
+        LIMIT 1${lock ? ' FOR UPDATE' : ''}`, [vector, job.namespace, job.access_level, embedding.provider, embedding.model, embedding.dimensions, job.memory_id])).rows[0];
 }
 async function completeExternalEmbedding(client: ScopedClient, job: IngestionJob, memory: Record<string, any>): Promise<StoreResult | null> {
   if (memory.embedding_provider !== job.embedding_provider || memory.embedding_model !== job.embedding_model ||
