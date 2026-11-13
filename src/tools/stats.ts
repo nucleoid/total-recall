@@ -1,4 +1,5 @@
-import { ingestionEnabled, ingestionStats } from '../ingestion.js';
+import { ingestionSchemaAvailable } from '../ingestion-read.js';
+import { ingestionStats } from '../ingestion.js';
 import { z } from 'zod';
 import { dbScopeFromAuth, withScopedClient } from '../db.js';
 import type { AuthContext } from '../types.js';
@@ -117,7 +118,7 @@ export async function memoryStats(
     }, scope, client);
 
     return {
-      ...(ingestionEnabled() ? { ingestion: await ingestionStats(auth, client) } : {}),
+      ...(await ingestionSchemaAvailable(scope, client) ? { ingestion: await ingestionStats(auth, client) } : {}),
       total_memories: parseInt(stats.total, 10),
       by_namespace: stats.by_namespace,
       by_source: stats.by_source,

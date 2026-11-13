@@ -40,6 +40,13 @@ export function ingestionInteger(raw: string | undefined, fallback: number, name
 export function inlineBudgetMs(): number {
   return ingestionInteger(process.env.MEMORY_STORE_INLINE_EMBED_MS, 3000, 'MEMORY_STORE_INLINE_EMBED_MS');
 }
+export function ingestionMaxAttempts(): number {
+  return ingestionInteger(process.env.MEMORY_INGESTION_MAX_ATTEMPTS, 12, 'MEMORY_INGESTION_MAX_ATTEMPTS', 1, 1000);
+}
+export function workerIngestionLeaseMs(policy = contradictionPolicyFromEnv()): number {
+  const embeddingMs = ingestionInteger(process.env.EMBEDDING_TIMEOUT_MS, 15000, 'EMBEDDING_TIMEOUT_MS', 100, 120000);
+  return Math.max(150000, embeddingMs + (policy.mutationEnabled ? policy.timeoutMs : 0) + 30000);
+}
 function ownerScope(job: IngestionJob): DbScope { return { namespaces: [job.namespace], keyId: job.client_id }; }
 function ownerAuth(job: IngestionJob): AuthContext {
   return { keyId: job.client_id, name: 'ingestion', namespaces: [job.namespace], permissions: ['read','write'], maxAccessLevel: job.access_level };
@@ -69,7 +76,7 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
         embedding_dimensions = CASE WHEN $13 THEN NULL ELSE memories.embedding_dimensions END,
         source = EXCLUDED.source, namespace = EXCLUDED.namespace, tags = EXCLUDED.tags,
         metadata = EXCLUDED.metadata, access_level = EXCLUDED.access_level, agent_id = EXCLUDED.agent_id,
-        session_id = EXCLUDED.session_id, expires_at = EXCLUDED.expires_at, updated_at = statement_timestamp()
+        session_id = EXCLUDED.session_id, expires_at = EXCLUDED.expires_at, memory_kind = EXCLUDED.memory_kind, updated_at = statement_timestamp()
         WHERE memories.deleted_at IS NULL AND memories.superseded_at IS NULL AND memories.consolidated_into_id IS NULL
         AND memories.namespace = ANY($14::text[]) AND EXCLUDED.namespace = ANY($14::text[])` : '';
       const values: unknown[] = [input.content, input.source || auth.name, input.namespace, input.tags,
@@ -143,13 +150,21 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
 export async function claimIngestionJob(scope: DbScope, options: { memoryId?: string; inline?: boolean; leaseMs?: number } = {}): Promise<IngestionJob | null> {
   if (!options.inline && !scope.isAdmin) throw new Error('Permission denied: ingestion worker requires admin');
   if (options.inline && !options.memoryId) throw new Error('Inline claim requires memory id');
-  const leaseMs = options.leaseMs ?? 150_000;
+  const leaseMs = options.leaseMs ?? workerIngestionLeaseMs();
   for (;;) {
   const claimed = await withScopedClient(scope, async client => {
     if (!options.inline) {
       await client.query('SELECT app_ingestion_control(NULL, true)');
       const settings = await client.query('SELECT ingestion_paused FROM instance_settings WHERE singleton');
       if (settings.rows[0]?.ingestion_paused) return null;
+      await client.query(`UPDATE memory_ingestion_jobs j SET
+        status = CASE WHEN m.deleted_at IS NOT NULL OR m.expires_at <= statement_timestamp() THEN 'cancelled' ELSE 'embedding_failed' END,
+        failure_category = CASE WHEN m.deleted_at IS NOT NULL OR m.expires_at <= statement_timestamp() THEN 'expired' ELSE 'transient' END,
+        last_error_code = CASE WHEN m.deleted_at IS NOT NULL OR m.expires_at <= statement_timestamp() THEN 'expired' ELSE 'attempts_exhausted' END,
+        finalized_at = statement_timestamp(), lease_token = NULL, lease_expires_at = NULL
+        FROM memories m WHERE j.memory_id = m.id AND j.namespace = m.namespace
+          AND j.status = 'processing' AND j.lease_expires_at < statement_timestamp() AND j.attempts >= $1
+          AND ($2::uuid IS NULL OR j.memory_id = $2)`, [ingestionMaxAttempts(), options.memoryId ?? null]);
     }
     const token = randomUUID();
     const job = (await client.query(`WITH candidate AS (
@@ -205,15 +220,16 @@ export function classifyIngestionFailure(error: unknown): { category: FailureCat
 }
 export async function failIngestionJob(job: IngestionJob, error: unknown): Promise<void> {
   const failure = classifyIngestionFailure(error);
-  const max = ingestionInteger(process.env.MEMORY_INGESTION_MAX_ATTEMPTS, 12, 'MEMORY_INGESTION_MAX_ATTEMPTS', 1, 1000);
+  const max = ingestionMaxAttempts();
+  const budgetHandoff = job.inline && error instanceof Error && ['TimeoutError','AbortError'].includes(error.name);
   const terminal = !job.inline && (failure.terminal || (failure.category !== 'provider_auth' && job.attempts >= max));
-  const retry = retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter);
+  const retry = budgetHandoff ? new Date() : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter);
   await withScopedClient(ownerScope(job), client => client.query(`UPDATE memory_ingestion_jobs SET
     status = $3, failure_category = $4, last_error_code = $5, next_attempt_at = $6,
     finalized_at = CASE WHEN $7 THEN statement_timestamp() ELSE NULL END,
     lease_token = NULL, lease_expires_at = NULL
     WHERE memory_id = $1 AND status = 'processing' AND lease_token = $2::uuid AND lease_expires_at > statement_timestamp()`,
-  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : 'retry_wait', failure.category, failure.code, retry, terminal]).then(() => undefined));
+  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : budgetHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal]).then(() => undefined));
 }
 
 /** Lease row lock and token fence cover dedupe, belief mutation, vector, outbox and audit together. */

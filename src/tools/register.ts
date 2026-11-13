@@ -303,7 +303,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_stats',
-    description: 'Get statistics about the memory store (admin-only). Includes a content-free ingestion block when durable queue visibility is enabled.',
+    description: 'Get statistics about the memory store (admin-only). Includes a content-free ingestion block when the ingestion schema is installed.',
     inputSchema: {
       type: 'object' as const,
       properties: {},

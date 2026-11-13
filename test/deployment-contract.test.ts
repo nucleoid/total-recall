@@ -47,6 +47,6 @@ test('durable ingestion worker has a dedicated unit and bounded npm entrypoint',
   const manifest = JSON.parse(await fs.readFile(path.join(root,'package.json'),'utf8'));
   assert.match(service,/current\/scripts\/ingestion-worker\.ts --concurrency 4/);
   assert.match(service,/EnvironmentFile=/);
-  assert.match(service,/TimeoutStopSec=160/);
+  assert.ok(Number(service.match(/TimeoutStopSec=(\d+)/)?.[1]) >= 210, 'shutdown must cover the maximum provider/classifier lease budget');
   assert.equal(manifest.scripts['ingest:worker'],'tsx scripts/ingestion-worker.ts');
 });

@@ -357,6 +357,12 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       assert.equal(exported.records.find(row=>row.provenance.memory_id===pending.id)?.ingestion_state,'pending');
     } finally { process.env.MEMORY_INGESTION_QUEUE_ENABLED='true'; }
   });
+  await t.test('accepted scope survives removal of the owner write permission and namespaces', async () => {
+    const a=await acceptMemory(input('accepted before ACL removal'),auth,agent); const job=await claim(a.id);
+    await owner!.query("UPDATE api_keys SET permissions=ARRAY['read'],namespaces=ARRAY['private'] WHERE id=$1",[ownerId]);
+    try { assert.equal((await finalizeIngestionJob(job,embedding))?.state,'ready'); }
+    finally { await owner!.query('UPDATE api_keys SET permissions=$2,namespaces=$3 WHERE id=$1',[ownerId,auth.permissions,auth.namespaces]); }
+  });
   await t.test('expired poison leases stop at the worker attempt cap without provider work', async () => {
     const a=await acceptMemory(input('poison lease'),auth,agent); await claim(a.id);
     process.env.MEMORY_INGESTION_MAX_ATTEMPTS='1';
@@ -366,6 +372,11 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       const row=(await owner!.query('SELECT status,failure_category,attempts FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0];
       assert.equal(row.status,'embedding_failed'); assert.equal(row.failure_category,'transient'); assert.equal(row.attempts,1);
       assert.equal((await memoryRecall({id:a.id},auth)).content,'poison lease');
+      const expired=await acceptMemory(input('expired poison lease',{ttl:20}),auth,agent); await claim(expired.id);
+      await owner!.query("UPDATE memories SET expires_at=now()-interval '1 second' WHERE id=$1",[expired.id]);
+      await owner!.query("UPDATE memory_ingestion_jobs SET attempts=1,lease_expires_at=now()-interval '1 second' WHERE memory_id=$1",[expired.id]);
+      assert.equal(await claimIngestionJob(dbScopeFromAuth(admin),{memoryId:expired.id}),null);
+      assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[expired.id])).rows[0].status,'cancelled');
     } finally { process.env.MEMORY_INGESTION_MAX_ATTEMPTS='12'; }
   });
   await t.test('inline budget exhaustion hands off immediately without consuming an attempt', async () => {

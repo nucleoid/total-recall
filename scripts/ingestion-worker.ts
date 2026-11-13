@@ -2,7 +2,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { validateKeyReadOnly } from '../src/auth.js';
 import { dbScopeFromAuth, shutdown } from '../src/db.js';
-import { claimIngestionJob, embedWithinBudget, failIngestionJob, finalizeIngestionJob, ingestionInteger,
+import { claimIngestionJob, embedWithinBudget, failIngestionJob, finalizeIngestionJob, ingestionInteger, ingestionMaxAttempts, workerIngestionLeaseMs,
   type IngestionJob } from '../src/ingestion.js';
 import type { DbScope } from '../src/db.js';
 
@@ -24,10 +24,12 @@ export async function processIngestionJob(job: IngestionJob, signal?: AbortSigna
   try {
     const timeout = ingestionInteger(process.env.EMBEDDING_TIMEOUT_MS, 15000, 'EMBEDDING_TIMEOUT_MS', 100, 120000);
     const result = await embedWithinBudget(job.content, timeout, undefined, signal);
+    if (signal?.aborted) throw new DOMException('Ingestion worker stopping','AbortError');
     await finalizeIngestionJob(job, result);
   } catch (error) { await failIngestionJob(job, error); }
 }
 export async function runIngestionWorker(options: IngestionWorkerOptions, signal: AbortSignal): Promise<{ processed: number }> {
+  ingestionMaxAttempts(); workerIngestionLeaseMs(); // Validate worker limits before claims.
   const rawKey = process.env.INGESTION_WORKER_API_KEY?.trim();
   if (!rawKey) throw new Error('INGESTION_WORKER_API_KEY is required');
   let processed = 0;

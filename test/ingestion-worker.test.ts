@@ -55,3 +55,13 @@ test('worker startup rejects invalid dedupe thresholds before claims', () => {
     assert.notEqual(result.status,0); assert.match(result.stderr,/MEMORY_DEDUPE_THRESHOLD/);
   }
 });
+
+test('worker leases cover the configured embedding plus approved classifier deadlines', async () => {
+  const {workerIngestionLeaseMs}=await import('../src/ingestion.js');
+  const {contradictionPolicyFromEnv}=await import('../src/contradictions.js');
+  const old=process.env.EMBEDDING_TIMEOUT_MS;
+  try { process.env.EMBEDDING_TIMEOUT_MS='120000';
+    const policy={...contradictionPolicyFromEnv(),mutationEnabled:true,timeoutMs:60000};
+    assert.ok(workerIngestionLeaseMs(policy)>=120000+policy.timeoutMs+30000);
+  } finally { if(old===undefined) delete process.env.EMBEDDING_TIMEOUT_MS; else process.env.EMBEDDING_TIMEOUT_MS=old; }
+});

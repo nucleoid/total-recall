@@ -11,7 +11,7 @@ ExecStart=/usr/bin/node --import tsx %h/.local/share/total-recall/current/script
 EnvironmentFile=%h/projects/total-recall/.env
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=160
+TimeoutStopSec=240
 
 [Install]
 WantedBy=default.target
