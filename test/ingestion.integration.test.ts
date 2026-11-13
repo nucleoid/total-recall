@@ -1,3 +1,4 @@
+import { createServer } from 'node:net';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -41,7 +42,14 @@ function faultingPool(pool: pg.Pool, fail: (sql: string) => boolean): pg.Pool {
 // This suite deliberately fails rather than skips when PostgreSQL evidence is unavailable.
 test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibility', { timeout: 180000 }, async t => {
   execFileSync('docker', ['version'], { stdio: 'ignore' });
-  const container = execFileSync('docker', ['run','--rm','-d','-e','POSTGRES_PASSWORD=test-only','-p','127.0.0.1::5432', process.env.POSTGRES_TEST_IMAGE || 'pgvector/pgvector:pg16'], { encoding: 'utf8' }).trim();
+  // Ask the Windows host for a bindable port before Docker publishes it.
+  const hostPort = await new Promise<number>((resolve,reject)=>{
+    const server=createServer(); server.once('error',reject); server.listen(0,'127.0.0.1',()=>{
+      const port=(server.address() as {port:number}).port;
+      server.close(error=>error ? reject(error) : resolve(port));
+    });
+  });
+  const container = execFileSync('docker', ['run','--rm','-d','-e','POSTGRES_PASSWORD=test-only','-p',`127.0.0.1:${hostPort}:5432`, process.env.POSTGRES_TEST_IMAGE || 'pgvector/pgvector:pg16'], { encoding: 'utf8' }).trim();
   let owner: pg.Client | undefined;
   let pool: pg.Pool | undefined;
   t.after(async () => {
@@ -50,7 +58,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     delete process.env.MEMORY_INGESTION_QUEUE_ENABLED; delete process.env.MEMORY_STORE_INLINE_EMBED_MS;
     delete process.env.MEMORY_INGESTION_MAX_ATTEMPTS;
   });
-  const port = execFileSync('docker',['port',container,'5432/tcp'], { encoding: 'utf8' }).trim().split(':').at(-1)!;
+  const port = hostPort;
   const url = `postgresql://postgres:test-only@127.0.0.1:${port}/postgres`;
   for (let i = 0; i < 100; i++) {
     const client = new pg.Client({ connectionString: url, connectionTimeoutMillis: 2000 });
