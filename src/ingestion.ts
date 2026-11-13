@@ -65,7 +65,7 @@ async function currentMutationAuthority(client: ScopedClient, job: IngestionJob,
     WHERE k.id::text = app_current_key_id() AND k.enabled = true AND k.revoked_at IS NULL
       AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())
       AND 'write' = ANY(k.permissions) AND $1 = ANY(k.namespaces)
-      AND ${accessLevelSql('$2::text', 'k.max_access_level')}${lock ? ' FOR SHARE' : ''}`,
+      AND ${accessLevelSql('$2::text', 'k.max_access_level')}${lock ? ' FOR NO KEY UPDATE' : ''}`,
   [job.namespace, job.access_level]);
   return result.rows.length === 1;
 }
@@ -269,7 +269,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       return (await client.query(`SELECT m.* FROM memories m
       JOIN memory_ingestion_jobs j ON j.memory_id = m.id
       WHERE m.id = $1 AND m.namespace = $2 AND m.content = $3 AND m.access_level = $4
-        AND m.embedding IS NULL AND m.deleted_at IS NULL AND m.superseded_at IS NULL
+        AND m.embedding IS NULL AND m.deleted_at IS NULL AND m.superseded_at IS NULL AND m.supersedes_id IS NULL
         AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
         AND j.status = 'processing' AND j.lease_token = $5 AND j.lease_expires_at > statement_timestamp()`,
       [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0];
@@ -286,6 +286,8 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
   }
   let shadow: (() => Promise<void>) | undefined;
   const result = await withCheckedOutClient(client => withScopedTransactionOnClient(client, scope, async client => {
+    await client.query("SET LOCAL lock_timeout = '5s'");
+    await client.query("SET LOCAL statement_timeout = '15s'");
     const fenced = await client.query(`SELECT * FROM memory_ingestion_jobs WHERE memory_id = $1 AND status = 'processing'
       AND lease_token = $2::uuid AND lease_expires_at > statement_timestamp() FOR UPDATE`, [job.memory_id, job.lease_token]);
     if (!fenced.rows.length) return null;
@@ -305,12 +307,16 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     if (embeddingIdentity(target) !== embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) || embeddingIdentity(target) !== embeddingIdentity(embedding)) {
       await finishJob(client, job, 'embedding_failed', 'space_mismatch'); return null;
     }
-    // Lock current authority only in this short transaction. Revocation either
-    // completes first (no cross-row effects) or waits until these effects commit.
-    const mutationAuthorized = await currentMutationAuthority(client, job, true);
-    if (mutationAuthorized && job.dedupe && job.ttl_seconds === null) {
-      // Keep namespace -> predecessor/canonical lock order for both outcomes.
+    // Existing explicit history belongs to the caller and must survive indexing.
+    const hasExplicitLink = memory.supersedes_id != null;
+    const crossRowPossible = !hasExplicitLink && ((job.dedupe && job.ttl_seconds === null) || preparedPredecessor !== null);
+    let mutationAuthorized = false;
+    if (crossRowPossible) {
+      // Do not fence the key while queued behind unrelated namespace work.
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`memory-store-dedupe:${JSON.stringify([job.namespace, job.access_level])}`]);
+      // Serialize contenders so later finalizers cannot join shared holders
+      // ahead of a waiting revoker. Authentication skips this telemetry lock.
+      mutationAuthorized = await currentMutationAuthority(client, job, true);
     }
     const semantic = semanticMemory(job, memory, vector);
     let revised = null;
@@ -351,7 +357,8 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       failure_category = NULL, last_error_code = NULL, inline_ready = $3
       WHERE memory_id = $1 AND lease_token = $2`, [job.memory_id, job.lease_token, job.inline === true]);
     await auditReady(client, job, false);
-    if (mutationAuthorized && job.contradiction_eligible && !policy.mutationEnabled && policyAllowsScope(policy, job.namespace, job.access_level)) {
+    if (!hasExplicitLink && job.contradiction_eligible && !policy.mutationEnabled && policyAllowsScope(policy, job.namespace, job.access_level) &&
+        await currentMutationAuthority(client, job)) {
       shadow = () => maybeReviseBelief(semantic, ownerAuth(job), { policy, allowMutation: false, excludeCandidateId: job.memory_id }).then(() => undefined);
     }
     return { id: job.memory_id, namespace: job.namespace, expires_at: memory.expires_at ?? null,

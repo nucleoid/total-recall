@@ -44,16 +44,23 @@ export function generateKey(): string {
 export async function validateKey(apiKey: string): Promise<AuthContext | null> {
   const hash = hashKey(apiKey);
   const res = await queryUnscoped(
-    `UPDATE api_keys SET last_used_at = NOW()
+    `WITH candidate AS (
+       SELECT id FROM api_keys
      WHERE key_hash = $1
        AND enabled = true
        AND revoked_at IS NULL
        AND (expires_at IS NULL OR expires_at > NOW())
-     RETURNING id, name, namespaces, permissions, max_access_level,
-               requests_per_minute, requests_per_day, expires_at`,
+       FOR NO KEY UPDATE SKIP LOCKED
+     )
+     UPDATE api_keys SET last_used_at = NOW()
+     FROM candidate WHERE api_keys.id = candidate.id
+     RETURNING api_keys.id, api_keys.name, api_keys.namespaces, api_keys.permissions, api_keys.max_access_level,
+               api_keys.requests_per_minute, api_keys.requests_per_day, api_keys.expires_at`,
     [hash]
   );
-  return authContextFromRow(res.rows[0]);
+  // Usage telemetry is best-effort under a revocation/finalization lock. The
+  // fallback still enforces current committed revocation, expiry and scope.
+  return res.rows.length ? authContextFromRow(res.rows[0]) : validateKeyReadOnly(apiKey);
 }
 
 /** Authenticate a no-mutation maintenance preview without updating last_used_at. */
