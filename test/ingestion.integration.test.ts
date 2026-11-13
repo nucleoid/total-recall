@@ -529,6 +529,32 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     const row=(await owner!.query('SELECT status,attempts,failure_category FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0];
     assert.equal(row.status,'ready');assert.equal(row.attempts,1);assert.equal(row.failure_category,null);
   });
+  await t.test('inline completion outside the mutation scope does not reserve or hand off classification', async () => {
+    const {contradictionPolicyFromEnv}=await import('../src/contradictions.js');
+    const policy={...contradictionPolicyFromEnv(),classificationEnabled:true,mutationEnabled:true,namespace:'private',timeoutMs:10000};
+    for (const [index,entry] of [
+      {namespace:'shared',access_level:'normal' as const},
+      {namespace:'private',access_level:'sensitive' as const},
+      {namespace:'private',access_level:'secret' as const},
+    ].entries()) {
+      const a=await acceptMemory(input(`outside mutation scope ${index}`,entry),auth,agent);
+      const job=await claim(a.id);
+      const result=await finalizeIngestionJob(job,embedding,{deadlineAt:Date.now()+3000,contradictionPolicy:policy,prepareRevision:async()=>{throw new Error('out-of-scope classifier must not run');}});
+      assert.equal(result?.state,'ready');assert.equal(result?.id,a.id);
+      assert.equal((await owner!.query('SELECT status,attempts FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'ready');
+    }
+  });
+  await t.test('keyed replacement before first readiness still creates exactly one notification', async () => {
+    const a=await acceptMemory(input('pending original',{idempotency_key:'pending-event-replacement'}),auth,agent);
+    const stale=await claim(a.id);
+    const b=await acceptMemory(input('pending replacement',{idempotency_key:'pending-event-replacement'}),auth,agent);
+    assert.equal(b.id,a.id);assert.equal(await finalizeIngestionJob(stale,embedding),null);
+    const job=await claim(b.id);const result=await finalizeIngestionJob(job,embedding);
+    assert.equal(result?.created,false,'notification eligibility is separate from the current upsert response');
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1',[a.id])).rows[0].n,1);
+    assert.equal(await finalizeIngestionJob(job,embedding),null);
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1',[a.id])).rows[0].n,1);
+  });
   await t.test('keyed content replacements do not emit subscription creation events', async () => {
     const a=await acceptMemory(input('keyed event original',{idempotency_key:'event-replacement'}),auth,agent);
     const nonmatching={...embedding,vector:Array.from({length:768},(_,i)=>i===20?1:0)};
