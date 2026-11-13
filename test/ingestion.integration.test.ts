@@ -391,9 +391,45 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     const a=await acceptMemory(input('ordered predecessor',{namespace:'private'}),auth,agent);
     await finalizeIngestionJob(await claim(a.id),perpendicular);
     const b=await acceptMemory(input('ordered correction',{namespace:'private',dedupe:true}),auth,agent);
-    const result=await finalizeIngestionJob(await claim(b.id),perpendicular,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>a.id});
+    let preparationCalls=0;
+    const result=await finalizeIngestionJob(await claim(b.id),perpendicular,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>{preparationCalls++;return a.id;}});
+    assert.equal(preparationCalls,0,'an existing dedupe hit must not spend classifier budget');
     assert.equal(result?.deduplicated,true); assert.equal(result?.id,a.id);
     assert.equal((await owner!.query('SELECT superseded_at FROM memories WHERE id=$1',[a.id])).rows[0].superseded_at,null);
+  });
+  await t.test('inline classifier deadline hands off pending and the worker applies the revision with its full budget', async () => {
+    const {prepareBeliefRevision,resetContradictionRuntimeForTesting}=await import('../src/contradictions.js');
+    await resetContradictionRuntimeForTesting();
+    const policy={classificationEnabled:true,mutationEnabled:true,provider:'test',model:'test',endpoint:'https://not-used.example',namespace:'private',timeoutMs:1000,mutationConfidence:0.95,
+      budget:{limitMicroUsd:100n,requestMicroUsd:1n,inputMicroUsdPerMillionBytes:0n,outputMicroUsdPerMillionBytes:0n,fingerprint:'ingestion-deadline'},shadowMaxInFlight:2,shadowMaxQueued:8};
+    const a=await acceptMemory(input('deadline predecessor',{namespace:'private'}),auth,agent);await finalizeIngestionJob(await claim(a.id),embedding);
+    const b=await acceptMemory(input('deadline correction',{namespace:'private',dedupe:false}),auth,agent);const job=await claim(b.id);
+    let calls=0;
+    const prepare:typeof prepareBeliefRevision=(memory,context,options)=>prepareBeliefRevision(memory,context,{...options,
+      findCandidates:async()=>[{id:a.id,content:'deadline predecessor',similarity:0.9}],
+      provider:{name:'slow',generate:async()=>{calls++;await new Promise(resolve=>setTimeout(resolve,250));return JSON.stringify({classification:'contradiction',confidence:1,candidate_id:a.id});}},
+    });
+    try {
+      let timeout:unknown;
+      await assert.rejects(finalizeIngestionJob(job,embedding,{deadlineAt:Date.now()+100,contradictionPolicy:policy,prepareRevision:prepare}),error=>{timeout=error;return (error as Error).name==='TimeoutError';});
+      assert.equal(calls,1);await failIngestionJob(job,timeout);
+      assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[b.id])).rows[0].status,'pending');
+      const worker=await claimIngestionJob(dbScopeFromAuth(admin),{memoryId:b.id});assert.ok(worker);
+      assert.equal((await finalizeIngestionJob(worker,embedding,{contradictionPolicy:policy,prepareRevision:prepare}))?.state,'ready');
+      assert.equal((await owner!.query('SELECT supersedes_id FROM memories WHERE id=$1',[b.id])).rows[0].supersedes_id,a.id);
+      assert.equal(calls,2);
+    }finally{await resetContradictionRuntimeForTesting();}
+  });
+  await t.test('graceful worker stop drains claimed work without a failure or retry penalty', async () => {
+    const {runIngestionWorker}=await import('../scripts/ingestion-worker.js');
+    await owner!.query("UPDATE memory_ingestion_jobs SET next_attempt_at=now()+interval '1 day' WHERE status IN ('pending','retry_wait')");
+    const a=await acceptMemory(input('finish on stop'),auth,agent);const controller=new AbortController();
+    process.env.INGESTION_WORKER_API_KEY='tr_worker';
+    t.mock.method(globalThis,'fetch',async()=>{controller.abort();await new Promise(resolve=>setTimeout(resolve,20));return new Response(JSON.stringify({embedding:{values:vector}}));});
+    try {await runIngestionWorker({once:false,maxJobs:1,pollMs:100,concurrency:1},controller.signal);}
+    finally {delete process.env.INGESTION_WORKER_API_KEY;t.mock.restoreAll();}
+    const row=(await owner!.query('SELECT status,attempts,failure_category FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0];
+    assert.equal(row.status,'ready');assert.equal(row.attempts,1);assert.equal(row.failure_category,null);
   });
   await t.test('HTTP inline budget is independent of provider timeout and happy path remains ready', async () => {
     const { app } = await import('../src/server.js');

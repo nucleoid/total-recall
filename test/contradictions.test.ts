@@ -391,3 +391,12 @@ test('per-call preparation deadlines retain the approved process runtime and ret
   }
   assert.ok(!reasons.includes('runtime_config_changed'));
 });
+
+test('a capped inline preparation deadline reports timeout instead of a no-match result', async () => {
+  const policy={...contradictionPolicyFromEnv(approvedEnv()),mutationEnabled:true};
+  const memory:SemanticMemoryInsert={content:'Correction',vector:'[]',source:'test',namespace:'work',tags:[],metadata:{},accessLevel:'normal',clientId:ID,agentId:ID,sessionId:null};
+  await assert.rejects(prepareBeliefRevision(memory,{keyId:ID,name:'test',namespaces:['work'],permissions:['read','write'],maxAccessLevel:'normal'},{
+    policy,timeoutMs:10,throwOnTimeout:true,findCandidates:async()=>candidates,
+    provider:{name:'slow',generate:async()=>{await new Promise(resolve=>setTimeout(resolve,100));return JSON.stringify({classification:'contradiction',confidence:1,candidate_id:ID});}},
+  }),{name:'TimeoutError'});
+});
