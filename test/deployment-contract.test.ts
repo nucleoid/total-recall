@@ -41,3 +41,12 @@ test('daily sync pins one config and bounds mcporter stats calls', async () => {
   assert.match(script, /timeout --signal=TERM/);
   assert.doesNotMatch(script, /"\$MCPORTER_BIN" call total-recall\.memory_stats/);
 });
+
+test('durable ingestion worker has a dedicated unit and bounded npm entrypoint', async () => {
+  const service = await fs.readFile(path.join(root,'deploy/systemd/total-recall-ingestion.service'),'utf8');
+  const manifest = JSON.parse(await fs.readFile(path.join(root,'package.json'),'utf8'));
+  assert.match(service,/current\/scripts\/ingestion-worker\.ts --concurrency 4/);
+  assert.match(service,/EnvironmentFile=/);
+  assert.match(service,/TimeoutStopSec=160/);
+  assert.equal(manifest.scripts['ingest:worker'],'tsx scripts/ingestion-worker.ts');
+});

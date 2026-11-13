@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ingestionStats, requeueIngestionJob, setIngestionPaused } from './ingestion.js';
+import { IngestionPersistenceError, ingestionStats, requeueIngestionJob, setIngestionPaused } from './ingestion.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -534,7 +534,9 @@ function permissionDenied(err: any): boolean {
 }
 
 function sendApiError(res: express.Response, label: string, err: any): void {
-  if (err.name === 'ZodError') {
+  if (err instanceof IngestionPersistenceError) {
+    res.status(503).json({ error: err.message, code: err.code });
+  } else if (err.name === 'ZodError') {
     res.status(400).json({ error: 'Invalid request', details: err.errors });
   } else if (typeof err.message === 'string' && err.message.startsWith('Invalid ')) {
     res.status(400).json({ error: err.message });

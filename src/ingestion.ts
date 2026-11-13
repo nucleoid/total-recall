@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
 import { logAudit } from './audit.js';
-import { dbScopeFromAuth, withScopedClient, type DbScope, type ScopedClient } from './db.js';
+import { dbScopeFromAuth, withScopedClient, withCheckedOutClient, withScopedTransactionOnClient, type DbScope, type ScopedClient } from './db.js';
 import { ACTIVE_EMBEDDING_PROFILE, embedWithProfile, embeddingIdentity, serializeEmbeddingVector,
   EmbeddingProviderError, EmbeddingValidationError, type EmbeddingResult } from './embedding.js';
 import { TombstonedSourceKeyConflictError, SupersededSourceKeyConflictError, MemoryConflictError } from './errors.js';
@@ -9,6 +9,12 @@ import { contradictionPolicyFromEnv, maybeReviseBelief, policyAllowsScope, sched
   type SemanticMemoryInsert } from './contradictions.js';
 import { retryAtForAttempt } from './retry.js';
 import type { AccessLevel, AuthContext, StoreResult } from './types.js';
+
+export class IngestionPersistenceError extends Error {
+  readonly statusCode = 503;
+  readonly code = 'ingestion_persistence_unavailable';
+  constructor(cause: unknown) { super('Durable memory acceptance unavailable', { cause }); }
+}
 
 export type IngestionState = 'pending' | 'processing' | 'retry_wait' | 'ready' | 'deduplicated' | 'embedding_failed' | 'cancelled';
 export type FailureCategory = 'transient' | 'rate_limited' | 'provider_auth' | 'input_rejected' | 'space_mismatch' | 'expired';
@@ -123,7 +129,9 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
         ...(sourceKey ? { idempotency_key_honored: true as const } : {}) };
     });
   } catch (error) {
-    if ((error as { code?: string }).code === '23505') throw new Error('Access denied to existing idempotent memory');
+    const code = (error as { code?: string }).code;
+    if (code === '23505' && sourceKey) throw new Error('Access denied to existing idempotent memory');
+    if (typeof code === 'string' && (/^[A-Z0-9]{5}$/.test(code) || /^E[A-Z]+$/.test(code))) throw new IngestionPersistenceError(error);
     throw error;
   }
 }
@@ -133,7 +141,8 @@ export async function claimIngestionJob(scope: DbScope, options: { memoryId?: st
   if (!options.inline && !scope.isAdmin) throw new Error('Permission denied: ingestion worker requires admin');
   if (options.inline && !options.memoryId) throw new Error('Inline claim requires memory id');
   const leaseMs = options.leaseMs ?? 150_000;
-  return withScopedClient(scope, async client => {
+  for (;;) {
+  const claimed = await withScopedClient(scope, async client => {
     if (!options.inline) {
       await client.query('SELECT app_ingestion_control(NULL, true)');
       const settings = await client.query('SELECT ingestion_paused FROM instance_settings WHERE singleton');
@@ -153,7 +162,11 @@ export async function claimIngestionJob(scope: DbScope, options: { memoryId?: st
       lease_token = $4::uuid, inline_attempted = j.inline_attempted OR $2
     FROM candidate c WHERE j.memory_id = c.memory_id RETURNING j.*`,
     [options.memoryId ?? null, options.inline === true, leaseMs, token])).rows[0] as IngestionJob | undefined;
-    if (!job) return null;
+    return job ?? null;
+  });
+  if (!claimed) return null;
+  const job = claimed;
+  const loaded = await withScopedClient(ownerScope(job), async client => {
     const memory = (await client.query(`SELECT content, expires_at,
       deleted_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= statement_timestamp()) AS expired
       FROM memories WHERE id = $1 AND namespace = $2`, [job.memory_id, job.namespace])).rows[0];
@@ -165,6 +178,9 @@ export async function claimIngestionJob(scope: DbScope, options: { memoryId?: st
     }
     return { ...job, content: memory.content, expires_at: memory.expires_at, inline: options.inline === true };
   });
+  if (loaded || options.inline) return loaded;
+  // Expired jobs are terminal bookkeeping, not evidence that the due queue is empty.
+  }
 }
 
 export function classifyIngestionFailure(error: unknown): { category: FailureCategory; code: string; terminal: boolean; retryAfter?: string } {
@@ -194,7 +210,7 @@ export async function failIngestionJob(job: IngestionJob, error: unknown): Promi
 export async function finalizeIngestionJob(job: IngestionJob, embedding: EmbeddingResult): Promise<StoreResult | null> {
   const scope = ownerScope(job);
   let shadow: (() => Promise<void>) | undefined;
-  const result = await withScopedClient(scope, async client => {
+  const result = await withCheckedOutClient(client => withScopedTransactionOnClient(client, scope, async client => {
     const fenced = await client.query(`SELECT * FROM memory_ingestion_jobs WHERE memory_id = $1 AND status = 'processing'
       AND lease_token = $2::uuid AND lease_expires_at > statement_timestamp() FOR UPDATE`, [job.memory_id, job.lease_token]);
     if (!fenced.rows.length) return null;
@@ -202,6 +218,9 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       FROM memories WHERE id = $1 AND namespace = $2 FOR UPDATE`, [job.memory_id, job.namespace])).rows[0];
     if (!memory || memory.deleted_at || memory.expired) {
       await finishJob(client, job, 'cancelled', 'expired'); return null;
+    }
+    if (!job.allowed_namespaces.includes(job.namespace)) {
+      await finishJob(client, job, 'cancelled'); return null;
     }
     // A later synchronous writer must never receive an older content vector.
     if (memory.content !== job.content || memory.access_level !== job.access_level || memory.superseded_at || memory.consolidated_into_id) {
@@ -263,7 +282,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     }
     return { id: job.memory_id, namespace: job.namespace, expires_at: memory.expires_at ?? null,
       created: true, deduplicated: false, state: 'ready' as const, accepted_at: job.accepted_at };
-  });
+  }));
   if (shadow) scheduleShadowClassification(contradictionPolicyFromEnv(), shadow);
   return result;
 }

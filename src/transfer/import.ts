@@ -145,6 +145,7 @@ export async function importMemoryBatch(
       return counts;
     }
 
+    // ingestion_state is advisory export metadata; every inserted row receives a fresh destination vector.
     const embeddings = pending.length > 0
       ? await embedder(pending.map(record => record.content), options.signal)
       : [];

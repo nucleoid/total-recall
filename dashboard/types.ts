@@ -6,6 +6,7 @@ export interface Capabilities {
 }
 
 export interface MemoryRecord {
+  ingestion?: { state: string; attempts?: number; failure_category?: string | null };
   id: string;
   content: string;
   source: string;
@@ -72,4 +73,11 @@ export interface MediaStats {
   top_albums: Array<{ album: string; artist: string | null; plays: number; duration_ms: number }>;
   top_tracks: Array<{ title: string; artist: string | null; plays: number; duration_ms: number }>;
   daily: Array<{ date: string; count: number; duration_ms: number }>;
+}
+
+export interface IngestionStats {
+  depth: Record<string, number>; oldest_pending_age_seconds: number | null;
+  attempts_histogram: Record<string, number>; failure_categories: Record<string, number>;
+  next_retry_at: string | null; inline_hit_rate: number | null; paused: boolean;
+  last_worker_heartbeat: string | null;
 }
