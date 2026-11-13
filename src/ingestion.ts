@@ -83,7 +83,7 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`memory-store-key:${auth.keyId}:${sourceKey}`]);
         // Match finalize's job -> memory lock order, including namespace moves.
         await client.query(`SELECT j.memory_id FROM memory_ingestion_jobs j WHERE j.client_id = $1 AND j.source_key = $2 FOR UPDATE`, [auth.keyId, sourceKey]);
-        previous = (await client.query(`SELECT content, namespace, access_level FROM memories WHERE client_id = $1 AND source_key = $2`, [auth.keyId, sourceKey])).rows[0];
+        previous = (await client.query(`SELECT content, namespace, access_level FROM memories WHERE client_id = $1 AND source_key = $2 FOR UPDATE`, [auth.keyId, sourceKey])).rows[0];
       }
       const changed = !previous || previous.content !== input.content || previous.namespace !== input.namespace || previous.access_level !== input.access_level;
       const conflict = sourceKey ? `ON CONFLICT (client_id, source_key) DO UPDATE SET
@@ -227,6 +227,9 @@ export async function claimIngestionJob(scope: DbScope, options: { memoryId?: st
 }
 
 export function classifyIngestionFailure(error: unknown): { category: FailureCategory; code: string; terminal: boolean; retryAfter?: string } {
+  if (['55P03','57014','40P01','40001'].includes((error as { code?: string } | null)?.code ?? '')) {
+    return { category: 'transient', code: 'db_contention', terminal: false };
+  }
   if (error instanceof EmbeddingValidationError || error instanceof SyntaxError) return { category: 'input_rejected', code: 'invalid_vector', terminal: true };
   if (error instanceof EmbeddingProviderError) {
     const status = error.status;
@@ -240,15 +243,18 @@ export async function failIngestionJob(job: IngestionJob, error: unknown): Promi
   const failure = classifyIngestionFailure(error);
   const max = ingestionMaxAttempts();
   const budgetHandoff = job.inline && error instanceof Error && ['TimeoutError','AbortError'].includes(error.name);
-  const terminal = !job.inline && (failure.terminal || (failure.category !== 'provider_auth' && job.attempts >= max));
-  const retry = budgetHandoff ? new Date() : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter);
+  const contention = failure.code === 'db_contention';
+  const inlineHandoff = job.inline === true && (budgetHandoff || contention);
+  const terminal = !contention && !job.inline && (failure.terminal || (failure.category !== 'provider_auth' && job.attempts >= max));
+  const retry = contention ? new Date(Date.now() + 1000) : budgetHandoff ? new Date() : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter);
   await withScopedClient(ownerScope(job), client => client.query(`UPDATE memory_ingestion_jobs SET
     status = $3, failure_category = $4, last_error_code = $5,
+    attempts = CASE WHEN $9::boolean THEN GREATEST(0, attempts - 1) ELSE attempts END,
     next_attempt_at = CASE WHEN $8::boolean THEN statement_timestamp() ELSE $6::timestamptz END,
     finalized_at = CASE WHEN $7 THEN statement_timestamp() ELSE NULL END,
     lease_token = NULL, lease_expires_at = NULL
     WHERE memory_id = $1 AND status = 'processing' AND lease_token = $2::uuid AND lease_expires_at > statement_timestamp()`,
-  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : budgetHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal, budgetHandoff]).then(() => undefined));
+  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : inlineHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal, inlineHandoff, contention && !job.inline]).then(() => undefined));
 }
 
 /** Lease row lock and token fence cover dedupe, belief mutation, vector, outbox and audit together. */

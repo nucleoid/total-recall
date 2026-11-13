@@ -20,6 +20,7 @@ The default worker provider timeout is 15 seconds (`EMBEDDING_TIMEOUT_MS`, max 1
 ## Recovery
 
 - Provider rate limit/outage: leave content visible, reduce concurrency, inspect only content-free stats. Retry uses jitter/Retry-After. No hot-loop retries. Inline attempts do not consume the 12 worker-attempt allowance.
+- Database contention: inspect `db_contention` job codes separately from provider outages. Inline work hands off pending; workers retry after one second without spending the provider-attempt allowance. During canary, measure finalization and revocation latency and inspect the dedupe query plan on the largest namespace; resolve persistent lock waits or slow scans before increasing concurrency.
 - Provider authentication: repair credentials in the existing secret store, restart affected processes, allow capped retries. They do not dead-letter the entire backlog.
 - Input rejected: correct the keyed content (same memory ID, new fenced job) or, after resolving the cause, admin requeue the affected ID. Requeue is audited; ready jobs cannot be requeued.
 - Embedding space mismatch: never label the old vector as new. Restore the accepted active profile and requeue, or follow `npm run reembed`'s separate repair process. Re-embedding skips active jobs and repairs other vectors without creating historical subscription events; terminal ingestion history remains intact. There is no automatic backlog retargeting.
