@@ -1,4 +1,6 @@
 -- Additive, default-off durable memory acceptance. No payload is stored here.
+-- Bound DDL lock acquisition independently of the runner's advisory-lock wait.
+SET LOCAL lock_timeout = '5s';
 CREATE TABLE public.memory_ingestion_jobs (
   memory_id UUID PRIMARY KEY,
   namespace TEXT NOT NULL,
@@ -98,7 +100,8 @@ BEGIN
   -- Historical re-embedding and ordinary content updates must not create events.
   IF TG_OP = 'UPDATE' AND NOT EXISTS (
     SELECT 1 FROM public.memory_ingestion_jobs j
-    WHERE j.memory_id = NEW.id AND j.namespace = NEW.namespace AND j.status IN ('pending','processing','retry_wait')
+    WHERE j.memory_id = NEW.id AND j.namespace = NEW.namespace AND j.memory_created
+      AND j.status IN ('pending','processing','retry_wait')
   ) THEN RETURN NEW; END IF;
   IF NEW.embedding IS NULL
      OR NEW.embedding_provider IS NULL

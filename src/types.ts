@@ -143,7 +143,7 @@ export interface StoreParams {
 }
 
 export interface StoreResult {
-  state?: 'ready' | 'queued';
+  state?: 'ready' | 'queued' | 'embedding_failed' | 'cancelled';
   accepted_at?: Date;
   id: string;
   namespace: string;

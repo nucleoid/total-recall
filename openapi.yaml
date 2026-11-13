@@ -1150,8 +1150,8 @@ components:
       properties:
         state:
           type: string
-          enum: [ready, queued]
-          description: Present when durable ingestion is enabled. Queued acknowledges committed content before indexing.
+          enum: [ready, queued, embedding_failed, cancelled]
+          description: Present when durable ingestion is enabled. Queued acknowledges committed content awaiting indexing; terminal states preserve the same ID and require recovery instead of promising automatic processing.
         accepted_at:
           type: string
           format: date-time

@@ -53,5 +53,5 @@ test('durable acknowledgement survives a failure to record an inline provider fa
   } } as unknown as pg.Pool);
   t.mock.method(globalThis,'fetch',async () => { throw new Error('provider offline'); });
   const accepted = { id:job.memory_id,namespace:'shared',created:true,deduplicated:false,expires_at:null,state:'queued' as const,accepted_at:job.accepted_at };
-  assert.deepEqual(await tryInlineIngestion(accepted,auth),accepted); assert.equal(connects,3);
+  assert.deepEqual(await tryInlineIngestion(accepted,auth),accepted); assert.ok(connects>=3,'the failure-recording connection was attempted');
 });

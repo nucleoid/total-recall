@@ -569,6 +569,42 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     assert.equal((await owner!.query("SELECT count(*)::int AS n FROM audit_log WHERE memory_id=$1 AND action='memory.ingest.ready'",[a.id])).rows[0].n,0);
     assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1',[a.id])).rows[0].n,0);
   });
+  await t.test('zero-row dedupe writes roll back canonical boosts and preserve the accepted memory', async () => {
+    const exact={...embedding,vector:Array.from({length:768},(_,i)=>i===25?1:0)};
+    const canonical=await acceptMemory(input('zero row canonical',{namespace:'private'}),auth,agent);
+    await finalizeIngestionJob(await claim(canonical.id),exact);
+    const a=await acceptMemory(input('zero row duplicate',{namespace:'private',dedupe:true}),auth,agent);const job=await claim(a.id);
+    await owner!.query(`CREATE FUNCTION ingestion_skip_dedupe_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF (TG_ARGV[0]='boost' AND NEW.access_count>OLD.access_count) OR (TG_ARGV[0]='delete' AND NEW.deleted_at IS NOT NULL) THEN RETURN NULL; END IF;
+      RETURN NEW; END $$`);
+    try {
+      for (const operation of ['boost','delete']) {
+        await owner!.query(`CREATE TRIGGER ingestion_skip_dedupe_test BEFORE UPDATE ON memories FOR EACH ROW EXECUTE FUNCTION ingestion_skip_dedupe_test('${operation}')`);
+        try {await assert.rejects(finalizeIngestionJob(job,exact),/memory update did not affect exactly one row/);}
+        finally {await owner!.query('DROP TRIGGER ingestion_skip_dedupe_test ON memories');}
+        assert.equal((await owner!.query('SELECT access_count FROM memories WHERE id=$1',[canonical.id])).rows[0].access_count,0);
+        assert.equal((await owner!.query('SELECT deleted_at FROM memories WHERE id=$1',[a.id])).rows[0].deleted_at,null);
+        assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'processing');
+      }
+    } finally {await owner!.query('DROP FUNCTION ingestion_skip_dedupe_test()');}
+  });
+  await t.test('revocation retains acceptance-time dedupe and approved revision authorization', async () => {
+    const {contradictionPolicyFromEnv}=await import('../src/contradictions.js');
+    const exact={...embedding,vector:Array.from({length:768},(_,i)=>i===26?1:0)};
+    const canonical=await acceptMemory(input('revocation canonical',{namespace:'private'}),auth,agent);
+    await finalizeIngestionJob(await claim(canonical.id),exact);
+    const duplicate=await acceptMemory(input('revocation duplicate',{namespace:'private',dedupe:true,tags:['accepted-tag']}),auth,agent);
+    const correction=await acceptMemory(input('revocation correction',{namespace:'private'}),auth,agent);
+    const duplicateJob=await claim(duplicate.id);const correctionJob=await claim(correction.id);
+    await owner!.query("UPDATE api_keys SET enabled=false,permissions=ARRAY['read'],namespaces=ARRAY['shared'] WHERE id=$1",[ownerId]);
+    try {
+      assert.equal((await finalizeIngestionJob(duplicateJob,exact))?.deduplicated,true);
+      assert.equal((await finalizeIngestionJob(correctionJob,exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>canonical.id}))?.id,correction.id);
+      const previous=(await owner!.query('SELECT tags,superseded_at FROM memories WHERE id=$1',[canonical.id])).rows[0];
+      assert.ok(previous.tags.includes('accepted-tag'));assert.ok(previous.superseded_at);
+      assert.equal((await owner!.query('SELECT supersedes_id FROM memories WHERE id=$1',[correction.id])).rows[0].supersedes_id,canonical.id);
+    } finally {await owner!.query('UPDATE api_keys SET enabled=true,permissions=$2,namespaces=$3 WHERE id=$1',[ownerId,auth.permissions,auth.namespaces]);}
+  });
   await t.test('migration 037 bounds table lock waits and rolls back before a safe retry', async () => {
     await owner!.query('CREATE DATABASE ingestion_lock_test');
     const lockUrl=new URL(url);lockUrl.pathname='/ingestion_lock_test';

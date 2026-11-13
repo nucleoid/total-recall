@@ -19,6 +19,13 @@ export class IngestionPersistenceError extends Error {
 
 export type IngestionState = 'pending' | 'processing' | 'retry_wait' | 'ready' | 'deduplicated' | 'embedding_failed' | 'cancelled';
 export type FailureCategory = 'transient' | 'rate_limited' | 'provider_auth' | 'input_rejected' | 'space_mismatch' | 'expired';
+function storeState(status: IngestionState): NonNullable<StoreResult['state']> {
+  if (status === 'embedding_failed' || status === 'cancelled') return status;
+  return status === 'ready' || status === 'deduplicated' ? 'ready' : 'queued';
+}
+function requireMemoryUpdate(result: { rowCount: number | null }): void {
+  if (result.rowCount !== 1) throw new Error('Ingestion memory update did not affect exactly one row');
+}
 export interface IngestionJob {
   memory_id: string; namespace: string; client_id: string; access_level: AccessLevel;
   allowed_namespaces: string[]; agent_id: string; session_id: string | null; source_key: string | null;
@@ -133,8 +140,8 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
       if (changed) await logAudit({ clientId: auth.keyId, action: 'memory.store', namespace: input.namespace,
         memoryId: memory.id, agentId, sessionId: input.session_id, details: { created: memory.created, deduplicated: false, queued: true, ...(sourceKey ? { idempotent: true } : {}) } }, dbScopeFromAuth(auth), client);
       return { id: memory.id, namespace: memory.namespace, expires_at: memory.expires_at ?? null,
-        created: job.status === 'ready' ? memory.created : true, deduplicated: false,
-        state: job.status === 'ready' ? 'ready' : 'queued', accepted_at: job.accepted_at,
+        created: storeState(job.status) === 'queued' ? true : memory.created, deduplicated: false,
+        state: storeState(job.status), accepted_at: job.accepted_at,
         ...(sourceKey ? { idempotency_key_honored: true as const } : {}) };
     });
   } catch (error) {
@@ -255,7 +262,8 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0], { readOnly: true });
     if (snapshot) {
       const remaining = options.deadlineAt === undefined ? policy.timeoutMs : options.deadlineAt - Date.now();
-      if (remaining < 1) throw new DOMException('Inline budget exhausted', 'TimeoutError');
+      // Do not reserve a paid classification that cannot receive its full timeout.
+      if (remaining < policy.timeoutMs) throw new DOMException('Inline classification budget exhausted', 'TimeoutError');
       preparedPredecessor = await (options.prepareRevision ?? prepareBeliefRevision)(semanticMemory(job, snapshot, vector), ownerAuth(job), {
         policy, timeoutMs: Math.min(policy.timeoutMs, remaining),
         throwOnTimeout: options.deadlineAt !== undefined && remaining < policy.timeoutMs, allowMutation: true, excludeCandidateId: job.memory_id,
@@ -304,11 +312,11 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       const similarity = Number(match?.similarity ?? NaN);
       const threshold = MEMORY_DEDUPE_THRESHOLD;
       if (match && Number.isFinite(similarity) && similarity >= threshold) {
-        await client.query(`UPDATE memories SET access_count = COALESCE(access_count,0) + 1,
+        requireMemoryUpdate(await client.query(`UPDATE memories SET access_count = COALESCE(access_count,0) + 1,
           accessed_at = statement_timestamp(), last_boosted_at = statement_timestamp(), updated_at = statement_timestamp(),
           tags = ARRAY(SELECT value FROM unnest(COALESCE(memories.tags, ARRAY[]::text[]) || $2::text[])
-            WITH ORDINALITY AS combined(value, position) GROUP BY value ORDER BY MIN(position)) WHERE id = $1`, [match.id, memory.tags]);
-        await client.query('UPDATE memories SET deleted_at = statement_timestamp(), updated_at = statement_timestamp() WHERE id = $1', [job.memory_id]);
+            WITH ORDINALITY AS combined(value, position) GROUP BY value ORDER BY MIN(position)) WHERE id = $1`, [match.id, memory.tags]));
+        requireMemoryUpdate(await client.query('UPDATE memories SET deleted_at = statement_timestamp(), updated_at = statement_timestamp() WHERE id = $1', [job.memory_id]));
         await client.query(`UPDATE memory_ingestion_jobs SET status = 'deduplicated', canonical_memory_id = $3,
           similarity = $4, ready_at = statement_timestamp(), finalized_at = statement_timestamp(), lease_token = NULL,
           lease_expires_at = NULL, failure_category = NULL, last_error_code = NULL, inline_ready = $5
@@ -318,9 +326,9 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
           similarity, state: 'ready' as const, accepted_at: job.accepted_at };
       }
     }
-    if (!revised) await client.query(`UPDATE memories SET embedding = $2::vector, embedding_provider = $3,
+    if (!revised) requireMemoryUpdate(await client.query(`UPDATE memories SET embedding = $2::vector, embedding_provider = $3,
       embedding_model = $4, embedding_dimensions = $5, updated_at = statement_timestamp() WHERE id = $1`,
-    [job.memory_id, vector, embedding.provider, embedding.model, embedding.dimensions]);
+    [job.memory_id, vector, embedding.provider, embedding.model, embedding.dimensions]));
     await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', ready_at = statement_timestamp(),
       finalized_at = statement_timestamp(), lease_token = NULL, lease_expires_at = NULL,
       failure_category = NULL, last_error_code = NULL, inline_ready = $3
@@ -375,25 +383,33 @@ async function auditReady(client: ScopedClient, job: IngestionJob, deduplicated:
     details: { attempts: job.attempts, deduplicated } }, ownerScope(job), client);
 }
 
+async function currentStoreResult(accepted: StoreResult, auth: AuthContext): Promise<StoreResult> {
+  const job = await withScopedClient(dbScopeFromAuth(auth), async client => (await client.query(`SELECT status,
+    canonical_memory_id, similarity, memory_created FROM memory_ingestion_jobs WHERE memory_id = $1`, [accepted.id])).rows[0]);
+  if (!job) return accepted;
+  const state = storeState(job.status);
+  return { ...accepted, state, created: state === 'queued' ? accepted.created : job.memory_created,
+    ...(job.status === 'deduplicated' ? { id: job.canonical_memory_id, deduplicated: true, created: false, similarity: job.similarity } : {}) };
+}
 export async function tryInlineIngestion(accepted: StoreResult, auth: AuthContext): Promise<StoreResult> {
-  if (accepted.state === 'ready') return accepted;
+  if (accepted.state !== 'queued') return accepted;
   let job: IngestionJob | null = null;
   try {
     const budget = inlineBudgetMs();
     if (budget === 0) return accepted;
     job = await claimIngestionJob(dbScopeFromAuth(auth), { memoryId: accepted.id, inline: true, leaseMs: budget + 30_000 });
-    if (!job) return accepted;
+    if (!job) return await currentStoreResult(accepted, auth);
     const deadlineAt = Date.now() + budget;
     const remaining = deadlineAt - Date.now();
     if (remaining < 1) throw new DOMException('Inline budget exhausted', 'TimeoutError');
     const embedding = await embedWithinBudget(job.content, remaining);
     const ready = await finalizeIngestionJob(job, embedding, { deadlineAt });
-    return ready ? { ...ready, ...(accepted.idempotency_key_honored ? { idempotency_key_honored: true } : {}) } : accepted;
+    return ready ? { ...ready, ...(accepted.idempotency_key_honored ? { idempotency_key_honored: true } : {}) } : await currentStoreResult(accepted, auth);
   } catch (error) {
     // Acceptance already committed. Even a second DB failure must never undo its acknowledgement.
     if (job) { try { await failIngestionJob(job, error); } catch { /* Lease expiry recovers the job. */ } }
     console.warn('[ingestion] outcome=inline_deferred');
-    return accepted;
+    try { return await currentStoreResult(accepted, auth); } catch { return accepted; }
   }
 }
 /** Race also bounds test/faulty providers which fail to honor AbortSignal. Late results never finalize. */
