@@ -25,3 +25,13 @@ test('queue acceptance persists before any provider attempt even when provider i
   assert.equal(persisted, true);
 });
 
+
+test('durable acknowledgement survives a claim failure after acceptance', async t => {
+  const { tryInlineIngestion } = await import('../src/ingestion.js');
+  process.env.MEMORY_STORE_INLINE_EMBED_MS='100';
+  t.after(() => { delete process.env.MEMORY_STORE_INLINE_EMBED_MS; setPoolForTesting(null); });
+  setPoolForTesting({ connect:async () => { throw new Error('private connection detail'); } } as unknown as pg.Pool);
+  const accepted = { id:'33333333-3333-4333-8333-333333333333', namespace:'shared', created:true,
+    deduplicated:false,expires_at:null,state:'queued' as const,accepted_at:new Date() };
+  assert.deepEqual(await tryInlineIngestion(accepted,auth),accepted);
+});
