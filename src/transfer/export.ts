@@ -1,3 +1,4 @@
+import { attachIngestion } from '../ingestion-read.js';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { accessLevelSql, checkPermission, filterNamespaces } from '../auth.js';
@@ -56,6 +57,7 @@ type ExportRow = {
   expires_at: Date | string | null;
   origin_namespace: string | null;
   insight_content_hash: string | null;
+  ingestion?: { state: string };
 };
 
 type CursorPayload = { v: 1; key: string; filter: string; created_at: string; id: string };
@@ -102,7 +104,7 @@ export async function exportMemoryPage(
 
   const instanceId = result.rows[0]?.instance_id ?? await getInstanceId(auth);
   const hasMore = result.rows.length > params.limit;
-  const selected = result.rows.slice(0, params.limit);
+  const selected = await attachIngestion(result.rows.slice(0, params.limit), dbScopeFromAuth(auth));
   const records = selected.map(row => rowToTransferRecord(row, instanceId));
   const last = selected.at(-1);
   return {
@@ -147,6 +149,7 @@ function rowToTransferRecord(row: ExportRow, instanceId: string): TransferMemory
   };
   return transferMemoryRecordSchema.parse({
     type: 'memory',
+    ...(row.ingestion ? { ingestion_state: row.ingestion.state } : {}),
     source_key: row.source_key ?? derivedTransferSourceKey(instanceId, row.id),
     content: row.content,
     source: row.source,

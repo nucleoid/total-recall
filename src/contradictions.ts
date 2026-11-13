@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer';
 import { z } from 'zod';
 import { accessLevelSql } from './auth.js';
 import { logAudit } from './audit.js';
-import { dbScopeFromAuth, withScopedClient } from './db.js';
+import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR } from './embedding.js';
 import {
   GenerationLimitError,
@@ -544,6 +544,7 @@ export async function maybeReviseBelief(
     excludeCandidateId?: string;
     metric?: (reason: ContradictionReason) => void;
     findCandidates?: typeof findContradictionCandidates;
+    finalizeExisting?: { id: string; client: ScopedClient };
   } = {},
 ): Promise<RevisionResult | null> {
   const policy = options.policy ?? contradictionPolicyFromEnv();
@@ -637,11 +638,12 @@ export async function maybeReviseBelief(
 
   let result: RevisionResult | null;
   try {
-    result = await commitAutomaticRevision(memory, classification.candidate_id!, auth);
+    result = await commitAutomaticRevision(memory, classification.candidate_id!, auth, options.finalizeExisting);
   } catch (error) {
     // Constraint/serialization conflicts are known rolled-back stale outcomes.
     // Do not swallow connection/commit uncertainty, which could duplicate a
     // successfully committed successor on fallback.
+    if (options.finalizeExisting) throw error;
     const code = databaseErrorCode(error);
     if (!['23503', '23505', '23514', '40001', '40P01'].includes(code ?? '')) throw error;
     metric('stale_candidate');
@@ -658,8 +660,9 @@ export async function commitAutomaticRevision(
   memory: SemanticMemoryInsert,
   predecessorId: string,
   auth: AuthContext,
+  existing?: { id: string; client: ScopedClient },
 ): Promise<RevisionResult | null> {
-  return withScopedClient(dbScopeFromAuth(auth), async client => {
+  const commit = async (client: ScopedClient): Promise<RevisionResult | null> => {
     const predecessor = await client.query<{ id: string }>(
       `SELECT m.id
        FROM memories m
@@ -701,7 +704,13 @@ export async function commitAutomaticRevision(
     );
     if (closed.rowCount !== 1) return null;
 
-    const inserted = await client.query<RevisionResult>(
+    const inserted = existing ? await client.query<RevisionResult>(
+      `UPDATE memories SET embedding = $2::vector, embedding_provider = $3, embedding_model = $4,
+         embedding_dimensions = $5, supersedes_id = $6::uuid, valid_from = $7::timestamptz,
+         updated_at = statement_timestamp() WHERE id = $1 RETURNING id, namespace`,
+      [existing.id, memory.vector, ACTIVE_EMBEDDING_DESCRIPTOR.provider, ACTIVE_EMBEDDING_DESCRIPTOR.model,
+       ACTIVE_EMBEDDING_DESCRIPTOR.dimensions, predecessorId, revisionAt],
+    ) : await client.query<RevisionResult>(
       `INSERT INTO memories (
          content, embedding, source, namespace, tags, metadata, access_level,
          client_id, agent_id, session_id, embedding_provider, embedding_model,
@@ -739,7 +748,8 @@ export async function commitAutomaticRevision(
       sessionId: memory.sessionId ?? undefined,
     }, dbScopeFromAuth(auth), client);
     return successor;
-  });
+  };
+  return existing ? commit(existing.client) : withScopedClient(dbScopeFromAuth(auth), commit);
 }
 
 class ContradictionBudgetExhaustedError extends Error {

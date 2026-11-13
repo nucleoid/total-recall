@@ -48,6 +48,7 @@ const provenanceSchema = z.object({
 
 export const transferMemoryRecordSchema = z.object({
   type: z.literal('memory'),
+  ingestion_state: z.enum(['pending','processing','retry_wait','ready','deduplicated','embedding_failed','cancelled']).optional(),
   source_key: z.string().min(1).max(MAX_SOURCE_KEY_CHARS),
   content: z.string().min(1).max(MEMORY_CONTENT_MAX_CHARS),
   source: z.string().min(1).max(TEXT_FIELD_MAX_CHARS),

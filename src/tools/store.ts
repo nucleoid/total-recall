@@ -1,3 +1,4 @@
+import { acceptMemory, ingestionEnabled, inlineBudgetMs, tryInlineIngestion } from '../ingestion.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { dbScopeFromAuth, withScopedClient } from '../db.js';
@@ -119,6 +120,11 @@ export async function memoryStore(
     auth.keyId,
     dbScopeFromAuth(auth)
   );
+
+  if (ingestionEnabled()) {
+    inlineBudgetMs(); // Reject invalid operator configuration before acceptance.
+    return tryInlineIngestion(await acceptMemory(params, auth, agentId), auth);
+  }
 
   // EmbeddingResult atomically carries the ACTIVE_EMBEDDING_DESCRIPTOR identity.
   const embedding = await embedWithProfile(params.content);
