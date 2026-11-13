@@ -408,7 +408,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     const lockKey='memory-store-dedupe:'+JSON.stringify(['private','normal']);
     await owner!.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[lockKey]);
     let released=false,calls=0;
-    const pending=finalizeIngestionJob(job,exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>{calls++;return c.id;}});
+    const pending=finalizeIngestionJob(job,exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>{calls++;const unlocked=(await owner!.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS unlocked',[lockKey])).rows[0].unlocked;assert.equal(unlocked,true,'classification re-entry must hold no namespace lock');await owner!.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',[lockKey]);return c.id;}});
     try {
       let blocked=false;const until=Date.now()+10000;
       while(Date.now()<until){
