@@ -210,6 +210,44 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       (memory_id,namespace,client_id,access_level,allowed_namespaces,dedupe,contradiction_eligible,embedding_provider,embedding_model,embedding_dimensions)
       VALUES (gen_random_uuid(),'shared',$1,'normal',ARRAY['shared'],false,false,$2,$3,768)`,[ownerId,embedding.provider,embedding.model])),/row-level security/);
   });
+  await t.test('a failure after vector/outbox work rolls back the whole finalization transaction', async () => {
+    const a = await acceptMemory(input('finalize atomic boundary'),auth,agent); const job = await claim(a.id);
+    await owner!.query(`CREATE FUNCTION reject_ready_audit_test() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.action='memory.ingest.ready' THEN RAISE EXCEPTION 'injected finalization crash'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER reject_ready_audit_test BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_ready_audit_test()`);
+    try { await assert.rejects(finalizeIngestionJob(job,embedding),/injected finalization crash/); }
+    finally { await owner!.query('DROP TRIGGER reject_ready_audit_test ON audit_log; DROP FUNCTION reject_ready_audit_test()'); }
+    const state = (await owner!.query(`SELECT m.embedding,j.status FROM memories m JOIN memory_ingestion_jobs j ON j.memory_id=m.id WHERE m.id=$1`,[a.id])).rows[0];
+    assert.equal(state.embedding,null); assert.equal(state.status,'processing');
+    assert.equal((await owner!.query('SELECT * FROM webhook_deliveries WHERE memory_id=$1',[a.id])).rows.length,0);
+    assert.equal((await finalizeIngestionJob(job,embedding))?.state,'ready');
+    assert.equal((await owner!.query('SELECT * FROM webhook_deliveries WHERE memory_id=$1',[a.id])).rows.length,1);
+  });
+  await t.test('real worker bounds concurrent providers and recovers scripted 429/500 failures', async () => {
+    const { runIngestionWorker } = await import('../scripts/ingestion-worker.js');
+    process.env.INGESTION_WORKER_API_KEY='tr_worker'; process.env.MEMORY_INGESTION_MAX_ATTEMPTS='12';
+    await owner!.query("UPDATE memory_ingestion_jobs SET next_attempt_at=now()+interval '1 day' WHERE status IN ('pending','retry_wait')");
+    const jobs = await Promise.all([acceptMemory(input('worker one'),auth,agent),acceptMemory(input('worker two'),auth,agent)]);
+    let active=0,maxActive=0,calls=0;
+    const stub = t.mock.method(globalThis,'fetch',async () => {
+      active++; maxActive=Math.max(maxActive,active); const call=calls++;
+      await new Promise(resolve => setTimeout(resolve,100)); active--;
+      return new Response('provider body stays private',{ status:call===0 ? 429 : 500, headers:{'Retry-After':'123'} });
+    });
+    try {
+      const first = await runIngestionWorker({ once:true,maxJobs:2,pollMs:100,concurrency:2 },new AbortController().signal);
+      assert.equal(first.processed,2); assert.equal(calls,2); assert.equal(maxActive,2);
+      const failures = (await owner!.query('SELECT status,attempts,next_attempt_at,last_error_code FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[])',[jobs.map(j=>j.id)])).rows;
+      assert.ok(failures.every(j=>j.status==='retry_wait' && j.attempts===1 && new Date(j.next_attempt_at).getTime()>Date.now()+59000));
+      await owner!.query('UPDATE memory_ingestion_jobs SET next_attempt_at=now() WHERE memory_id=ANY($1::uuid[])',[jobs.map(j=>j.id)]);
+      stub.restore();
+      t.mock.method(globalThis,'fetch',async () => new Response(JSON.stringify({ embedding:{ values:vector } })));
+      const second = await runIngestionWorker({ once:true,maxJobs:2,pollMs:100,concurrency:2 },new AbortController().signal);
+      assert.equal(second.processed,2);
+      const ready = (await owner!.query('SELECT status,attempts FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[])',[jobs.map(j=>j.id)])).rows;
+      assert.ok(ready.every(j=>j.status==='ready' && j.attempts===2));
+    } finally { t.mock.restoreAll(); delete process.env.INGESTION_WORKER_API_KEY; }
+  });
   await t.test('HTTP inline budget is independent of provider timeout and happy path remains ready', async () => {
     const { app } = await import('../src/server.js');
     process.env.MEMORY_STORE_INLINE_EMBED_MS='40';
@@ -220,6 +258,13 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     t.mock.method(globalThis,'fetch',async () => new Response(JSON.stringify({ embedding:{ values:vector } })));
     process.env.MEMORY_STORE_INLINE_EMBED_MS='1000';
     const ready = await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({ content:'http healthy',agent_name:'http',dedupe:false }); assert.equal(ready.body.state,'ready',JSON.stringify(ready.body));
+    await owner!.query(`CREATE FUNCTION reject_http_acceptance_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'private database failure'; END $$;
+      CREATE TRIGGER reject_http_acceptance_test BEFORE INSERT ON memory_ingestion_jobs FOR EACH ROW EXECUTE FUNCTION reject_http_acceptance_test()`);
+    try {
+      const unavailable = await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({ content:'must not acknowledge',agent_name:'http',dedupe:false });
+      assert.equal(unavailable.status,503); assert.equal(unavailable.body.code,'ingestion_persistence_unavailable');
+      assert.doesNotMatch(JSON.stringify(unavailable.body),/private database failure|must not acknowledge/);
+    } finally { await owner!.query('DROP TRIGGER reject_http_acceptance_test ON memory_ingestion_jobs; DROP FUNCTION reject_http_acceptance_test()'); }
     const forbidden = await request(app).get('/api/ingestion/stats').set('Authorization','Bearer tr_owner'); assert.equal(forbidden.status,403);
     const stats = await request(app).get('/api/ingestion/stats').set('Authorization','Bearer tr_worker'); assert.equal(stats.status,200);
   });
