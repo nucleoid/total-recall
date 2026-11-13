@@ -34,6 +34,8 @@ CREATE TABLE public.memory_ingestion_jobs (
   requeued_by TEXT,
   requeued_at TIMESTAMPTZ,
   memory_created BOOLEAN NOT NULL DEFAULT true,
+  -- First-readiness eligibility survives replacements before the first embedding.
+  creation_pending BOOLEAN NOT NULL DEFAULT true,
   inline_attempted BOOLEAN NOT NULL DEFAULT false,
   inline_ready BOOLEAN NOT NULL DEFAULT false,
   FOREIGN KEY (namespace, memory_id) REFERENCES public.memories(namespace, id)
@@ -100,7 +102,7 @@ BEGIN
   -- Historical re-embedding and ordinary content updates must not create events.
   IF TG_OP = 'UPDATE' AND NOT EXISTS (
     SELECT 1 FROM public.memory_ingestion_jobs j
-    WHERE j.memory_id = NEW.id AND j.namespace = NEW.namespace AND j.memory_created
+    WHERE j.memory_id = NEW.id AND j.namespace = NEW.namespace AND j.creation_pending
       AND j.status IN ('pending','processing','retry_wait')
   ) THEN RETURN NEW; END IF;
   IF NEW.embedding IS NULL

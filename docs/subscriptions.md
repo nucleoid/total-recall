@@ -1,6 +1,6 @@
 # Memory subscriptions and webhook delivery
 
-Memory subscriptions are prospective semantic interests. A new `normal` memory whose stamped embedding space and cosine score match an active subscription creates an outbox row in the same database transaction. Content updates, deletes, boosts, historical rows, `sensitive`/`secret` rows, unstamped vectors, and vectors from another embedding space do not create events. The pending-to-ready embedding transition is the creation event only for a queued job generation that created its memory; a keyed content replacement cannot create a newly matching event. Matching is deterministic and capped at 100 subscriptions per created memory.
+Memory subscriptions are prospective semantic interests. A new `normal` memory whose stamped embedding space and cosine score match an active subscription creates an outbox row in the same database transaction. Content updates after first readiness, deletes, boosts, historical rows, `sensitive`/`secret` rows, unstamped vectors, and vectors from another embedding space do not create events. The first pending-to-ready embedding transition is the creation event for a newly accepted queued memory, even if keyed content was replaced before that first readiness. Later keyed replacements cannot create newly matching events. Matching is deterministic and capped at 100 subscriptions per created memory.
 
 ## Enablement and operation
 

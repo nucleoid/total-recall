@@ -108,9 +108,9 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
       const profile = ACTIVE_EMBEDDING_PROFILE;
       const job = (await client.query(`INSERT INTO memory_ingestion_jobs
         (memory_id, namespace, client_id, access_level, allowed_namespaces, agent_id, session_id, source_key,
-         dedupe, ttl_seconds, contradiction_eligible, embedding_provider, embedding_model, embedding_dimensions, status, ready_at, accepted_at, memory_created)
+         dedupe, ttl_seconds, contradiction_eligible, embedding_provider, embedding_model, embedding_dimensions, status, ready_at, accepted_at, memory_created, creation_pending)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
-          CASE WHEN $15 THEN 'pending' ELSE 'ready' END, CASE WHEN $15 THEN NULL ELSE statement_timestamp() END, $17, $18)
+          CASE WHEN $15 THEN 'pending' ELSE 'ready' END, CASE WHEN $15 THEN NULL ELSE statement_timestamp() END, $17, $18, $18)
         ON CONFLICT (memory_id) DO UPDATE SET
           memory_created = CASE WHEN $16 THEN EXCLUDED.memory_created ELSE memory_ingestion_jobs.memory_created END,
           namespace = EXCLUDED.namespace, access_level = CASE WHEN $16 THEN EXCLUDED.access_level ELSE memory_ingestion_jobs.access_level END,
@@ -250,7 +250,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
   const policy = options.contradictionPolicy ?? contradictionPolicyFromEnv();
   let preparedPredecessor: string | null = null;
   // Never hold a checked-out connection, row lock or dedupe lock across provider classification.
-  if (job.contradiction_eligible && policy.mutationEnabled &&
+  if (job.contradiction_eligible && policy.mutationEnabled && policyAllowsScope(policy, job.namespace, job.access_level) &&
       embeddingIdentity(target) === embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) &&
       embeddingIdentity(target) === embeddingIdentity(embedding)) {
     const snapshot = await withScopedClient(scope, async client => (await client.query(`SELECT m.* FROM memories m
@@ -317,7 +317,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
           tags = ARRAY(SELECT value FROM unnest(COALESCE(memories.tags, ARRAY[]::text[]) || $2::text[])
             WITH ORDINALITY AS combined(value, position) GROUP BY value ORDER BY MIN(position)) WHERE id = $1`, [match.id, memory.tags]));
         requireMemoryUpdate(await client.query('UPDATE memories SET deleted_at = statement_timestamp(), updated_at = statement_timestamp() WHERE id = $1', [job.memory_id]));
-        await client.query(`UPDATE memory_ingestion_jobs SET status = 'deduplicated', canonical_memory_id = $3,
+        await client.query(`UPDATE memory_ingestion_jobs SET status = 'deduplicated', creation_pending = false, canonical_memory_id = $3,
           similarity = $4, ready_at = statement_timestamp(), finalized_at = statement_timestamp(), lease_token = NULL,
           lease_expires_at = NULL, failure_category = NULL, last_error_code = NULL, inline_ready = $5
           WHERE memory_id = $1 AND lease_token = $2`, [job.memory_id, job.lease_token, match.id, similarity, job.inline === true]);
@@ -329,7 +329,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     if (!revised) requireMemoryUpdate(await client.query(`UPDATE memories SET embedding = $2::vector, embedding_provider = $3,
       embedding_model = $4, embedding_dimensions = $5, updated_at = statement_timestamp() WHERE id = $1`,
     [job.memory_id, vector, embedding.provider, embedding.model, embedding.dimensions]));
-    await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', ready_at = statement_timestamp(),
+    await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', creation_pending = false, ready_at = statement_timestamp(),
       finalized_at = statement_timestamp(), lease_token = NULL, lease_expires_at = NULL,
       failure_category = NULL, last_error_code = NULL, inline_ready = $3
       WHERE memory_id = $1 AND lease_token = $2`, [job.memory_id, job.lease_token, job.inline === true]);
@@ -360,7 +360,7 @@ async function completeExternalEmbedding(client: ScopedClient, job: IngestionJob
       memory.embedding_dimensions !== job.embedding_dimensions) {
     await finishJob(client, job, 'cancelled'); return null;
   }
-  await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', ready_at = statement_timestamp(),
+  await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', creation_pending = false, ready_at = statement_timestamp(),
     finalized_at = statement_timestamp(), lease_token = NULL, lease_expires_at = NULL,
     failure_category = NULL, last_error_code = NULL WHERE memory_id = $1 AND lease_token = $2`, [job.memory_id, job.lease_token]);
   await auditReady(client, job, false);

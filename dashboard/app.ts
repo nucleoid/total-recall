@@ -224,6 +224,11 @@ function sequencePager(offset: number, limit: number, received: number, onPage: 
 function memoryCard(memory: MemoryRecord): HTMLElement {
   const article = el('article', undefined, 'memory-card');
   const heading = el('h3', `${memory.namespace} · ${memory.source}`);
+  if (memory.ingestion) {
+    const badge = el('span', `Ingestion: ${memory.ingestion.state.replace(/_/g, ' ')}`, 'ingestion-badge');
+    if (['embedding_failed', 'cancelled'].includes(memory.ingestion.state)) badge.classList.add('error');
+    heading.append(' ', badge);
+  }
   const content = el('p', memory.content, 'memory-content');
   const provenance = el('p', `Agent: ${agentName(memory)}`, 'memory-agent');
   provenance.title = memory.agent_id ?? 'No agent GUID recorded';

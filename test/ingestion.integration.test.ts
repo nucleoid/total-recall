@@ -277,7 +277,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
   });
   await t.test('classifier preparation holds no row or namespace locks and concurrent revisions revalidate one predecessor', async () => {
     const { contradictionPolicyFromEnv } = await import('../src/contradictions.js');
-    const policy = { ...contradictionPolicyFromEnv(),mutationEnabled:true };
+    const policy = { ...contradictionPolicyFromEnv(),classificationEnabled:true,namespace:'private',mutationEnabled:true };
     const concurrentEmbedding={...embedding,vector:Array.from({length:768},(_,i)=>i===15 ? 1 : 0)};
     const predecessor = await acceptMemory(input('concurrent predecessor',{ namespace:'private' }),auth,agent);
     await finalizeIngestionJob(await claim(predecessor.id),concurrentEmbedding);
@@ -307,7 +307,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     await owner!.query(`CREATE FUNCTION stale_revision_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
       IF NEW.supersedes_id IS NOT NULL THEN RAISE EXCEPTION 'stale revision' USING ERRCODE='23505'; END IF; RETURN NEW; END $$;
       CREATE TRIGGER stale_revision_test BEFORE UPDATE ON memories FOR EACH ROW EXECUTE FUNCTION stale_revision_test()`);
-    try { assert.equal((await finalizeIngestionJob(job,embedding,{ contradictionPolicy:{ ...contradictionPolicyFromEnv(),mutationEnabled:true }, prepareRevision:async()=>a.id }))?.state,'ready'); }
+    try { assert.equal((await finalizeIngestionJob(job,embedding,{ contradictionPolicy:{ ...contradictionPolicyFromEnv(),classificationEnabled:true,namespace:'private',mutationEnabled:true }, prepareRevision:async()=>a.id }))?.state,'ready'); }
     finally { await owner!.query('DROP TRIGGER stale_revision_test ON memories; DROP FUNCTION stale_revision_test()'); }
     assert.equal((await owner!.query('SELECT superseded_at FROM memories WHERE id=$1',[a.id])).rows[0].superseded_at,null);
     assert.equal((await owner!.query('SELECT supersedes_id FROM memories WHERE id=$1',[b.id])).rows[0].supersedes_id,null);
@@ -468,7 +468,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     await finalizeIngestionJob(await claim(predecessor.id),weak);
     const accepted=await acceptMemory(input('stale predecessor correction',{namespace:'private',dedupe:true}),auth,agent);
     let calls=0;
-    const result=await finalizeIngestionJob(await claim(accepted.id),exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>{
+    const result=await finalizeIngestionJob(await claim(accepted.id),exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),classificationEnabled:true,namespace:'private',mutationEnabled:true},prepareRevision:async()=>{
       calls++;
       await owner!.query('UPDATE memories SET deleted_at=now() WHERE id=$1',[predecessor.id]);
       return predecessor.id;
@@ -488,7 +488,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       IF NEW.supersedes_id IS NOT NULL THEN RAISE EXCEPTION 'stale revision' USING ERRCODE='23505'; END IF; RETURN NEW; END $$;
       CREATE TRIGGER priority_constraint_test BEFORE UPDATE ON memories FOR EACH ROW EXECUTE FUNCTION priority_constraint_test()`);
     try {
-      const result=await finalizeIngestionJob(await claim(accepted.id),exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>{calls++;return predecessor.id;}});
+      const result=await finalizeIngestionJob(await claim(accepted.id),exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),classificationEnabled:true,namespace:'private',mutationEnabled:true},prepareRevision:async()=>{calls++;return predecessor.id;}});
       assert.equal(calls,1); assert.equal(result?.deduplicated,true); assert.equal(result?.id,predecessor.id);
     } finally { await owner!.query('DROP TRIGGER priority_constraint_test ON memories; DROP FUNCTION priority_constraint_test()'); }
     assert.equal((await owner!.query('SELECT superseded_at FROM memories WHERE id=$1',[predecessor.id])).rows[0].superseded_at,null);
@@ -625,7 +625,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     await owner!.query("UPDATE api_keys SET enabled=false,permissions=ARRAY['read'],namespaces=ARRAY['shared'] WHERE id=$1",[ownerId]);
     try {
       assert.equal((await finalizeIngestionJob(duplicateJob,exact))?.deduplicated,true);
-      assert.equal((await finalizeIngestionJob(correctionJob,exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>canonical.id}))?.id,correction.id);
+      assert.equal((await finalizeIngestionJob(correctionJob,exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),classificationEnabled:true,namespace:'private',mutationEnabled:true},prepareRevision:async()=>canonical.id}))?.id,correction.id);
       const previous=(await owner!.query('SELECT tags,superseded_at FROM memories WHERE id=$1',[canonical.id])).rows[0];
       assert.ok(previous.tags.includes('accepted-tag'));assert.ok(previous.superseded_at);
       assert.equal((await owner!.query('SELECT supersedes_id FROM memories WHERE id=$1',[correction.id])).rows[0].supersedes_id,canonical.id);
