@@ -229,7 +229,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     await owner!.query("UPDATE memory_ingestion_jobs SET next_attempt_at=now()+interval '1 day' WHERE status IN ('pending','retry_wait')");
     const jobs = await Promise.all([acceptMemory(input('worker one'),auth,agent),acceptMemory(input('worker two'),auth,agent)]);
     let active=0,maxActive=0,calls=0;
-    const stub = t.mock.method(globalThis,'fetch',async () => {
+    t.mock.method(globalThis,'fetch',async () => {
       active++; maxActive=Math.max(maxActive,active); const call=calls++;
       await new Promise(resolve => setTimeout(resolve,100)); active--;
       return new Response('provider body stays private',{ status:call===0 ? 429 : 500, headers:{'Retry-After':'123'} });
@@ -240,7 +240,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       const failures = (await owner!.query('SELECT status,attempts,next_attempt_at,last_error_code FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[])',[jobs.map(j=>j.id)])).rows;
       assert.ok(failures.every(j=>j.status==='retry_wait' && j.attempts===1 && new Date(j.next_attempt_at).getTime()>Date.now()+59000));
       await owner!.query('UPDATE memory_ingestion_jobs SET next_attempt_at=now() WHERE memory_id=ANY($1::uuid[])',[jobs.map(j=>j.id)]);
-      stub.restore();
+      t.mock.restoreAll();
       t.mock.method(globalThis,'fetch',async () => new Response(JSON.stringify({ embedding:{ values:vector } })));
       const second = await runIngestionWorker({ once:true,maxJobs:2,pollMs:100,concurrency:2 },new AbortController().signal);
       assert.equal(second.processed,2);
@@ -269,3 +269,4 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     const stats = await request(app).get('/api/ingestion/stats').set('Authorization','Bearer tr_worker'); assert.equal(stats.status,200);
   });
 });
+
