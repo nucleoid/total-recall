@@ -1,6 +1,6 @@
 import { MEMORY_DEDUPE_THRESHOLD } from './store-config.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
+import { accessLevelSql, checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
 import { logAudit } from './audit.js';
 import { dbScopeFromAuth, withScopedClient, withCheckedOutClient, withScopedTransactionOnClient, type DbScope, type ScopedClient } from './db.js';
 import { ACTIVE_EMBEDDING_PROFILE, embedWithProfile, embeddingIdentity, serializeEmbeddingVector,
@@ -57,6 +57,17 @@ export function workerIngestionLeaseMs(policy = contradictionPolicyFromEnv()): n
 function ownerScope(job: IngestionJob): DbScope { return { namespaces: [job.namespace], keyId: job.client_id }; }
 function ownerAuth(job: IngestionJob): AuthContext {
   return { keyId: job.client_id, name: 'ingestion', namespaces: [job.namespace], permissions: ['read','write'], maxAccessLevel: job.access_level };
+}
+
+/** Finishing the accepted row survives revocation; effects on other rows do not. */
+async function currentMutationAuthority(client: ScopedClient, job: IngestionJob, lock = false): Promise<boolean> {
+  const result = await client.query(`SELECT k.id FROM api_keys k
+    WHERE k.id::text = app_current_key_id() AND k.enabled = true AND k.revoked_at IS NULL
+      AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())
+      AND 'write' = ANY(k.permissions) AND $1 = ANY(k.namespaces)
+      AND ${accessLevelSql('$2::text', 'k.max_access_level')}${lock ? ' FOR SHARE' : ''}`,
+  [job.namespace, job.access_level]);
+  return result.rows.length === 1;
 }
 
 /** The only acknowledgement boundary: memory, job and acceptance audit commit together. */
@@ -253,13 +264,16 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
   if (job.contradiction_eligible && policy.mutationEnabled && policyAllowsScope(policy, job.namespace, job.access_level) &&
       embeddingIdentity(target) === embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) &&
       embeddingIdentity(target) === embeddingIdentity(embedding)) {
-    const snapshot = await withScopedClient(scope, async client => (await client.query(`SELECT m.* FROM memories m
+    const snapshot = await withScopedClient(scope, async client => {
+      if (!await currentMutationAuthority(client, job)) return undefined;
+      return (await client.query(`SELECT m.* FROM memories m
       JOIN memory_ingestion_jobs j ON j.memory_id = m.id
       WHERE m.id = $1 AND m.namespace = $2 AND m.content = $3 AND m.access_level = $4
         AND m.embedding IS NULL AND m.deleted_at IS NULL AND m.superseded_at IS NULL
         AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
         AND j.status = 'processing' AND j.lease_token = $5 AND j.lease_expires_at > statement_timestamp()`,
-      [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0], { readOnly: true });
+      [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0];
+    }, { readOnly: true });
     if (snapshot) {
       const remaining = options.deadlineAt === undefined ? policy.timeoutMs : options.deadlineAt - Date.now();
       // Do not reserve a paid classification that cannot receive its full timeout.
@@ -291,13 +305,16 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     if (embeddingIdentity(target) !== embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) || embeddingIdentity(target) !== embeddingIdentity(embedding)) {
       await finishJob(client, job, 'embedding_failed', 'space_mismatch'); return null;
     }
-    if (job.dedupe && job.ttl_seconds === null) {
+    // Lock current authority only in this short transaction. Revocation either
+    // completes first (no cross-row effects) or waits until these effects commit.
+    const mutationAuthorized = await currentMutationAuthority(client, job, true);
+    if (mutationAuthorized && job.dedupe && job.ttl_seconds === null) {
       // Keep namespace -> predecessor/canonical lock order for both outcomes.
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`memory-store-dedupe:${JSON.stringify([job.namespace, job.access_level])}`]);
     }
     const semantic = semanticMemory(job, memory, vector);
     let revised = null;
-    if (preparedPredecessor) {
+    if (mutationAuthorized && preparedPredecessor) {
       await client.query('SAVEPOINT ingestion_revision');
       try {
         revised = await commitAutomaticRevision(semantic, preparedPredecessor, ownerAuth(job), { id: job.memory_id, client });
@@ -307,7 +324,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       }
       await client.query('RELEASE SAVEPOINT ingestion_revision');
     }
-    if (!revised && job.dedupe && job.ttl_seconds === null) {
+    if (mutationAuthorized && !revised && job.dedupe && job.ttl_seconds === null) {
       const match = await findIngestionDedupeCandidate(client, job, embedding, vector);
       const similarity = Number(match?.similarity ?? NaN);
       const threshold = MEMORY_DEDUPE_THRESHOLD;
@@ -334,7 +351,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       failure_category = NULL, last_error_code = NULL, inline_ready = $3
       WHERE memory_id = $1 AND lease_token = $2`, [job.memory_id, job.lease_token, job.inline === true]);
     await auditReady(client, job, false);
-    if (job.contradiction_eligible && !policy.mutationEnabled && policyAllowsScope(policy, job.namespace, job.access_level)) {
+    if (mutationAuthorized && job.contradiction_eligible && !policy.mutationEnabled && policyAllowsScope(policy, job.namespace, job.access_level)) {
       shadow = () => maybeReviseBelief(semantic, ownerAuth(job), { policy, allowMutation: false, excludeCandidateId: job.memory_id }).then(() => undefined);
     }
     return { id: job.memory_id, namespace: job.namespace, expires_at: memory.expires_at ?? null,
