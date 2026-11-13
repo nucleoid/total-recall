@@ -510,12 +510,12 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     try {
       let timeout:unknown;
       await assert.rejects(finalizeIngestionJob(job,embedding,{deadlineAt:Date.now()+100,contradictionPolicy:policy,prepareRevision:prepare}),error=>{timeout=error;return (error as Error).name==='TimeoutError';});
-      assert.equal(calls,1);await failIngestionJob(job,timeout);
+      assert.equal(calls,0,'an inline budget shorter than the full classifier timeout must not reserve or call the provider');await failIngestionJob(job,timeout);
       assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[b.id])).rows[0].status,'pending');
       const worker=await claimIngestionJob(dbScopeFromAuth(admin),{memoryId:b.id});assert.ok(worker);
       assert.equal((await finalizeIngestionJob(worker,embedding,{contradictionPolicy:policy,prepareRevision:prepare}))?.state,'ready');
       assert.equal((await owner!.query('SELECT supersedes_id FROM memories WHERE id=$1',[b.id])).rows[0].supersedes_id,a.id);
-      assert.equal(calls,2);
+      assert.equal(calls,1,'only the worker should spend classifier budget');
     }finally{await resetContradictionRuntimeForTesting();}
   });
   await t.test('graceful worker stop drains claimed work without a failure or retry penalty', async () => {
@@ -528,6 +528,68 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     finally {delete process.env.INGESTION_WORKER_API_KEY;t.mock.restoreAll();}
     const row=(await owner!.query('SELECT status,attempts,failure_category FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0];
     assert.equal(row.status,'ready');assert.equal(row.attempts,1);assert.equal(row.failure_category,null);
+  });
+  await t.test('keyed content replacements do not emit subscription creation events', async () => {
+    const a=await acceptMemory(input('keyed event original',{idempotency_key:'event-replacement'}),auth,agent);
+    const nonmatching={...embedding,vector:Array.from({length:768},(_,i)=>i===20?1:0)};
+    await finalizeIngestionJob(await claim(a.id),nonmatching);
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1',[a.id])).rows[0].n,0);
+    const b=await acceptMemory(input('keyed event changed',{idempotency_key:'event-replacement'}),auth,agent);
+    assert.equal(b.id,a.id);
+    await finalizeIngestionJob(await claim(b.id),embedding);
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1',[a.id])).rows[0].n,0,'replacing content must not create a newly matching subscription event');
+  });
+  await t.test('terminal keyed retries report actual state without silently requeueing', async () => {
+    for (const status of ['embedding_failed','cancelled']) {
+      const content=`terminal retry ${status}`;
+      const a=await acceptMemory(input(content,{idempotency_key:status}),auth,agent);
+      await owner!.query('UPDATE memory_ingestion_jobs SET status=$2,finalized_at=now() WHERE memory_id=$1',[a.id,status]);
+      const replay=await acceptMemory(input(content,{idempotency_key:status}),auth,agent);
+      assert.equal(replay.id,a.id); assert.equal(replay.state,status); assert.equal(replay.created,false);
+      assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,status);
+    }
+  });
+  await t.test('inline completion exposes a permanent profile mismatch instead of queued', async () => {
+    const {tryInlineIngestion}=await import('../src/ingestion.js');
+    const a=await acceptMemory(input('inline mismatched profile'),auth,agent);
+    await owner!.query("UPDATE memory_ingestion_jobs SET embedding_model='different-target' WHERE memory_id=$1",[a.id]);
+    process.env.MEMORY_STORE_INLINE_EMBED_MS='1000';
+    t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({embedding:{values:vector}})));
+    try { assert.equal((await tryInlineIngestion(a,auth)).state,'embedding_failed'); }
+    finally {process.env.MEMORY_STORE_INLINE_EMBED_MS='0';t.mock.restoreAll();}
+  });
+  await t.test('a zero-row vector update rolls back readiness, outbox and audit', async () => {
+    const a=await acceptMemory(input('blocked vector write'),auth,agent);const job=await claim(a.id);
+    await owner!.query(`CREATE FUNCTION ingestion_skip_vector_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+      CREATE TRIGGER ingestion_skip_vector_test BEFORE UPDATE OF embedding ON memories FOR EACH ROW EXECUTE FUNCTION ingestion_skip_vector_test()`);
+    try { await assert.rejects(finalizeIngestionJob(job,embedding),/memory update did not affect exactly one row/); }
+    finally {await owner!.query('DROP TRIGGER ingestion_skip_vector_test ON memories; DROP FUNCTION ingestion_skip_vector_test()');}
+    const row=(await owner!.query('SELECT m.embedding,j.status FROM memories m JOIN memory_ingestion_jobs j ON j.memory_id=m.id WHERE m.id=$1',[a.id])).rows[0];
+    assert.equal(row.embedding,null);assert.equal(row.status,'processing');
+    assert.equal((await owner!.query("SELECT count(*)::int AS n FROM audit_log WHERE memory_id=$1 AND action='memory.ingest.ready'",[a.id])).rows[0].n,0);
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1',[a.id])).rows[0].n,0);
+  });
+  await t.test('migration 037 bounds table lock waits and rolls back before a safe retry', async () => {
+    await owner!.query('CREATE DATABASE ingestion_lock_test');
+    const lockUrl=new URL(url);lockUrl.pathname='/ingestion_lock_test';
+    const migrator=new pg.Client({connectionString:lockUrl.href});const locker=new pg.Client({connectionString:lockUrl.href});
+    try {
+      await migrator.connect();await locker.connect();
+      await migrator.query('CREATE EXTENSION vector');
+      await provisionDatabase(migrator,{appPassword:'app-test-only',rotateAppPassword:false});
+      const inventory=loadMigrationInventory(fileURLToPath(new URL('../migrations',import.meta.url)));
+      await runMigrations(migrator,inventory,{throughNumber:36,lockTimeoutMs:5000});
+      await migrator.query("SET statement_timeout = '8s'");
+      await locker.query('BEGIN; LOCK TABLE memories IN ROW EXCLUSIVE MODE');
+      const started=Date.now();
+      try {await assert.rejects(runMigrations(migrator,inventory,{lockTimeoutMs:5000}),error=>(error as {code?:string}).code==='55P03');}
+      finally {await locker.query('ROLLBACK');}
+      assert.ok(Date.now()-started<10000,'DDL acquisition must be bounded independently of the advisory migration lock');
+      assert.equal((await migrator.query("SELECT to_regclass('public.memory_ingestion_jobs') AS jobs")).rows[0].jobs,null);
+      assert.equal((await migrator.query("SELECT count(*)::int AS n FROM schema_migrations WHERE version='037_memory_ingestion_queue'")).rows[0].n,0);
+      await runMigrations(migrator,inventory,{lockTimeoutMs:5000});
+      assert.equal((await migrator.query("SELECT count(*)::int AS n FROM schema_migrations WHERE version='037_memory_ingestion_queue'")).rows[0].n,1);
+    } finally {await locker.end();await migrator.end();await owner!.query('DROP DATABASE ingestion_lock_test');}
   });
   await t.test('HTTP inline budget is independent of provider timeout and happy path remains ready', async () => {
     const { app } = await import('../src/server.js');
