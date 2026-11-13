@@ -8,7 +8,7 @@ import request from 'supertest';
 import { loadMigrationInventory, runMigrations } from '../scripts/migrate.js';
 import { provisionDatabase } from '../scripts/provision-db.js';
 import { setPoolForTesting, withScopedClient, dbScopeFromAuth } from '../src/db.js';
-import { hashKey } from '../src/auth.js';
+import { hashKey, validateKey } from '../src/auth.js';
 import { acceptMemory, claimIngestionJob, finalizeIngestionJob, failIngestionJob,
   requeueIngestionJob, setIngestionPaused, ingestionStats, type IngestionJob } from '../src/ingestion.js';
 import { memoryStore, storeSchema } from '../src/tools/store.js';
@@ -690,9 +690,11 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     const canonical=await acceptMemory(input('authority lock canonical',{namespace:'private'}),auth,agent);
     await finalizeIngestionJob(await claim(canonical.id),exact);
     const a=await acceptMemory(input('authority lock duplicate',{namespace:'private',dedupe:true}),auth,agent);const job=await claim(a.id);
+    const secondCanonical=await acceptMemory(input('authority lock second canonical'),auth,agent);await finalizeIngestionJob(await claim(secondCanonical.id),exact);
+    const second=await acceptMemory(input('authority lock second duplicate',{dedupe:true}),auth,agent);const secondJob=await claim(second.id);
     const revoker=new pg.Client({connectionString:url});await revoker.connect();
     const revokerPid=(await revoker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
-    let completion:Promise<unknown>|undefined;let revocation:Promise<unknown>|undefined;
+    let completion:Promise<unknown>|undefined;let revocation:Promise<unknown>|undefined;let authentication:ReturnType<typeof validateKey>|undefined;let secondCompletion:Promise<unknown>|undefined;
     await owner!.query("SELECT pg_advisory_lock(hashtextextended('ingestion-authority-effect-test',0))");
     await owner!.query(`CREATE FUNCTION ingestion_authority_lock_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
       PERFORM pg_advisory_xact_lock(hashtextextended('ingestion-authority-effect-test',0)); RETURN NEW; END $$;
@@ -705,6 +707,12 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
         if(inEffects)break;await new Promise(resolve=>setTimeout(resolve,10));
       }
       assert.equal(inEffects,true,'finalizer must reach canonical effects after the authority check');
+      authentication=validateKey('tr_owner');
+      let timer:ReturnType<typeof setTimeout>|undefined;
+      const authenticated=await Promise.race([authentication,new Promise<'blocked'>(resolve=>{timer=setTimeout(()=>resolve('blocked'),1000);})]);
+      if(timer)clearTimeout(timer);
+      assert.notEqual(authenticated,'blocked','usage timestamp contention must not block authentication');
+      assert.equal((authenticated as AuthContext).keyId,ownerId);
       let revoked=false;revocation=revoker.query('UPDATE api_keys SET enabled=false WHERE id=$1',[ownerId]).then(()=>{revoked=true;});
       let revocationBlocked=false;
       for(let i=0;i<100;i++){
@@ -712,15 +720,72 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
         if(revocationBlocked)break;await new Promise(resolve=>setTimeout(resolve,10));
       }
       assert.equal(revocationBlocked,true,'the authority row must remain locked through cross-row effects');assert.equal(revoked,false);
+      secondCompletion=finalizeIngestionJob(secondJob,exact);
+      let secondBlocked=false;
+      for(let i=0;i<100;i++){
+        secondBlocked=(await owner!.query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%SELECT k.id FROM api_keys%') AS blocked")).rows[0].blocked;
+        if(secondBlocked)break;await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      assert.equal(secondBlocked,true,'later finalizers must queue behind a waiting revoker rather than join shared holders');
       await owner!.query("SELECT pg_advisory_unlock(hashtextextended('ingestion-authority-effect-test',0))");
       assert.equal((await completion as {deduplicated:boolean}).deduplicated,true);await revocation;
       assert.equal(revoked,true);
+      const later=await secondCompletion as {id:string;deduplicated:boolean;state:string};
+      assert.equal(later.id,second.id);assert.equal(later.deduplicated,false);assert.equal(later.state,'ready');
+      assert.equal((await owner!.query('SELECT access_count FROM memories WHERE id=$1',[secondCanonical.id])).rows[0].access_count,0);
+      assert.equal(await validateKey('tr_owner'),null,'the read-only authentication fallback must still reject a committed revocation');
     } finally {
       await owner!.query("SELECT pg_advisory_unlock(hashtextextended('ingestion-authority-effect-test',0))");
-      await completion?.catch(()=>undefined);await revocation?.catch(()=>undefined);await revoker.end();
+      await completion?.catch(()=>undefined);await revocation?.catch(()=>undefined);await authentication?.catch(()=>undefined);await secondCompletion?.catch(()=>undefined);await revoker.end();
       await owner!.query('DROP TRIGGER ingestion_authority_lock_test ON memories; DROP FUNCTION ingestion_authority_lock_test()');
       await owner!.query('UPDATE api_keys SET enabled=true WHERE id=$1',[ownerId]);
     }
+  });
+  await t.test('unlinked completion without cross-row effects does not wait for the accepting key lock', async () => {
+    const a=await acceptMemory(input('key-independent completion',{idempotency_key:'key-independent'}),auth,agent);const job=await claim(a.id);
+    await owner!.query('BEGIN');await owner!.query('SELECT id FROM api_keys WHERE id=$1 FOR UPDATE',[ownerId]);
+    let completion:Promise<unknown>|undefined;let timer:ReturnType<typeof setTimeout>|undefined;
+    try {
+      completion=finalizeIngestionJob(job,embedding);
+      const result=await Promise.race([completion,new Promise<'blocked'>(resolve=>{timer=setTimeout(()=>resolve('blocked'),1000);})]);
+      assert.notEqual(result,'blocked','a keyed completion has no other-memory effect requiring a key-row fence');
+      assert.equal((result as {state:string}).state,'ready');
+    } finally {if(timer)clearTimeout(timer);await owner!.query('ROLLBACK');await completion?.catch(()=>undefined);}
+  });
+  await t.test('namespace contention does not fence off revocation before effects can start', async () => {
+    const a=await acceptMemory(input('namespace wait duplicate',{namespace:'private',dedupe:true}),auth,agent);const job=await claim(a.id);
+    const namespaceLock='memory-store-dedupe:'+JSON.stringify(['private','normal']);
+    const revoker=new pg.Client({connectionString:url});await revoker.connect();
+    await owner!.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[namespaceLock]);
+    let completion:Promise<unknown>|undefined;let revocation:Promise<unknown>|undefined;let timer:ReturnType<typeof setTimeout>|undefined;
+    try {
+      completion=finalizeIngestionJob(job,embedding);
+      let waiting=false;
+      for(let i=0;i<100;i++){
+        waiting=(await owner!.query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT pg_advisory_xact_lock%') AS waiting")).rows[0].waiting;
+        if(waiting)break;await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      assert.equal(waiting,true);
+      revocation=revoker.query('UPDATE api_keys SET enabled=false WHERE id=$1',[ownerId]);
+      const revoked=await Promise.race([revocation.then(()=>true),new Promise<'blocked'>(resolve=>{timer=setTimeout(()=>resolve('blocked'),1000);})]);
+      assert.equal(revoked,true,'waiting for a namespace must not hold the key-row fence');
+    } finally {
+      if(timer)clearTimeout(timer);await owner!.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',[namespaceLock]);
+      await completion?.catch(()=>undefined);await revocation?.catch(()=>undefined);await revoker.end();await owner!.query('UPDATE api_keys SET enabled=true WHERE id=$1',[ownerId]);
+    }
+  });
+  await t.test('an explicitly linked pending successor keeps its history during embedding finalization', async () => {
+    const {memoryUpdate}=await import('../src/tools/update.js');
+    const exact={...embedding,vector:Array.from({length:768},(_,i)=>i===35?1:0)};
+    const previous=await acceptMemory(input('explicit history predecessor',{namespace:'private'}),auth,agent);await finalizeIngestionJob(await claim(previous.id),exact);
+    const canonical=await acceptMemory(input('explicit history unrelated canonical',{namespace:'private'}),auth,agent);await finalizeIngestionJob(await claim(canonical.id),exact);
+    const successor=await acceptMemory(input('explicit history queued successor',{namespace:'private',dedupe:true}),auth,agent);const job=await claim(successor.id);
+    await memoryUpdate({id:successor.id,supersedes:previous.id},auth);
+    const result=await finalizeIngestionJob(job,exact);assert.equal(result?.id,successor.id);assert.equal(result?.deduplicated,false);
+    const linked=(await owner!.query('SELECT supersedes_id,deleted_at,embedding IS NOT NULL AS embedded FROM memories WHERE id=$1',[successor.id])).rows[0];
+    assert.deepEqual(linked,{supersedes_id:previous.id,deleted_at:null,embedded:true});
+    assert.ok((await owner!.query('SELECT superseded_at FROM memories WHERE id=$1',[previous.id])).rows[0].superseded_at);
+    assert.equal((await owner!.query('SELECT access_count FROM memories WHERE id=$1',[canonical.id])).rows[0].access_count,0);
   });
   await t.test('migration 037 bounds table lock waits and rolls back before a safe retry', async () => {
     await owner!.query('CREATE DATABASE ingestion_lock_test');
