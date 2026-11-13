@@ -544,6 +544,37 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       assert.equal((await owner!.query('SELECT status,attempts FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'ready');
     }
   });
+  await t.test('HTTP out-of-scope stores stay inline with one embedding call under approved mutation', async () => {
+    const {contradictionPolicyFromEnv,resetContradictionRuntimeForTesting}=await import('../src/contradictions.js');
+    const settings={
+      CONTRADICTION_CLASSIFICATION_ENABLED:'true',CONTRADICTION_PROCESSING_APPROVED:'true',CONTRADICTION_PROVIDER:'test',
+      CONTRADICTION_MODEL:'test',CONTRADICTION_GENERATION_ENDPOINT:'https://classifier-not-used.test',CONTRADICTION_PROVIDER_MODEL_APPROVED:'true',
+      CONTRADICTION_PRIVACY_APPROVED:'true',CONTRADICTION_RETENTION_APPROVED:'true',CONTRADICTION_TRAINING_APPROVED:'true',
+      CONTRADICTION_APPROVED_NAMESPACE:'private',CONTRADICTION_SCOPE_APPROVED:'true',CONTRADICTION_COST_BUDGET_APPROVED:'true',
+      CONTRADICTION_COST_BUDGET_USD:'1',CONTRADICTION_ESTIMATED_REQUEST_COST_USD:'0.001',
+      CONTRADICTION_ESTIMATED_INPUT_COST_USD_PER_MILLION_BYTES:'0',CONTRADICTION_ESTIMATED_OUTPUT_COST_USD_PER_MILLION_BYTES:'0',
+      CONTRADICTION_AUTO_MUTATION_ENABLED:'true',CONTRADICTION_MUTATION_APPROVED:'true',CONTRADICTION_SHADOW_METRICS_REVIEWED:'true',
+      DEPLOYMENT_ENVIRONMENT:'ingestion-test',CONTRADICTION_MUTATION_ENVIRONMENT:'ingestion-test',CONTRADICTION_TIMEOUT_MS:'10000',
+      MEMORY_STORE_INLINE_EMBED_MS:'3000',
+    };
+    const saved=new Map(Object.keys(settings).map(key=>[key,process.env[key]]));
+    await resetContradictionRuntimeForTesting();Object.assign(process.env,settings);
+    let embeddings=0;
+    t.mock.method(globalThis,'fetch',async url=>{assert.ok(!String(url).includes('classifier-not-used.test'));embeddings++;return new Response(JSON.stringify({embedding:{values:vector}}));});
+    try {
+      assert.equal(contradictionPolicyFromEnv().mutationEnabled,true);
+      const {app}=await import('../src/server.js');
+      for (const [index,entry] of [
+        {namespace:'shared',access_level:'normal'},
+        {namespace:'private',access_level:'sensitive'},
+        {namespace:'private',access_level:'secret'},
+      ].entries()) {
+        const result=await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({content:`scope HTTP ${index}`,agent_name:'scope-http',dedupe:false,...entry});
+        assert.equal(result.status,200,JSON.stringify(result.body));assert.equal(result.body.state,'ready');
+        assert.equal(embeddings,index+1,'each request must embed exactly once and avoid worker handoff');
+      }
+    } finally {t.mock.restoreAll();for(const [key,value]of saved){if(value===undefined)delete process.env[key];else process.env[key]=value;}await resetContradictionRuntimeForTesting();}
+  });
   await t.test('keyed replacement before first readiness still creates exactly one notification', async () => {
     const a=await acceptMemory(input('pending original',{idempotency_key:'pending-event-replacement'}),auth,agent);
     const stale=await claim(a.id);
@@ -653,6 +684,43 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       const previous=(await owner!.query('SELECT superseded_at,access_count FROM memories WHERE id=$1',[canonical.id])).rows[0];
       assert.deepEqual(previous,{superseded_at:null,access_count:0});
     } finally {await owner!.query('UPDATE api_keys SET enabled=true WHERE id=$1',[ownerId]);}
+  });
+  await t.test('revocation cannot complete between the final authority check and canonical effects', async () => {
+    const exact={...embedding,vector:Array.from({length:768},(_,i)=>i===33?1:0)};
+    const canonical=await acceptMemory(input('authority lock canonical',{namespace:'private'}),auth,agent);
+    await finalizeIngestionJob(await claim(canonical.id),exact);
+    const a=await acceptMemory(input('authority lock duplicate',{namespace:'private',dedupe:true}),auth,agent);const job=await claim(a.id);
+    const revoker=new pg.Client({connectionString:url});await revoker.connect();
+    const revokerPid=(await revoker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+    let completion:Promise<unknown>|undefined;let revocation:Promise<unknown>|undefined;
+    await owner!.query("SELECT pg_advisory_lock(hashtextextended('ingestion-authority-effect-test',0))");
+    await owner!.query(`CREATE FUNCTION ingestion_authority_lock_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      PERFORM pg_advisory_xact_lock(hashtextextended('ingestion-authority-effect-test',0)); RETURN NEW; END $$;
+      CREATE TRIGGER ingestion_authority_lock_test BEFORE UPDATE OF access_count ON memories FOR EACH ROW EXECUTE FUNCTION ingestion_authority_lock_test()`);
+    try {
+      completion=finalizeIngestionJob(job,exact);
+      let inEffects=false;
+      for(let i=0;i<100;i++){
+        inEffects=(await owner!.query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%access_count = COALESCE%') AS active")).rows[0].active;
+        if(inEffects)break;await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      assert.equal(inEffects,true,'finalizer must reach canonical effects after the authority check');
+      let revoked=false;revocation=revoker.query('UPDATE api_keys SET enabled=false WHERE id=$1',[ownerId]).then(()=>{revoked=true;});
+      let revocationBlocked=false;
+      for(let i=0;i<100;i++){
+        revocationBlocked=(await owner!.query("SELECT wait_event_type='Lock' AS blocked FROM pg_stat_activity WHERE pid=$1",[revokerPid])).rows[0]?.blocked===true;
+        if(revocationBlocked)break;await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      assert.equal(revocationBlocked,true,'the authority row must remain locked through cross-row effects');assert.equal(revoked,false);
+      await owner!.query("SELECT pg_advisory_unlock(hashtextextended('ingestion-authority-effect-test',0))");
+      assert.equal((await completion as {deduplicated:boolean}).deduplicated,true);await revocation;
+      assert.equal(revoked,true);
+    } finally {
+      await owner!.query("SELECT pg_advisory_unlock(hashtextextended('ingestion-authority-effect-test',0))");
+      await completion?.catch(()=>undefined);await revocation?.catch(()=>undefined);await revoker.end();
+      await owner!.query('DROP TRIGGER ingestion_authority_lock_test ON memories; DROP FUNCTION ingestion_authority_lock_test()');
+      await owner!.query('UPDATE api_keys SET enabled=true WHERE id=$1',[ownerId]);
+    }
   });
   await t.test('migration 037 bounds table lock waits and rolls back before a safe retry', async () => {
     await owner!.query('CREATE DATABASE ingestion_lock_test');
