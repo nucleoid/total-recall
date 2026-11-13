@@ -132,6 +132,76 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     const changed = await acceptMemory(input('ready replacement',{ idempotency_key: 'stable', namespace: 'private' }),auth,agent); assert.equal(changed.state,'queued');
     await failIngestionJob(await claim(first.id),new Error('private detail')); const retry = await acceptMemory(input('ready replacement',{ idempotency_key: 'stable', namespace: 'private' }),auth,agent); assert.equal(retry.id,first.id);
   });
+  await t.test('identical keyed retry preserves content/vector pairing against a synchronous writer', async () => {
+    const a=await acceptMemory(input('key race original',{idempotency_key:'sync-writer-race'}),auth,agent);
+    await finalizeIngestionJob(await claim(a.id),embedding);
+    const replacement=Array.from({length:768},(_,i)=>i===40?1:0);
+    let readReached!:()=>void;let resumeRead!:()=>void;
+    const reached=new Promise<void>(resolve=>{readReached=resolve;});
+    const resume=new Promise<void>(resolve=>{resumeRead=resolve;});
+    setPoolForTesting({query:pool!.query.bind(pool!),connect:async()=>{
+      const client=await pool!.connect();
+      return {release:(error?:Error)=>client.release(error),query:async(sql:string,values?:unknown[])=>{
+        const result=await client.query(sql,values);
+        if(sql.startsWith('SELECT content, namespace, access_level FROM memories')) {readReached();await resume;}
+        return result;
+      }};
+    }} as unknown as pg.Pool);
+    const writer=new pg.Client({connectionString:url});await writer.connect();
+    let retry:ReturnType<typeof acceptMemory>|undefined;let write:Promise<unknown>|undefined;
+    try {
+      retry=acceptMemory(input('key race original',{idempotency_key:'sync-writer-race'}),auth,agent);
+      await reached;
+      const pid=(await writer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      let finished=false;
+      write=writer.query('UPDATE memories SET content=$2,embedding=$3::vector WHERE id=$1',
+        [a.id,'key race replacement',JSON.stringify(replacement)]).then(()=>{finished=true;});
+      // The old implementation lets this commit between its stale read and upsert.
+      // A correct implementation either locks that read or resets the vector atomically.
+      let waiting=false;
+      for(let i=0;i<100;i++) {
+        waiting=(await owner!.query("SELECT wait_event_type='Lock' AS waiting FROM pg_stat_activity WHERE pid=$1",[pid])).rows[0]?.waiting===true;
+        if(finished||waiting)break;await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      assert.ok(finished||waiting,'synchronous writer must commit or reach the row-lock barrier');
+      resumeRead();await retry;await write;
+      const row=(await owner!.query('SELECT content,embedding::text AS embedding FROM memories WHERE id=$1',[a.id])).rows[0];
+      assert.deepEqual(JSON.parse(row.embedding),row.content==='key race original'?vector:replacement,
+        'a ready vector must belong to the content committed with it');
+      assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'ready');
+    } finally {resumeRead();await retry?.catch(()=>undefined);await write?.catch(()=>undefined);setPoolForTesting(pool!);await writer.end();}
+  });
+  await t.test('database contention rolls back and retries without spending provider attempts', async () => {
+    process.env.MEMORY_INGESTION_MAX_ATTEMPTS='1';
+    await owner!.query(`CREATE FUNCTION ingestion_contention_test() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION USING ERRCODE=TG_ARGV[0], MESSAGE='private SQL content'; END $$`);
+    try {
+      for(const inline of [true,false]) for(const code of ['55P03','57014','40P01','40001']) {
+        const a=await acceptMemory(input(`database contention ${inline} ${code}`),auth,agent);
+        const job=await claimIngestionJob(dbScopeFromAuth(inline?auth:admin),{memoryId:a.id,inline});assert.ok(job);
+        await owner!.query(`CREATE TRIGGER ingestion_contention_test BEFORE UPDATE OF embedding ON memories
+          FOR EACH ROW WHEN (NEW.id='${a.id}') EXECUTE FUNCTION ingestion_contention_test('${code}')`);
+        let failure:unknown;
+        try {await finalizeIngestionJob(job,embedding);}
+        catch(error) {failure=error;}
+        finally {await owner!.query('DROP TRIGGER ingestion_contention_test ON memories');}
+        assert.equal((failure as {code:string})?.code,code);
+        assert.equal((await owner!.query('SELECT embedding FROM memories WHERE id=$1',[a.id])).rows[0].embedding,null);
+        await failIngestionJob(job,failure);
+        const row=(await owner!.query(`SELECT status,attempts,last_error_code,
+          EXTRACT(EPOCH FROM next_attempt_at-now())*1000 AS delay FROM memory_ingestion_jobs WHERE memory_id=$1`,[a.id])).rows[0];
+        assert.equal(row.status,inline?'pending':'retry_wait');assert.equal(row.attempts,0);
+        assert.equal(row.last_error_code,'db_contention');
+        assert.ok(inline?Number(row.delay)<=0:Number(row.delay)>0&&Number(row.delay)<=1500);
+        await owner!.query('UPDATE memory_ingestion_jobs SET next_attempt_at=now() WHERE memory_id=$1',[a.id]);
+        const recovery=await claimIngestionJob(dbScopeFromAuth(admin),{memoryId:a.id});assert.ok(recovery);
+        assert.equal((await finalizeIngestionJob(recovery,embedding))?.state,'ready');
+        // Replayed failure from the old token must not change the recovered generation.
+        await failIngestionJob(job,failure);
+        assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'ready');
+      }
+    } finally {await owner!.query('DROP FUNCTION ingestion_contention_test()');process.env.MEMORY_INGESTION_MAX_ATTEMPTS='12';}
+  });
   await t.test('identical retries retain the accepted security/provenance and embedding-target snapshot', async () => {
     const a = await acceptMemory(input('immutable snapshot',{ idempotency_key:'snapshot' }),auth,agent);
     await owner!.query("UPDATE memory_ingestion_jobs SET embedding_model='original-accepted-model' WHERE memory_id=$1",[a.id]);

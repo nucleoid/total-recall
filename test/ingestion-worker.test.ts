@@ -20,6 +20,13 @@ test('ingestion classifies HTTP, invalid vectors and transport errors without re
     assert.doesNotMatch(JSON.stringify(classifyIngestionFailure(error)),/private/);
   }
 });
+test('database contention has a content-free code distinct from provider failures', () => {
+  for (const code of ['55P03','57014','40P01','40001']) {
+    const failure = classifyIngestionFailure(Object.assign(new Error('private SQL content'), { code }));
+    assert.deepEqual(failure, { category:'transient', code:'db_contention', terminal:false });
+  }
+});
+
 test('retry curve has positive bounded jitter, honors Retry-After and reaches twelve-hour cap', () => {
   const now = new Date('2026-01-01T00:00:00Z');
   for (const [attempt,seconds] of [[1,60],[2,300],[3,1800],[4,7200],[5,43200],[12,43200]]) {
