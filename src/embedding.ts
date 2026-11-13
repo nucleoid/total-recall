@@ -35,8 +35,8 @@ export interface EmbeddingProfile {
 }
 
 export class EmbeddingProviderError extends Error {
-  constructor(public readonly status: number, public readonly retryAfter?: string) {
-    super(`Embedding provider HTTP ${status}`);
+  constructor(public readonly status: number, public readonly retryAfter?: string, operation = 'Embedding provider') {
+    super(`${operation} failed (${status})`);
     this.name = 'EmbeddingProviderError';
   }
 }
@@ -228,7 +228,7 @@ async function requestProfile(profile: EmbeddingProfile, texts: string[], signal
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${profile.model}:${path}?key=${profile.apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: requestSignal,
       });
-      if (!response.ok) throw new EmbeddingProviderError(response.status, response.headers.get('retry-after') ?? undefined);
+      if (!response.ok) throw new EmbeddingProviderError(response.status, response.headers.get('retry-after') ?? undefined, `Gemini ${path}`);
       const data = await response.json() as { embedding?: { values?: unknown }; embeddings?: Array<{ values?: unknown }> };
       if (!batch) return [validateEmbeddingVector(data.embedding?.values, 'Gemini scalar', profile.dimensions)];
       return validateEmbeddingBatch(data.embeddings?.map(item => item.values), texts.length, profile.dimensions);
@@ -238,7 +238,7 @@ async function requestProfile(profile: EmbeddingProfile, texts: string[], signal
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: profile.model, input: texts }), signal: requestSignal,
     });
-    if (!response.ok) throw new EmbeddingProviderError(response.status, response.headers.get('retry-after') ?? undefined);
+    if (!response.ok) throw new EmbeddingProviderError(response.status, response.headers.get('retry-after') ?? undefined, 'Ollama embed');
     const data = await response.json() as { embeddings?: unknown };
     return validateEmbeddingBatch(data.embeddings, texts.length, profile.dimensions);
   });
