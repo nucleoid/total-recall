@@ -534,10 +534,9 @@ export async function classifyContradiction(
  * high-confidence contradiction mutation. null always means the caller should
  * execute its normal unlinked insert.
  */
-export async function maybeReviseBelief(
-  memory: SemanticMemoryInsert,
-  auth: AuthContext,
-  options: {
+export interface BeliefRevisionOptions {
+    /** Per-call execution budget; does not alter the approved runtime configuration. */
+    timeoutMs?: number;
     policy?: ContradictionPolicy;
     provider?: GenerationProvider;
     allowMutation?: boolean;
@@ -545,8 +544,35 @@ export async function maybeReviseBelief(
     metric?: (reason: ContradictionReason) => void;
     findCandidates?: typeof findContradictionCandidates;
     finalizeExisting?: { id: string; client: ScopedClient };
-  } = {},
+  }
+
+export async function maybeReviseBelief(
+  memory: SemanticMemoryInsert,
+  auth: AuthContext,
+  options: BeliefRevisionOptions = {},
 ): Promise<RevisionResult | null> {
+  const predecessorId = await prepareBeliefRevision(memory, auth, options);
+  if (!predecessorId) return null;
+  const metric = options.metric ?? emitContradictionMetric;
+  let result: RevisionResult | null;
+  try {
+    result = await commitAutomaticRevision(memory, predecessorId, auth, options.finalizeExisting);
+  } catch (error) {
+    if (options.finalizeExisting) throw error;
+    const code = databaseErrorCode(error);
+    if (!['23503', '23505', '23514', '40001', '40P01'].includes(code ?? '')) throw error;
+    metric('stale_candidate'); return null;
+  }
+  metric(result ? 'mutated' : 'stale_candidate');
+  return result;
+}
+
+/** Network classification only. Callers must revalidate the selected predecessor before mutation. */
+export async function prepareBeliefRevision(
+  memory: SemanticMemoryInsert,
+  auth: AuthContext,
+  options: BeliefRevisionOptions = {},
+): Promise<string | null> {
   const policy = options.policy ?? contradictionPolicyFromEnv();
   const metric = options.metric ?? emitContradictionMetric;
   if (!policyAllowsScope(policy, memory.namespace, memory.accessLevel)) {
@@ -563,6 +589,7 @@ export async function maybeReviseBelief(
     return null;
   }
   const classificationStartedAt = Date.now();
+  const timeoutMs = Math.min(policy.timeoutMs, options.timeoutMs ?? policy.timeoutMs);
 
   try {
   let candidates: ContradictionCandidate[];
@@ -572,7 +599,7 @@ export async function maybeReviseBelief(
       memory.namespace,
       auth,
       options.excludeCandidateId ?? null,
-      policy.timeoutMs,
+      timeoutMs,
     );
   } catch (error) {
     metric(databaseErrorCode(error) === '57014' ? 'candidate_timeout' : 'candidate_query_error');
@@ -587,7 +614,7 @@ export async function maybeReviseBelief(
     metric('shadow_shutdown');
     return null;
   }
-  const remainingTimeoutMs = policy.timeoutMs - (Date.now() - classificationStartedAt);
+  const remainingTimeoutMs = timeoutMs - (Date.now() - classificationStartedAt);
   if (remainingTimeoutMs < 1) {
     metric('provider_timeout');
     return null;
@@ -636,21 +663,7 @@ export async function maybeReviseBelief(
     return null;
   }
 
-  let result: RevisionResult | null;
-  try {
-    result = await commitAutomaticRevision(memory, classification.candidate_id!, auth, options.finalizeExisting);
-  } catch (error) {
-    // Constraint/serialization conflicts are known rolled-back stale outcomes.
-    // Do not swallow connection/commit uncertainty, which could duplicate a
-    // successfully committed successor on fallback.
-    if (options.finalizeExisting) throw error;
-    const code = databaseErrorCode(error);
-    if (!['23503', '23505', '23514', '40001', '40P01'].includes(code ?? '')) throw error;
-    metric('stale_candidate');
-    return null;
-  }
-  metric(result ? 'mutated' : 'stale_candidate');
-  return result;
+  return classification.candidate_id!;
   } finally {
     finishClassification(runtime);
   }

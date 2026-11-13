@@ -6,6 +6,7 @@ import {
   contradictionPolicyFromEnv,
   contradictionRuntimeSnapshot,
   maybeReviseBelief,
+  prepareBeliefRevision,
   policyAllowsScope,
   resetContradictionRuntimeForTesting,
   scheduleShadowClassification,
@@ -376,4 +377,17 @@ test('superseded-row search demotion has a restrictive reversible gate', () => {
   assert.equal(supersededSearchDemotionEnabledFromEnv({ SUPERSEDED_SEARCH_DEMOTION_ENABLED: 'false' }), false);
   assert.equal(supersededSearchDemotionEnabledFromEnv({ SUPERSEDED_SEARCH_DEMOTION_ENABLED: 'TRUE' }), false);
   assert.equal(supersededSearchDemotionEnabledFromEnv({ SUPERSEDED_SEARCH_DEMOTION_ENABLED: 'true' }), true);
+});
+
+test('per-call preparation deadlines retain the approved process runtime and return only a predecessor', async () => {
+  const policy={ ...contradictionPolicyFromEnv(approvedEnv()),mutationEnabled:true };
+  const memory:SemanticMemoryInsert={ content:'New belief',vector:'[]',source:'test',namespace:'work',tags:[],metadata:{},accessLevel:'normal',clientId:ID,agentId:ID,sessionId:null };
+  const reasons:ContradictionReason[]=[];
+  for(const timeoutMs of [100,200]) {
+    assert.equal(await prepareBeliefRevision(memory,{ keyId:ID,name:'test',namespaces:['work'],permissions:['read','write'],maxAccessLevel:'normal' },{
+      policy,timeoutMs,metric:reason=>reasons.push(reason),findCandidates:async()=>candidates,
+      provider:provider(JSON.stringify({ classification:'contradiction',confidence:1,candidate_id:ID })),
+    }),ID);
+  }
+  assert.ok(!reasons.includes('runtime_config_changed'));
 });

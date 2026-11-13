@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { classifyIngestionFailure, embedWithinBudget, inlineBudgetMs } from '../src/ingestion.js';
@@ -43,4 +44,14 @@ test('worker CLI validates bounded concurrency and rejects missing values', () =
   const old = process.env.MEMORY_STORE_INLINE_EMBED_MS;
   try { process.env.MEMORY_STORE_INLINE_EMBED_MS=''; assert.throws(inlineBudgetMs); process.env.MEMORY_STORE_INLINE_EMBED_MS='0'; assert.equal(inlineBudgetMs(),0); }
   finally { if (old === undefined) delete process.env.MEMORY_STORE_INLINE_EMBED_MS; else process.env.MEMORY_STORE_INLINE_EMBED_MS=old; }
+});
+
+test('worker startup rejects invalid dedupe thresholds before claims', () => {
+  for (const value of ['', 'abc', '-1', '1.01']) {
+    const result = spawnSync(process.execPath, ['--import','./test/setup-embedding-env.mjs','--import','tsx',
+      '--input-type=module','--eval',"await import('./scripts/ingestion-worker.ts')"], {
+      cwd: process.cwd(), encoding:'utf8', env:{ ...process.env, MEMORY_DEDUPE_THRESHOLD:value },
+    });
+    assert.notEqual(result.status,0); assert.match(result.stderr,/MEMORY_DEDUPE_THRESHOLD/);
+  }
 });

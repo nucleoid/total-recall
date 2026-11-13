@@ -134,6 +134,7 @@ async function renderOverview(): Promise<void> {
       card('Newest', formatDate(stats.newest_memory)),
     );
     section.append(metrics, el('h3', 'By namespace'), table(stats.by_namespace ?? [], ['namespace', 'count']));
+    try {
     const queue = await getIngestionStats();
     section.append(el('h3', 'Ingestion queue'), el('p', queue.paused ? 'Worker paused' : 'Worker accepting jobs'),
       table(Object.entries(queue.depth).map(([state, count]) => ({ state, count })), ['state', 'count']),
@@ -146,6 +147,7 @@ async function renderOverview(): Promise<void> {
       catch (error) { fail(error); }
     })());
     section.append(toggle);
+    } catch { section.append(el('h3', 'Ingestion queue'), el('p', 'Queue status unavailable. Core memory statistics remain available.', 'muted')); }
   } else {
     const stats = await api<PagedMemories>('/api/memories?limit=1');
     metrics.append(

@@ -31,21 +31,35 @@ export async function runIngestionWorker(options: IngestionWorkerOptions, signal
   const rawKey = process.env.INGESTION_WORKER_API_KEY?.trim();
   if (!rawKey) throw new Error('INGESTION_WORKER_API_KEY is required');
   let processed = 0;
+  let failures = 0;
+  const pauseAfterFailure = async () => {
+    failures = Math.min(failures + 1, 6);
+    console.warn('[ingestion-worker] outcome=poll_deferred');
+    await sleep(Math.min(60000, options.pollMs * 2 ** failures), undefined, { signal })
+      .catch(error => { if (!signal.aborted) throw error; });
+  };
   // No queue gate: switching API acceptance off must still allow backlog drainage.
   while (!signal.aborted && processed < options.maxJobs) {
-    const auth = await validateKeyReadOnly(rawKey);
+    let auth;
+    try { auth = await validateKeyReadOnly(rawKey); }
+    catch (error) { if (options.once) throw error; await pauseAfterFailure(); continue; }
     if (!auth || !auth.permissions.includes('admin')) throw new Error('Enabled admin ingestion worker API key required');
     const scope: DbScope = dbScopeFromAuth(auth);
     const capacity = Math.min(options.concurrency, options.maxJobs - processed);
-    const jobs = (await Promise.all(Array.from({ length: capacity }, () => claimIngestionJob(scope))))
-      .filter((job): job is IngestionJob => job !== null);
+    const claims = await Promise.allSettled(Array.from({ length: capacity }, () => claimIngestionJob(scope)));
+    const jobs = claims.flatMap(claim => claim.status === 'fulfilled' && claim.value ? [claim.value] : []);
+    const claimFailed = claims.some(claim => claim.status === 'rejected');
+    processed += jobs.length;
+    const completions = await Promise.allSettled(jobs.map(job => processIngestionJob(job, signal)));
+    if (claimFailed || completions.some(completion => completion.status === 'rejected')) {
+      if (options.once) throw new Error('Ingestion poll incomplete; leases recover automatically');
+      await pauseAfterFailure(); continue;
+    }
+    failures = 0;
     if (!jobs.length) {
       if (options.once) break;
       await sleep(options.pollMs, undefined, { signal }).catch(error => { if (!signal.aborted) throw error; });
-      continue;
     }
-    processed += jobs.length;
-    await Promise.all(jobs.map(job => processIngestionJob(job, signal)));
   }
   return { processed };
 }

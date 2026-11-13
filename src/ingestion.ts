@@ -1,3 +1,4 @@
+import { MEMORY_DEDUPE_THRESHOLD } from './store-config.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
 import { logAudit } from './audit.js';
@@ -5,8 +6,8 @@ import { dbScopeFromAuth, withScopedClient, withCheckedOutClient, withScopedTran
 import { ACTIVE_EMBEDDING_PROFILE, embedWithProfile, embeddingIdentity, serializeEmbeddingVector,
   EmbeddingProviderError, EmbeddingValidationError, type EmbeddingResult } from './embedding.js';
 import { TombstonedSourceKeyConflictError, SupersededSourceKeyConflictError, MemoryConflictError } from './errors.js';
-import { contradictionPolicyFromEnv, maybeReviseBelief, policyAllowsScope, scheduleShadowClassification,
-  type SemanticMemoryInsert } from './contradictions.js';
+import { contradictionPolicyFromEnv, maybeReviseBelief, prepareBeliefRevision, commitAutomaticRevision, policyAllowsScope, scheduleShadowClassification,
+  type SemanticMemoryInsert, type ContradictionPolicy } from './contradictions.js';
 import { retryAtForAttempt } from './retry.js';
 import type { AccessLevel, AuthContext, StoreResult } from './types.js';
 
@@ -21,7 +22,7 @@ export type FailureCategory = 'transient' | 'rate_limited' | 'provider_auth' | '
 export interface IngestionJob {
   memory_id: string; namespace: string; client_id: string; access_level: AccessLevel;
   allowed_namespaces: string[]; agent_id: string; session_id: string | null; source_key: string | null;
-  dedupe: boolean; ttl_seconds: string | null; contradiction_eligible: boolean;
+  memory_created: boolean; dedupe: boolean; ttl_seconds: string | null; contradiction_eligible: boolean;
   embedding_provider: string; embedding_model: string; embedding_dimensions: number;
   status: IngestionState; attempts: number; lease_token: string; accepted_at: Date;
   content: string; expires_at: Date | null; inline?: boolean;
@@ -78,10 +79,10 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
       if (sourceKey) values.push(changed, auth.namespaces);
       const memory = (await client.query(`INSERT INTO memories
         (content, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id,
-         source_key, expires_at, embedding, memory_kind, valid_from, created_at)
+         source_key, expires_at, embedding, memory_kind, valid_from, created_at, updated_at, accessed_at)
         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,
           CASE WHEN $11::bigint IS NULL THEN NULL ELSE statement_timestamp() + $11::double precision * interval '1 second' END,
-          $12::vector, 'semantic', statement_timestamp(), statement_timestamp()) ${conflict}
+          $12::vector, 'semantic', statement_timestamp(), statement_timestamp(), statement_timestamp(), statement_timestamp()) ${conflict}
         RETURNING id, namespace, expires_at, statement_timestamp() AS accepted_at, embedding IS NOT NULL AS embedded, (xmax = 0) AS created`, values)).rows[0];
       if (!memory) {
         const existing = (await client.query(`SELECT deleted_at, superseded_at FROM memories WHERE client_id = $1 AND source_key = $2`, [auth.keyId, sourceKey])).rows[0];
@@ -93,10 +94,11 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
       const profile = ACTIVE_EMBEDDING_PROFILE;
       const job = (await client.query(`INSERT INTO memory_ingestion_jobs
         (memory_id, namespace, client_id, access_level, allowed_namespaces, agent_id, session_id, source_key,
-         dedupe, ttl_seconds, contradiction_eligible, embedding_provider, embedding_model, embedding_dimensions, status, ready_at, accepted_at)
+         dedupe, ttl_seconds, contradiction_eligible, embedding_provider, embedding_model, embedding_dimensions, status, ready_at, accepted_at, memory_created)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
-          CASE WHEN $15 THEN 'pending' ELSE 'ready' END, CASE WHEN $15 THEN NULL ELSE statement_timestamp() END, $17)
+          CASE WHEN $15 THEN 'pending' ELSE 'ready' END, CASE WHEN $15 THEN NULL ELSE statement_timestamp() END, $17, $18)
         ON CONFLICT (memory_id) DO UPDATE SET
+          memory_created = CASE WHEN $16 THEN EXCLUDED.memory_created ELSE memory_ingestion_jobs.memory_created END,
           namespace = EXCLUDED.namespace, access_level = CASE WHEN $16 THEN EXCLUDED.access_level ELSE memory_ingestion_jobs.access_level END,
           allowed_namespaces = CASE WHEN $16 THEN EXCLUDED.allowed_namespaces ELSE memory_ingestion_jobs.allowed_namespaces END, agent_id = CASE WHEN $16 THEN EXCLUDED.agent_id ELSE memory_ingestion_jobs.agent_id END, session_id = CASE WHEN $16 THEN EXCLUDED.session_id ELSE memory_ingestion_jobs.session_id END,
           dedupe = CASE WHEN $16 THEN EXCLUDED.dedupe ELSE memory_ingestion_jobs.dedupe END, ttl_seconds = CASE WHEN $16 THEN EXCLUDED.ttl_seconds ELSE memory_ingestion_jobs.ttl_seconds END, contradiction_eligible = CASE WHEN $16 THEN EXCLUDED.contradiction_eligible ELSE memory_ingestion_jobs.contradiction_eligible END,
@@ -119,10 +121,10 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
         RETURNING accepted_at, status`,
       [memory.id, input.namespace, auth.keyId, input.access_level, auth.namespaces, agentId, input.session_id ?? null, sourceKey,
         input.dedupe !== false && !sourceKey && input.ttl === undefined, input.ttl ?? null, !sourceKey && input.ttl === undefined,
-        profile.provider, profile.model, profile.dimensions, reset, changed, memory.accepted_at])).rows[0];
+        profile.provider, profile.model, profile.dimensions, reset, changed, memory.accepted_at, memory.created])).rows[0];
       // Identical keyed retries do not create duplicate acceptance audit events.
       if (changed) await logAudit({ clientId: auth.keyId, action: 'memory.store', namespace: input.namespace,
-        memoryId: memory.id, agentId, sessionId: input.session_id, details: { created: true, deduplicated: false, queued: true } }, dbScopeFromAuth(auth), client);
+        memoryId: memory.id, agentId, sessionId: input.session_id, details: { created: memory.created, deduplicated: false, queued: true, ...(sourceKey ? { idempotent: true } : {}) } }, dbScopeFromAuth(auth), client);
       return { id: memory.id, namespace: memory.namespace, expires_at: memory.expires_at ?? null,
         created: job.status === 'ready' ? memory.created : true, deduplicated: false,
         state: job.status === 'ready' ? 'ready' : 'queued', accepted_at: job.accepted_at,
@@ -168,14 +170,21 @@ export async function claimIngestionJob(scope: DbScope, options: { memoryId?: st
   if (!claimed) return null;
   const job = claimed;
   const loaded = await withScopedClient(ownerScope(job), async client => {
-    const memory = (await client.query(`SELECT content, expires_at,
+    const fence = await client.query(`SELECT 1 FROM memory_ingestion_jobs WHERE memory_id = $1
+      AND status = 'processing' AND lease_token = $2 AND lease_expires_at > statement_timestamp() FOR UPDATE`,
+      [job.memory_id, job.lease_token]);
+    if (!fence.rows.length) return null;
+    const memory = (await client.query(`SELECT *,
       deleted_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= statement_timestamp()) AS expired
-      FROM memories WHERE id = $1 AND namespace = $2`, [job.memory_id, job.namespace])).rows[0];
+      FROM memories WHERE id = $1 AND namespace = $2 FOR UPDATE`, [job.memory_id, job.namespace])).rows[0];
     if (!memory || memory.expired) {
       await client.query(`UPDATE memory_ingestion_jobs SET status = 'cancelled', failure_category = 'expired',
         last_error_code = 'expired', finalized_at = statement_timestamp(), lease_token = NULL, lease_expires_at = NULL
         WHERE memory_id = $1 AND lease_token = $2`, [job.memory_id, job.lease_token]);
       return null;
+    }
+    if (memory.embedding !== null) {
+      await completeExternalEmbedding(client, job, memory); return null;
     }
     return { ...job, content: memory.content, expires_at: memory.expires_at, inline: options.inline === true };
   });
@@ -208,8 +217,33 @@ export async function failIngestionJob(job: IngestionJob, error: unknown): Promi
 }
 
 /** Lease row lock and token fence cover dedupe, belief mutation, vector, outbox and audit together. */
-export async function finalizeIngestionJob(job: IngestionJob, embedding: EmbeddingResult): Promise<StoreResult | null> {
+export async function finalizeIngestionJob(job: IngestionJob, embedding: EmbeddingResult, options: {
+  deadlineAt?: number; contradictionPolicy?: ContradictionPolicy; prepareRevision?: typeof prepareBeliefRevision;
+} = {}): Promise<StoreResult | null> {
   const scope = ownerScope(job);
+  const vector = serializeEmbeddingVector(embedding.vector);
+  const target = { provider: job.embedding_provider, model: job.embedding_model, dimensions: job.embedding_dimensions };
+  const policy = options.contradictionPolicy ?? contradictionPolicyFromEnv();
+  let preparedPredecessor: string | null = null;
+  // Never hold a checked-out connection, row lock or dedupe lock across provider classification.
+  if (job.contradiction_eligible && policy.mutationEnabled &&
+      embeddingIdentity(target) === embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) &&
+      embeddingIdentity(target) === embeddingIdentity(embedding)) {
+    const snapshot = await withScopedClient(scope, async client => (await client.query(`SELECT m.* FROM memories m
+      JOIN memory_ingestion_jobs j ON j.memory_id = m.id
+      WHERE m.id = $1 AND m.namespace = $2 AND m.content = $3 AND m.access_level = $4
+        AND m.embedding IS NULL AND m.deleted_at IS NULL AND m.superseded_at IS NULL
+        AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+        AND j.status = 'processing' AND j.lease_token = $5 AND j.lease_expires_at > statement_timestamp()`,
+      [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0]);
+    if (snapshot) {
+      const remaining = options.deadlineAt === undefined ? policy.timeoutMs : options.deadlineAt - Date.now();
+      if (remaining < 1) throw new DOMException('Inline budget exhausted', 'TimeoutError');
+      preparedPredecessor = await (options.prepareRevision ?? prepareBeliefRevision)(semanticMemory(job, snapshot, vector), ownerAuth(job), {
+        policy, timeoutMs: Math.min(policy.timeoutMs, remaining), allowMutation: true, excludeCandidateId: job.memory_id,
+      });
+    }
+  }
   let shadow: (() => Promise<void>) | undefined;
   const result = await withCheckedOutClient(client => withScopedTransactionOnClient(client, scope, async client => {
     const fenced = await client.query(`SELECT * FROM memory_ingestion_jobs WHERE memory_id = $1 AND status = 'processing'
@@ -223,15 +257,14 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     if (!job.allowed_namespaces.includes(job.namespace)) {
       await finishJob(client, job, 'cancelled'); return null;
     }
+    if (memory.embedding !== null) return completeExternalEmbedding(client, job, memory);
     // A later synchronous writer must never receive an older content vector.
     if (memory.content !== job.content || memory.access_level !== job.access_level || memory.superseded_at || memory.consolidated_into_id) {
       await finishJob(client, job, 'cancelled'); return null;
     }
-    const target = { provider: job.embedding_provider, model: job.embedding_model, dimensions: job.embedding_dimensions };
     if (embeddingIdentity(target) !== embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) || embeddingIdentity(target) !== embeddingIdentity(embedding)) {
       await finishJob(client, job, 'embedding_failed', 'space_mismatch'); return null;
     }
-    const vector = serializeEmbeddingVector(embedding.vector);
     if (job.dedupe && job.ttl_seconds === null) {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`memory-store-dedupe:${JSON.stringify([job.namespace, job.access_level])}`]);
       const match = (await client.query(`SELECT m.id, m.namespace, 1 - (m.embedding <=> $1::vector) AS similarity
@@ -245,7 +278,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
           calculate_relevance(m.relevance_base_score,m.decay_rate,m.accessed_at,m.access_count) DESC, m.created_at ASC, m.id ASC
         LIMIT 1 FOR UPDATE`, [vector, job.namespace, job.access_level, embedding.provider, embedding.model, embedding.dimensions, job.memory_id])).rows[0];
       const similarity = Number(match?.similarity ?? NaN);
-      const threshold = Number(process.env.MEMORY_DEDUPE_THRESHOLD ?? '0.95');
+      const threshold = MEMORY_DEDUPE_THRESHOLD;
       if (match && Number.isFinite(similarity) && similarity >= threshold) {
         await client.query(`UPDATE memories SET access_count = COALESCE(access_count,0) + 1,
           accessed_at = statement_timestamp(), last_boosted_at = statement_timestamp(), updated_at = statement_timestamp(),
@@ -261,14 +294,17 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
           similarity, state: 'ready' as const, accepted_at: job.accepted_at };
       }
     }
-    const semantic: SemanticMemoryInsert = { content: memory.content, vector, source: memory.source,
-      namespace: memory.namespace, tags: memory.tags, metadata: memory.metadata, accessLevel: memory.access_level,
-      clientId: job.client_id, agentId: job.agent_id, sessionId: job.session_id };
-    const policy = contradictionPolicyFromEnv();
+    const semantic = semanticMemory(job, memory, vector);
     let revised = null;
-    if (job.contradiction_eligible && policy.mutationEnabled) {
-      revised = await maybeReviseBelief(semantic, ownerAuth(job), { policy, allowMutation: true,
-        excludeCandidateId: job.memory_id, finalizeExisting: { id: job.memory_id, client } });
+    if (preparedPredecessor) {
+      await client.query('SAVEPOINT ingestion_revision');
+      try {
+        revised = await commitAutomaticRevision(semantic, preparedPredecessor, ownerAuth(job), { id: job.memory_id, client });
+      } catch (error) {
+        if (!['23503','23505','23514','40001','40P01'].includes((error as { code?: string }).code ?? '')) throw error;
+        await client.query('ROLLBACK TO SAVEPOINT ingestion_revision');
+      }
+      await client.query('RELEASE SAVEPOINT ingestion_revision');
     }
     if (!revised) await client.query(`UPDATE memories SET embedding = $2::vector, embedding_provider = $3,
       embedding_model = $4, embedding_dimensions = $5, updated_at = statement_timestamp() WHERE id = $1`,
@@ -282,10 +318,27 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       shadow = () => maybeReviseBelief(semantic, ownerAuth(job), { policy, allowMutation: false, excludeCandidateId: job.memory_id }).then(() => undefined);
     }
     return { id: job.memory_id, namespace: job.namespace, expires_at: memory.expires_at ?? null,
-      created: true, deduplicated: false, state: 'ready' as const, accepted_at: job.accepted_at };
+      created: job.memory_created, deduplicated: false, state: 'ready' as const, accepted_at: job.accepted_at };
   }));
   if (shadow) scheduleShadowClassification(contradictionPolicyFromEnv(), shadow);
   return result;
+}
+async function completeExternalEmbedding(client: ScopedClient, job: IngestionJob, memory: Record<string, any>): Promise<StoreResult | null> {
+  if (memory.embedding_provider !== job.embedding_provider || memory.embedding_model !== job.embedding_model ||
+      memory.embedding_dimensions !== job.embedding_dimensions) {
+    await finishJob(client, job, 'cancelled'); return null;
+  }
+  await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', ready_at = statement_timestamp(),
+    finalized_at = statement_timestamp(), lease_token = NULL, lease_expires_at = NULL,
+    failure_category = NULL, last_error_code = NULL WHERE memory_id = $1 AND lease_token = $2`, [job.memory_id, job.lease_token]);
+  await auditReady(client, job, false);
+  return { id: job.memory_id, namespace: job.namespace, expires_at: memory.expires_at ?? null,
+    created: job.memory_created, deduplicated: false, state: 'ready', accepted_at: job.accepted_at };
+}
+function semanticMemory(job: IngestionJob, memory: Record<string, any>, vector: string): SemanticMemoryInsert {
+  return { content: memory.content, vector, source: memory.source, namespace: memory.namespace,
+    tags: memory.tags, metadata: memory.metadata, accessLevel: memory.access_level,
+    clientId: job.client_id, agentId: job.agent_id, sessionId: job.session_id };
 }
 async function finishJob(client: ScopedClient, job: IngestionJob, state: IngestionState, category?: FailureCategory): Promise<void> {
   await client.query(`UPDATE memory_ingestion_jobs SET status = $3, failure_category = $4, last_error_code = $4,
@@ -300,15 +353,24 @@ async function auditReady(client: ScopedClient, job: IngestionJob, deduplicated:
 
 export async function tryInlineIngestion(accepted: StoreResult, auth: AuthContext): Promise<StoreResult> {
   if (accepted.state === 'ready') return accepted;
-  const budget = inlineBudgetMs();
-  if (budget === 0) return accepted;
-  const job = await claimIngestionJob(dbScopeFromAuth(auth), { memoryId: accepted.id, inline: true, leaseMs: budget + 30_000 });
-  if (!job) return accepted;
+  let job: IngestionJob | null = null;
   try {
-    const embedding = await embedWithinBudget(job.content, budget);
-    const ready = await finalizeIngestionJob(job, embedding);
+    const budget = inlineBudgetMs();
+    if (budget === 0) return accepted;
+    job = await claimIngestionJob(dbScopeFromAuth(auth), { memoryId: accepted.id, inline: true, leaseMs: budget + 30_000 });
+    if (!job) return accepted;
+    const deadlineAt = Date.now() + budget;
+    const remaining = deadlineAt - Date.now();
+    if (remaining < 1) throw new DOMException('Inline budget exhausted', 'TimeoutError');
+    const embedding = await embedWithinBudget(job.content, remaining);
+    const ready = await finalizeIngestionJob(job, embedding, { deadlineAt });
     return ready ? { ...ready, ...(accepted.idempotency_key_honored ? { idempotency_key_honored: true } : {}) } : accepted;
-  } catch (error) { await failIngestionJob(job, error); return accepted; }
+  } catch (error) {
+    // Acceptance already committed. Even a second DB failure must never undo its acknowledgement.
+    if (job) { try { await failIngestionJob(job, error); } catch { /* Lease expiry recovers the job. */ } }
+    console.warn('[ingestion] outcome=inline_deferred');
+    return accepted;
+  }
 }
 /** Race also bounds test/faulty providers which fail to honor AbortSignal. Late results never finalize. */
 export async function embedWithinBudget(content: string, budget: number, embed = embedWithProfile, signal?: AbortSignal): Promise<EmbeddingResult> {

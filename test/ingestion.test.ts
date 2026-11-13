@@ -35,3 +35,23 @@ test('durable acknowledgement survives a claim failure after acceptance', async 
     deduplicated:false,expires_at:null,state:'queued' as const,accepted_at:new Date() };
   assert.deepEqual(await tryInlineIngestion(accepted,auth),accepted);
 });
+
+test('durable acknowledgement survives a failure to record an inline provider failure', async t => {
+  const { tryInlineIngestion } = await import('../src/ingestion.js');
+  process.env.MEMORY_STORE_INLINE_EMBED_MS='1000';
+  t.after(() => { delete process.env.MEMORY_STORE_INLINE_EMBED_MS; setPoolForTesting(null); });
+  let connects=0;
+  const job = { memory_id:'33333333-3333-4333-8333-333333333333', namespace:'shared', client_id:auth.keyId,
+    lease_token:'44444444-4444-4444-8444-444444444444', attempts:0, accepted_at:new Date(),allowed_namespaces:['shared'] };
+  setPoolForTesting({ connect:async () => {
+    if (++connects===3) throw new Error('private failure-update detail');
+    return { release() {},query:async (sql:string) => {
+      const rows = sql.includes('WITH candidate AS') ? [job] : sql.includes('SELECT 1 FROM memory_ingestion_jobs') ? [{}] :
+        sql.includes('FROM memories WHERE') ? [{ content:'retained',embedding:null,expires_at:null,expired:false }] : [];
+      return { rows,rowCount:rows.length };
+    } };
+  } } as unknown as pg.Pool);
+  t.mock.method(globalThis,'fetch',async () => { throw new Error('provider offline'); });
+  const accepted = { id:job.memory_id,namespace:'shared',created:true,deduplicated:false,expires_at:null,state:'queued' as const,accepted_at:job.accepted_at };
+  assert.deepEqual(await tryInlineIngestion(accepted,auth),accepted); assert.equal(connects,3);
+});

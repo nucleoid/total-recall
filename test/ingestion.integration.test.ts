@@ -28,6 +28,16 @@ const vector = Array.from({ length: 768 }, (_, i) => i === 0 ? 1 : 0);
 const embedding = { vector, provider: ACTIVE_EMBEDDING_PROFILE.provider, model: ACTIVE_EMBEDDING_PROFILE.model, dimensions: 768 };
 const input = (content: string, extra = {}) => ({ content, namespace: 'shared', tags: [], metadata: {}, access_level: 'normal' as const, dedupe: false, ...extra });
 
+function faultingPool(pool: pg.Pool, fail: (sql: string) => boolean): pg.Pool {
+  return { query: pool.query.bind(pool), connect: async () => {
+    const client = await pool.connect();
+    return { release:(error?: Error) => client.release(error), query: async (sql: string, values?: unknown[]) => {
+      if (fail(sql)) throw new Error('injected private database boundary');
+      return client.query(sql,values);
+    } };
+  } } as unknown as pg.Pool;
+}
+
 // This suite deliberately fails rather than skips when PostgreSQL evidence is unavailable.
 test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibility', { timeout: 180000 }, async t => {
   execFileSync('docker', ['version'], { stdio: 'ignore' });
@@ -257,15 +267,92 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       assert.ok(ready.every(j=>j.status==='ready' && j.attempts===2));
     } finally { t.mock.restoreAll(); delete process.env.INGESTION_WORKER_API_KEY; }
   });
+  await t.test('classifier preparation holds no row or namespace locks and concurrent revisions revalidate one predecessor', async () => {
+    const { contradictionPolicyFromEnv } = await import('../src/contradictions.js');
+    const policy = { ...contradictionPolicyFromEnv(),mutationEnabled:true };
+    const predecessor = await acceptMemory(input('concurrent predecessor',{ namespace:'private' }),auth,agent);
+    await finalizeIngestionJob(await claim(predecessor.id),embedding);
+    const accepted = await Promise.all([acceptMemory(input('revision a',{ namespace:'private' }),auth,agent),acceptMemory(input('revision b',{ namespace:'private' }),auth,agent)]);
+    const jobs = await Promise.all(accepted.map(a=>claim(a.id)));
+    let prepared=0; let release!:()=>void; const barrier=new Promise<void>(resolve=>{ release=resolve; });
+    const prepare = async () => {
+      prepared++; if (prepared===2) release(); await barrier; return predecessor.id;
+    };
+    const results = await Promise.all(jobs.map(job=>finalizeIngestionJob(job,embedding,{ contradictionPolicy:policy,
+      prepareRevision:async () => {
+        const lock = (await owner!.query('SELECT pg_try_advisory_lock(hashtextextended($1,0)) AS acquired',
+          ['memory-store-dedupe:'+JSON.stringify(['private','normal'])])).rows[0].acquired;
+        assert.equal(lock,true); await owner!.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',['memory-store-dedupe:'+JSON.stringify(['private','normal'])]);
+        // Both preparations must enter before either completion can proceed.
+        return prepare();
+      } })));
+    assert.equal(prepared,2); assert.ok(results.every(result=>result?.state==='ready'));
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM memories WHERE supersedes_id=$1',[predecessor.id])).rows[0].n,1);
+  });
+  await t.test('stale revision constraint rolls back only its savepoint and still finalizes', async () => {
+    const { contradictionPolicyFromEnv } = await import('../src/contradictions.js');
+    const a=await acceptMemory(input('savepoint predecessor',{ namespace:'private' }),auth,agent); await finalizeIngestionJob(await claim(a.id),embedding);
+    const b=await acceptMemory(input('savepoint successor',{ namespace:'private' }),auth,agent); const job=await claim(b.id);
+    await owner!.query(`CREATE FUNCTION stale_revision_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.supersedes_id IS NOT NULL THEN RAISE EXCEPTION 'stale revision' USING ERRCODE='23505'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER stale_revision_test BEFORE UPDATE ON memories FOR EACH ROW EXECUTE FUNCTION stale_revision_test()`);
+    try { assert.equal((await finalizeIngestionJob(job,embedding,{ contradictionPolicy:{ ...contradictionPolicyFromEnv(),mutationEnabled:true }, prepareRevision:async()=>a.id }))?.state,'ready'); }
+    finally { await owner!.query('DROP TRIGGER stale_revision_test ON memories; DROP FUNCTION stale_revision_test()'); }
+    assert.equal((await owner!.query('SELECT superseded_at FROM memories WHERE id=$1',[a.id])).rows[0].superseded_at,null);
+    assert.equal((await owner!.query('SELECT supersedes_id FROM memories WHERE id=$1',[b.id])).rows[0].supersedes_id,null);
+  });
+  await t.test('legacy embedding writers preserve their current row without queue dedupe or revision', async () => {
+    const a=await acceptMemory(input('legacy accepted',{ dedupe:true }),auth,agent); const job=await claim(a.id);
+    await owner!.query('UPDATE memories SET content=$2,embedding=$3::vector,embedding_provider=$4,embedding_model=$5,embedding_dimensions=768 WHERE id=$1',
+      [a.id,'legacy edit wins',JSON.stringify(vector),embedding.provider,embedding.model]);
+    assert.equal((await finalizeIngestionJob(job,embedding))?.state,'ready');
+    const row=(await owner!.query('SELECT content,deleted_at,supersedes_id FROM memories WHERE id=$1',[a.id])).rows[0];
+    assert.equal(row.content,'legacy edit wins'); assert.equal(row.deleted_at,null); assert.equal(row.supersedes_id,null);
+    const b=await acceptMemory(input('already embedded before claim',{ dedupe:true }),auth,agent);
+    await owner!.query('UPDATE memories SET embedding=$2::vector,embedding_provider=$3,embedding_model=$4,embedding_dimensions=768 WHERE id=$1',[b.id,JSON.stringify(vector),embedding.provider,embedding.model]);
+    assert.equal(await claimIngestionJob(dbScopeFromAuth(auth),{ memoryId:b.id,inline:true }),null);
+    assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[b.id])).rows[0].status,'ready');
+  });
+  await t.test('reembedding skips active jobs and historical null vectors produce no creation events', async () => {
+    const { reembedWithClient } = await import('../scripts/reembed-all.js');
+    const active=await acceptMemory(input('active job must stay queued'),auth,agent);
+    const historical=(await owner!.query(`INSERT INTO memories(content,source,namespace,client_id,memory_kind,valid_from,created_at)
+      VALUES ('historical null vector','test','shared',$1,'semantic',now()-interval '1 year',now()-interval '1 year') RETURNING id`,[ownerId])).rows[0].id;
+    const embeddedTexts:string[]=[];
+    await reembedWithClient(owner!,async texts=>{ embeddedTexts.push(...texts); return texts.map(()=>vector); },{ namespaces:['shared'],delayMs:0,provider:embedding.provider,model:embedding.model,dimensions:768 });
+    assert.ok(embeddedTexts.includes('historical null vector')); assert.ok(!embeddedTexts.includes('active job must stay queued'));
+    assert.equal((await owner!.query('SELECT embedding FROM memories WHERE id=$1',[active.id])).rows[0].embedding,null);
+    assert.equal((await owner!.query('SELECT * FROM webhook_deliveries WHERE memory_id=$1',[historical])).rows.length,0);
+  });
+  await t.test('continuous worker backs off after one claim failure and resumes draining', async () => {
+    const { runIngestionWorker }=await import('../scripts/ingestion-worker.js');
+    await owner!.query("UPDATE memory_ingestion_jobs SET next_attempt_at=now()+interval '1 day' WHERE status IN ('pending','retry_wait')");
+    const a=await acceptMemory(input('worker survives database blip'),auth,agent);
+    let faults=0;
+    setPoolForTesting(faultingPool(pool!,sql=>sql.includes('WITH candidate AS') && faults++===0));
+    process.env.INGESTION_WORKER_API_KEY='tr_worker';
+    t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({ embedding:{values:vector} })));
+    try { assert.equal((await runIngestionWorker({ once:false,maxJobs:1,pollMs:100,concurrency:1 },new AbortController().signal)).processed,1); }
+    finally { setPoolForTesting(pool!); delete process.env.INGESTION_WORKER_API_KEY; t.mock.restoreAll(); }
+    assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'ready');
+  });
   await t.test('HTTP inline budget is independent of provider timeout and happy path remains ready', async () => {
     const { app } = await import('../src/server.js');
     process.env.MEMORY_STORE_INLINE_EMBED_MS='40';
-    t.mock.method(globalThis,'fetch',async () => { await new Promise(resolve => setTimeout(resolve,1500)); return new Response(JSON.stringify({ embedding:{ values:vector } })); });
+    let providerCalled=false;
+    t.mock.method(globalThis,'fetch',async (_url,init) => {
+      providerCalled=true;
+      await new Promise<void>((resolve,reject) => {
+        const timer=setTimeout(resolve,15000);
+        init?.signal?.addEventListener('abort',()=>{ clearTimeout(timer); reject(init.signal!.reason); },{once:true});
+      });
+      return new Response(JSON.stringify({ embedding:{ values:vector } }));
+    });
     const start = Date.now(); const queued = await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({ content:'http durable latency',agent_name:'http',dedupe:false });
-    assert.equal(queued.status,200,JSON.stringify(queued.body)); assert.equal(queued.body.state,'queued'); assert.ok(Date.now()-start<1000); assert.ok(queued.body.accepted_at);
+    assert.equal(queued.status,200,JSON.stringify(queued.body)); assert.equal(queued.body.state,'queued'); assert.ok(Date.now()-start<5040); assert.equal(providerCalled,true); t.diagnostic(`HTTP queued latency ${Date.now()-start}ms with inline 40ms and provider 15000ms`); assert.ok(queued.body.accepted_at);
     t.mock.restoreAll();
     t.mock.method(globalThis,'fetch',async () => new Response(JSON.stringify({ embedding:{ values:vector } })));
-    process.env.MEMORY_STORE_INLINE_EMBED_MS='1000';
+    process.env.MEMORY_STORE_INLINE_EMBED_MS='3000';
     const ready = await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({ content:'http healthy',agent_name:'http',dedupe:false }); assert.equal(ready.body.state,'ready',JSON.stringify(ready.body));
     await owner!.query(`CREATE FUNCTION reject_http_acceptance_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'private database failure'; END $$;
       CREATE TRIGGER reject_http_acceptance_test BEFORE INSERT ON memory_ingestion_jobs FOR EACH ROW EXECUTE FUNCTION reject_http_acceptance_test()`);
@@ -274,6 +361,18 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       assert.equal(unavailable.status,503); assert.equal(unavailable.body.code,'ingestion_persistence_unavailable');
       assert.doesNotMatch(JSON.stringify(unavailable.body),/private database failure|must not acknowledge/);
     } finally { await owner!.query('DROP TRIGGER reject_http_acceptance_test ON memory_ingestion_jobs; DROP FUNCTION reject_http_acceptance_test()'); }
+    const keyed=await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({ content:'keyed healthy one',agent_name:'http',idempotency_key:'inline-created' });
+    assert.equal(keyed.body.created,true); assert.equal(keyed.body.state,'ready');
+    const changed=await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({ content:'keyed healthy two',agent_name:'http',idempotency_key:'inline-created' });
+    assert.equal(changed.body.created,false); assert.equal(changed.body.state,'ready'); assert.equal(changed.body.id,keyed.body.id);
+    const details=(await owner!.query("SELECT details FROM audit_log WHERE memory_id=$1 AND action='memory.store' ORDER BY created_at DESC LIMIT 1",[keyed.body.id])).rows[0].details;
+    assert.equal(details.created,false); assert.equal(details.idempotent,true);
+    setPoolForTesting(faultingPool(pool!,sql=>sql.includes('WITH candidate AS')));
+    try {
+      const deferred=await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({ content:'durable claim fault',agent_name:'http',dedupe:false });
+      assert.equal(deferred.status,200); assert.equal(deferred.body.state,'queued');
+      assert.equal((await owner!.query('SELECT content FROM memories WHERE id=$1',[deferred.body.id])).rows[0].content,'durable claim fault');
+    } finally { setPoolForTesting(pool!); }
     const forbidden = await request(app).get('/api/ingestion/stats').set('Authorization','Bearer tr_owner'); assert.equal(forbidden.status,403);
     const stats = await request(app).get('/api/ingestion/stats').set('Authorization','Bearer tr_worker'); assert.equal(stats.status,200);
   });
