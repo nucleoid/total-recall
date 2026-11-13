@@ -614,22 +614,45 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       }
     } finally {await owner!.query('DROP FUNCTION ingestion_skip_dedupe_test()');}
   });
-  await t.test('revocation retains acceptance-time dedupe and approved revision authorization', async () => {
+  await t.test('revoked or narrowed keys finish accepted rows without dedupe, tags or supersession effects', async () => {
     const {contradictionPolicyFromEnv}=await import('../src/contradictions.js');
-    const exact={...embedding,vector:Array.from({length:768},(_,i)=>i===26?1:0)};
-    const canonical=await acceptMemory(input('revocation canonical',{namespace:'private'}),auth,agent);
+    const changes=["enabled=false","permissions=ARRAY['read']","namespaces=ARRAY['shared']","revoked_at=now()","expires_at=now()-interval '1 second'","max_access_level='normal'"];
+    for (const [index,change] of changes.entries()) {
+      const level=index===5?'secret':'normal';
+      const exact={...embedding,vector:Array.from({length:768},(_,i)=>i===26+index?1:0)};
+      const canonical=await acceptMemory(input(`revocation canonical ${index}`,{namespace:'private',access_level:level}),auth,agent);
+      await finalizeIngestionJob(await claim(canonical.id),exact);
+      const duplicate=await acceptMemory(input(`revocation duplicate ${index}`,{namespace:'private',access_level:level,dedupe:true,tags:['accepted-tag']}),auth,agent);
+      const correction=await acceptMemory(input(`revocation correction ${index}`,{namespace:'private',access_level:level}),auth,agent);
+      const duplicateJob=await claim(duplicate.id);const correctionJob=await claim(correction.id);
+      await owner!.query(`UPDATE api_keys SET ${change} WHERE id=$1`,[ownerId]);
+      let calls=0;
+      try {
+        const result=await finalizeIngestionJob(duplicateJob,exact);
+        assert.equal(result?.deduplicated,false,change);assert.equal(result?.id,duplicate.id);assert.equal(result?.state,'ready');
+        assert.equal((await finalizeIngestionJob(correctionJob,exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),classificationEnabled:true,namespace:'private',mutationEnabled:true},prepareRevision:async()=>{calls++;return canonical.id;}}))?.state,'ready');
+        assert.equal(calls,0,'revoked/narrowed jobs must not spend classification budget');
+        const previous=(await owner!.query('SELECT tags,superseded_at,access_count FROM memories WHERE id=$1',[canonical.id])).rows[0];
+        assert.equal(previous.tags.includes('accepted-tag'),false);assert.equal(previous.superseded_at,null);assert.equal(previous.access_count,0);
+        const accepted=(await owner!.query('SELECT supersedes_id,embedding IS NOT NULL AS embedded,deleted_at FROM memories WHERE id=$1',[correction.id])).rows[0];
+        assert.deepEqual(accepted,{supersedes_id:null,embedded:true,deleted_at:null});
+      } finally {await owner!.query('UPDATE api_keys SET enabled=true,permissions=$2,namespaces=$3,revoked_at=NULL,expires_at=NULL,max_access_level=$4 WHERE id=$1',[ownerId,auth.permissions,auth.namespaces,auth.maxAccessLevel]);}
+    }
+  });
+  await t.test('revocation during unlocked classification prevents a prepared revision from committing', async () => {
+    const {contradictionPolicyFromEnv}=await import('../src/contradictions.js');
+    const exact={...embedding,vector:Array.from({length:768},(_,i)=>i===32?1:0)};
+    const canonical=await acceptMemory(input('revocation race canonical',{namespace:'private'}),auth,agent);
     await finalizeIngestionJob(await claim(canonical.id),exact);
-    const duplicate=await acceptMemory(input('revocation duplicate',{namespace:'private',dedupe:true,tags:['accepted-tag']}),auth,agent);
-    const correction=await acceptMemory(input('revocation correction',{namespace:'private'}),auth,agent);
-    const duplicateJob=await claim(duplicate.id);const correctionJob=await claim(correction.id);
-    await owner!.query("UPDATE api_keys SET enabled=false,permissions=ARRAY['read'],namespaces=ARRAY['shared'] WHERE id=$1",[ownerId]);
+    const a=await acceptMemory(input('revocation race correction',{namespace:'private',dedupe:true}),auth,agent);
     try {
-      assert.equal((await finalizeIngestionJob(duplicateJob,exact))?.deduplicated,true);
-      assert.equal((await finalizeIngestionJob(correctionJob,exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),classificationEnabled:true,namespace:'private',mutationEnabled:true},prepareRevision:async()=>canonical.id}))?.id,correction.id);
-      const previous=(await owner!.query('SELECT tags,superseded_at FROM memories WHERE id=$1',[canonical.id])).rows[0];
-      assert.ok(previous.tags.includes('accepted-tag'));assert.ok(previous.superseded_at);
-      assert.equal((await owner!.query('SELECT supersedes_id FROM memories WHERE id=$1',[correction.id])).rows[0].supersedes_id,canonical.id);
-    } finally {await owner!.query('UPDATE api_keys SET enabled=true,permissions=$2,namespaces=$3 WHERE id=$1',[ownerId,auth.permissions,auth.namespaces]);}
+      const result=await finalizeIngestionJob(await claim(a.id),exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),classificationEnabled:true,namespace:'private',mutationEnabled:true},prepareRevision:async()=>{
+        await owner!.query('UPDATE api_keys SET enabled=false WHERE id=$1',[ownerId]);return canonical.id;
+      }});
+      assert.equal(result?.id,a.id);assert.equal(result?.deduplicated,false);assert.equal(result?.state,'ready');
+      const previous=(await owner!.query('SELECT superseded_at,access_count FROM memories WHERE id=$1',[canonical.id])).rows[0];
+      assert.deepEqual(previous,{superseded_at:null,access_count:0});
+    } finally {await owner!.query('UPDATE api_keys SET enabled=true WHERE id=$1',[ownerId]);}
   });
   await t.test('migration 037 bounds table lock waits and rolls back before a safe retry', async () => {
     await owner!.query('CREATE DATABASE ingestion_lock_test');
