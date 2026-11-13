@@ -336,6 +336,46 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     finally { setPoolForTesting(pool!); delete process.env.INGESTION_WORKER_API_KEY; t.mock.restoreAll(); }
     assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'ready');
   });
+  await t.test('rollback acceptance gate preserves deduplicated aliases and pending visibility', async () => {
+    const a=await acceptMemory(input('rollback canonical',{ namespace:'private' }),auth,agent); await finalizeIngestionJob(await claim(a.id),embedding);
+    const b=await acceptMemory(input('rollback duplicate',{ namespace:'private',dedupe:true }),auth,agent);
+    const result=await finalizeIngestionJob(await claim(b.id),embedding); assert.equal(result?.deduplicated,true);
+    const pending=await acceptMemory(input('rollback still pending'),auth,agent);
+    delete process.env.MEMORY_INGESTION_QUEUE_ENABLED;
+    try {
+      const recalled=await memoryRecall({id:b.id},auth); assert.equal(recalled.id,result!.id); assert.equal(recalled.ingestion.state,'deduplicated');
+      assert.equal((await memoryRecall({id:pending.id},auth)).ingestion.state,'pending');
+      const exported=await exportMemoryPage(exportPageSchema.parse({}),auth);
+      assert.equal(exported.records.find(row=>row.provenance.memory_id===pending.id)?.ingestion_state,'pending');
+    } finally { process.env.MEMORY_INGESTION_QUEUE_ENABLED='true'; }
+  });
+  await t.test('expired poison leases stop at the worker attempt cap without provider work', async () => {
+    const a=await acceptMemory(input('poison lease'),auth,agent); await claim(a.id);
+    process.env.MEMORY_INGESTION_MAX_ATTEMPTS='1';
+    await owner!.query("UPDATE memory_ingestion_jobs SET attempts=1,lease_expires_at=now()-interval '1 second' WHERE memory_id=$1",[a.id]);
+    try {
+      assert.equal(await claimIngestionJob(dbScopeFromAuth(admin),{memoryId:a.id}),null);
+      const row=(await owner!.query('SELECT status,failure_category,attempts FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0];
+      assert.equal(row.status,'embedding_failed'); assert.equal(row.failure_category,'transient'); assert.equal(row.attempts,1);
+      assert.equal((await memoryRecall({id:a.id},auth)).content,'poison lease');
+    } finally { process.env.MEMORY_INGESTION_MAX_ATTEMPTS='12'; }
+  });
+  await t.test('inline budget exhaustion hands off immediately without consuming an attempt', async () => {
+    const a=await acceptMemory(input('budget handoff'),auth,agent); const job=await claim(a.id);
+    await failIngestionJob(job,new DOMException('budget exhausted','TimeoutError'));
+    const row=(await owner!.query('SELECT status,attempts,next_attempt_at<=now() AS due FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0];
+    assert.equal(row.status,'pending'); assert.equal(row.attempts,0); assert.equal(row.due,true);
+  });
+  await t.test('resolved plan deduplicates before applying a prepared contradiction revision', async () => {
+    const {contradictionPolicyFromEnv}=await import('../src/contradictions.js');
+    const perpendicular={...embedding,vector:[0,1,...Array(766).fill(0)]};
+    const a=await acceptMemory(input('ordered predecessor',{namespace:'private'}),auth,agent);
+    await finalizeIngestionJob(await claim(a.id),perpendicular);
+    const b=await acceptMemory(input('ordered correction',{namespace:'private',dedupe:true}),auth,agent);
+    const result=await finalizeIngestionJob(await claim(b.id),perpendicular,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>a.id});
+    assert.equal(result?.deduplicated,true); assert.equal(result?.id,a.id);
+    assert.equal((await owner!.query('SELECT superseded_at FROM memories WHERE id=$1',[a.id])).rows[0].superseded_at,null);
+  });
   await t.test('HTTP inline budget is independent of provider timeout and happy path remains ready', async () => {
     const { app } = await import('../src/server.js');
     process.env.MEMORY_STORE_INLINE_EMBED_MS='40';
