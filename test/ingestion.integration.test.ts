@@ -397,6 +397,31 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     assert.equal(result?.deduplicated,true); assert.equal(result?.id,a.id);
     assert.equal((await owner!.query('SELECT superseded_at FROM memories WHERE id=$1',[a.id])).rows[0].superseded_at,null);
   });
+  await t.test('a stale read-only dedupe probe falls back to classification after releasing locks', async () => {
+    const {contradictionPolicyFromEnv}=await import('../src/contradictions.js');
+    const exactVector=Array(768).fill(0);exactVector[4]=1;
+    const weakVector=Array(768).fill(0);weakVector[4]=0.9;weakVector[5]=Math.sqrt(0.19);
+    const exact={...embedding,vector:exactVector};const weak={...embedding,vector:weakVector};
+    const a=await acceptMemory(input('probe duplicate',{namespace:'private'}),auth,agent);await finalizeIngestionJob(await claim(a.id),exact);
+    const c=await acceptMemory(input('probe predecessor',{namespace:'private'}),auth,agent);await finalizeIngestionJob(await claim(c.id),weak);
+    const b=await acceptMemory(input('probe correction',{namespace:'private',dedupe:true}),auth,agent);const job=await claim(b.id);
+    const lockKey='memory-store-dedupe:'+JSON.stringify(['private','normal']);
+    await owner!.query('SELECT pg_advisory_lock(hashtextextended($1,0))',[lockKey]);
+    let released=false,calls=0;
+    const pending=finalizeIngestionJob(job,exact,{contradictionPolicy:{...contradictionPolicyFromEnv(),mutationEnabled:true},prepareRevision:async()=>{calls++;return c.id;}});
+    try {
+      let blocked=false;const until=Date.now()+10000;
+      while(Date.now()<until){
+        blocked=(await owner!.query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock%') AS blocked")).rows[0].blocked;
+        if(blocked)break;await new Promise(resolve=>setTimeout(resolve,10));
+      }
+      assert.equal(blocked,true,'finalizer must reach the authoritative locked decision');
+      await owner!.query('UPDATE memories SET deleted_at=now() WHERE id=$1',[a.id]);
+      await owner!.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',[lockKey]);released=true;
+      const result=await pending;assert.equal(result?.id,b.id);assert.equal(result?.deduplicated,false);
+      assert.equal(calls,1);assert.equal((await owner!.query('SELECT supersedes_id FROM memories WHERE id=$1',[b.id])).rows[0].supersedes_id,c.id);
+    }finally{if(!released)await owner!.query('SELECT pg_advisory_unlock(hashtextextended($1,0))',[lockKey]);await pending.catch(()=>null);}
+  });
   await t.test('inline classifier deadline hands off pending and the worker applies the revision with its full budget', async () => {
     const {prepareBeliefRevision,resetContradictionRuntimeForTesting}=await import('../src/contradictions.js');
     await resetContradictionRuntimeForTesting();
