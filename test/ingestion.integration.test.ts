@@ -114,6 +114,15 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     const changed = await acceptMemory(input('ready replacement',{ idempotency_key: 'stable', namespace: 'private' }),auth,agent); assert.equal(changed.state,'queued');
     await failIngestionJob(await claim(first.id),new Error('private detail')); const retry = await acceptMemory(input('ready replacement',{ idempotency_key: 'stable', namespace: 'private' }),auth,agent); assert.equal(retry.id,first.id);
   });
+  await t.test('identical retries retain the accepted security/provenance and embedding-target snapshot', async () => {
+    const a = await acceptMemory(input('immutable snapshot',{ idempotency_key:'snapshot' }),auth,agent);
+    await owner!.query("UPDATE memory_ingestion_jobs SET embedding_model='original-accepted-model' WHERE memory_id=$1",[a.id]);
+    await acceptMemory(input('immutable snapshot',{ idempotency_key:'snapshot' }),auth,agent);
+    const snapshot = (await owner!.query('SELECT embedding_model,accepted_at FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0];
+    assert.equal(snapshot.embedding_model,'original-accepted-model'); assert.equal(snapshot.accepted_at.toISOString(),a.accepted_at!.toISOString());
+    await acceptMemory(input('new generation',{ idempotency_key:'snapshot' }),auth,agent);
+    assert.equal((await owner!.query('SELECT embedding_model FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].embedding_model,embedding.model);
+  });
   await t.test('TTL begins at acceptance and expiry cancels claim/finalize without vector writes', async () => {
     const a = await acceptMemory(input('ttl claim',{ ttl: 20 }),auth,agent);
     const ttl = (await owner!.query('SELECT EXTRACT(EPOCH FROM expires_at-created_at)::int AS ttl FROM memories WHERE id=$1',[a.id])).rows[0].ttl; assert.equal(ttl,20);

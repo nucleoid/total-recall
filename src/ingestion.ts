@@ -78,11 +78,11 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
       if (sourceKey) values.push(changed, auth.namespaces);
       const memory = (await client.query(`INSERT INTO memories
         (content, source, namespace, tags, metadata, access_level, client_id, agent_id, session_id,
-         source_key, expires_at, embedding, memory_kind, valid_from)
+         source_key, expires_at, embedding, memory_kind, valid_from, created_at)
         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,
           CASE WHEN $11::bigint IS NULL THEN NULL ELSE statement_timestamp() + $11::double precision * interval '1 second' END,
-          $12::vector, 'semantic', statement_timestamp()) ${conflict}
-        RETURNING id, namespace, expires_at, embedding IS NOT NULL AS embedded, (xmax = 0) AS created`, values)).rows[0];
+          $12::vector, 'semantic', statement_timestamp(), statement_timestamp()) ${conflict}
+        RETURNING id, namespace, expires_at, statement_timestamp() AS accepted_at, embedding IS NOT NULL AS embedded, (xmax = 0) AS created`, values)).rows[0];
       if (!memory) {
         const existing = (await client.query(`SELECT deleted_at, superseded_at FROM memories WHERE client_id = $1 AND source_key = $2`, [auth.keyId, sourceKey])).rows[0];
         if (existing?.deleted_at) throw new TombstonedSourceKeyConflictError();
@@ -93,21 +93,21 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
       const profile = ACTIVE_EMBEDDING_PROFILE;
       const job = (await client.query(`INSERT INTO memory_ingestion_jobs
         (memory_id, namespace, client_id, access_level, allowed_namespaces, agent_id, session_id, source_key,
-         dedupe, ttl_seconds, contradiction_eligible, embedding_provider, embedding_model, embedding_dimensions, status, ready_at)
+         dedupe, ttl_seconds, contradiction_eligible, embedding_provider, embedding_model, embedding_dimensions, status, ready_at, accepted_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
-          CASE WHEN $15 THEN 'pending' ELSE 'ready' END, CASE WHEN $15 THEN NULL ELSE statement_timestamp() END)
+          CASE WHEN $15 THEN 'pending' ELSE 'ready' END, CASE WHEN $15 THEN NULL ELSE statement_timestamp() END, $17)
         ON CONFLICT (memory_id) DO UPDATE SET
-          namespace = EXCLUDED.namespace, access_level = EXCLUDED.access_level,
-          allowed_namespaces = EXCLUDED.allowed_namespaces, agent_id = EXCLUDED.agent_id, session_id = EXCLUDED.session_id,
-          dedupe = EXCLUDED.dedupe, ttl_seconds = EXCLUDED.ttl_seconds, contradiction_eligible = EXCLUDED.contradiction_eligible,
-          embedding_provider = EXCLUDED.embedding_provider, embedding_model = EXCLUDED.embedding_model,
-          embedding_dimensions = EXCLUDED.embedding_dimensions,
+          namespace = EXCLUDED.namespace, access_level = CASE WHEN $16 THEN EXCLUDED.access_level ELSE memory_ingestion_jobs.access_level END,
+          allowed_namespaces = CASE WHEN $16 THEN EXCLUDED.allowed_namespaces ELSE memory_ingestion_jobs.allowed_namespaces END, agent_id = CASE WHEN $16 THEN EXCLUDED.agent_id ELSE memory_ingestion_jobs.agent_id END, session_id = CASE WHEN $16 THEN EXCLUDED.session_id ELSE memory_ingestion_jobs.session_id END,
+          dedupe = CASE WHEN $16 THEN EXCLUDED.dedupe ELSE memory_ingestion_jobs.dedupe END, ttl_seconds = CASE WHEN $16 THEN EXCLUDED.ttl_seconds ELSE memory_ingestion_jobs.ttl_seconds END, contradiction_eligible = CASE WHEN $16 THEN EXCLUDED.contradiction_eligible ELSE memory_ingestion_jobs.contradiction_eligible END,
+          embedding_provider = CASE WHEN $16 THEN EXCLUDED.embedding_provider ELSE memory_ingestion_jobs.embedding_provider END, embedding_model = CASE WHEN $16 THEN EXCLUDED.embedding_model ELSE memory_ingestion_jobs.embedding_model END,
+          embedding_dimensions = CASE WHEN $16 THEN EXCLUDED.embedding_dimensions ELSE memory_ingestion_jobs.embedding_dimensions END,
           status = CASE WHEN $16 THEN 'pending' ELSE memory_ingestion_jobs.status END,
           attempts = CASE WHEN $16 THEN 0 ELSE memory_ingestion_jobs.attempts END,
           lease_token = CASE WHEN $16 THEN NULL ELSE memory_ingestion_jobs.lease_token END,
           lease_expires_at = CASE WHEN $16 THEN NULL ELSE memory_ingestion_jobs.lease_expires_at END,
           next_attempt_at = CASE WHEN $16 THEN statement_timestamp() ELSE memory_ingestion_jobs.next_attempt_at END,
-          accepted_at = CASE WHEN $16 THEN statement_timestamp() ELSE memory_ingestion_jobs.accepted_at END,
+          accepted_at = CASE WHEN $16 THEN EXCLUDED.accepted_at ELSE memory_ingestion_jobs.accepted_at END,
           ready_at = CASE WHEN $16 THEN NULL ELSE memory_ingestion_jobs.ready_at END,
           finalized_at = CASE WHEN $16 THEN NULL ELSE memory_ingestion_jobs.finalized_at END,
           canonical_memory_id = CASE WHEN $16 THEN NULL ELSE memory_ingestion_jobs.canonical_memory_id END,
@@ -119,7 +119,7 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
         RETURNING accepted_at, status`,
       [memory.id, input.namespace, auth.keyId, input.access_level, auth.namespaces, agentId, input.session_id ?? null, sourceKey,
         input.dedupe !== false && !sourceKey && input.ttl === undefined, input.ttl ?? null, !sourceKey && input.ttl === undefined,
-        profile.provider, profile.model, profile.dimensions, reset, changed])).rows[0];
+        profile.provider, profile.model, profile.dimensions, reset, changed, memory.accepted_at])).rows[0];
       // Identical keyed retries do not create duplicate acceptance audit events.
       if (changed) await logAudit({ clientId: auth.keyId, action: 'memory.store', namespace: input.namespace,
         memoryId: memory.id, agentId, sessionId: input.session_id, details: { created: true, deduplicated: false, queued: true } }, dbScopeFromAuth(auth), client);
@@ -131,8 +131,9 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
   } catch (error) {
     const code = (error as { code?: string }).code;
     if (code === '23505' && sourceKey) throw new Error('Access denied to existing idempotent memory');
-    if (typeof code === 'string' && (/^[A-Z0-9]{5}$/.test(code) || /^E[A-Z]+$/.test(code))) throw new IngestionPersistenceError(error);
-    throw error;
+    if (error instanceof TombstonedSourceKeyConflictError || error instanceof SupersededSourceKeyConflictError ||
+        (error instanceof Error && error.message.startsWith('Access denied'))) throw error;
+    throw new IngestionPersistenceError(error);
   }
 }
 
