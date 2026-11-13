@@ -236,35 +236,24 @@ export async function failIngestionJob(job: IngestionJob, error: unknown): Promi
 /** Lease row lock and token fence cover dedupe, belief mutation, vector, outbox and audit together. */
 export async function finalizeIngestionJob(job: IngestionJob, embedding: EmbeddingResult, options: {
   deadlineAt?: number; contradictionPolicy?: ContradictionPolicy; prepareRevision?: typeof prepareBeliefRevision;
-  /** Internal re-entry after an optimistic duplicate disappeared. */
-  skipDedupeProbe?: boolean;
 } = {}): Promise<StoreResult | null> {
   const scope = ownerScope(job);
   const vector = serializeEmbeddingVector(embedding.vector);
   const target = { provider: job.embedding_provider, model: job.embedding_model, dimensions: job.embedding_dimensions };
   const policy = options.contradictionPolicy ?? contradictionPolicyFromEnv();
   let preparedPredecessor: string | null = null;
-  let skippedPreparationForDedupe = false;
   // Never hold a checked-out connection, row lock or dedupe lock across provider classification.
   if (job.contradiction_eligible && policy.mutationEnabled &&
       embeddingIdentity(target) === embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) &&
       embeddingIdentity(target) === embeddingIdentity(embedding)) {
-    const probe = await withScopedClient(scope, async client => {
-      const snapshot = (await client.query(`SELECT m.* FROM memories m
+    const snapshot = await withScopedClient(scope, async client => (await client.query(`SELECT m.* FROM memories m
       JOIN memory_ingestion_jobs j ON j.memory_id = m.id
       WHERE m.id = $1 AND m.namespace = $2 AND m.content = $3 AND m.access_level = $4
         AND m.embedding IS NULL AND m.deleted_at IS NULL AND m.superseded_at IS NULL
         AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
         AND j.status = 'processing' AND j.lease_token = $5 AND j.lease_expires_at > statement_timestamp()`,
-      [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0];
-      const match = snapshot && !options.skipDedupeProbe && job.dedupe && job.ttl_seconds === null
-        ? await findIngestionDedupeCandidate(client, job, embedding, vector, false) : undefined;
-      const similarity = Number(match?.similarity ?? NaN);
-      return { snapshot, nearDuplicate: !!match && Number.isFinite(similarity) && similarity >= MEMORY_DEDUPE_THRESHOLD };
-    }, { readOnly: true });
-    const snapshot = probe.snapshot;
-    skippedPreparationForDedupe = probe.nearDuplicate;
-    if (snapshot && !probe.nearDuplicate) {
+      [job.memory_id, job.namespace, job.content, job.access_level, job.lease_token])).rows[0], { readOnly: true });
+    if (snapshot) {
       const remaining = options.deadlineAt === undefined ? policy.timeoutMs : options.deadlineAt - Date.now();
       if (remaining < 1) throw new DOMException('Inline budget exhausted', 'TimeoutError');
       preparedPredecessor = await (options.prepareRevision ?? prepareBeliefRevision)(semanticMemory(job, snapshot, vector), ownerAuth(job), {
@@ -295,8 +284,23 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       await finishJob(client, job, 'embedding_failed', 'space_mismatch'); return null;
     }
     if (job.dedupe && job.ttl_seconds === null) {
+      // Keep namespace -> predecessor/canonical lock order for both outcomes.
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`memory-store-dedupe:${JSON.stringify([job.namespace, job.access_level])}`]);
-      const match = await findIngestionDedupeCandidate(client, job, embedding, vector, true);
+    }
+    const semantic = semanticMemory(job, memory, vector);
+    let revised = null;
+    if (preparedPredecessor) {
+      await client.query('SAVEPOINT ingestion_revision');
+      try {
+        revised = await commitAutomaticRevision(semantic, preparedPredecessor, ownerAuth(job), { id: job.memory_id, client });
+      } catch (error) {
+        if (!['23503','23505','23514','40001','40P01'].includes((error as { code?: string }).code ?? '')) throw error;
+        await client.query('ROLLBACK TO SAVEPOINT ingestion_revision');
+      }
+      await client.query('RELEASE SAVEPOINT ingestion_revision');
+    }
+    if (!revised && job.dedupe && job.ttl_seconds === null) {
+      const match = await findIngestionDedupeCandidate(client, job, embedding, vector);
       const similarity = Number(match?.similarity ?? NaN);
       const threshold = MEMORY_DEDUPE_THRESHOLD;
       if (match && Number.isFinite(similarity) && similarity >= threshold) {
@@ -314,19 +318,6 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
           similarity, state: 'ready' as const, accepted_at: job.accepted_at };
       }
     }
-    if (skippedPreparationForDedupe) return { deferClassification: true as const };
-    const semantic = semanticMemory(job, memory, vector);
-    let revised = null;
-    if (preparedPredecessor) {
-      await client.query('SAVEPOINT ingestion_revision');
-      try {
-        revised = await commitAutomaticRevision(semantic, preparedPredecessor, ownerAuth(job), { id: job.memory_id, client });
-      } catch (error) {
-        if (!['23503','23505','23514','40001','40P01'].includes((error as { code?: string }).code ?? '')) throw error;
-        await client.query('ROLLBACK TO SAVEPOINT ingestion_revision');
-      }
-      await client.query('RELEASE SAVEPOINT ingestion_revision');
-    }
     if (!revised) await client.query(`UPDATE memories SET embedding = $2::vector, embedding_provider = $3,
       embedding_model = $4, embedding_dimensions = $5, updated_at = statement_timestamp() WHERE id = $1`,
     [job.memory_id, vector, embedding.provider, embedding.model, embedding.dimensions]);
@@ -341,15 +332,10 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     return { id: job.memory_id, namespace: job.namespace, expires_at: memory.expires_at ?? null,
       created: job.memory_created, deduplicated: false, state: 'ready' as const, accepted_at: job.accepted_at };
   }));
-  if (result && 'deferClassification' in result) {
-    // The first transaction has released every lock and its pool session. Recheck
-    // once without the optimistic shortcut, then make the fenced decision again.
-    return finalizeIngestionJob(job, embedding, { ...options, contradictionPolicy: policy, skipDedupeProbe: true });
-  }
   if (shadow) scheduleShadowClassification(contradictionPolicyFromEnv(), shadow);
   return result;
 }
-async function findIngestionDedupeCandidate(client: ScopedClient, job: IngestionJob, embedding: EmbeddingResult, vector: string, lock: boolean) {
+async function findIngestionDedupeCandidate(client: ScopedClient, job: IngestionJob, embedding: EmbeddingResult, vector: string) {
   return (await client.query(`SELECT m.id, m.namespace, 1 - (m.embedding <=> $1::vector) AS similarity
         FROM memories m WHERE m.namespace = $2 AND COALESCE(m.access_level,'normal') = $3
           AND m.embedding IS NOT NULL AND m.embedding_provider = $4 AND m.embedding_model = $5 AND m.embedding_dimensions = $6
@@ -359,7 +345,7 @@ async function findIngestionDedupeCandidate(client: ScopedClient, job: Ingestion
           AND m.memory_kind NOT IN ('document_chunk','episode_chunk')
         ORDER BY m.embedding <=> $1::vector ASC,
           calculate_relevance(m.relevance_base_score,m.decay_rate,m.accessed_at,m.access_count) DESC, m.created_at ASC, m.id ASC
-        LIMIT 1${lock ? ' FOR UPDATE' : ''}`, [vector, job.namespace, job.access_level, embedding.provider, embedding.model, embedding.dimensions, job.memory_id])).rows[0];
+        LIMIT 1 FOR UPDATE`, [vector, job.namespace, job.access_level, embedding.provider, embedding.model, embedding.dimensions, job.memory_id])).rows[0];
 }
 async function completeExternalEmbedding(client: ScopedClient, job: IngestionJob, memory: Record<string, any>): Promise<StoreResult | null> {
   if (memory.embedding_provider !== job.embedding_provider || memory.embedding_model !== job.embedding_model ||
