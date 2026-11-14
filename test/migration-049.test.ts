@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-test('037 installs a content-free fenced queue, namespace RLS, cascades and disabled ready trigger', async () => {
-  const sql = await readFile(new URL('../migrations/037_memory_ingestion_queue.sql',import.meta.url),'utf8');
+test('049 installs a content-free fenced queue, namespace RLS, cascades and disabled ready trigger', async () => {
+  const sql = await readFile(new URL('../migrations/049_memory_ingestion_queue.sql',import.meta.url),'utf8');
   const table = sql.slice(0,sql.indexOf('CREATE INDEX'));
   assert.match(table,/memory_id UUID PRIMARY KEY/);
   assert.match(table,/lease_token UUID/);

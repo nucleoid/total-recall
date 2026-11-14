@@ -4,6 +4,9 @@ import { z } from 'zod';
 import { resolveAgent } from './agents.js';
 import { logAudit } from './audit.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR } from './embedding-descriptor.js';
+import { QWEN_CONTRACT_ID } from './local-embedding-contract.js';
+import { localServingEnabled } from './local-embedding-runtime.js';
+import { prepareLocalDocument, publishPreparedLocalDocument, type PreparedLocalDocument } from './local-embedding-consumers.js';
 import {
   dbScopeFromAuth,
   withCheckedOutClient,
@@ -213,6 +216,24 @@ export async function consolidationReadiness(
   client: ScopedClient,
   namespace: string,
 ): Promise<ConsolidationReadiness> {
+  if (localServingEnabled()) {
+    const serving = await client.query<{ active: boolean }>(`SELECT EXISTS(
+      SELECT 1 FROM embedding_serving_settings WHERE singleton=true AND contract_id=$1
+    ) AS active`, [QWEN_CONTRACT_ID]);
+    if (serving.rows[0]?.active !== true) throw new Error('shadow_embedding.serving_contract_mismatch');
+    const result = await client.query<{ scope_count: string; eligible_count: string; incomplete_count: string }>(`
+      SELECT count(*)::text AS scope_count,
+        count(*) FILTER (WHERE f.is_current AND f.source_revision=m.revision
+          AND (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$2 AND c.parent_id=m.id)=f.chunk_count)::text AS eligible_count,
+        count(*) FILTER (WHERE f.parent_id IS NULL OR NOT f.is_current OR f.source_revision<>m.revision
+          OR (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$2 AND c.parent_id=m.id)<>f.chunk_count)::text AS incomplete_count
+      FROM memories m LEFT JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$2
+      WHERE ${ELIGIBLE_SQL}
+    `, [namespace, QWEN_CONTRACT_ID]);
+    const row = result.rows[0];
+    return { scopeCount: Number(row?.scope_count ?? 0), eligibleCount: Number(row?.eligible_count ?? 0),
+      unknownIdentityCount: Number(row?.incomplete_count ?? 0), foreignIdentityCount: 0 };
+  }
   const descriptor = ACTIVE_EMBEDDING_DESCRIPTOR;
   const result = await client.query<{
     scope_count: string;
@@ -256,10 +277,18 @@ export async function selectConsolidationClusters(
     HARD_CONSOLIDATION_CLUSTER_LIMIT,
     'clusterLimit',
   );
+  const local = localServingEnabled();
   const descriptor = ACTIVE_EMBEDDING_DESCRIPTOR;
   const readiness = await consolidationReadiness(client, options.namespace);
   const cursor = options.cursor ?? null;
-  const anchors = await client.query<AnchorRow>(`
+  const anchors = await client.query<AnchorRow>(local ? `
+    SELECT m.id, m.created_at::text AS created_at, m.revision
+    FROM memories m JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$2
+    WHERE ${ELIGIBLE_SQL} AND f.is_current AND f.source_revision=m.revision
+      AND (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$2 AND c.parent_id=m.id)=f.chunk_count
+      AND ($3::timestamptz IS NULL OR (m.created_at, m.id) > ($3::timestamptz, $4::uuid))
+    ORDER BY m.created_at, m.id LIMIT $5
+  ` : `
     SELECT m.id, m.created_at::text AS created_at, m.revision
     FROM memories m
     WHERE ${ELIGIBLE_SQL}
@@ -268,7 +297,7 @@ export async function selectConsolidationClusters(
       AND ($5::timestamptz IS NULL OR (m.created_at, m.id) > ($5::timestamptz, $6::uuid))
     ORDER BY m.created_at, m.id
     LIMIT $7
-  `, [
+  `, local ? [options.namespace, QWEN_CONTRACT_ID, cursor?.createdAt ?? null, cursor?.id ?? null, anchorLimit] : [
     options.namespace,
     descriptor.provider,
     descriptor.model,
@@ -291,7 +320,23 @@ export async function selectConsolidationClusters(
     anchorsExamined += 1;
     lastCursor = { createdAt: anchorRow.created_at, id: anchorRow.id };
     if (consumed.has(anchorRow.id)) continue;
-    const neighborResult = await client.query<CandidateRow>(`
+    const neighborResult = await client.query<CandidateRow>(local ? `
+      SELECT candidate.id,candidate.created_at::text AS created_at,candidate.revision,
+        max(1-(candidate_chunk.embedding <=> anchor_chunk.embedding)) AS similarity
+      FROM memories anchor
+      JOIN memory_embedding_manifests anchor_manifest ON anchor_manifest.parent_id=anchor.id
+        AND anchor_manifest.contract_id=$2 AND anchor_manifest.is_current AND anchor_manifest.source_revision=anchor.revision
+      JOIN memory_embedding_chunks anchor_chunk ON anchor_chunk.parent_id=anchor.id AND anchor_chunk.contract_id=$2
+      JOIN memories candidate ON candidate.namespace=anchor.namespace
+      JOIN memory_embedding_manifests candidate_manifest ON candidate_manifest.parent_id=candidate.id
+        AND candidate_manifest.contract_id=$2 AND candidate_manifest.is_current AND candidate_manifest.source_revision=candidate.revision
+      JOIN memory_embedding_chunks candidate_chunk ON candidate_chunk.parent_id=candidate.id AND candidate_chunk.contract_id=$2
+      WHERE anchor.id=$3::uuid AND ${ELIGIBLE_SQL.replaceAll('m.', 'candidate.')}
+        AND (candidate.created_at,candidate.id)>=(anchor.created_at,anchor.id)
+      GROUP BY candidate.id,candidate.created_at,candidate.revision
+      HAVING max(1-(candidate_chunk.embedding <=> anchor_chunk.embedding)) >= $4
+      ORDER BY candidate.created_at,candidate.id LIMIT $5
+    ` : `
       SELECT candidate.id, candidate.created_at::text AS created_at, candidate.revision,
              1 - (candidate.embedding <=> anchor.embedding) AS similarity
       FROM memories anchor
@@ -304,7 +349,8 @@ export async function selectConsolidationClusters(
         AND 1 - (candidate.embedding <=> anchor.embedding) >= $6
       ORDER BY candidate.created_at, candidate.id
       LIMIT $7
-    `, [
+    `, local ? [options.namespace, QWEN_CONTRACT_ID, anchorRow.id, CONSOLIDATION_SIMILARITY_THRESHOLD,
+      CONSOLIDATION_MAX_CLUSTER_SIZE + 1] : [
       options.namespace,
       descriptor.provider,
       descriptor.model,
@@ -322,13 +368,20 @@ export async function selectConsolidationClusters(
     if (candidates.length < CONSOLIDATION_MIN_CLUSTER_SIZE) continue;
 
     const ids = candidates.map(candidate => candidate.id);
-    const pairs = await client.query<PairRow>(`
+    const pairs = await client.query<PairRow>(local ? `
+      SELECT left_chunk.parent_id AS left_id,right_chunk.parent_id AS right_id,
+        max(1-(left_chunk.embedding <=> right_chunk.embedding)) AS similarity
+      FROM memory_embedding_chunks left_chunk JOIN memory_embedding_chunks right_chunk
+        ON left_chunk.parent_id<right_chunk.parent_id AND right_chunk.contract_id=left_chunk.contract_id
+      WHERE left_chunk.contract_id=$2 AND left_chunk.parent_id=ANY($1::uuid[]) AND right_chunk.parent_id=ANY($1::uuid[])
+      GROUP BY left_chunk.parent_id,right_chunk.parent_id
+    ` : `
       SELECT left_memory.id AS left_id, right_memory.id AS right_id,
              1 - (left_memory.embedding <=> right_memory.embedding) AS similarity
       FROM memories left_memory
       JOIN memories right_memory ON left_memory.id < right_memory.id
       WHERE left_memory.id = ANY($1::uuid[]) AND right_memory.id = ANY($1::uuid[])
-    `, [ids]);
+    `, local ? [ids, QWEN_CONTRACT_ID] : [ids]);
     const similarities = new Map(pairs.rows.map(row => [pairKey(row.left_id, row.right_id), Number(row.similarity)]));
     const anchor = candidates.find(candidate => candidate.id === anchorRow.id) ?? {
       id: anchorRow.id,
@@ -397,10 +450,12 @@ interface LoadedMember {
   tags: string[];
   revision: number;
   created_at: string;
-  embedding_provider: string;
-  embedding_model: string;
-  embedding_dimensions: number;
-  embedding: string;
+  embedding_provider: string | null;
+  embedding_model: string | null;
+  embedding_dimensions: number | null;
+  embedding: string | null;
+  target_source_revision?: number;
+  target_source_sha256?: string;
   updated_at: string;
   fingerprint: string;
 }
@@ -558,15 +613,19 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
         throwIfAborted(options.signal);
         const controller = linkedTimeout(options.signal, options.embeddingTimeoutMs ?? 30_000);
         let vector: string;
+        let localPrepared: PreparedLocalDocument | undefined;
         try {
+          localPrepared = await prepareLocalDocument(generated.canonical_content!, controller.signal);
           if (options.embedCanonical) {
             vector = serializeCanonicalVector(await options.embedCanonical(generated.canonical_content!, controller.signal));
           } else {
             const embeddingModule = await import('./embedding.js');
-            const embedding = await embeddingModule.embedWithProfile(
-              generated.canonical_content!, embeddingModule.ACTIVE_EMBEDDING_PROFILE, controller.signal,
-            );
-            vector = embeddingModule.serializeEmbeddingVector(embedding.vector);
+            const embeddingVector = localPrepared && embeddingModule.ACTIVE_EMBEDDING_PROFILE.provider === 'llama.cpp'
+              ? localPrepared.vectors[0]
+              : (await embeddingModule.embedWithProfile(
+                generated.canonical_content!, embeddingModule.ACTIVE_EMBEDDING_PROFILE, controller.signal,
+              )).vector;
+            vector = embeddingModule.serializeEmbeddingVector(embeddingVector);
           }
         } finally {
           controller.close();
@@ -581,6 +640,7 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
           generated,
           vector,
           { createdAt: cluster.anchor.createdAt, id: cluster.anchor.id },
+          localPrepared,
         ));
         if (canonicalId) mergedCanonicalIds.push(canonicalId);
       }
@@ -654,14 +714,14 @@ async function loadCheckpoint(
   ownerKeyId: string,
   namespace: string,
 ): Promise<ConsolidationCursor | null> {
+  const descriptor = consolidationSemanticDescriptor();
   return withScopedTransactionOnClient(client, scope, async scoped => {
     const result = await scoped.query<{ cursor_created_at: string | null; cursor_id: string | null }>(`
       SELECT cursor_created_at::text, cursor_id
       FROM memory_consolidation_checkpoints
       WHERE owner_key_id = $1::uuid AND namespace = $2 AND access_level = 'normal'
         AND embedding_provider = $3 AND embedding_model = $4 AND embedding_dimensions = $5
-    `, [ownerKeyId, namespace, ACTIVE_EMBEDDING_DESCRIPTOR.provider,
-      ACTIVE_EMBEDDING_DESCRIPTOR.model, ACTIVE_EMBEDDING_DESCRIPTOR.dimensions]);
+    `, [ownerKeyId, namespace, descriptor.provider, descriptor.model, descriptor.dimensions]);
     const row = result.rows[0];
     return row?.cursor_created_at && row.cursor_id
       ? { createdAt: row.cursor_created_at, id: row.cursor_id }
@@ -687,6 +747,7 @@ async function saveCheckpoint(
   namespace: string,
   cursor: ConsolidationCursor | null,
 ): Promise<void> {
+  const descriptor = consolidationSemanticDescriptor();
   await client.query(`
     INSERT INTO memory_consolidation_checkpoints (
       owner_key_id, namespace, access_level, embedding_provider, embedding_model,
@@ -695,8 +756,7 @@ async function saveCheckpoint(
     ON CONFLICT (owner_key_id, namespace, access_level, embedding_provider, embedding_model, embedding_dimensions)
     DO UPDATE SET cursor_created_at = EXCLUDED.cursor_created_at, cursor_id = EXCLUDED.cursor_id,
                   updated_at = statement_timestamp()
-  `, [ownerKeyId, namespace, ACTIVE_EMBEDDING_DESCRIPTOR.provider,
-    ACTIVE_EMBEDDING_DESCRIPTOR.model, ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
+  `, [ownerKeyId, namespace, descriptor.provider, descriptor.model, descriptor.dimensions,
     cursor?.createdAt ?? null, cursor?.id ?? null]);
 }
 
@@ -707,6 +767,7 @@ async function createRun(
   policyHash: string,
   anchorsExamined: number,
 ): Promise<string> {
+  const descriptor = consolidationSemanticDescriptor();
   return withScopedTransactionOnClient(client, scope, async scoped => {
     const result = await scoped.query<{ id: string }>(`
       INSERT INTO memory_consolidation_runs (
@@ -714,15 +775,27 @@ async function createRun(
         embedding_dimensions, mode, status, policy_hash, anchors_examined
       ) VALUES ($1::uuid, $2, 'normal', $3, $4, $5, 'apply', 'running', $6, $7)
       RETURNING id
-    `, [options.auth.keyId, options.namespace, ACTIVE_EMBEDDING_DESCRIPTOR.provider,
-      ACTIVE_EMBEDDING_DESCRIPTOR.model, ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
+    `, [options.auth.keyId, options.namespace, descriptor.provider, descriptor.model, descriptor.dimensions,
       policyHash, anchorsExamined]);
     return result.rows[0].id;
   });
 }
 
 async function loadMembers(client: ScopedClient, ids: string[]): Promise<LoadedMember[]> {
-  const result = await client.query<Omit<LoadedMember, 'fingerprint'>>(`
+  const local = localServingEnabled();
+  const result = await client.query<Omit<LoadedMember, 'fingerprint'>>(local ? `
+    SELECT m.id,m.content,m.namespace,m.tags,m.revision,m.created_at::text AS created_at,
+      m.embedding_provider,m.embedding_model,m.embedding_dimensions,m.embedding::text AS embedding,
+      m.updated_at::text AS updated_at,f.source_revision AS target_source_revision,f.source_sha256 AS target_source_sha256
+    FROM memories m JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$2
+    WHERE m.id=ANY($1::uuid[]) AND m.access_level='normal' AND m.memory_kind='semantic'
+      AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp())
+      AND m.superseded_at IS NULL AND m.valid_to IS NULL AND m.valid_from<=statement_timestamp()
+      AND m.consolidated_into_id IS NULL AND m.document_id IS NULL AND m.source_key IS NULL
+      AND f.is_current AND f.source_revision=m.revision
+      AND (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$2 AND c.parent_id=m.id)=f.chunk_count
+    ORDER BY m.id
+  ` : `
     SELECT id, content, namespace, tags, revision, created_at::text AS created_at,
            embedding_provider, embedding_model, embedding_dimensions,
            embedding::text AS embedding, updated_at::text AS updated_at
@@ -736,7 +809,7 @@ async function loadMembers(client: ScopedClient, ids: string[]): Promise<LoadedM
       AND embedding IS NOT NULL
       AND embedding_provider = $2 AND embedding_model = $3 AND embedding_dimensions = $4
     ORDER BY id
-  `, [ids, ACTIVE_EMBEDDING_DESCRIPTOR.provider, ACTIVE_EMBEDDING_DESCRIPTOR.model,
+  `, local ? [ids, QWEN_CONTRACT_ID] : [ids, ACTIVE_EMBEDDING_DESCRIPTOR.provider, ACTIVE_EMBEDDING_DESCRIPTOR.model,
     ACTIVE_EMBEDDING_DESCRIPTOR.dimensions]);
   return result.rows.map(row => ({ ...row, fingerprint: memberFingerprint(row) }));
 }
@@ -757,13 +830,27 @@ async function applyCluster(
   generated: ConsolidationGenerationResult,
   vector: string,
   checkpoint: ConsolidationCursor,
+  localPrepared?: PreparedLocalDocument,
 ): Promise<string | null> {
   const ids = loaded.map(member => member.id).sort();
+  const local = localServingEnabled();
   const locked = await client.query<{
     id: string; content: string; namespace: string; tags: string[]; revision: number; created_at: string;
-    embedding_provider: string; embedding_model: string; embedding_dimensions: number;
-    embedding: string; updated_at: string;
-  }>(`
+    embedding_provider: string | null; embedding_model: string | null; embedding_dimensions: number | null;
+    embedding: string | null; updated_at: string; target_source_revision?: number; target_source_sha256?: string;
+  }>(local ? `
+    SELECT m.id,m.content,m.namespace,m.tags,m.revision,m.created_at::text AS created_at,
+      m.embedding_provider,m.embedding_model,m.embedding_dimensions,m.embedding::text AS embedding,
+      m.updated_at::text AS updated_at,f.source_revision AS target_source_revision,f.source_sha256 AS target_source_sha256
+    FROM memories m JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$3
+    WHERE m.id=ANY($1::uuid[]) AND m.namespace=$2 AND m.access_level='normal' AND m.memory_kind='semantic'
+      AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp())
+      AND m.superseded_at IS NULL AND m.valid_to IS NULL AND m.valid_from<=statement_timestamp()
+      AND m.consolidated_into_id IS NULL AND m.document_id IS NULL AND m.source_key IS NULL
+      AND f.is_current AND f.source_revision=m.revision
+      AND (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$3 AND c.parent_id=m.id)=f.chunk_count
+    ORDER BY m.id FOR UPDATE OF m
+  ` : `
     SELECT id, content, namespace, tags, revision, created_at::text AS created_at,
            embedding_provider, embedding_model, embedding_dimensions,
            embedding::text AS embedding, updated_at::text AS updated_at
@@ -775,7 +862,7 @@ async function applyCluster(
       AND consolidated_into_id IS NULL AND document_id IS NULL AND source_key IS NULL
       AND embedding IS NOT NULL AND embedding_provider = $3 AND embedding_model = $4 AND embedding_dimensions = $5
     ORDER BY id FOR UPDATE
-  `, [ids, options.namespace, ACTIVE_EMBEDDING_DESCRIPTOR.provider,
+  `, local ? [ids, options.namespace, QWEN_CONTRACT_ID] : [ids, options.namespace, ACTIVE_EMBEDDING_DESCRIPTOR.provider,
     ACTIVE_EMBEDDING_DESCRIPTOR.model, ACTIVE_EMBEDDING_DESCRIPTOR.dimensions]);
   if (locked.rows.length !== loaded.length) {
     await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint);
@@ -788,13 +875,22 @@ async function applyCluster(
     return null;
   }
 
-  const incompatible = await client.query<{ count: string }>(`
+  const incompatible = await client.query<{ count: string }>(local ? `
+    SELECT count(*)::text AS count FROM (
+      SELECT left_chunk.parent_id,right_chunk.parent_id
+      FROM memory_embedding_chunks left_chunk JOIN memory_embedding_chunks right_chunk
+        ON left_chunk.parent_id<right_chunk.parent_id AND right_chunk.contract_id=left_chunk.contract_id
+      WHERE left_chunk.contract_id=$2 AND left_chunk.parent_id=ANY($1::uuid[]) AND right_chunk.parent_id=ANY($1::uuid[])
+      GROUP BY left_chunk.parent_id,right_chunk.parent_id
+      HAVING max(1-(left_chunk.embedding <=> right_chunk.embedding)) < $3
+    ) incompatible_pairs
+  ` : `
     SELECT count(*)::text AS count
     FROM memories left_memory
     JOIN memories right_memory ON left_memory.id < right_memory.id
     WHERE left_memory.id = ANY($1::uuid[]) AND right_memory.id = ANY($1::uuid[])
       AND 1 - (left_memory.embedding <=> right_memory.embedding) < $2
-  `, [ids, CONSOLIDATION_SIMILARITY_THRESHOLD]);
+  `, local ? [ids, QWEN_CONTRACT_ID, CONSOLIDATION_SIMILARITY_THRESHOLD] : [ids, CONSOLIDATION_SIMILARITY_THRESHOLD]);
   if (Number(incompatible.rows[0]?.count ?? 0) !== 0) {
     await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint);
     return null;
@@ -834,6 +930,7 @@ async function applyCluster(
     timestamp,
   ]);
   let canonicalId = inserted.rows[0]?.id;
+  if (canonicalId) await publishPreparedLocalDocument(client, canonicalId, localPrepared);
   if (!canonicalId) {
     const existing = await client.query<{ id: string }>(`
       SELECT id FROM memories
@@ -855,6 +952,7 @@ async function applyCluster(
   }
 
   for (const member of current) {
+    const semantic = consolidationSemanticDescriptor();
     await client.query(`
       INSERT INTO memory_consolidation_memberships (
         owner_key_id, namespace, access_level, run_id, canonical_id, member_id, member_revision,
@@ -862,8 +960,7 @@ async function applyCluster(
         consolidated_at, policy_hash
       ) VALUES ($1::uuid, $2, 'normal', $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11::timestamptz, $12)
     `, [options.auth.keyId, options.namespace, runId, canonicalId, member.id, member.revision,
-      member.fingerprint, ACTIVE_EMBEDDING_DESCRIPTOR.provider, ACTIVE_EMBEDDING_DESCRIPTOR.model,
-      ACTIVE_EMBEDDING_DESCRIPTOR.dimensions, timestamp, policyHash]);
+      member.fingerprint, semantic.provider, semantic.model, semantic.dimensions, timestamp, policyHash]);
   }
   const linked = await client.query(`
     UPDATE memories SET consolidated_into_id = $1::uuid, consolidated_at = $2::timestamptz,
@@ -1060,8 +1157,8 @@ function assertDeconsolidationAuthority(auth: AuthContext, namespace: string): v
 
 function memberFingerprint(member: {
   id: string; content: string; namespace: string; revision: number; created_at: string;
-  embedding_provider: string; embedding_model: string; embedding_dimensions: number;
-  embedding: string; updated_at: string;
+  embedding_provider: string | null; embedding_model: string | null; embedding_dimensions: number | null;
+  embedding: string | null; updated_at: string; target_source_revision?: number; target_source_sha256?: string;
 }): string {
   return sha256(stableJson({
     id: member.id,
@@ -1074,7 +1171,16 @@ function memberFingerprint(member: {
     embeddingDimensions: member.embedding_dimensions,
     embedding: member.embedding,
     updatedAt: member.updated_at,
+    targetSourceRevision: member.target_source_revision,
+    targetSourceSha256: member.target_source_sha256,
   }));
+}
+
+export function consolidationSemanticDescriptor(): { provider: string; model: string; dimensions: 768 } {
+  return localServingEnabled()
+    ? { provider: 'llama.cpp', model: QWEN_CONTRACT_ID, dimensions: 768 }
+    : { provider: ACTIVE_EMBEDDING_DESCRIPTOR.provider, model: ACTIVE_EMBEDDING_DESCRIPTOR.model,
+      dimensions: ACTIVE_EMBEDDING_DESCRIPTOR.dimensions };
 }
 
 function compareCandidate(left: ConsolidationCandidate, right: ConsolidationCandidate): number {

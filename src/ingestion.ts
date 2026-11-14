@@ -1,3 +1,5 @@
+import { prepareLocalDocument, publishPreparedLocalDocument, findLocalDocumentDuplicate, type PreparedLocalDocument } from './local-embedding-consumers.js';
+import { localServingEnabled } from './local-embedding-runtime.js';
 import { isDeepStrictEqual } from 'node:util';
 import { MEMORY_DEDUPE_THRESHOLD } from './store-config.js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -17,6 +19,8 @@ export class IngestionPersistenceError extends Error {
   readonly code = 'ingestion_persistence_unavailable';
   constructor(cause: unknown) { super('Durable memory acceptance unavailable', { cause }); }
 }
+
+export interface IngestionEmbeddingResult extends EmbeddingResult { localPrepared?: PreparedLocalDocument }
 
 export type IngestionState = 'pending' | 'processing' | 'retry_wait' | 'ready' | 'deduplicated' | 'embedding_failed' | 'cancelled';
 export type FailureCategory = 'transient' | 'rate_limited' | 'provider_auth' | 'input_rejected' | 'space_mismatch' | 'expired';
@@ -441,9 +445,10 @@ export async function tryInlineDocument(documentId: string, count: number, auth:
 }
 
 /** Lease row lock and token fence cover dedupe, belief mutation, vector, outbox and audit together. */
-export async function finalizeIngestionJob(job: IngestionJob, embedding: EmbeddingResult, options: {
+export async function finalizeIngestionJob(job: IngestionJob, embedding: IngestionEmbeddingResult, options: {
   deadlineAt?: number; contradictionPolicy?: ContradictionPolicy; prepareRevision?: typeof prepareBeliefRevision;
 } = {}): Promise<StoreResult | null> {
+  if (localServingEnabled() && !embedding.localPrepared) throw new Error('shadow_embedding.ingestion_vectors_required');
   const scope = ownerScope(job);
   const vector = serializeEmbeddingVector(embedding.vector);
   const target = { provider: job.embedding_provider, model: job.embedding_model, dimensions: job.embedding_dimensions };
@@ -467,7 +472,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       const remaining = options.deadlineAt === undefined ? policy.timeoutMs : options.deadlineAt - Date.now();
       // Do not reserve a paid classification that cannot receive its full timeout.
       if (remaining < policy.timeoutMs) throw new DOMException('Inline classification budget exhausted', 'TimeoutError');
-      preparedPredecessor = await (options.prepareRevision ?? prepareBeliefRevision)(semanticMemory(job, snapshot, vector), ownerAuth(job), {
+      preparedPredecessor = await (options.prepareRevision ?? prepareBeliefRevision)(semanticMemory(job, snapshot, vector, embedding.localPrepared), ownerAuth(job), {
         policy, timeoutMs: Math.min(policy.timeoutMs, remaining),
         throwOnTimeout: options.deadlineAt !== undefined && remaining < policy.timeoutMs, allowMutation: true, excludeCandidateId: job.memory_id,
       });
@@ -480,7 +485,10 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     const fenced = await client.query(`SELECT * FROM memory_ingestion_jobs WHERE memory_id = $1 AND status = 'processing'
       AND lease_token = $2::uuid AND lease_expires_at > statement_timestamp() FOR UPDATE`, [job.memory_id, job.lease_token]);
     if (!fenced.rows.length) return null;
-    const memory = (await client.query(`SELECT *, (expires_at IS NOT NULL AND expires_at <= statement_timestamp()) AS expired
+    const memory = (await client.query(`SELECT *, (expires_at IS NOT NULL AND expires_at <= statement_timestamp()) AS expired,
+        superseded_at IS NULL AND consolidated_into_id IS NULL
+          AND (valid_from IS NULL OR valid_from<=statement_timestamp())
+          AND (valid_to IS NULL OR valid_to>statement_timestamp()) AS local_index_eligible
       FROM memories WHERE id = $1 AND namespace = $2 FOR UPDATE`, [job.memory_id, job.namespace])).rows[0];
     if (!memory || memory.deleted_at || memory.expired) {
       await finishJob(client, job, 'cancelled', 'expired'); return null;
@@ -511,7 +519,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       // ahead of a waiting revoker. Authentication skips this telemetry lock.
       mutationAuthorized = await currentMutationAuthority(client, job, true);
     }
-    const semantic = semanticMemory(job, memory, vector);
+    const semantic = semanticMemory(job, memory, vector, embedding.localPrepared);
     let revised = null;
     if (mutationAuthorized && preparedPredecessor) {
       await client.query('SAVEPOINT ingestion_revision');
@@ -524,7 +532,9 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       await client.query('RELEASE SAVEPOINT ingestion_revision');
     }
     if (mutationAuthorized && !revised && job.dedupe && job.ttl_seconds === null) {
-      const match = await findIngestionDedupeCandidate(client, job, embedding, vector);
+      const match = embedding.localPrepared
+        ? await findLocalDocumentDuplicate(client, embedding.localPrepared, job.namespace, job.access_level, job.memory_id)
+        : await findIngestionDedupeCandidate(client, job, embedding, vector);
       const similarity = Number(match?.similarity ?? NaN);
       const threshold = MEMORY_DEDUPE_THRESHOLD;
       if (match && Number.isFinite(similarity) && similarity >= threshold) {
@@ -547,6 +557,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
         AND embedding IS NULL AND content = $6 AND namespace = $7 AND COALESCE(access_level, 'normal') = $8
         AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())`,
     [job.memory_id, vector, embedding.provider, embedding.model, embedding.dimensions, job.content, job.namespace, job.access_level]));
+    if (!revised && memory.local_index_eligible) await publishPreparedLocalDocument(client, job.memory_id, embedding.localPrepared, { ingestionLease: job.lease_token });
     await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', creation_pending = false, ready_at = statement_timestamp(),
       finalized_at = statement_timestamp(), lease_token = NULL, lease_expires_at = NULL,
       failure_category = NULL, last_error_code = NULL, inline_ready = $3
@@ -575,6 +586,19 @@ async function findIngestionDedupeCandidate(client: ScopedClient, job: Ingestion
         LIMIT 1 FOR UPDATE`, [vector, job.namespace, job.access_level, embedding.provider, embedding.model, embedding.dimensions, job.memory_id])).rows[0];
 }
 async function completeExternalEmbedding(client: ScopedClient, job: IngestionJob, memory: Record<string, any>): Promise<StoreResult | null> {
+  if (localServingEnabled()) {
+    const complete = await client.query(`SELECT 1 FROM memory_embedding_manifests f
+      JOIN memories m ON m.id=f.parent_id WHERE f.parent_id=$1 AND f.contract_id=$2
+        AND f.is_current AND f.source_revision=m.revision
+        AND f.source_sha256=encode(digest(convert_to(m.content,'UTF8'),'sha256'),'hex')
+        AND f.source_bytes=octet_length(convert_to(m.content,'UTF8'))
+        AND f.chunk_count=(SELECT count(*) FROM memory_embedding_chunks c WHERE c.parent_id=m.id AND c.contract_id=f.contract_id)
+        AND COALESCE((SELECT min(c.ordinal)=0 AND max(c.ordinal)=f.chunk_count-1 FROM memory_embedding_chunks c
+          WHERE c.parent_id=m.id AND c.contract_id=f.contract_id),false)`, [job.memory_id, process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT]);
+    if (!complete.rows.length) {
+      await finishJob(client, job, 'embedding_failed', 'space_mismatch'); return null;
+    }
+  }
   if (memory.embedding_provider !== job.embedding_provider || memory.embedding_model !== job.embedding_model ||
       memory.embedding_dimensions !== job.embedding_dimensions) {
     await finishJob(client, job, 'cancelled'); return null;
@@ -586,8 +610,8 @@ async function completeExternalEmbedding(client: ScopedClient, job: IngestionJob
   return { id: job.memory_id, namespace: job.namespace, expires_at: memory.expires_at ?? null,
     created: job.memory_created, deduplicated: false, state: 'ready', accepted_at: job.accepted_at };
 }
-function semanticMemory(job: IngestionJob, memory: Record<string, any>, vector: string): SemanticMemoryInsert {
-  return { content: memory.content, vector, source: memory.source, namespace: memory.namespace,
+function semanticMemory(job: IngestionJob, memory: Record<string, any>, vector: string, localPrepared?: PreparedLocalDocument): SemanticMemoryInsert {
+  return { content: memory.content, vector, localPrepared, source: memory.source, namespace: memory.namespace,
     tags: memory.tags, metadata: memory.metadata, accessLevel: memory.access_level,
     clientId: job.client_id, agentId: job.agent_id, sessionId: job.session_id };
 }
@@ -632,12 +656,23 @@ export async function tryInlineIngestion(accepted: StoreResult, auth: AuthContex
   }
 }
 /** Race also bounds test/faulty providers which fail to honor AbortSignal. Late results never finalize. */
-export async function embedWithinBudget(content: string, budget: number, embed = embedWithProfile, signal?: AbortSignal): Promise<EmbeddingResult> {
+export async function embedWithinBudget(content: string, budget: number, embed = embedWithProfile, signal?: AbortSignal): Promise<IngestionEmbeddingResult> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const combined = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
   try {
-    return await Promise.race([embed(content, ACTIVE_EMBEDDING_PROFILE, combined), new Promise<never>((_, reject) => {
+    const work = async (): Promise<IngestionEmbeddingResult> => {
+      if (embed === embedWithProfile && localServingEnabled()) {
+        const localPrepared = await prepareLocalDocument(content, combined);
+        if (!localPrepared) throw new Error('shadow_embedding.ingestion_vectors_required');
+        const embedding = ACTIVE_EMBEDDING_PROFILE.provider === 'llama.cpp'
+          ? { vector: localPrepared.vectors[0], ...ACTIVE_EMBEDDING_PROFILE }
+          : await embed(content, ACTIVE_EMBEDDING_PROFILE, combined);
+        return { ...embedding, localPrepared };
+      }
+      return embed(content, ACTIVE_EMBEDDING_PROFILE, combined);
+    };
+    return await Promise.race([work(), new Promise<never>((_, reject) => {
       timer = setTimeout(() => { controller.abort(); reject(new DOMException('Embedding budget exhausted', 'TimeoutError')); }, budget);
     })]);
   } finally { if (timer) clearTimeout(timer); controller.abort(); }

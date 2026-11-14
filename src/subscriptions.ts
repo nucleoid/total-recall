@@ -2,7 +2,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { AuthContext } from './types.js';
 import { checkPermission } from './auth.js';
 import { dbScopeFromAuth, withScopedClient, type DbScope, type ScopedClient } from './db.js';
-import { embed, embeddingDescriptorParams, serializeEmbeddingVector } from './embedding.js';
+import { ACTIVE_EMBEDDING_PROFILE, embedQuery, embeddingDescriptorParams, serializeEmbeddingVector } from './embedding.js';
+import { prepareLocalQuery, publishPreparedLocalQuery } from './local-embedding-consumers.js';
 import { logAudit } from './audit.js';
 import {
   canonicalJson,
@@ -75,6 +76,13 @@ export async function createSubscription(params: CreateSubscriptionParams, auth:
   })).digest('hex');
   // Recover a lost create response without another DNS/provider dependency.
   const replay = await withScopedClient(dbScopeFromAuth(auth), async client => {
+    const currentKey = await client.query<{ namespaces: string[] }>(`SELECT namespaces FROM api_keys
+      WHERE id=$1::uuid AND enabled=true AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at>statement_timestamp()) AND 'write'=ANY(permissions)
+      FOR SHARE`,[auth.keyId]);
+    if(!currentKey.rows[0])throw new Error('Subscription owner key is disabled or no longer writable');
+    const denied=namespaces.find(namespace=>!currentKey.rows[0].namespaces.includes(namespace));
+    if(denied)throw new Error(`Access denied to namespace '${denied}'`);
     const existing = await client.query<{ id: string; request_hash: string }>(
       'SELECT id, request_hash FROM memory_subscriptions WHERE api_key_id = $1::uuid AND idempotency_key = $2',
       [auth.keyId, params.idempotency_key]);
@@ -85,14 +93,18 @@ export async function createSubscription(params: CreateSubscriptionParams, auth:
   if (replay) return replay;
   // Registration validation is intentionally repeated by the worker before every attempt.
   await resolveWebhookDestination(url.toString());
-  const vector = serializeEmbeddingVector(await embed(params.query));
+  const localPrepared = await prepareLocalQuery(params.query);
+  const vector = serializeEmbeddingVector(localPrepared && ACTIVE_EMBEDDING_PROFILE.provider === 'llama.cpp'
+    ? localPrepared.vector : await embedQuery(params.query));
   const signingSecret = randomBytes(32).toString('base64url');
   const encryptedUrl = encryptValue(url.toString(), ring, 'webhook-url');
   const encryptedSecret = encryptValue(signingSecret, ring, 'signing-secret');
 
   return withScopedClient(dbScopeFromAuth(auth), async client => {
     const currentKey = await client.query<{ namespaces: string[]; enabled: boolean; permissions: string[] }>(
-      'SELECT namespaces, enabled, permissions FROM api_keys WHERE id = $1::uuid FOR SHARE', [auth.keyId]);
+      `SELECT namespaces, enabled, permissions FROM api_keys
+       WHERE id = $1::uuid AND enabled=true AND revoked_at IS NULL
+         AND (expires_at IS NULL OR expires_at>statement_timestamp()) FOR SHARE`, [auth.keyId]);
     const key = currentKey.rows[0];
     if (!key?.enabled || !key.permissions.includes('write')) throw new Error('Subscription owner key is disabled or no longer writable');
     const denied = namespaces.find(namespace => !key.namespaces.includes(namespace));
@@ -128,6 +140,7 @@ export async function createSubscription(params: CreateSubscriptionParams, auth:
         await client.query('INSERT INTO subscription_namespaces (subscription_id, api_key_id, namespace) VALUES ($1::uuid, $2::uuid, $3)',
           [id, auth.keyId, namespace]);
       }
+      await publishPreparedLocalQuery(client, id, localPrepared);
       await logAudit({ clientId: auth.keyId, action: 'subscription.create', resultCount: namespaces.length }, dbScopeFromAuth(auth), client);
     } else {
       const existing = await client.query<{ id: string; request_hash: string }>(

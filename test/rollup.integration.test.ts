@@ -146,6 +146,13 @@ class FakePool {
 
   constructor(private readonly failureMode: FailureMode = undefined) {}
 
+  async query<T extends pg.QueryResultRow>(sql: string): Promise<pg.QueryResult<T>> {
+    if (/to_regclass\('public\.embedding_serving_settings'\)/i.test(sql)) {
+      return result([{ serving_table: null, reservation_function: null } as unknown as T]);
+    }
+    throw new Error(`Unexpected pool SQL: ${sql}`);
+  }
+
   async connect(): Promise<FakeClient> {
     const client = new FakeClient(this.clients.length + 100, this.db, this.failureMode);
     this.clients.push(client);
