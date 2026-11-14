@@ -117,6 +117,10 @@ test('queued episodes and generated facts preserve local target publication and 
     const input=params(3),episode=await memoryStoreSession(input,auth);
     assert.equal(episode.state,'queued');
     assert.equal((await owner!.query("SELECT count(*)::int AS n FROM embedding_work_items WHERE parent_type='memory' AND parent_id IN (SELECT id FROM memories WHERE document_id=$1)",[episode.episode_id])).rows[0].n,3);
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM shadow_subscription_insert_events WHERE memory_id IN (SELECT id FROM memories WHERE document_id=$1)',[episode.episode_id])).rows[0].n,0);
+    // Older API builds captured episode events before migration 053. They must stay excluded too.
+    await owner!.query(`INSERT INTO shadow_subscription_insert_events(memory_id,contract_id,source_revision,inserted_at)
+      SELECT id,$2,revision,clock_timestamp() FROM memories WHERE document_id=$1`,[episode.episode_id,QWEN_CONTRACT_ID]);
     const jobs=await claim(episode.episode_id),prepared=await embedBatchWithinBudget(jobs.map(job => job.content),30000);
     await memoryUpdate({ id:jobs[0].memory_id,tags:['metadata-only'] },auth);
     assert.ok(await finalizeIngestionBatch(jobs,prepared)); await assertComplete(episode.episode_id,3);

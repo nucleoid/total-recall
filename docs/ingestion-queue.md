@@ -1,6 +1,10 @@
 # Durable memory ingestion
 
-`memory_store` (MCP) and `POST /api/store` can acknowledge a committed memory before its embedding provider recovers. Enable `MEMORY_INGESTION_QUEUE_ENABLED=true` only after applying migration 049 and starting the dedicated worker. The default is off and preserves synchronous storage. Content updates additionally require migration 050 and `MEMORY_INGESTION_UPDATE_ENABLED=true`. Documents require migration 052 and `MEMORY_INGESTION_DOCUMENT_ENABLED=true`. Session ingestion retains synchronous episode embedding; #161 owns adopting this path in `src/session-distillation.ts`.
+`memory_store` (MCP) and `POST /api/store` can acknowledge a committed memory before its embedding provider recovers. Enable `MEMORY_INGESTION_QUEUE_ENABLED=true` only after applying migration 049 and starting the dedicated worker. The default is off and preserves synchronous storage. Content updates additionally require migration 050 and `MEMORY_INGESTION_UPDATE_ENABLED=true`. Documents require migration 052 and `MEMORY_INGESTION_DOCUMENT_ENABLED=true`. Sessions require migration 053 and `MEMORY_INGESTION_SESSION_ENABLED=true`.
+
+## Sessions
+
+MCP-only `memory_store_session` commits all physical episode chunks, document-kind jobs, the distillation run and audit atomically before one bounded inline document batch. Distillation reads physical text even while chunks are queued. The approved session worker commits facts, derivations and scalar ingestion jobs atomically with run completion, then attempts fact embeddings. An embedding outage cannot repeat generation or spend its budget. `memory_session_status` separates content-free episode/fact embedding summaries from distillation status. Sensitive and secret chunks embed but remain undistilled. See [session distillation](session-distillation.md#durable-embedding-ingestion-161) for gates, replay, canary and rollback. The shared queue, owner/admin RLS, profile and lease/content fences, local publication and requeue controls apply unchanged.
 
 ## Documents
 

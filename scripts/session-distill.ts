@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import { validateKeyReadOnly } from '../src/auth.js';
 import { dbScopeFromAuth, shutdown, withScopedClient } from '../src/db.js';
 import { HttpJsonGenerationProvider, type GenerationProvider } from '../src/generation.js';
+import { embedWithProfile, type EmbeddingResult } from '../src/embedding.js';
+import { ingestionSessionEnabled } from '../src/ingestion.js';
 import {
   applySessionDistillation,
   assertSessionPolicyEffective,
@@ -17,6 +19,7 @@ import {
   sessionDistillationInputBytes,
   type SessionDistillationJob,
   type SessionDistillationPolicy,
+  type DistilledFact,
 } from '../src/session-distillation.js';
 import type { AuthContext } from '../src/types.js';
 
@@ -123,8 +126,11 @@ export async function runSessionWorker(
         policy.budget.maxOutputBytesPerSession,
         signal,
       );
+      const prepared: Array<DistilledFact & { embedding?: EmbeddingResult }> = [];
+      for (const fact of generated.facts) prepared.push(ingestionSessionEnabled()
+        ? fact : { ...fact, embedding: await embedWithProfile(fact.content, undefined, signal) });
       const applied = await withScopedClient(scope, client => applySessionDistillation(
-        client, job, loaded, generated.facts, generated.outputBytes, policy,
+        client, job, loaded, prepared, generated.outputBytes, policy,
       ));
       if (!applied) {
         await fail(scope, job, 'source_changed', true);

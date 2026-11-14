@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
 import { logAudit } from './audit.js';
 import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
-import { embedWithProfile, embeddingDescriptorParams, serializeEmbeddingVector } from './embedding.js';
+import { embedWithProfile, embeddingDescriptorParams, serializeEmbeddingVector, type EmbeddingResult } from './embedding.js';
 import { generateBounded, type GenerationProvider } from './generation.js';
 import { resolveAgent } from './agents.js';
 import { chunkDocumentContent, MAX_DOCUMENT_CONTENT_BYTES } from './tools/store-document.js';
@@ -517,15 +517,14 @@ export async function applySessionDistillation(
   client: ScopedClient,
   job: SessionDistillationJob,
   loaded: LoadedSessionTranscript,
-  facts: readonly DistilledFact[],
+  facts: readonly (DistilledFact & { embedding?: EmbeddingResult })[],
   outputBytes: number,
   policy: SessionDistillationPolicy,
 ): Promise<boolean> {
   assertSessionPolicyEffective(policy);
   const queued = ingestionSessionEnabled();
-  // Gate-off installations retain synchronous embedding and need no queue schema.
-  const vectors: string[] = [];
-  if (!queued) for (const fact of facts) vectors.push(serializeEmbeddingVector((await embedWithProfile(fact.content)).vector));
+  // Gate-off callers prepare embeddings outside this transaction, as before.
+  if (!queued && facts.some(fact => !fact.embedding)) throw new Error('Synchronous session facts require prepared embeddings');
   const policyHash = sessionDistillationPolicyHash(policy);
   const locked = await client.query<any>(`
     SELECT r.id, d.agent_id, d.session_id, d.chunk_count, k.enabled AS owner_enabled,
@@ -565,7 +564,7 @@ export async function applySessionDistillation(
       ) VALUES ($1, $2::vector, 'session-distillation', $3, $4::text[], $5::jsonb, $6, $7,
         $8::uuid, $9, $10, $11, $12, $13, 'semantic', statement_timestamp())
       ON CONFLICT (client_id, source_key) DO NOTHING RETURNING id
-    `, [fact.content, queued ? null : vectors[index], job.namespace, ['session-distilled', fact.kind].sort(),
+    `, [fact.content, queued ? null : serializeEmbeddingVector(fact.embedding!.vector), job.namespace, ['session-distilled', fact.kind].sort(),
       JSON.stringify({ schema: 1, episode_id: job.episodeId, run_id: job.runId, durable_kind: fact.kind,
         generation_provider: policy.generation.provider, generation_model: policy.generation.model,
         policy_hash: policyHash }), job.accessLevel, job.ownerKeyId, loaded.agentId, loaded.sessionId,
@@ -632,7 +631,7 @@ export async function tryInlineSessionFacts(job: SessionDistillationJob, worker:
     const owner: AuthContext = { keyId:job.ownerKeyId, name:'session-distillation', namespaces:[job.namespace],
       permissions:['read','write'], maxAccessLevel:job.accessLevel };
     for (const fact of facts) await tryInlineIngestion({ id:fact.memory_id, namespace:job.namespace,
-      created:true, deduplicated:false, state:'queued' }, owner);
+      created:true, deduplicated:false, state:'queued', expires_at:null }, owner);
   } catch { console.warn('[session-distill] outcome=fact_embedding_deferred'); }
 }
 
