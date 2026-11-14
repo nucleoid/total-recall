@@ -52,6 +52,9 @@ export function ingestionUpdateEnabled(): boolean {
 export function ingestionDocumentEnabled(): boolean {
   return ingestionEnabled() && process.env.MEMORY_INGESTION_DOCUMENT_ENABLED === 'true';
 }
+export function ingestionSessionEnabled(): boolean {
+  return ingestionEnabled() && process.env.MEMORY_INGESTION_SESSION_ENABLED === 'true';
+}
 export function documentInlineMaxChunks(): number {
   return ingestionInteger(process.env.MEMORY_STORE_DOCUMENT_INLINE_MAX_CHUNKS, 8, 'MEMORY_STORE_DOCUMENT_INLINE_MAX_CHUNKS', 0, 64);
 }
@@ -83,6 +86,37 @@ export async function documentIngestionState(client: ScopedClient, documentId: s
         SELECT failure_category,COUNT(*)::int AS count FROM chunks WHERE failure_category IS NOT NULL GROUP BY failure_category
       ) categories),'{}'::jsonb) AS failure_categories FROM chunks`, [documentId])).rows[0];
   return { document_id:documentId,...counts,state:counts.ready===counts.chunk_count ? 'ready' : !counts.queued && counts.failed ? 'embedding_failed' : 'queued' };
+}
+
+export interface SessionEmbeddingSummary {
+  state: DocumentStatus['state']; ready: number; queued: number; failed: number;
+}
+
+export async function factIngestionState(client: ScopedClient, runId: string): Promise<SessionEmbeddingSummary> {
+  const counts = (await client.query(`WITH facts AS (
+    SELECT CASE WHEN m.deleted_at IS NOT NULL OR j.status='cancelled' THEN 'cancelled'
+      WHEN j.status='embedding_failed' THEN 'failed'
+      WHEN j.status IN ('ready','deduplicated') OR (j.status IS NULL AND m.embedding IS NOT NULL) THEN 'ready'
+      ELSE 'queued' END AS state
+    FROM memory_session_derivations d JOIN memories m ON m.id=d.memory_id
+    LEFT JOIN memory_ingestion_jobs j ON j.memory_id=m.id WHERE d.run_id=$1
+  ) SELECT count(*)::int AS total, count(*) FILTER (WHERE state='ready')::int AS ready,
+    count(*) FILTER (WHERE state='queued')::int AS queued, count(*) FILTER (WHERE state='failed')::int AS failed
+    FROM facts`, [runId])).rows[0];
+  return { state: counts.ready===counts.total ? 'ready' : !counts.queued && counts.failed ? 'embedding_failed' : 'queued',
+    ready:counts.ready, queued:counts.queued, failed:counts.failed };
+}
+
+/** The caller's transaction owns the fact and derivation before creating its job. */
+export async function acceptSessionFact(client: ScopedClient, memoryId: string, namespace: string): Promise<void> {
+  const profile=ACTIVE_EMBEDDING_PROFILE;
+  await client.query(`INSERT INTO memory_ingestion_jobs
+    (memory_id,namespace,client_id,access_level,allowed_namespaces,agent_id,session_id,source_key,
+     dedupe,contradiction_eligible,embedding_provider,embedding_model,embedding_dimensions,kind,source_revision)
+    SELECT id,namespace,client_id,COALESCE(access_level,'normal'),ARRAY[namespace],agent_id,session_id,source_key,
+      false,false,$3,$4,$5,'store',revision FROM memories
+    WHERE id=$1 AND namespace=$2 AND embedding IS NULL
+    ON CONFLICT (memory_id) DO NOTHING`, [memoryId,namespace,profile.provider,profile.model,profile.dimensions]);
 }
 
 /** Called under the patch transaction after locking jobs before memories. */

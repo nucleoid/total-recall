@@ -9,7 +9,7 @@ import {
   assertSessionPolicyEffective,
   claimSessionDistillationJob,
   distillSessionTranscript,
-  embedDistilledFacts,
+  tryInlineSessionFacts,
   loadSessionTranscript,
   markSessionDistillationFailed,
   parseSessionDistillationPolicy,
@@ -123,9 +123,8 @@ export async function runSessionWorker(
         policy.budget.maxOutputBytesPerSession,
         signal,
       );
-      const vectors = await embedDistilledFacts(generated.facts, signal);
       const applied = await withScopedClient(scope, client => applySessionDistillation(
-        client, job, loaded, generated.facts, vectors, generated.outputBytes, policy,
+        client, job, loaded, generated.facts, generated.outputBytes, policy,
       ));
       if (!applied) {
         await fail(scope, job, 'source_changed', true);
@@ -139,7 +138,9 @@ export async function runSessionWorker(
       await fail(scope, job, code, code === 'input_too_large');
       metric(code);
       if (signal.aborted) break;
+      continue;
     }
+    await tryInlineSessionFacts(job, auth);
   }
   return { processed, providerCalls, factsStored };
 }
