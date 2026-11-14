@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-
-test('049 adds update generations without rewriting history or exposing private jobs', async () => {
-  const sql = await readFile(new URL('../migrations/049_memory_ingestion_update_kind.sql', import.meta.url), 'utf8');
-  assert.match(sql, /kind TEXT NOT NULL DEFAULT 'store' CHECK \(kind IN \('store','update','document'\)\)/);
-  assert.match(sql, /source_revision INTEGER NOT NULL DEFAULT 0/);
-  assert.match(sql, /j\.kind <> 'store'/);
-  assert.match(sql, /creation_pending = false/);
-  assert.match(sql, /lease_token = EXCLUDED.lease_token/);
-  assert.match(sql, /namespace = ANY\(public.app_allowed_namespaces\(\)\)/);
-  assert.match(sql, /'write' = ANY\(k.permissions\)/);
-  assert.match(sql, /REVOKE ALL ON FUNCTION public.app_enqueue_memory_reembed/);
-  assert.doesNotMatch(sql, /CREATE POLICY|DISABLE TRIGGER|ENABLE TRIGGER/);
+test('049 installs a content-free fenced queue, namespace RLS, cascades and disabled ready trigger', async () => {
+  const sql = await readFile(new URL('../migrations/049_memory_ingestion_queue.sql',import.meta.url),'utf8');
+  const table = sql.slice(0,sql.indexOf('CREATE INDEX'));
+  assert.match(table,/memory_id UUID PRIMARY KEY/);
+  assert.match(table,/lease_token UUID/);
+  assert.doesNotMatch(table,/\bcontent\s+TEXT|\bembedding\s+VECTOR/i);
+  assert.match(sql,/FOREIGN KEY \(namespace, memory_id\)[\s\S]*ON UPDATE CASCADE ON DELETE CASCADE/);
+  assert.match(sql,/ENABLE ROW LEVEL SECURITY/);
+  assert.match(sql,/CREATE POLICY ingestion_insert[\s\S]*client_id = app_current_key_id\(\) OR app_current_key_is_admin\(\)/);
+  assert.match(sql,/NEW.memory_kind <> 'episode_chunk'/);
+  assert.match(sql,/DISABLE TRIGGER memories_subscription_ready_enqueue/);
+  assert.match(sql,/GRANT SELECT, INSERT, UPDATE ON public.memory_ingestion_jobs/);
+  assert.doesNotMatch(sql,/GRANT[^;]*DELETE[^;]*memory_ingestion_jobs/);
 });

@@ -32,7 +32,7 @@ test('durable local writes publish complete chunks before readiness and fence qu
       const body = JSON.parse(String(init?.body));
       if (String(target).endsWith('/tokenize')) return Response.json({ tokens: Array(Math.max(1, Math.ceil(Buffer.byteLength(body.content)/8))).fill(1) });
       return Response.json({ data: body.input.map((_: string, index: number) => ({ index,
-        embedding: Array.from({ length: 1024 }, (_, i) => i === 0 ? 1 : 0) })),
+        embedding: Array.from({ length: QWEN_CHUNK_CONTRACT.nativeDimensions }, (_, i) => i === 0 ? 1 : 0) })),
         usage: { prompt_tokens: body.input.reduce((sum: number, input: string) => sum + Math.max(1, Math.ceil(Buffer.byteLength(input)/8)), 0) } });
     }) as typeof fetch });
   try {

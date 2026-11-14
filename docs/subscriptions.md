@@ -4,7 +4,7 @@ Memory subscriptions are prospective semantic interests. A new `normal` memory w
 
 ## Enablement and operation
 
-With migration 049, `memory_update` content replacements use `kind='update'` and never create a `memory.stored` event, including when they replace an original store that has not reached first readiness. Keyed `memory_store` replacements retain their existing first-creation rules. Both insert and pending-to-ready triggers keep this distinction.
+With migration 050, `memory_update` content replacements use `kind='update'` and never create a `memory.stored` event, including when they replace an original store that has not reached first readiness. Keyed `memory_store` replacements retain their existing first-creation rules. Both insert and pending-to-ready triggers keep this distinction.
 
 Creation and delivery have separate fail-closed gates:
 
@@ -56,4 +56,4 @@ Only public HTTPS destinations on port 443 are accepted. URLs with user-info or 
 
 There is no backfill or query replay. Rollback by disabling creation, stopping the worker, and disabling the `memories_subscription_enqueue` trigger. Retain encrypted subscriptions, content-free outbox history, and audit rows. Delivery/truncation rows intentionally do not hold a foreign key to `memories`: hard deletion may remove memory content while retaining only its former opaque ID in notification history. Disabling a subscription/key or narrowing an ACL wins before a new connection, but cannot recall an HTTP request already in flight. Content-bearing payloads and private-network destinations require a separate policy and contract review.
 
-With migration 048 and durable ingestion enabled, enable `memories_subscription_ready_enqueue` together with `memories_subscription_enqueue`. The new trigger ships disabled and excludes episode chunks. Rollback disables both triggers. The shared transactional outbox identity prevents duplicate creation events when finalization is replayed. See [ingestion rollout](rollouts/048-memory-ingestion-queue.md).
+With migration 049 and durable ingestion enabled, enable `memories_subscription_ready_enqueue` together with `memories_subscription_enqueue`. The new trigger ships disabled and excludes episode chunks. Rollback disables both triggers. The shared transactional outbox identity prevents duplicate creation events when finalization is replayed. See [ingestion rollout](rollouts/049-memory-ingestion-queue.md).

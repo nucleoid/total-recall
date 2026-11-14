@@ -233,8 +233,8 @@ Initial cutover uses a second, independently hashed JSON file so its exact audit
 
 ```json
 {
-  "version": 2,
-  "contractId": "91e3bb787cf8c10c8dcd2e1a724d3b18acfc03a1ea063ee920548e99e7b95d97",
+  "version": 1,
+  "contractId": "d38fb12a30cbd3a47a4f683b714779353d9dff6c6954f3c66e910909fbd1803d",
   "runId": "<run UUID>",
   "operationalManifestSha256": "<operational manifest hash>",
   "watermark": "<coordinated audited ISO-8601 instant>",
@@ -297,3 +297,7 @@ For local verification, never point tests at `DATABASE_URL` or a production data
 ```powershell
 node node_modules/typescript/bin/tsc --project tsconfig.scripts.json --noEmit
 ```
+
+## Integrated durable ingestion
+
+The retained shadow/archive history 037–048, including the versioned-contract migration, is byte-identical to the reviewed Qwen4B lineage. Queue acceptance and content updates append migrations 049/050; migration 051 integrates their publication and subscription routing with the explicitly active captured contract. Existing 0.6B vectors remain in their original contract and cannot satisfy Qwen4B readiness. See [durable ingestion rollout](rollouts/049-memory-ingestion-queue.md) for the separate-main ingestion 037/038 history fence. A source merge neither applies migrations nor activates Qwen serving.

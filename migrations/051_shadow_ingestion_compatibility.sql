@@ -68,7 +68,11 @@ CREATE OR REPLACE FUNCTION public.enqueue_shadow_subscription_webhooks() RETURNS
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE pending public.shadow_subscription_insert_events%ROWTYPE;
 BEGIN
-  IF NOT NEW.is_current OR NEW.contract_id <> '4340ee2917358817a4fe69234f137eb29580dd799266b783725f13c5a66d5f9e' THEN RETURN NEW; END IF;
+  IF NOT NEW.is_current OR NOT EXISTS (
+    SELECT 1 FROM public.embedding_serving_settings s
+    JOIN public.embedding_contracts c ON c.id=s.contract_id AND c.capture_enabled
+    WHERE s.singleton AND s.contract_id=NEW.contract_id
+  ) THEN RETURN NEW; END IF;
   IF NOT EXISTS (SELECT 1 FROM public.embedding_serving_settings s
     WHERE s.singleton AND s.contract_id=NEW.contract_id) THEN RETURN NEW; END IF;
   -- Serialize consumption. A prospective insert gets exactly one notification
@@ -166,21 +170,20 @@ CREATE FUNCTION public.publish_local_ingestion_embedding(
 ) RETURNS BOOLEAN
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE
-  qwen CONSTANT TEXT := '4340ee2917358817a4fe69234f137eb29580dd799266b783725f13c5a66d5f9e';
   parent public.memories%ROWTYPE;
   source_bytes BYTEA;
   item RECORD;
   item_count INTEGER;
   total_tokens BIGINT;
 BEGIN
-  IF p_contract IS DISTINCT FROM qwen OR p_source_sha !~ '^[a-f0-9]{64}$'
+  IF p_contract IS NULL OR p_contract !~ '^[a-f0-9]{64}$' OR p_source_sha !~ '^[a-f0-9]{64}$'
     OR jsonb_typeof(p_chunks) IS DISTINCT FROM 'array' THEN
     RAISE EXCEPTION 'embedding.publish_shape';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM public.embedding_serving_settings s
     JOIN public.embedding_contracts c ON c.id=s.contract_id AND c.capture_enabled
-    WHERE s.singleton AND s.contract_id=qwen
+    WHERE s.singleton AND s.contract_id=p_contract
   ) THEN RAISE EXCEPTION 'embedding.publish_contract'; END IF;
 
   PERFORM 1 FROM public.memory_ingestion_jobs j
@@ -244,23 +247,23 @@ BEGIN
 
   INSERT INTO public.memory_embedding_manifests(contract_id,parent_id,source_sha256,source_revision,
     source_bytes,chunk_count,total_tokens,is_current)
-  VALUES(qwen,p_parent,p_source_sha,parent.revision,octet_length(source_bytes),item_count,total_tokens,false)
+  VALUES(p_contract,p_parent,p_source_sha,parent.revision,octet_length(source_bytes),item_count,total_tokens,false)
   ON CONFLICT(contract_id,parent_id) DO UPDATE SET source_sha256=EXCLUDED.source_sha256,
     source_revision=EXCLUDED.source_revision,source_bytes=EXCLUDED.source_bytes,
     chunk_count=EXCLUDED.chunk_count,total_tokens=EXCLUDED.total_tokens,is_current=false,
     committed_at=statement_timestamp();
-  DELETE FROM public.memory_embedding_chunks WHERE contract_id=qwen AND parent_id=p_parent;
+  DELETE FROM public.memory_embedding_chunks WHERE contract_id=p_contract AND parent_id=p_parent;
   INSERT INTO public.memory_embedding_chunks(contract_id,parent_id,ordinal,core_start,core_end,
     chunk_sha256,formatted_tokens,embedding)
-  SELECT qwen,p_parent,x.ordinal,x.core_start,x.core_end,x.sha256,x.tokens,x.vector::vector
+  SELECT p_contract,p_parent,x.ordinal,x.core_start,x.core_end,x.sha256,x.tokens,x.vector::vector
   FROM jsonb_to_recordset(p_chunks) AS x(
     ordinal INTEGER, core_start INTEGER, core_end INTEGER, sha256 TEXT, tokens INTEGER, vector TEXT
   );
   UPDATE public.memory_embedding_manifests SET is_current=true,committed_at=statement_timestamp()
-  WHERE contract_id=qwen AND parent_id=p_parent;
+  WHERE contract_id=p_contract AND parent_id=p_parent;
   INSERT INTO public.embedding_work_items(contract_id,parent_type,parent_id,state,generation,attempts,
     next_attempt_at,source_sha256,source_revision,updated_at)
-  VALUES(qwen,'memory',p_parent,'complete',1,0,statement_timestamp(),p_source_sha,parent.revision,statement_timestamp())
+  VALUES(p_contract,'memory',p_parent,'complete',1,0,statement_timestamp(),p_source_sha,parent.revision,statement_timestamp())
   ON CONFLICT(contract_id,parent_type,parent_id) DO UPDATE SET state='complete',
     generation=embedding_work_items.generation+1,claimed_by=NULL,lease_until=NULL,attempts=0,
     next_attempt_at=statement_timestamp(),source_sha256=EXCLUDED.source_sha256,
@@ -278,21 +281,20 @@ CREATE FUNCTION public.publish_local_memory_update_embedding(
 ) RETURNS BOOLEAN
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE
-  qwen CONSTANT TEXT := '4340ee2917358817a4fe69234f137eb29580dd799266b783725f13c5a66d5f9e';
   parent public.memories%ROWTYPE;
   source_bytes BYTEA;
   item RECORD;
   item_count INTEGER;
   total_tokens BIGINT;
 BEGIN
-  IF p_contract IS DISTINCT FROM qwen OR p_source_sha !~ '^[a-f0-9]{64}$'
+  IF p_contract IS NULL OR p_contract !~ '^[a-f0-9]{64}$' OR p_source_sha !~ '^[a-f0-9]{64}$'
     OR jsonb_typeof(p_chunks) IS DISTINCT FROM 'array' THEN
     RAISE EXCEPTION 'embedding.publish_shape';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM public.embedding_serving_settings s
     JOIN public.embedding_contracts c ON c.id=s.contract_id AND c.capture_enabled
-    WHERE s.singleton AND s.contract_id=qwen
+    WHERE s.singleton AND s.contract_id=p_contract
   ) THEN RAISE EXCEPTION 'embedding.publish_contract'; END IF;
 
   SELECT m.* INTO parent FROM public.memories m
@@ -351,23 +353,23 @@ BEGIN
 
   INSERT INTO public.memory_embedding_manifests(contract_id,parent_id,source_sha256,source_revision,
     source_bytes,chunk_count,total_tokens,is_current)
-  VALUES(qwen,p_parent,p_source_sha,parent.revision,octet_length(source_bytes),item_count,total_tokens,false)
+  VALUES(p_contract,p_parent,p_source_sha,parent.revision,octet_length(source_bytes),item_count,total_tokens,false)
   ON CONFLICT(contract_id,parent_id) DO UPDATE SET source_sha256=EXCLUDED.source_sha256,
     source_revision=EXCLUDED.source_revision,source_bytes=EXCLUDED.source_bytes,
     chunk_count=EXCLUDED.chunk_count,total_tokens=EXCLUDED.total_tokens,is_current=false,
     committed_at=statement_timestamp();
-  DELETE FROM public.memory_embedding_chunks WHERE contract_id=qwen AND parent_id=p_parent;
+  DELETE FROM public.memory_embedding_chunks WHERE contract_id=p_contract AND parent_id=p_parent;
   INSERT INTO public.memory_embedding_chunks(contract_id,parent_id,ordinal,core_start,core_end,
     chunk_sha256,formatted_tokens,embedding)
-  SELECT qwen,p_parent,x.ordinal,x.core_start,x.core_end,x.sha256,x.tokens,x.vector::vector
+  SELECT p_contract,p_parent,x.ordinal,x.core_start,x.core_end,x.sha256,x.tokens,x.vector::vector
   FROM jsonb_to_recordset(p_chunks) AS x(
     ordinal INTEGER, core_start INTEGER, core_end INTEGER, sha256 TEXT, tokens INTEGER, vector TEXT
   );
   UPDATE public.memory_embedding_manifests SET is_current=true,committed_at=statement_timestamp()
-  WHERE contract_id=qwen AND parent_id=p_parent;
+  WHERE contract_id=p_contract AND parent_id=p_parent;
   INSERT INTO public.embedding_work_items(contract_id,parent_type,parent_id,state,generation,attempts,
     next_attempt_at,source_sha256,source_revision,updated_at)
-  VALUES(qwen,'memory',p_parent,'complete',1,0,statement_timestamp(),p_source_sha,parent.revision,statement_timestamp())
+  VALUES(p_contract,'memory',p_parent,'complete',1,0,statement_timestamp(),p_source_sha,parent.revision,statement_timestamp())
   ON CONFLICT(contract_id,parent_type,parent_id) DO UPDATE SET state='complete',
     generation=embedding_work_items.generation+1,claimed_by=NULL,lease_until=NULL,attempts=0,
     next_attempt_at=statement_timestamp(),source_sha256=EXCLUDED.source_sha256,

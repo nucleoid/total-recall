@@ -55,14 +55,14 @@ test('the complete migration history parses and executes on PostgreSQL 16', { ti
   assert.equal((await owner.query(
     "SELECT count(*)::int AS count FROM schema_migrations WHERE version = '032_memory_ttl'",
   )).rows[0].count, 0);
-  await runMigrations(owner, inventory, { lockTimeoutMs: 5_000, throughNumber: 47 });
+  await runMigrations(owner, inventory, { lockTimeoutMs: 5_000, throughNumber: 48 });
   const retainedLineage = (await owner.query(
     'SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version',
   )).rows;
   await runMigrations(owner, inventory, { lockTimeoutMs: 5_000 });
   assert.deepEqual((await owner.query(
     'SELECT version, checksum, applied_at FROM schema_migrations WHERE version < $1 ORDER BY version',
-    ['048'],
+    ['049'],
   )).rows, retainedLineage, 'appending ingestion must not rewrite applied shadow migration identities');
 
   const ledger = await owner.query<{ version: string; checksum: string }>(
@@ -91,8 +91,8 @@ test('the complete migration history parses and executes on PostgreSQL 16', { ti
       await divergent.query('CREATE EXTENSION vector');
       await runMigrations(divergent, inventory, { lockTimeoutMs: 5_000, throughNumber: 36 });
       for (const [current, original] of [
-        ['048_memory_ingestion_queue', '037_memory_ingestion_queue'],
-        ['049_memory_ingestion_update_kind', '038_memory_ingestion_update_kind'],
+        ['049_memory_ingestion_queue', '037_memory_ingestion_queue'],
+        ['050_memory_ingestion_update_kind', '038_memory_ingestion_update_kind'],
       ]) {
         const migration = inventory.find(item => item.version === current)!;
         await divergent.query(migration.sql);
