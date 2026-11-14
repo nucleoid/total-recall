@@ -76,6 +76,7 @@ export interface MediaStats {
 }
 
 export interface IngestionStats {
+  history_available: boolean; depth_scope: 'all' | 'nonterminal';
   depth: Record<string, number>; oldest_pending_age_seconds: number | null;
   attempts_histogram: Record<string, number>; failure_categories: Record<string, number>;
   next_retry_at: string | null; inline_hit_rate: number | null; paused: boolean;

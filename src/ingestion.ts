@@ -488,19 +488,41 @@ export async function setIngestionPaused(paused: boolean, auth: AuthContext): Pr
 }
 export async function ingestionStats(auth: AuthContext) {
   checkPermission(auth, 'admin');
-  return withScopedClient(dbScopeFromAuth(auth), async client => {
-    // Queue history must not inherit memory_stats' covering-index planner overrides.
+  const scope = dbScopeFromAuth(auth);
+  const visible = accessLevelSql('j.access_level', '$1');
+  const monitoring = await withScopedClient(scope, async client => {
     await client.query("SET LOCAL statement_timeout = '5s'");
-    const visible = accessLevelSql('j.access_level', '$1');
-    const result = await client.query(`SELECT
-      COALESCE((SELECT jsonb_object_agg(status, count) FROM (SELECT status, COUNT(*)::int AS count FROM memory_ingestion_jobs j WHERE ${visible} GROUP BY status) s), '{}'::jsonb) AS depth,
-      (SELECT EXTRACT(EPOCH FROM statement_timestamp() - MIN(accepted_at))::double precision FROM memory_ingestion_jobs j WHERE j.status IN ('pending','retry_wait','processing') AND ${visible}) AS oldest_pending_age_seconds,
-      (SELECT MIN(next_attempt_at) FROM memory_ingestion_jobs j WHERE j.status IN ('pending','retry_wait','processing') AND j.status = 'retry_wait' AND ${visible}) AS next_retry_at,
-      COALESCE((SELECT jsonb_object_agg(attempts, count) FROM (SELECT attempts, COUNT(*)::int AS count FROM memory_ingestion_jobs j WHERE ${visible} GROUP BY attempts) a), '{}'::jsonb) AS attempts_histogram,
-      COALESCE((SELECT jsonb_object_agg(failure_category, count) FROM (SELECT failure_category, COUNT(*)::int AS count FROM memory_ingestion_jobs j WHERE failure_category IS NOT NULL AND ${visible} GROUP BY failure_category) f), '{}'::jsonb) AS failure_categories,
-      COUNT(*) FILTER (WHERE inline_ready)::double precision / NULLIF(COUNT(*) FILTER (WHERE inline_attempted),0) AS inline_hit_rate
-      FROM memory_ingestion_jobs j WHERE ${visible}`, [auth.maxAccessLevel]);
+    const result = await client.query(`WITH live AS MATERIALIZED (
+        SELECT status, accepted_at, next_attempt_at, failure_category FROM memory_ingestion_jobs j
+        WHERE j.status IN ('pending','retry_wait','processing') AND ${visible}
+      ), failures AS (
+        SELECT failure_category FROM live WHERE failure_category IS NOT NULL
+        UNION ALL
+        SELECT j.failure_category FROM memory_ingestion_jobs j
+        WHERE j.status IN ('embedding_failed','cancelled') AND j.failure_category IS NOT NULL
+          AND j.finalized_at >= statement_timestamp() - interval '24 hours' AND ${visible}
+      ) SELECT
+        COALESCE((SELECT jsonb_object_agg(status, count) FROM (SELECT status, COUNT(*)::int AS count FROM live GROUP BY status) s), '{}'::jsonb) AS depth,
+        (SELECT EXTRACT(EPOCH FROM statement_timestamp() - MIN(accepted_at))::double precision FROM live) AS oldest_pending_age_seconds,
+        (SELECT MIN(next_attempt_at) FROM live WHERE status = 'retry_wait') AS next_retry_at,
+        COALESCE((SELECT jsonb_object_agg(failure_category, count) FROM (SELECT failure_category, COUNT(*)::int AS count FROM failures GROUP BY failure_category) f), '{}'::jsonb) AS failure_categories`, [auth.maxAccessLevel]);
     const settings = (await client.query('SELECT ingestion_paused AS paused, ingestion_worker_seen_at AS last_worker_heartbeat FROM instance_settings WHERE singleton')).rows[0];
-    return { ...result.rows[0], ...settings };
+    return { ...result.rows[0], ...settings, attempts_histogram: {}, inline_hit_rate: null,
+      history_available: false, depth_scope: 'nonterminal' as const };
   });
+  try {
+    const history = await withScopedClient(scope, async client => {
+      // This optional history query cannot abort already committed monitoring.
+      await client.query("SET LOCAL statement_timeout = '5s'");
+      return (await client.query(`SELECT
+        COALESCE((SELECT jsonb_object_agg(status, count) FROM (SELECT status, COUNT(*)::int AS count FROM memory_ingestion_jobs j WHERE ${visible} GROUP BY status) s), '{}'::jsonb) AS depth,
+        COALESCE((SELECT jsonb_object_agg(attempts, count) FROM (SELECT attempts, COUNT(*)::int AS count FROM memory_ingestion_jobs j WHERE ${visible} GROUP BY attempts) a), '{}'::jsonb) AS attempts_histogram,
+        COUNT(*) FILTER (WHERE inline_ready)::double precision / NULLIF(COUNT(*) FILTER (WHERE inline_attempted),0) AS inline_hit_rate
+        FROM memory_ingestion_jobs j WHERE ${visible}`, [auth.maxAccessLevel])).rows[0];
+    });
+    return { ...monitoring, ...history, history_available: true, depth_scope: 'all' as const };
+  } catch {
+    console.warn('[ingestion] outcome=history_metrics_unavailable');
+    return monitoring;
+  }
 }

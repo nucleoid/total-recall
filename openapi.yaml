@@ -1954,12 +1954,17 @@ components:
         similarity: { type: [number, "null"] }
     IngestionStats:
       type: object
-      required: [depth, oldest_pending_age_seconds, attempts_histogram, failure_categories, next_retry_at, inline_hit_rate, paused, last_worker_heartbeat]
+      required: [depth, oldest_pending_age_seconds, attempts_histogram, failure_categories, next_retry_at, inline_hit_rate, paused, last_worker_heartbeat, history_available, depth_scope]
       properties:
+        history_available: { type: boolean, description: Whether retained-history aggregates are available. }
+        depth_scope: { type: string, enum: [all, nonterminal], description: States covered by depth counts. }
         depth: { type: object, additionalProperties: { type: integer, minimum: 0 } }
         oldest_pending_age_seconds: { type: [number, "null"] }
         attempts_histogram: { type: object, additionalProperties: { type: integer, minimum: 0 } }
-        failure_categories: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+        failure_categories:
+          type: object
+          description: Current nonterminal failures plus terminal failures finalized in the last 24 hours.
+          additionalProperties: { type: integer, minimum: 0 }
         next_retry_at: { type: [string, "null"], format: date-time }
         inline_hit_rate: { type: [number, "null"], minimum: 0, maximum: 1 }
         paused: { type: boolean }

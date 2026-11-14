@@ -44,6 +44,10 @@ CREATE TABLE public.memory_ingestion_jobs (
 CREATE INDEX memory_ingestion_claim_idx ON public.memory_ingestion_jobs
   (next_attempt_at, accepted_at, memory_id) WHERE status IN ('pending','retry_wait','processing');
 CREATE INDEX memory_ingestion_owner_idx ON public.memory_ingestion_jobs (client_id, status);
+-- Recent terminal failures stay monitorable without scanning retained history.
+CREATE INDEX memory_ingestion_recent_failure_idx ON public.memory_ingestion_jobs (finalized_at)
+  INCLUDE (failure_category, namespace, access_level, client_id)
+  WHERE status IN ('embedding_failed','cancelled') AND failure_category IS NOT NULL;
 ALTER TABLE public.memory_ingestion_jobs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY ingestion_read ON public.memory_ingestion_jobs FOR SELECT USING (
   namespace = ANY(app_allowed_namespaces()) AND

@@ -139,7 +139,8 @@ async function renderOverview(): Promise<void> {
     section.append(el('h3', 'Ingestion queue'), el('p', queue.paused ? 'Worker paused' : 'Worker accepting jobs'),
       table(Object.entries(queue.depth).map(([state, count]) => ({ state, count })), ['state', 'count']),
       el('p', `Oldest queued: ${queue.oldest_pending_age_seconds == null ? 'none' : Math.round(queue.oldest_pending_age_seconds) + ' seconds'} · Last worker heartbeat: ${formatDate(queue.last_worker_heartbeat)}`),
-      el('p', `Inline ready: ${queue.inline_hit_rate == null ? 'no attempts' : Math.round(queue.inline_hit_rate * 100) + '%'} · Next retry: ${formatDate(queue.next_retry_at)}`));
+      el('p', `Inline ready: ${queue.history_available === false ? 'history unavailable' : queue.inline_hit_rate == null ? 'no attempts' : Math.round(queue.inline_hit_rate * 100) + '%'} · Next retry: ${formatDate(queue.next_retry_at)}`));
+    if (queue.history_available === false) section.append(el('p', 'Historical metrics unavailable; counts show active jobs only.', 'muted'));
     const toggle = el('button', queue.paused ? 'Resume ingestion worker' : 'Pause ingestion worker');
     toggle.addEventListener('click', () => void (async () => {
       toggle.disabled = true;

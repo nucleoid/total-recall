@@ -1,4 +1,4 @@
-import { pathToFileURL } from 'node:url';
+import { isDirectExecution } from './entrypoint.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { validateKeyReadOnly } from './auth.js';
 import { dbScopeFromAuth, shutdown } from './db.js';
@@ -73,6 +73,6 @@ export async function ingestionWorkerMain(): Promise<void> {
   try { console.log('[ingestion-worker] stopped', await runIngestionWorker(parseIngestionWorkerCli(process.argv.slice(2)), controller.signal)); }
   finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); await shutdown(); }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isDirectExecution(import.meta.url, process.argv[1])) {
   ingestionWorkerMain().catch(() => { console.error('[ingestion-worker] failed; check database and worker configuration'); process.exitCode = 1; });
 }
