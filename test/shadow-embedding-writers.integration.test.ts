@@ -11,7 +11,7 @@ import {activateAttestedServing} from './shadow-embedding-fixtures.js';
 
 const url = process.env.SHADOW_EMBEDDING_TEST_DATABASE_URL;
 const sha = (value:string) => createHash('sha256').update(value).digest('hex');
-const nativeVector = (axis:number) => Array.from({length:1024},(_,i)=>i===axis?1:0);
+const nativeVector = (axis:number) => Array.from({length:QWEN_CHUNK_CONTRACT.nativeDimensions},(_,i)=>i===axis?1:0);
 
 function fakeClient(onEmbed?:()=>Promise<void>) {
   let notified=false;

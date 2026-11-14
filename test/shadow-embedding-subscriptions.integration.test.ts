@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import {activateAttestedServing} from './shadow-embedding-fixtures.js';
+import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
 
 const url = process.env.SHADOW_EMBEDDING_TEST_DATABASE_URL;
-const contractId = '4340ee2917358817a4fe69234f137eb29580dd799266b783725f13c5a66d5f9e';
-const contract = { version: 'total-recall/qwen3-0.6b-q8/paragraph256-utf8/v1', artifactSha256: '06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439', upstreamRevision: '370f27d7550e0def9b39c1f16d3fbaa13aa67728', quantization: 'Q8_0', tokenizer: 'artifact-tokenizer/add_special=true', pooling: 'last-token', nativeDimensions: 1024, storedDimensions: 768, projection: 'first-768-then-l2', documentPrefix: '', queryPrefix: 'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:', queryPrefixSha256: '9fab7feb99edb69f560d85cf1bb849dd556c37f383d0336574f78f1303e90740', allocatedContextTokens: 4096, truncation: 'reject', chunkTokens: 256, finalParagraphIsolationTokens: 64, chunkAlgorithm: 'blank-line-pack/recursive-codepoint-bisection/python-unicode-whitespace', offsets: 'utf8-bytes/codepoint-boundaries', overlap: 0, empty: 'one-empty-chunk', requestMaxInputs: 4, requestMaxTokens: 2000, queryMaxTokens: 2000, runtimeContract: 'llama.cpp/b11669/last-pool/tokenize-special/native1024' };
+const contractId = QWEN_CONTRACT_ID;
+const contract = QWEN_CHUNK_CONTRACT;
 const unit = `[1,${Array(767).fill(0).join(',')}]`;
 
 test('target subscription matching is prospective, complete-manifest-only and authorization bounded', { skip: !url }, async () => {

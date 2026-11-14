@@ -6,6 +6,7 @@ import { readShadowEmbeddingStatus } from '../src/shadow-embedding-status.js';
 import { inventoryShadowPage, prepareShadowRun, requeueShadowItems, setShadowRunState,
   hashOperationalManifest, validateOperationalManifest, type ManifestEnvelope } from '../src/shadow-embedding-control.js';
 import { LocalEmbeddingClient, type VerifiedLocalRuntime } from '../src/local-embedding-client.js';
+import { OpenRouterEmbeddingClient } from '../src/openrouter-embedding-client.js';
 import { QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
 import { ShadowEmbeddingStore } from '../src/shadow-embedding-store.js';
 import { runShadowBatch } from '../src/shadow-embedding-worker.js';
@@ -86,6 +87,12 @@ function runtimeEnvironment(): { baseUrl: string; bearerToken: string; runtime: 
   return { baseUrl, bearerToken, runtime };
 }
 
+function openRouterApiKey(): string {
+  const value = process.env.OPENROUTER_API_KEY;
+  if (!value?.trim() || /[\r\n]/u.test(value)) throw new Error('embedding.openrouter_credential_required');
+  return value;
+}
+
 export async function runWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, envelope: ManifestEnvelope) {
   return runBoundedWorkerCommand(pool,args,envelope,'backfill');
 }
@@ -127,9 +134,19 @@ async function runBoundedWorkerCommand(pool: pg.Pool, args: ShadowCliArguments, 
     expectedRuntimeHost: approvedRuntime.expectedRuntimeHost,
     expectedRuntimeMode: approvedRuntime.expectedRuntimeMode });
   const local = new LocalEmbeddingClient({ ...environment, beforeInference: guard });
+  const embedding = mode === 'backfill' && envelope.manifest.backfill?.provider === 'openrouter'
+    ? new OpenRouterEmbeddingClient({
+      apiKey: openRouterApiKey(),
+      countFormattedTokens: local.countFormattedTokens.bind(local),
+      beforeInference: guard,
+    })
+    : local;
+  if (mode === 'backfill' && envelope.manifest.version === 2 && embedding === local) {
+    throw new Error('embedding.backfill_provider_required');
+  }
   const store = new ShadowEmbeddingStore(pool, args.runId!,120,mode);
   await store.verifyDatabase(args.database);
-  return runShadowBatch(store, local, {
+  return runShadowBatch(store, embedding, {
     maxParents: resources.maxParentsPerBatch, maxSourceBytes: resources.maxSourceBytesPerBatch,
     maxTokens: resources.maxTokensPerBatch, maxElapsedMs: resources.maxElapsedMsPerBatch, maxAttempts: resources.maxAttempts,
   }, guard);

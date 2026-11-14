@@ -12,7 +12,7 @@ function fixture(mutator?: (body: Record<string, any>) => void, tokenize = (s: s
     const body = JSON.parse(init?.body as string);
     calls.push({ url: String(url), body, init: init! });
     if (String(url).endsWith('/tokenize')) return Response.json({ tokens: Array(tokenize(body.content)).fill(1) });
-    const response = { data: body.input.map((_: string, i: number) => ({ index: i, embedding: Array(1024).fill(i + 1) })),
+    const response = { data: body.input.map((_: string, i: number) => ({ index: i, embedding: Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(i + 1) })),
       usage: { prompt_tokens: body.input.reduce((n: number, s: string) => n + tokenize(s), 0) } };
     mutator?.(response);
     return Response.json(response);
@@ -45,11 +45,24 @@ test('input and aggregate budgets reject before inference without truncation', a
   assert.equal(f.guards(), 0);
 });
 
+test('NFC tokenization is identical for raw chunk planning and document/query inference', async () => {
+  const text = 'cafe\u0301\r\n'; const normalized = text.normalize('NFC');
+  const f = fixture(); await f.client.countFormattedTokens(text);
+  assert.equal(f.calls[0].body.content, normalized);
+  const doc = fixture(); const result = await doc.client.embed([text], 'document');
+  assert.equal(doc.calls[0].body.content, normalized);
+  assert.deepEqual(doc.calls[1].body.input, [normalized]);
+  assert.deepEqual(result.tokens, [normalized.length + 2]);
+  const query = fixture(); await query.client.embed([text], 'query');
+  assert.equal(query.calls[0].body.content, QWEN_QUERY_PREFIX + normalized);
+  assert.deepEqual(query.calls[1].body.input, [QWEN_QUERY_PREFIX + normalized]);
+});
+
 test('wrong count, ordering, shape, dimensions and token usage are systemic failures', async () => {
   for (const mutate of [
     (b: any) => { b.data = []; }, (b: any) => { b.data[0].index = 1; },
     (b: any) => { b.data[0].embedding = Array(768).fill(1); },
-    (b: any) => { b.data[0].embedding = Array(1024).fill(0); },
+    (b: any) => { b.data[0].embedding = Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(0); },
     (b: any) => { b.usage.prompt_tokens++; }, (b: any) => { delete b.usage; },
   ]) {
     await assert.rejects(fixture(mutate).client.embed(['x'], 'document'),

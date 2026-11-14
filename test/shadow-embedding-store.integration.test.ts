@@ -21,7 +21,7 @@ function fakeClient(status?: number) {
       if (status) return new Response('private error body', { status, headers: { 'Retry-After': '10' } });
       const body = JSON.parse(init?.body as string);
       return String(url).endsWith('/tokenize') ? Response.json({ tokens: Array(body.content.length + 2).fill(1) })
-        : Response.json({ data: body.input.map((_: string, index: number) => ({ index, embedding: Array(1024).fill(1) })),
+        : Response.json({ data: body.input.map((_: string, index: number) => ({ index, embedding: Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(1) })),
           usage: { prompt_tokens: body.input.reduce((sum: number, s: string) => sum + s.length + 2, 0) } });
     }) as typeof fetch });
 }

@@ -9,7 +9,7 @@ import type { Socket } from 'node:net';
 import net from 'node:net';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import https from 'node:https';
-import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID, projectQwenVector } from './local-embedding-contract.js';
+import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID, normalizeEmbeddingInputText, projectQwenVector } from './local-embedding-contract.js';
 import {verifyWindowsEmbeddingPermissions,protectNewWindowsEmbeddingDirectory} from './windows-embedding-permissions.js';
 
 export interface GatewayReceipt {
@@ -183,10 +183,12 @@ export class LocalEmbeddingGateway {
       const body=await readJson(req);
       if(req.url==='/tokenize'){
         if(typeof body.content!=='string'||Buffer.byteLength(body.content)>1_048_576||body.add_special!==true)throw new Error('gateway.tokenize_shape');
+        if(body.content!==normalizeEmbeddingInputText(body.content))throw new Error('gateway.text_normalization');
         const data=await this.upstream('/tokenize',{content:body.content,add_special:true});validateTokens(data,1_048_576);
         return respond(res,200,data);
       }
       if(!Array.isArray(body.input)||body.input.length<1||body.input.length>4||body.truncate!==false||body.input.some((x:unknown)=>typeof x!=='string'))throw new Error('gateway.embedding_shape');
+      if(body.input.some((input:string)=>input!==normalizeEmbeddingInputText(input)))throw new Error('gateway.text_normalization');
       let total=0;for(const input of body.input){const t=await this.upstream('/tokenize',{content:input,add_special:true});total+=validateTokens(t);}
       if(total>2000)throw new Error('gateway.token_limit');
       const data=await this.upstream('/v1/embeddings',{input:body.input,truncate:false});
@@ -229,7 +231,7 @@ function validateTokens(data:any,max=1_048_576):number{if(!Array.isArray(data?.t
 function respond(res:ServerResponse,status:number,value:unknown){res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify(value));}
 function gatewayHttpFailure(error:unknown):{status:number;code:string}{const code=error instanceof Error&&/^gateway\.[a-z0-9_]+$/.test(error.message)?error.message:'gateway.failure';
   if(code==='gateway.body_limit')return{status:413,code};
-  if(['gateway.request_json','gateway.tokenize_shape','gateway.embedding_shape','gateway.token_limit'].includes(code))return{status:400,code};
+  if(['gateway.request_json','gateway.tokenize_shape','gateway.embedding_shape','gateway.token_limit','gateway.text_normalization'].includes(code))return{status:400,code};
   if(code==='gateway.authorization_expired')return{status:403,code};
   if(['gateway.telemetry_stale','gateway.host_guard','gateway.gpu_guard','gateway.cpu_guard','gateway.resource_unavailable','gateway.backend_unavailable'].includes(code)||/^gateway\.upstream_(?:429|5\d\d)$/.test(code))return{status:503,code};
   return{status:502,code};}

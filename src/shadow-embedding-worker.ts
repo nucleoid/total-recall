@@ -1,6 +1,7 @@
 import { performance } from 'node:perf_hooks';
 import { planEmbeddingChunks } from './embedding-chunks.js';
-import { LocalEmbeddingClient, LocalEmbeddingError } from './local-embedding-client.js';
+import { LocalEmbeddingError } from './local-embedding-client.js';
+import type { EmbeddingClient } from './embedding-client.js';
 import { ShadowEmbeddingStore } from './shadow-embedding-store.js';
 import { formatLocalEmbeddingInput } from './local-embedding-contract.js';
 
@@ -36,7 +37,7 @@ export function validateShadowLimits(limits: ShadowWorkerLimits): void {
 }
 
 /** Finite resumable execution. This does not install a service or imply whole-run completion. */
-export async function runShadowBatch(store: ShadowEmbeddingStore, client: LocalEmbeddingClient,
+export async function runShadowBatch(store: ShadowEmbeddingStore, client: EmbeddingClient,
   limits: ShadowWorkerLimits, resourceGuard: () => Promise<void>, signal?: AbortSignal): Promise<ShadowBatchReceipt> {
   validateShadowLimits(limits);
   const started = performance.now();

@@ -4,23 +4,31 @@ export const QWEN_QUERY_PREFIX = 'Instruct: Given a web search query, retrieve r
 
 /** Semantic fields only: endpoints, credentials and mutable model tags are not identity. */
 export const QWEN_CHUNK_CONTRACT = Object.freeze({
-  version: 'total-recall/qwen3-0.6b-q8/paragraph256-utf8/v1',
-  artifactSha256: '06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439',
-  upstreamRevision: '370f27d7550e0def9b39c1f16d3fbaa13aa67728',
+  version: 'total-recall/qwen3-4b-q8/paragraph256-utf8/v3',
+  model: 'Qwen/Qwen3-Embedding-4B',
+  upstreamRevision: '5cf2132abc99cad020ac570b19d031efec650f2b',
+  localArtifact: 'Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q8_0.gguf',
+  localArtifactRevision: 'f4602530db1d980e16da9d7d3a70294cf5c190be',
+  artifactSha256: 'b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d',
   quantization: 'Q8_0',
+  hostedModel: 'qwen/qwen3-embedding-4b',
+  hostedProvider: 'DeepInfra',
   tokenizer: 'artifact-tokenizer/add_special=true',
+  tokenizerJsonSha256: '83cdf8c3a34f68862319cb1810ee7b1e2c0a44e0864ae930194ddb76bb7feb8d',
+  textNormalization: 'NFC',
   pooling: 'last-token',
-  nativeDimensions: 1024,
+  nativeDimensions: 2560,
   storedDimensions: 768,
   projection: 'first-768-then-l2',
   documentPrefix: '',
+  emptyDocumentInput: '[Blank document]',
   queryPrefix: QWEN_QUERY_PREFIX,
   queryPrefixSha256: '9fab7feb99edb69f560d85cf1bb849dd556c37f383d0336574f78f1303e90740',
   allocatedContextTokens: 4096,
   truncation: 'reject',
   chunkTokens: 256,
   finalParagraphIsolationTokens: 64,
-  chunkAlgorithm: 'blank-line-pack/recursive-codepoint-bisection/python-unicode-whitespace',
+  chunkAlgorithm: 'blank-line-pack/recursive-codepoint-bisection/python-unicode-whitespace/nfc-wire-byte-preflight',
   offsets: 'utf8-bytes/codepoint-boundaries',
   overlap: 0,
   empty: 'one-empty-chunk',
@@ -28,7 +36,7 @@ export const QWEN_CHUNK_CONTRACT = Object.freeze({
   requestMaxTokens: 2000,
   queryMaxTokens: 2000,
   // Additional runtimes require recorded compatibility acceptance before use.
-  runtimeContract: 'llama.cpp/b11669/last-pool/tokenize-special/native1024',
+  runtimeContract: 'llama.cpp/b11669/last-pool/tokenize-special/native2560',
 });
 
 export function sha256(value: string | Buffer): string {
@@ -51,10 +59,17 @@ export function validateEmbeddingText(text: string): void {
   if (Buffer.byteLength(text, 'utf8') > 1_048_576) throw new Error('embedding.parent_byte_limit');
 }
 
+/** Match the pinned upstream tokenizer; canonical text, hashes and offsets stay raw. */
+export function normalizeEmbeddingInputText(text: string): string {
+  return text.normalize(QWEN_CHUNK_CONTRACT.textNormalization);
+}
+
 export function formatLocalEmbeddingInput(text: string, role: 'query' | 'document'): string {
   validateEmbeddingText(text);
   if (role !== 'query' && role !== 'document') throw new Error('embedding.invalid_role');
-  return role === 'query' ? QWEN_QUERY_PREFIX + text : text;
+  const normalized = normalizeEmbeddingInputText(text);
+  return role === 'query' ? QWEN_QUERY_PREFIX + normalized
+    : normalized === '' ? QWEN_CHUNK_CONTRACT.emptyDocumentInput : normalized;
 }
 
 /** Accept native vectors only; an already-cropped vector cannot masquerade as native. */

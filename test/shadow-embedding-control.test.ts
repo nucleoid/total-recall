@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { QWEN_CHUNK_CONTRACT } from '../src/local-embedding-contract.js';
+import { QWEN_CHUNK_CONTRACT, QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
 import { CURRENT_PARENT_ELIGIBILITY } from '../src/shadow-embedding-store.js';
 import { validateOperationalManifest } from '../src/shadow-embedding-control.js';
 import { parseShadowEmbeddingArguments, runWorkerCommand } from '../scripts/shadow-embeddings.js';
@@ -65,7 +65,7 @@ test('worker runtime receipt must equal the approved manifest receipt', async ()
   };
   process.env.SHADOW_EMBEDDING_URL = 'http://localhost:1234';
   process.env.SHADOW_EMBEDDING_API_KEY = 'synthetic';
-  process.env.SHADOW_EMBEDDING_RUNTIME_JSON = JSON.stringify({ contractId: '4340ee2917358817a4fe69234f137eb29580dd799266b783725f13c5a66d5f9e',
+  process.env.SHADOW_EMBEDDING_RUNTIME_JSON = JSON.stringify({ contractId: QWEN_CONTRACT_ID,
     artifactSha256: QWEN_CHUNK_CONTRACT.artifactSha256, runtimeContract: QWEN_CHUNK_CONTRACT.runtimeContract,
     acceptanceReceiptSha256: 'd'.repeat(64) });
   const pool = { query: async () => ({ rows: [{ status: 'running', release_sha: value.source.releaseSha,
@@ -79,4 +79,31 @@ test('worker runtime receipt must equal the approved manifest receipt', async ()
     if (previous.key === undefined) delete process.env.SHADOW_EMBEDDING_API_KEY; else process.env.SHADOW_EMBEDDING_API_KEY = previous.key;
     if (previous.runtime === undefined) delete process.env.SHADOW_EMBEDDING_RUNTIME_JSON; else process.env.SHADOW_EMBEDDING_RUNTIME_JSON = previous.runtime;
   }
+});
+
+test('version 2 manifest pins OpenRouter model, endpoint, provider and concurrency', () => {
+  const base = manifest();
+  const value = {
+    ...base,
+    version: 2 as const,
+    backfill: {
+      provider: 'openrouter' as const,
+      model: QWEN_CHUNK_CONTRACT.hostedModel,
+      providerName: QWEN_CHUNK_CONTRACT.hostedProvider,
+      endpoint: 'https://openrouter.ai/api/v1/embeddings',
+      maxConcurrency: 1,
+    },
+  };
+  assert.equal(validateOperationalManifest(value, hash(value)).manifest.backfill?.provider, 'openrouter');
+  for (const backfill of [
+    { ...value.backfill, model: 'qwen/qwen3-embedding-8b' },
+    { ...value.backfill, providerName: 'AnyProvider' },
+    { ...value.backfill, endpoint: 'https://example.com/embeddings' },
+    { ...value.backfill, maxConcurrency: 2 },
+  ]) {
+    const invalid = { ...value, backfill };
+    assert.throws(() => validateOperationalManifest(invalid, hash(invalid)), /backfill_contract/);
+  }
+  const missing = { ...base, version: 2 as const };
+  assert.throws(() => validateOperationalManifest(missing, hash(missing)), /operational_manifest/);
 });

@@ -249,7 +249,7 @@ test('frontend does not listen until authenticated backend health and warmup suc
   await gateway.start();try{assert.equal(calls.length,2);assert.match(calls[0],/\/health Bearer [a-f0-9]{64}/);assert.match(calls[1],/\/v1\/embeddings Bearer [a-f0-9]{64}/);assert.equal(commonGuards,1);assert.equal(fullGuards,1);assert.doesNotMatch(calls.join(' '),new RegExp(`Bearer ${'s'.repeat(32)}`));}finally{await gateway.close();}
 });
 
-function nativeVector(axis:number):number[]{return Array.from({length:1024},(_,i)=>i===axis?1:0);}
+function nativeVector(axis:number):number[]{return Array.from({length:QWEN_CHUNK_CONTRACT.nativeDimensions},(_,i)=>i===axis?1:0);}
 function healthyGpuTelemetry(receipt:GatewayReceipt){return{hostId:receipt.hostId,timestamp:Date.now(),mode:'gpu' as const,gpuDeviceUuid:'GPU-test-1',gpuTempC:50,vramUsedMiB:1,vramTotalMiB:1024,
   availableBytes:3*1024**3,diskFreeBytes:101*1024**3,swapUsedBytes:0,...(receipt.host.platform==='win32'?{cpuUtilizationPercent:20}:{load1:0.5})};}
 
@@ -275,6 +275,26 @@ async function invokeGateway(gateway:LocalEmbeddingGateway,url:'/health'|'/token
   req.headers={authorization:`Bearer ${'s'.repeat(32)}`,...(raw?{'content-length':String(Buffer.byteLength(raw))}:{})};let status=0,value='';
   const res={writeHead:(n:number)=>{status=n;},end:(v:string)=>{value=v;}} as any;await(gateway as any).handle(req,res);return{status,body:JSON.parse(value)};
 }
+
+test('wire NFC is enforced before either tokenizer or inference while preserving byte guards', async () => {
+  const receipt=base('cpu'); let calls=0;
+  const gateway=new LocalEmbeddingGateway(receipt,Buffer.from('s'.repeat(32)),19000,{
+    telemetry:async()=>healthyCpuTelemetry(receipt),commonTelemetry:async()=>healthyCpuTelemetry(receipt),
+    fetch:(async target=>{calls++;return String(target).endsWith('/tokenize') ? Response.json({tokens:[1]})
+      :Response.json({data:[{index:0,embedding:nativeVector(0)}],usage:{prompt_tokens:1}});}) as typeof fetch});
+  (gateway as any).backendSecret=Buffer.from('b'.repeat(32));
+  assert.deepEqual(await invokeGateway(gateway,'/tokenize',{content:'e\u0301',add_special:true}),
+    {status:400,body:{error:'gateway.text_normalization'}});
+  assert.deepEqual(await invokeGateway(gateway,'/v1/embeddings',{input:['e\u0301'],truncate:false}),
+    {status:400,body:{error:'gateway.text_normalization'}});
+  assert.equal(calls,0);
+  assert.equal((await invokeGateway(gateway,'/tokenize',{content:'é',add_special:true})).status,200);
+  assert.equal((await invokeGateway(gateway,'/v1/embeddings',{input:['é'],truncate:false})).status,200);
+  assert.equal(calls,3);
+  assert.deepEqual(await invokeGateway(gateway,'/tokenize',{content:'é'.repeat(524289),add_special:true}),
+    {status:400,body:{error:'gateway.tokenize_shape'}});
+  assert.equal(calls,3);
+});
 
 test('GPU tokenizer uses only common host guards and common failure prevents backend work',async()=>{
   const receipt=base();let full=0,backend=0;

@@ -21,7 +21,7 @@ function fakeClient(){return new LocalEmbeddingClient({baseUrl:'http://localhost
   artifactSha256:QWEN_CHUNK_CONTRACT.artifactSha256,runtimeContract:QWEN_CHUNK_CONTRACT.runtimeContract,acceptanceReceiptSha256:runtime.acceptanceReceiptSha256},
   beforeInference:async()=>{},fetch:(async(input:string|URL|Request,init?:RequestInit)=>{const body=JSON.parse(String(init?.body));
     if(String(input).endsWith('/tokenize'))return Response.json({tokens:Array(body.content.length+2).fill(1)});
-    return Response.json({data:body.input.map((_:string,index:number)=>({index,embedding:Array(1024).fill(1)})),usage:{prompt_tokens:body.input.reduce((n:number,s:string)=>n+s.length+2,0)}});}) as typeof fetch});}
+    return Response.json({data:body.input.map((_:string,index:number)=>({index,embedding:Array(QWEN_CHUNK_CONTRACT.nativeDimensions).fill(1)})),usage:{prompt_tokens:body.input.reduce((n:number,s:string)=>n+s.length+2,0)}});}) as typeof fetch});}
 function manifest():OperationalManifest{return{version:1,approval:{reference:'synthetic',sha256:'b'.repeat(64),approvedBy:'test',approvedAt:'2026-10-20T00:00:00Z'},
   source:{releaseSha:'c'.repeat(40)},eligibility:{predicate:CURRENT_PARENT_ELIGIBILITY,namespaces:'all',includeNullVectors:true,activeSubscriptions:true},
   resources,runtime:{...runtime,expectedRuntimeMode:'gpu'},steadyState:{resources,runtime}};}

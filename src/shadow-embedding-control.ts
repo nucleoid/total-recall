@@ -17,13 +17,17 @@ export interface OperationalRuntime {
   acceptanceReceiptSha256: string; artifactSha256: string; runtimeContract: string;
   expectedRuntimeHost: string; expectedRuntimeMode: 'gpu' | 'cpu'; tls?: {caSha256:string;spkiSha256:string};
 }
+export interface OperationalBackfill {
+  provider: 'openrouter'; model: string; providerName: string; endpoint: string; maxConcurrency: number;
+}
 export interface OperationalManifest {
-  version: 1;
+  version: 1 | 2;
   approval: { reference: string; sha256: string; approvedBy: string; approvedAt: string };
   source: { releaseSha: string };
   eligibility: { predicate: string; namespaces: 'all'; includeNullVectors: true; activeSubscriptions: true };
   resources: OperationalResources;
   runtime: OperationalRuntime;
+  backfill?: OperationalBackfill;
   steadyState?: { resources: OperationalResources; runtime: OperationalRuntime };
 }
 
@@ -44,13 +48,15 @@ export function validateOperationalManifest(value: unknown, expectedHash: string
   if (!SHA256.test(expectedHash)) throw new Error('embedding.manifest_hash');
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('embedding.operational_manifest');
   const m = value as OperationalManifest;
-  exactKeys(m as unknown as Record<string, unknown>, m.steadyState===undefined
-    ? ['version','approval','source','eligibility','resources','runtime']
-    : ['version','approval','source','eligibility','resources','runtime','steadyState']);
+  const manifestKeys = ['version','approval','source','eligibility','resources','runtime'];
+  if (m.backfill !== undefined) manifestKeys.push('backfill');
+  if (m.steadyState !== undefined) manifestKeys.push('steadyState');
+  exactKeys(m as unknown as Record<string, unknown>, manifestKeys);
   exactKeys(m.approval as unknown as Record<string, unknown>, ['reference','sha256','approvedBy','approvedAt']);
   exactKeys(m.source as unknown as Record<string, unknown>, ['releaseSha']);
   exactKeys(m.eligibility as unknown as Record<string, unknown>, ['predicate','namespaces','includeNullVectors','activeSubscriptions']);
-  if (m.version !== 1 || !m.approval || !m.source || !m.eligibility || !m.resources || !m.runtime) throw new Error('embedding.operational_manifest');
+  if (![1,2].includes(m.version) || !m.approval || !m.source || !m.eligibility || !m.resources || !m.runtime
+    || (m.version === 2) !== (m.backfill !== undefined)) throw new Error('embedding.operational_manifest');
   if (typeof m.approval.reference !== 'string' || !m.approval.reference.trim()
     || typeof m.approval.sha256 !== 'string' || !SHA256.test(m.approval.sha256)
     || typeof m.approval.approvedBy !== 'string' || !m.approval.approvedBy.trim()
@@ -60,6 +66,7 @@ export function validateOperationalManifest(value: unknown, expectedHash: string
     || m.eligibility.includeNullVectors !== true || m.eligibility.activeSubscriptions !== true) throw new Error('embedding.eligibility_contract');
   validateOperationalResources(m.resources);
   validateOperationalRuntime(m.runtime);
+  if (m.backfill !== undefined) validateOperationalBackfill(m.backfill);
   if (m.steadyState !== undefined) {
     if (!m.steadyState || typeof m.steadyState !== 'object' || Array.isArray(m.steadyState)) throw new Error('embedding.operational_manifest');
     exactKeys(m.steadyState as unknown as Record<string, unknown>, ['resources','runtime']);
@@ -70,6 +77,17 @@ export function validateOperationalManifest(value: unknown, expectedHash: string
   const actual = hashOperationalManifest(m);
   if (actual !== expectedHash) throw new Error('embedding.manifest_hash_mismatch');
   return { manifest: m, manifestSha256: actual };
+}
+
+function validateOperationalBackfill(backfill: OperationalBackfill): void {
+  if (!backfill || typeof backfill !== 'object' || Array.isArray(backfill)) throw new Error('embedding.backfill_contract');
+  exactKeys(backfill as unknown as Record<string, unknown>, ['provider','model','providerName','endpoint','maxConcurrency']);
+  if (backfill.provider !== 'openrouter' || backfill.model !== QWEN_CHUNK_CONTRACT.hostedModel
+    || backfill.providerName !== QWEN_CHUNK_CONTRACT.hostedProvider
+    || backfill.endpoint !== 'https://openrouter.ai/api/v1/embeddings'
+    || backfill.maxConcurrency !== 1) {
+    throw new Error('embedding.backfill_contract');
+  }
 }
 
 function validateOperationalResources(resources: OperationalResources): void {

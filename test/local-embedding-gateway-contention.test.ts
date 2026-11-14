@@ -41,7 +41,7 @@ async function runPairedOrder(firstRole:'document'|'query'){
   const gateway=new LocalEmbeddingGateway(r,Buffer.from(secret),19000,{commonTelemetry:async()=>healthy(r),telemetry:async()=>healthy(r),
     fetch:(async(target:string|URL|Request)=>{upstream++;if(upstream===1){admitted();await hold;}
       if(String(target).endsWith('/tokenize'))return Response.json({tokens:[1]});
-      return Response.json({data:[{index:0,embedding:[1,...Array(1023).fill(0)]}],usage:{prompt_tokens:1}});
+      return Response.json({data:[{index:0,embedding:[1,...Array(QWEN_CHUNK_CONTRACT.nativeDimensions-1).fill(0)]}],usage:{prompt_tokens:1}});
     }) as typeof fetch});
   (gateway as any).backendSecret=Buffer.from('b'.repeat(32));
   const runtime={contractId:QWEN_CONTRACT_ID,artifactSha256:QWEN_CHUNK_CONTRACT.artifactSha256,
@@ -80,7 +80,7 @@ test('real loopback HTTP sockets preserve health, paired POST admission, and que
     const gateway=new LocalEmbeddingGateway(r,Buffer.from(secret),19000,{commonTelemetry:async()=>healthy(r),telemetry:async()=>healthy(r),
       fetch:(async(target:string|URL|Request)=>{upstream++;if(upstream===1){admitted();await hold;}
         if(String(target).endsWith('/tokenize'))return Response.json({tokens:[1]});
-        return Response.json({data:[{index:0,embedding:[1,...Array(1023).fill(0)]}],usage:{prompt_tokens:1}});
+        return Response.json({data:[{index:0,embedding:[1,...Array(QWEN_CHUNK_CONTRACT.nativeDimensions-1).fill(0)]}],usage:{prompt_tokens:1}});
       }) as typeof fetch});
     (gateway as any).backendSecret=Buffer.from('b'.repeat(32));
     const server=createServer((req,res)=>{void(gateway as any).handle(req,res);});
