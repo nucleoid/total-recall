@@ -4,12 +4,14 @@ import dotenv from 'dotenv';
 import { validateKeyReadOnly } from '../src/auth.js';
 import { dbScopeFromAuth, shutdown, withScopedClient } from '../src/db.js';
 import { HttpJsonGenerationProvider, type GenerationProvider } from '../src/generation.js';
+import { embedWithProfile, type EmbeddingResult } from '../src/embedding.js';
+import { ingestionSessionEnabled } from '../src/ingestion.js';
 import {
   applySessionDistillation,
   assertSessionPolicyEffective,
   claimSessionDistillationJob,
   distillSessionTranscript,
-  embedDistilledFacts,
+  tryInlineSessionFacts,
   loadSessionTranscript,
   markSessionDistillationFailed,
   parseSessionDistillationPolicy,
@@ -17,6 +19,7 @@ import {
   sessionDistillationInputBytes,
   type SessionDistillationJob,
   type SessionDistillationPolicy,
+  type DistilledFact,
 } from '../src/session-distillation.js';
 import type { AuthContext } from '../src/types.js';
 
@@ -123,9 +126,11 @@ export async function runSessionWorker(
         policy.budget.maxOutputBytesPerSession,
         signal,
       );
-      const vectors = await embedDistilledFacts(generated.facts, signal);
+      const prepared: Array<DistilledFact & { embedding?: EmbeddingResult }> = [];
+      for (const fact of generated.facts) prepared.push(ingestionSessionEnabled()
+        ? fact : { ...fact, embedding: await embedWithProfile(fact.content, undefined, signal) });
       const applied = await withScopedClient(scope, client => applySessionDistillation(
-        client, job, loaded, generated.facts, vectors, generated.outputBytes, policy,
+        client, job, loaded, prepared, generated.outputBytes, policy,
       ));
       if (!applied) {
         await fail(scope, job, 'source_changed', true);
@@ -139,7 +144,9 @@ export async function runSessionWorker(
       await fail(scope, job, code, code === 'input_too_large');
       metric(code);
       if (signal.aborted) break;
+      continue;
     }
+    await tryInlineSessionFacts(job, auth);
   }
   return { processed, providerCalls, factsStored };
 }

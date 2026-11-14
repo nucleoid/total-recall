@@ -4,12 +4,14 @@ import { z } from 'zod';
 import { checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
 import { logAudit } from './audit.js';
 import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
-import { embedWithProfile, embeddingDescriptorParams, serializeEmbeddingVector } from './embedding.js';
+import { embedWithProfile, embeddingDescriptorParams, serializeEmbeddingVector, type EmbeddingResult } from './embedding.js';
 import { generateBounded, type GenerationProvider } from './generation.js';
 import { resolveAgent } from './agents.js';
 import { chunkDocumentContent, MAX_DOCUMENT_CONTENT_BYTES } from './tools/store-document.js';
 import type { AccessLevel, AuthContext } from './types.js';
 import { TEXT_FIELD_MAX_CHARS } from './http-limits.js';
+import { acceptChunks, acceptSessionFact, documentIngestionState, factIngestionState, ingestionSessionEnabled,
+  documentInlineMaxChunks, inlineBudgetMs, tryInlineDocument, tryInlineIngestion, type SessionEmbeddingSummary } from './ingestion.js';
 
 export const MAX_SESSION_TRANSCRIPT_BYTES = MAX_DOCUMENT_CONTENT_BYTES;
 export const MAX_SESSION_FACTS = 50;
@@ -132,6 +134,7 @@ export interface StoredSessionResult {
   chunks_stored: number;
   status: SessionRunStatus;
   idempotent_replay: boolean;
+  state?: SessionEmbeddingSummary['state'];
 }
 export type SessionRunStatus = 'pending' | 'processing' | 'retry' | 'completed' | 'dead';
 
@@ -178,10 +181,14 @@ export async function memoryStoreSession(input: StoreSessionParams, auth: AuthCo
     runtime: params.agent_runtime,
   };
   const requestHash = canonicalSessionRequestHash(params, auth.keyId, agent);
+  const queued = ingestionSessionEnabled();
+  if (queued) { documentInlineMaxChunks(); inlineBudgetMs(); }
   if (params.session_id) {
-    const existing = await withScopedClient(dbScopeFromAuth(auth), client =>
-      findExistingSession(client, auth.keyId, params.namespace, params.session_id!));
-    if (existing) return completedExistingSession(existing, requestHash);
+    const existing = await withScopedClient(dbScopeFromAuth(auth), async client => {
+      const row = await findExistingSession(client, auth.keyId, params.namespace, params.session_id!);
+      return row ? existingSessionResult(client, row, requestHash) : null;
+    });
+    if (existing) return existing;
   }
 
   const agentId = await resolveAgent(
@@ -189,9 +196,9 @@ export async function memoryStoreSession(input: StoreSessionParams, auth: AuthCo
   );
   const chunks = chunkDocumentContent(params.transcript);
   const vectors: string[] = [];
-  for (const chunk of chunks) vectors.push(serializeEmbeddingVector((await embedWithProfile(chunk)).vector));
+  if (!queued) for (const chunk of chunks) vectors.push(serializeEmbeddingVector((await embedWithProfile(chunk)).vector));
 
-  return withScopedClient(dbScopeFromAuth(auth), async client => {
+  const result = await withScopedClient(dbScopeFromAuth(auth), async client => {
     const document = await client.query<{ id: string }>(`
       INSERT INTO documents (
         title, source, namespace, tags, client_id, access_level, document_kind,
@@ -209,7 +216,7 @@ export async function memoryStoreSession(input: StoreSessionParams, auth: AuthCo
       if (!params.session_id) throw new Error('Session episode insert failed without an idempotency identity');
       const existing = await findExistingSession(client, auth.keyId, params.namespace, params.session_id);
       if (!existing) throw new Error('Session idempotency conflict is not visible to this owner');
-      return completedExistingSession(existing, requestHash);
+      return existingSessionResult(client, existing, requestHash);
     }
     const episodeId = document.rows[0].id;
     for (let index = 0; index < chunks.length; index += 1) {
@@ -220,10 +227,11 @@ export async function memoryStoreSession(input: StoreSessionParams, auth: AuthCo
           embedding_dimensions, memory_kind, valid_from
         ) VALUES ($1, $2::vector, $3, $4, $5::text[], '{}'::jsonb, $6, $7, $8::uuid, $9,
           $10::uuid, $11, $12, $13, $14, 'episode_chunk', statement_timestamp())
-      `, [chunks[index], vectors[index], auth.name, params.namespace, ['episodic', 'session'],
+      `, [chunks[index], queued ? null : vectors[index], auth.name, params.namespace, ['episodic', 'session'],
         params.access_level, auth.keyId, agentId, params.session_id ?? null, episodeId, index,
-        ...embeddingDescriptorParams()]);
+        ...(queued ? [null, null, null] : embeddingDescriptorParams())]);
     }
+    if (queued) await acceptChunks(client, episodeId, auth);
     const run = await client.query<{ id: string; status: SessionRunStatus }>(`
       INSERT INTO memory_session_distillation_runs (
         owner_key_id, episode_id, namespace, access_level, request_hash
@@ -233,8 +241,20 @@ export async function memoryStoreSession(input: StoreSessionParams, auth: AuthCo
     await logAudit({ clientId: auth.keyId, action: 'session.store', namespace: params.namespace,
       memoryId: episodeId, resultCount: chunks.length, agentId, sessionId: params.session_id }, dbScopeFromAuth(auth), client);
     return { episode_id: episodeId, run_id: run.rows[0].id, chunks_stored: chunks.length,
-      status: run.rows[0].status, idempotent_replay: false };
+      status: run.rows[0].status, idempotent_replay: false, ...(queued ? { state: 'queued' as const } : {}) };
   });
+  if (!queued || result.idempotent_replay) return result;
+  await tryInlineDocument(result.episode_id, chunks.length, auth);
+  try {
+    return { ...result, state: (await withScopedClient(dbScopeFromAuth(auth), client => documentIngestionState(client, result.episode_id))).state };
+  } catch { return result; } // Acceptance is durable; abandoned leases recover.
+}
+
+async function existingSessionResult(client: ScopedClient, row: ExistingSessionRow, requestHash: string): Promise<StoredSessionResult> {
+  const result = completedExistingSession(row, requestHash);
+  const schema = await client.query("SELECT to_regclass('public.memory_ingestion_jobs') IS NOT NULL AS available");
+  if (!schema.rows[0]?.available) return result;
+  return { ...result, state: (await documentIngestionState(client, row.episode_id)).state };
 }
 
 async function findExistingSession(
@@ -278,6 +298,7 @@ export async function memorySessionStatus(
 ): Promise<{
   episode_id: string; run_id: string; status: SessionRunStatus; attempts: number;
   facts_stored: number; last_error_code: string | null;
+  embedding?: { episode: SessionEmbeddingSummary; facts: SessionEmbeddingSummary };
 }> {
   const params = sessionStatusSchema.parse(input);
   checkPermission(auth, 'read');
@@ -288,7 +309,14 @@ export async function memorySessionStatus(
       WHERE episode_id = $1::uuid AND owner_key_id = $2::uuid
     `, [params.episode_id, auth.keyId]);
     if (!result.rows[0]) throw new Error('Session not found');
-    return result.rows[0];
+    const row = result.rows[0];
+    const schema = await client.query("SELECT to_regclass('public.memory_ingestion_jobs') IS NOT NULL AS available");
+    if (!schema.rows[0]?.available) return row;
+    const episode = await documentIngestionState(client, params.episode_id);
+    return { ...row, embedding: {
+      episode: { state:episode.state, ready:episode.ready, queued:episode.queued, failed:episode.failed },
+      facts: await factIngestionState(client, row.run_id),
+    } };
   });
 }
 
@@ -489,13 +517,14 @@ export async function applySessionDistillation(
   client: ScopedClient,
   job: SessionDistillationJob,
   loaded: LoadedSessionTranscript,
-  facts: readonly DistilledFact[],
-  vectors: readonly string[],
+  facts: readonly (DistilledFact & { embedding?: EmbeddingResult })[],
   outputBytes: number,
   policy: SessionDistillationPolicy,
 ): Promise<boolean> {
   assertSessionPolicyEffective(policy);
-  if (facts.length !== vectors.length) throw new Error('Fact and embedding counts differ');
+  const queued = ingestionSessionEnabled();
+  // Gate-off callers prepare embeddings outside this transaction, as before.
+  if (!queued && facts.some(fact => !fact.embedding)) throw new Error('Synchronous session facts require prepared embeddings');
   const policyHash = sessionDistillationPolicyHash(policy);
   const locked = await client.query<any>(`
     SELECT r.id, d.agent_id, d.session_id, d.chunk_count, k.enabled AS owner_enabled,
@@ -535,11 +564,11 @@ export async function applySessionDistillation(
       ) VALUES ($1, $2::vector, 'session-distillation', $3, $4::text[], $5::jsonb, $6, $7,
         $8::uuid, $9, $10, $11, $12, $13, 'semantic', statement_timestamp())
       ON CONFLICT (client_id, source_key) DO NOTHING RETURNING id
-    `, [fact.content, vectors[index], job.namespace, ['session-distilled', fact.kind].sort(),
+    `, [fact.content, queued ? null : serializeEmbeddingVector(fact.embedding!.vector), job.namespace, ['session-distilled', fact.kind].sort(),
       JSON.stringify({ schema: 1, episode_id: job.episodeId, run_id: job.runId, durable_kind: fact.kind,
         generation_provider: policy.generation.provider, generation_model: policy.generation.model,
         policy_hash: policyHash }), job.accessLevel, job.ownerKeyId, loaded.agentId, loaded.sessionId,
-      sourceKey, ...embeddingDescriptorParams()]);
+      sourceKey, ...(queued ? [null, null, null] : embeddingDescriptorParams())]);
     let memoryId = inserted.rows[0]?.id;
     if (!memoryId) {
       const existing = await client.query<{ id: string; content: string }>(`
@@ -558,6 +587,7 @@ export async function applySessionDistillation(
       ) VALUES ($1::uuid, $1::text, $2, $3, $4::uuid, $5::uuid, $6::uuid)
       ON CONFLICT (episode_id, memory_id) DO NOTHING
     `, [job.ownerKeyId, job.namespace, job.accessLevel, job.runId, job.episodeId, memoryId]);
+    if (queued) await acceptSessionFact(client, memoryId, job.namespace);
   }
   const completed = await client.query(`
     UPDATE memory_session_distillation_runs
@@ -589,10 +619,20 @@ export async function markSessionDistillationFailed(
   return result.rowCount === 1;
 }
 
-export async function embedDistilledFacts(facts: readonly DistilledFact[], signal?: AbortSignal): Promise<string[]> {
-  const vectors: string[] = [];
-  for (const fact of facts) vectors.push(serializeEmbeddingVector((await embedWithProfile(fact.content, undefined, signal)).vector));
-  return vectors;
+/** Post-commit best effort only: embedding failures never enter generation retry accounting. */
+export async function tryInlineSessionFacts(job: SessionDistillationJob, worker: AuthContext): Promise<void> {
+  try {
+    const schema = await withScopedClient(dbScopeFromAuth(worker), client =>
+      client.query("SELECT to_regclass('public.memory_ingestion_jobs') IS NOT NULL AS available"));
+    if (!schema.rows[0]?.available) return;
+    const facts = await withScopedClient(dbScopeFromAuth(worker), async client => (await client.query(`
+      SELECT j.memory_id FROM memory_session_derivations d JOIN memory_ingestion_jobs j ON j.memory_id=d.memory_id
+      WHERE d.run_id=$1 AND j.kind='store' AND j.status IN ('pending','retry_wait')`, [job.runId])).rows);
+    const owner: AuthContext = { keyId:job.ownerKeyId, name:'session-distillation', namespaces:[job.namespace],
+      permissions:['read','write'], maxAccessLevel:job.accessLevel };
+    for (const fact of facts) await tryInlineIngestion({ id:fact.memory_id, namespace:job.namespace,
+      created:true, deduplicated:false, state:'queued', expires_at:null }, owner);
+  } catch { console.warn('[session-distill] outcome=fact_embedding_deferred'); }
 }
 
 function normalizeFactContent(content: string): string {

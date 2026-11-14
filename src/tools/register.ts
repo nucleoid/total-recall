@@ -162,7 +162,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_store_session',
-    description: 'Atomically store a bounded transcript as an episodic document and enqueue asynchronous durable-fact distillation. Generation remains disabled unless a separate #57 policy and worker are approved.',
+    description: 'Atomically store a bounded transcript as an episodic document and enqueue asynchronous durable-fact distillation. With queued session ingestion enabled, state is ready, queued or embedding_failed independently of distillation status; transcript chunks are durable before embedding. Identical session_id retries return the same episode and run. Generation remains disabled unless a separate #57 policy and worker are approved.',
     inputSchema: {
       type: 'object' as const,
       additionalProperties: false,
@@ -181,7 +181,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_session_status',
-    description: 'Inspect an owned transcript distillation run without returning transcript or generated fact content.',
+    description: 'Inspect an owned transcript distillation run and separate episode/fact embedding summaries (state, ready, queued, failed), without returning transcript or generated fact content. Completed means generated facts are durable, independently of embedding readiness.',
     inputSchema: {
       type: 'object' as const,
       additionalProperties: false,
