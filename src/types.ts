@@ -1,4 +1,11 @@
 export type AccessLevel = 'normal' | 'sensitive' | 'secret';
+export type DocumentState = 'ready' | 'queued' | 'embedding_failed';
+export interface StoredDocumentResult { document_id: string; chunks_stored: number; title: string; state?: DocumentState }
+export interface DocumentStatus {
+  document_id: string; state: DocumentState; chunk_count: number;
+  ready: number; queued: number; failed: number; cancelled: number;
+  oldest_pending_age_seconds: number | null; failure_categories: Record<string, number>;
+}
 export type MemoryKind = 'unspecified' | 'semantic' | 'document_chunk' | 'episode_chunk' | 'synced' | 'media_rollup' | 'consolidation' | 'insight';
 
 export interface Memory {

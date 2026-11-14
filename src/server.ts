@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { IngestionPersistenceError, ingestionStats, requeueIngestionJob, setIngestionPaused } from './ingestion.js';
+import { IngestionPersistenceError, ingestionStats, requeueIngestionJob, requeueDocument, setIngestionPaused } from './ingestion.js';
+import { memoryDocumentStatus, documentStatusSchema } from './tools/document-status.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -608,7 +609,7 @@ registerRestRoute(app, 'post', '/api/store-document', async (req, res) => {
     if (!auth) return;
     const params = storeDocumentSchema.parse(req.body);
     const result = await memoryStoreDocument(params, auth);
-    res.json({ id: result.document_id, chunks: result.chunks_stored });
+    res.json({ id: result.document_id, chunks: result.chunks_stored, ...(result.state ? { state: result.state } : {}) });
   } catch (err: any) {
     sendApiError(res, '/api/store-document', err);
   }
@@ -680,6 +681,16 @@ registerRestRoute(app, 'delete', '/api/memories', async (req, res) => {
 registerRestRoute(app, 'get', '/api/ingestion/stats', async (req, res) => {
   try { const auth = await authenticateRequest(req, res); if (!auth) return; res.json(await ingestionStats(auth)); }
   catch (err) { sendApiError(res, '/api/ingestion/stats', err); }
+});
+registerRestRoute(app, 'get', '/api/documents/:id/status', async (req,res) => {
+  try { const auth=await authenticateRequest(req,res); if (!auth) return;
+    res.json(await memoryDocumentStatus(documentStatusSchema.parse({ document_id:req.params.id }),auth)); }
+  catch (err) { sendApiError(res,'/api/documents/status',err); }
+});
+registerRestRoute(app, 'post', '/api/ingestion/documents/:id/requeue', async (req,res) => {
+  try { const auth=await authenticateRequest(req,res); if (!auth) return; checkPermission(auth,'admin');
+    res.json(await requeueDocument(z.string().uuid().parse(req.params.id),auth)); }
+  catch (err) { sendApiError(res,'/api/ingestion/documents/requeue',err); }
 });
 registerRestRoute(app, 'post', '/api/ingestion/jobs/:memory_id/requeue', async (req, res) => {
   try { const auth = await authenticateRequest(req, res); if (!auth) return; checkPermission(auth, 'admin');

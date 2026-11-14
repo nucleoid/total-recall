@@ -88,6 +88,7 @@ class FakeClient {
       return this.result([]);
     }
     if (normalized.startsWith("SELECT set_config('app.")) return this.result([]);
+    if (normalized.startsWith("SELECT to_regclass('public.memory_ingestion_jobs')")) return this.result([{ available: false }] as unknown as T[]);
     if (normalized === 'COMMIT') {
       if (this.failures.failCommit) throw new Error('commit failed');
       this.db.docs.push(...this.pendingDocs);

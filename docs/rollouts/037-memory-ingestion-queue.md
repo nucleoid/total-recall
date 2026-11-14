@@ -1,5 +1,13 @@
 # Rollout 037: durable memory ingestion
 
+## Document ingestion (039)
+
+Apply additive migration 039 after 038 using the owner migration runner. It adds nullable job document/chunk provenance, a partial `(document_id,status)` index, and a trigger-function correction so `document` jobs retain chunk creation events while `update` jobs stay suppressed. No backfill or memory reindex. The transactional ALTER/index takes a table lock and scans the existing job table for index construction; the five-second lock timeout bounds acquisition, not the scan duration. Measure retained-job volume and schedule a maintenance window if needed. Existing subscription trigger enablement is preserved.
+
+Deploy the new worker first (`--batch-size 16`, range 1–64), then API, then canary both queue/document gates. Inline documents default to at most 8 chunks and the existing inline provider budget. Each batch is at most 64 chunks of at most 2,000 UTF-8 bytes and uses the configured provider's validated batch API. Check profile identity and provider batch availability before enabling. Canary offline acceptance, a large queued document reaching ready, content-free owner status, FTS/recall/export, failed-chunk requeue and chunk subscription events. Old 037/038 workers process document jobs singly without losing chunks; rollback should retain migration 039 and new workers until backlog drains. Disable only the document sub-gate to restore synchronous new document stores. Re-embedding skips active queue jobs; drain them with the worker before using reembed for repairs. No reauthentication, secret or permission changes. Sessions remain unchanged for #161.
+
+This migration is compatible with isolated main after #157/#159 only. Separate draft PR158 at `420a42dabcf692d02b42294b9f2f3a65c5c328f6` uses conflicting 037–047 numbering; this change neither adopts nor renames its history and claims no combined compatibility.
+
 This is an operator procedure, not authorization to migrate a live database. No production migration, merge or deployment is part of implementation #157.
 
 ## Integration prerequisite

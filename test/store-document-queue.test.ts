@@ -7,6 +7,7 @@ import pg from 'pg';
 import { loadMigrationInventory, runMigrations } from '../scripts/migrate.js';
 import { provisionDatabase } from '../scripts/provision-db.js';
 import { finalizeMemoryValidity } from '../scripts/finalize-memory-validity.js';
+import { createDocumentIdempotencyIndex } from '../scripts/document-idempotency-index.js';
 import { hashKey } from '../src/auth.js';
 import { setPoolForTesting } from '../src/db.js';
 import { memoryStoreDocument } from '../src/tools/store-document.js';
@@ -38,6 +39,7 @@ test('document queue acceptance and batching on disposable PostgreSQL', { timeou
   await provisionDatabase(owner, { appPassword: 'app-test-only', rotateAppPassword: false });
   await runMigrations(owner, loadMigrationInventory(fileURLToPath(new URL('../migrations', import.meta.url))), { lockTimeoutMs: 5000 });
   await finalizeMemoryValidity(owner);
+  await createDocumentIdempotencyIndex({ connectionString: `postgresql://postgres:test-only@127.0.0.1:${port}/postgres` });
   pool = new pg.Pool({ connectionString: `postgresql://total_recall_app:app-test-only@127.0.0.1:${port}/postgres` }); setPoolForTesting(pool);
   await owner.query(`INSERT INTO api_keys(id,key_hash,name,namespaces,permissions,max_access_level) VALUES ($1,$2,$3,$4,$5,$6)`, [auth.keyId,hashKey('tr_document-owner'),auth.name,auth.namespaces,auth.permissions,auth.maxAccessLevel]);
   process.env.MEMORY_INGESTION_QUEUE_ENABLED = 'true'; process.env.MEMORY_INGESTION_DOCUMENT_ENABLED = 'true'; process.env.MEMORY_STORE_INLINE_EMBED_MS = '1000';

@@ -46,7 +46,9 @@ test('inline budget bounds providers ignoring abort; late success cannot finaliz
   assert.ok(Date.now()-start<95); assert.equal(completed,false);
 });
 test('worker CLI validates bounded concurrency and rejects missing values', () => {
-  assert.deepEqual(parseIngestionWorkerCli(['--once','--max-jobs','5','--poll-ms','200','--concurrency','2']),{ once:true,maxJobs:5,pollMs:200,concurrency:2 });
+  assert.deepEqual(parseIngestionWorkerCli(['--once','--max-jobs','5','--poll-ms','200','--concurrency','2']),{ once:true,maxJobs:5,pollMs:200,concurrency:2,batchSize:16 });
+  assert.equal(parseIngestionWorkerCli(['--batch-size','64']).batchSize,64);
+  for (const value of ['','0','65','1.5']) assert.throws(() => parseIngestionWorkerCli(['--batch-size',value]));
   for (const args of [['--concurrency','33'],['--concurrency'],['--max-jobs','0'],['--poll-ms','1'],['--wat']]) assert.throws(() => parseIngestionWorkerCli(args));
   const old = process.env.MEMORY_STORE_INLINE_EMBED_MS;
   try { process.env.MEMORY_STORE_INLINE_EMBED_MS=''; assert.throws(inlineBudgetMs); process.env.MEMORY_STORE_INLINE_EMBED_MS='0'; assert.equal(inlineBudgetMs(),0); }

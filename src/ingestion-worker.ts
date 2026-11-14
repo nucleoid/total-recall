@@ -2,23 +2,35 @@ import { isDirectExecution } from './entrypoint.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { validateKeyReadOnly } from './auth.js';
 import { dbScopeFromAuth, shutdown } from './db.js';
-import { claimIngestionJob, embedWithinBudget, failIngestionJob, finalizeIngestionJob, ingestionInteger, ingestionMaxAttempts, workerIngestionLeaseMs,
+import { claimIngestionJobs, embedWithinBudget, failIngestionJob, finalizeIngestionJob, ingestionInteger, ingestionMaxAttempts, workerIngestionLeaseMs,
+  embedBatchWithinBudget, failIngestionBatch, finalizeIngestionBatch,
   type IngestionJob } from './ingestion.js';
 import type { DbScope } from './db.js';
 
-export interface IngestionWorkerOptions { once: boolean; maxJobs: number; pollMs: number; concurrency: number }
+export interface IngestionWorkerOptions { once: boolean; maxJobs: number; pollMs: number; concurrency: number; batchSize?: number }
 export function parseIngestionWorkerCli(args: string[], env: NodeJS.ProcessEnv = process.env): IngestionWorkerOptions {
   const options = { once: false, maxJobs: Number.MAX_SAFE_INTEGER, pollMs: 1000,
-    concurrency: ingestionInteger(env.MEMORY_INGESTION_CONCURRENCY, 4, 'MEMORY_INGESTION_CONCURRENCY', 1, 32) };
+    concurrency: ingestionInteger(env.MEMORY_INGESTION_CONCURRENCY, 4, 'MEMORY_INGESTION_CONCURRENCY', 1, 32), batchSize: 16 };
   for (let index = 0; index < args.length; index++) {
     const flag = args[index];
     if (flag === '--once') options.once = true;
     else if (flag === '--concurrency') options.concurrency = ingestionInteger(args[++index] ?? '', 4, flag, 1, 32);
     else if (flag === '--max-jobs') options.maxJobs = ingestionInteger(args[++index] ?? '', 1, flag, 1, 100000);
     else if (flag === '--poll-ms') options.pollMs = ingestionInteger(args[++index] ?? '', 1000, flag, 100, 60000);
+    else if (flag === '--batch-size') options.batchSize = ingestionInteger(args[++index] ?? '', 16, flag, 1, 64);
     else throw new Error(`Unknown ingestion worker option: ${flag}`);
   }
   return options;
+}
+export async function processIngestionBatch(jobs: IngestionJob[], signal?: AbortSignal): Promise<void> {
+  if (!jobs.length) return;
+  if (jobs[0].kind !== 'document' || !jobs[0].document_id) { await processIngestionJob(jobs[0],signal); return; }
+  try {
+    const timeout = ingestionInteger(process.env.EMBEDDING_TIMEOUT_MS,15000,'EMBEDDING_TIMEOUT_MS',100,120000);
+    const result = await embedBatchWithinBudget(jobs.map(job => job.content),timeout,signal);
+    if (signal?.aborted) throw new DOMException('Ingestion worker stopping','AbortError');
+    await finalizeIngestionBatch(jobs,result);
+  } catch (error) { await failIngestionBatch(jobs,error); }
 }
 export async function processIngestionJob(job: IngestionJob, signal?: AbortSignal): Promise<void> {
   try {
@@ -30,6 +42,7 @@ export async function processIngestionJob(job: IngestionJob, signal?: AbortSigna
 }
 export async function runIngestionWorker(options: IngestionWorkerOptions, signal: AbortSignal): Promise<{ processed: number }> {
   ingestionMaxAttempts(); workerIngestionLeaseMs(); // Validate worker limits before claims.
+  const batchSize=ingestionInteger(String(options.batchSize ?? 16),16,'batch-size',1,64);
   const rawKey = process.env.INGESTION_WORKER_API_KEY?.trim();
   if (!rawKey) throw new Error('INGESTION_WORKER_API_KEY is required');
   let processed = 0;
@@ -48,18 +61,21 @@ export async function runIngestionWorker(options: IngestionWorkerOptions, signal
     if (!auth || !auth.permissions.includes('admin')) throw new Error('Enabled admin ingestion worker API key required');
     const scope: DbScope = dbScopeFromAuth(auth);
     const capacity = Math.min(options.concurrency, options.maxJobs - processed);
-    const claims = await Promise.allSettled(Array.from({ length: capacity }, () => claimIngestionJob(scope)));
-    const jobs = claims.flatMap(claim => claim.status === 'fulfilled' && claim.value ? [claim.value] : []);
+    // Reserve each concurrent slot's maximum so --max-jobs remains a chunk limit.
+    const remaining=options.maxJobs-processed;
+    const slots=Math.min(capacity,Math.ceil(remaining/batchSize));
+    const claims = await Promise.allSettled(Array.from({ length: slots }, (_,index) => claimIngestionJobs(scope,{ limit: Math.min(batchSize,remaining-index*batchSize) })));
+    const batches = claims.flatMap(claim => claim.status === 'fulfilled' && claim.value.length ? [claim.value] : []);
     const claimFailed = claims.some(claim => claim.status === 'rejected');
-    processed += jobs.length;
+    processed += batches.reduce((count,jobs) => count+jobs.length,0);
     // Stop new polls on SIGTERM; claimed work drains within the bounded lease/stop budget.
-    const completions = await Promise.allSettled(jobs.map(job => processIngestionJob(job)));
+    const completions = await Promise.allSettled(batches.map(jobs => processIngestionBatch(jobs)));
     if (claimFailed || completions.some(completion => completion.status === 'rejected')) {
       if (options.once) throw new Error('Ingestion poll incomplete; leases recover automatically');
       await pauseAfterFailure(); continue;
     }
     failures = 0;
-    if (!jobs.length) {
+    if (!batches.length) {
       if (options.once) break;
       await sleep(options.pollMs, undefined, { signal }).catch(error => { if (!signal.aborted) throw error; });
     }

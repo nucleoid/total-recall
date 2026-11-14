@@ -4,13 +4,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { accessLevelSql, checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
 import { logAudit } from './audit.js';
 import { dbScopeFromAuth, withScopedClient, withCheckedOutClient, withScopedTransactionOnClient, type DbScope, type ScopedClient } from './db.js';
-import { ACTIVE_EMBEDDING_PROFILE, embedWithProfile, embeddingIdentity, serializeEmbeddingVector,
+import { ACTIVE_EMBEDDING_PROFILE, embedWithProfile, embedBatchWithProfile, embeddingIdentity, serializeEmbeddingVector, validateEmbeddingBatch,
   EmbeddingProviderError, EmbeddingValidationError, type EmbeddingResult } from './embedding.js';
 import { TombstonedSourceKeyConflictError, SupersededSourceKeyConflictError, MemoryConflictError } from './errors.js';
 import { contradictionPolicyFromEnv, maybeReviseBelief, prepareBeliefRevision, commitAutomaticRevision, policyAllowsScope, scheduleShadowClassification,
   type SemanticMemoryInsert, type ContradictionPolicy } from './contradictions.js';
 import { retryAtForAttempt } from './retry.js';
-import type { AccessLevel, AuthContext, StoreResult } from './types.js';
+import type { AccessLevel, AuthContext, StoreResult, DocumentStatus } from './types.js';
 
 export class IngestionPersistenceError extends Error {
   readonly statusCode = 503;
@@ -35,6 +35,7 @@ export interface IngestionJob {
   status: IngestionState; attempts: number; last_error_code: string | null; lease_token: string; accepted_at: Date;
   content: string; expires_at: Date | null; inline?: boolean;
   kind?: 'store' | 'update' | 'document'; source_revision?: number;
+  document_id?: string | null; chunk_index?: number | null;
 }
 export interface AcceptMemoryInput {
   content: string; namespace: string; source?: string; tags: string[]; metadata: Record<string, unknown>;
@@ -43,6 +44,41 @@ export interface AcceptMemoryInput {
 export function ingestionEnabled(): boolean { return process.env.MEMORY_INGESTION_QUEUE_ENABLED === 'true'; }
 export function ingestionUpdateEnabled(): boolean {
   return ingestionEnabled() && process.env.MEMORY_INGESTION_UPDATE_ENABLED === 'true';
+}
+export function ingestionDocumentEnabled(): boolean {
+  return ingestionEnabled() && process.env.MEMORY_INGESTION_DOCUMENT_ENABLED === 'true';
+}
+export function documentInlineMaxChunks(): number {
+  return ingestionInteger(process.env.MEMORY_STORE_DOCUMENT_INLINE_MAX_CHUNKS, 8, 'MEMORY_STORE_DOCUMENT_INLINE_MAX_CHUNKS', 0, 64);
+}
+
+/** Called inside the document acceptance transaction, after its chunk rows exist. */
+export async function acceptChunks(client: ScopedClient, documentId: string, auth: AuthContext): Promise<void> {
+  const profile = ACTIVE_EMBEDDING_PROFILE;
+  await client.query(`INSERT INTO memory_ingestion_jobs
+    (memory_id,namespace,client_id,access_level,allowed_namespaces,dedupe,contradiction_eligible,
+     embedding_provider,embedding_model,embedding_dimensions,kind,source_revision,document_id,chunk_index)
+    SELECT id,namespace,client_id,COALESCE(access_level,'normal'),$3,false,false,$4,$5,$6,'document',revision,document_id,chunk_index
+    FROM memories WHERE document_id=$1 AND client_id=$2 AND embedding IS NULL`,
+  [documentId,auth.keyId,auth.namespaces,profile.provider,profile.model,profile.dimensions]);
+}
+
+/** Legacy synchronous chunks have no job and are already ready. State is never stored. */
+export async function documentIngestionState(client: ScopedClient, documentId: string): Promise<DocumentStatus> {
+  const counts = (await client.query(`WITH chunks AS MATERIALIZED (
+      SELECT CASE WHEN m.deleted_at IS NOT NULL OR j.status='cancelled' THEN 'cancelled'
+        WHEN j.status='embedding_failed' THEN 'failed'
+        WHEN j.status IN ('ready','deduplicated') OR (j.status IS NULL AND m.embedding IS NOT NULL) THEN 'ready'
+        ELSE 'queued' END AS state, j.accepted_at, j.failure_category
+      FROM memories m LEFT JOIN memory_ingestion_jobs j ON j.memory_id=m.id WHERE m.document_id=$1
+    ) SELECT COUNT(*)::int AS chunk_count, COUNT(*) FILTER (WHERE state='ready')::int AS ready,
+      COUNT(*) FILTER (WHERE state='queued')::int AS queued, COUNT(*) FILTER (WHERE state='failed')::int AS failed,
+      COUNT(*) FILTER (WHERE state='cancelled')::int AS cancelled,
+      EXTRACT(EPOCH FROM statement_timestamp()-MIN(accepted_at) FILTER (WHERE state='queued'))::double precision AS oldest_pending_age_seconds,
+      COALESCE((SELECT jsonb_object_agg(failure_category,count) FROM (
+        SELECT failure_category,COUNT(*)::int AS count FROM chunks WHERE failure_category IS NOT NULL GROUP BY failure_category
+      ) categories),'{}'::jsonb) AS failure_categories FROM chunks`, [documentId])).rows[0];
+  return { document_id:documentId,...counts,state:counts.queued ? 'queued' : counts.failed || counts.cancelled ? 'embedding_failed' : 'ready' };
 }
 
 /** Called under the patch transaction after locking jobs before memories. */
@@ -183,15 +219,19 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
 
 /** One short transaction per claim. Only a worker admin may claim arbitrary jobs. */
 export async function claimIngestionJob(scope: DbScope, options: { memoryId?: string; inline?: boolean; leaseMs?: number } = {}): Promise<IngestionJob | null> {
+  return (await claimIngestionJobs(scope, { ...options, limit: 1 }))[0] ?? null;
+}
+export async function claimIngestionJobs(scope: DbScope, options: { memoryId?: string; documentId?: string; inline?: boolean; leaseMs?: number; limit?: number } = {}): Promise<IngestionJob[]> {
   if (!options.inline && !scope.isAdmin) throw new Error('Permission denied: ingestion worker requires admin');
-  if (options.inline && !options.memoryId) throw new Error('Inline claim requires memory id');
+  if (options.inline && !options.memoryId && !options.documentId) throw new Error('Inline claim requires memory or document id');
+  const limit = ingestionInteger(String(options.limit ?? 16), 16, 'batch-size', 1, 64);
   const leaseMs = options.leaseMs ?? workerIngestionLeaseMs();
   for (;;) {
   const claimed = await withScopedClient(scope, async client => {
     if (!options.inline) {
       await client.query('SELECT app_ingestion_control(NULL, true)');
       const settings = await client.query('SELECT ingestion_paused FROM instance_settings WHERE singleton');
-      if (settings.rows[0]?.ingestion_paused) return null;
+      if (settings.rows[0]?.ingestion_paused) return [];
       await client.query(`UPDATE memory_ingestion_jobs j SET
         status = CASE WHEN m.deleted_at IS NOT NULL OR m.expires_at <= statement_timestamp() THEN 'cancelled' ELSE 'embedding_failed' END,
         failure_category = CASE WHEN m.deleted_at IS NOT NULL OR m.expires_at <= statement_timestamp() THEN 'expired' ELSE 'transient' END,
@@ -202,24 +242,33 @@ export async function claimIngestionJob(scope: DbScope, options: { memoryId?: st
           AND ($2::uuid IS NULL OR j.memory_id = $2)`, [ingestionMaxAttempts(), options.memoryId ?? null]);
     }
     const token = randomUUID();
-    const job = (await client.query(`WITH candidate AS (
-      SELECT j.memory_id FROM memory_ingestion_jobs j
+    const jobs = (await client.query(`WITH seed AS MATERIALIZED (
+      SELECT j.memory_id, CASE WHEN j.kind='document' THEN j.document_id END AS document_id FROM memory_ingestion_jobs j
       WHERE ($1::uuid IS NULL OR j.memory_id = $1)
+        AND ($5::uuid IS NULL OR j.document_id = $5)
         AND (($2 AND j.client_id = app_current_key_id()) OR NOT $2)
         AND ((j.status IN ('pending','retry_wait') AND j.next_attempt_at <= statement_timestamp())
           OR (j.status = 'processing' AND j.lease_expires_at < statement_timestamp()))
-      ORDER BY j.next_attempt_at, j.accepted_at, j.memory_id FOR UPDATE SKIP LOCKED LIMIT 1
+      ORDER BY j.next_attempt_at, j.accepted_at, j.chunk_index, j.memory_id FOR UPDATE SKIP LOCKED LIMIT 1
+    ), candidate AS MATERIALIZED (
+      SELECT j.memory_id FROM memory_ingestion_jobs j CROSS JOIN seed s
+      WHERE (j.memory_id=s.memory_id OR ($1::uuid IS NULL AND s.document_id IS NOT NULL AND j.kind='document' AND j.document_id=s.document_id))
+        AND (($2 AND j.client_id=app_current_key_id()) OR NOT $2)
+        AND ((j.status IN ('pending','retry_wait') AND j.next_attempt_at <= statement_timestamp())
+          OR (j.status='processing' AND j.lease_expires_at < statement_timestamp()))
+      ORDER BY j.chunk_index, j.memory_id FOR UPDATE OF j SKIP LOCKED LIMIT $6
     ) UPDATE memory_ingestion_jobs j SET status = 'processing',
       attempts = j.attempts + CASE WHEN $2 THEN 0 ELSE 1 END,
       locked_at = statement_timestamp(), lease_expires_at = statement_timestamp() + $3::double precision * interval '1 millisecond',
       lease_token = $4::uuid, inline_attempted = j.inline_attempted OR $2
     FROM candidate c WHERE j.memory_id = c.memory_id RETURNING j.*`,
-    [options.memoryId ?? null, options.inline === true, leaseMs, token])).rows[0] as IngestionJob | undefined;
-    return job ?? null;
+    [options.memoryId ?? null, options.inline === true, leaseMs, token, options.documentId ?? null, limit])).rows as IngestionJob[];
+    return jobs.sort((a,b) => (a.chunk_index ?? 0)-(b.chunk_index ?? 0));
   });
-  if (!claimed) return null;
-  const job = claimed;
-  const loaded = await withScopedClient(ownerScope(job), async client => {
+  if (!claimed.length) return [];
+  const loaded: IngestionJob[] = [];
+  for (const job of claimed) {
+  const item = await withScopedClient(ownerScope(job), async client => {
     const fence = await client.query(`SELECT 1 FROM memory_ingestion_jobs WHERE memory_id = $1
       AND status = 'processing' AND lease_token = $2 AND lease_expires_at > statement_timestamp() FOR UPDATE`,
       [job.memory_id, job.lease_token]);
@@ -238,7 +287,9 @@ export async function claimIngestionJob(scope: DbScope, options: { memoryId?: st
     }
     return { ...job, content: memory.content, expires_at: memory.expires_at, inline: options.inline === true };
   });
-  if (loaded || options.inline) return loaded;
+  if (item) loaded.push(item);
+  }
+  if (loaded.length || options.inline) return loaded;
   // Expired jobs are terminal bookkeeping, not evidence that the due queue is empty.
   }
 }
@@ -256,7 +307,7 @@ export function classifyIngestionFailure(error: unknown): { category: FailureCat
   // Error text can contain content, tokens and URLs. Never persist or emit it.
   return { category: 'transient', code: 'provider_unavailable', terminal: false };
 }
-export async function failIngestionJob(job: IngestionJob, error: unknown): Promise<void> {
+export async function failIngestionJob(job: IngestionJob, error: unknown, batch?: { client: ScopedClient; now: Date; retries: Map<string, Date> }): Promise<void> {
   const failure = classifyIngestionFailure(error);
   const max = ingestionMaxAttempts();
   const budgetHandoff = job.inline && error instanceof Error && ['TimeoutError','AbortError'].includes(error.name);
@@ -265,15 +316,90 @@ export async function failIngestionJob(job: IngestionJob, error: unknown): Promi
   // Only the first consecutive contention failure gets a free short retry.
   const freeContention = contention && !job.inline && job.last_error_code !== 'db_contention';
   const terminal = !freeContention && !job.inline && (failure.terminal || (failure.category !== 'provider_auth' && job.attempts >= max));
-  const retry = freeContention ? new Date(Date.now() + 1000) : budgetHandoff ? new Date() : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter);
-  await withScopedClient(ownerScope(job), client => client.query(`UPDATE memory_ingestion_jobs SET
+  const now = batch?.now ?? new Date();
+  const retryKey = `${failure.category}:${job.attempts}:${failure.retryAfter ?? ''}:${freeContention}:${budgetHandoff}`;
+  const retry = batch?.retries.get(retryKey) ?? (freeContention ? new Date(now.getTime() + 1000) : budgetHandoff ? now : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter, now));
+  batch?.retries.set(retryKey,retry);
+  const update = (client: ScopedClient) => client.query(`UPDATE memory_ingestion_jobs SET
     status = $3, failure_category = $4, last_error_code = $5,
     attempts = CASE WHEN $9::boolean THEN GREATEST(0, attempts - 1) ELSE attempts END,
     next_attempt_at = CASE WHEN $8::boolean THEN statement_timestamp() ELSE $6::timestamptz END,
     finalized_at = CASE WHEN $7 THEN statement_timestamp() ELSE NULL END,
     lease_token = NULL, lease_expires_at = NULL
     WHERE memory_id = $1 AND status = 'processing' AND lease_token = $2::uuid AND lease_expires_at > statement_timestamp()`,
-  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : inlineHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal, inlineHandoff, freeContention]).then(() => undefined));
+  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : inlineHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal, inlineHandoff, freeContention]).then(() => undefined);
+  if (batch) await update(batch.client); else await withScopedClient(ownerScope(job), update);
+}
+
+export async function failIngestionBatch(jobs: IngestionJob[], error: unknown): Promise<void> {
+  if (!jobs.length) return;
+  const now = new Date();
+  const retries = new Map<string, Date>();
+  await withScopedClient(ownerScope(jobs[0]), async client => {
+    await client.query('SELECT memory_id FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[]) ORDER BY memory_id FOR UPDATE', [jobs.map(job => job.memory_id)]);
+    for (const job of jobs) await failIngestionJob(job, error, { client, now, retries });
+  });
+}
+
+/** All leases and memories are locked before any vector/outbox/audit is written. */
+export async function finalizeIngestionBatch(jobs: IngestionJob[], embeddings: EmbeddingResult[]): Promise<boolean> {
+  if (!jobs.length) return false;
+  validateEmbeddingBatch(embeddings.map(item => item.vector), jobs.length);
+  const first = jobs[0];
+  if (!first.document_id || jobs.some(job => job.kind !== 'document' || job.document_id !== first.document_id || job.client_id !== first.client_id || job.namespace !== first.namespace)) throw new Error('Document batch must share owner and document');
+  return withScopedClient(ownerScope(first), async client => {
+    await client.query("SET LOCAL lock_timeout = '5s'");
+    await client.query("SET LOCAL statement_timeout = '15s'");
+    const ids = jobs.map(job => job.memory_id);
+    const leases = (await client.query(`SELECT *, lease_expires_at > statement_timestamp() AS live
+      FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[]) ORDER BY memory_id FOR UPDATE`, [ids])).rows;
+    if (leases.length !== jobs.length || jobs.some(job => !leases.some(lease => lease.memory_id===job.memory_id && lease.status==='processing' && lease.live && lease.lease_token===job.lease_token))) return false;
+    const memories = (await client.query(`SELECT *, expires_at <= statement_timestamp() AS expired
+      FROM memories WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE`, [ids])).rows;
+    if (memories.length !== jobs.length || jobs.some(job => !memories.some(memory => memory.id===job.memory_id && memory.namespace===job.namespace && memory.content===job.content && (memory.access_level ?? 'normal')===job.access_level && !memory.deleted_at && !memory.expired && !memory.superseded_at && !memory.consolidated_into_id && job.allowed_namespaces.includes(job.namespace)))) return false;
+    if (jobs.some((job,index) => embeddingIdentity({ provider:job.embedding_provider, model:job.embedding_model, dimensions:job.embedding_dimensions })!==embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) || embeddingIdentity(embeddings[index])!==embeddingIdentity(ACTIVE_EMBEDDING_PROFILE))) {
+      for (const job of jobs) await finishJob(client,job,'embedding_failed','space_mismatch');
+      return false;
+    }
+    for (let index=0; index<jobs.length; index++) {
+      const job=jobs[index], embedding=embeddings[index];
+      const memory=memories.find(memory => memory.id===job.memory_id)!;
+      if (memory.embedding !== null) { await completeExternalEmbedding(client,job,memory); continue; }
+      requireMemoryUpdate(await client.query(`UPDATE memories SET embedding=$2::vector, embedding_provider=$3,
+        embedding_model=$4, embedding_dimensions=$5, updated_at=statement_timestamp()
+        WHERE id=$1 AND embedding IS NULL`, [job.memory_id,serializeEmbeddingVector(embedding.vector),embedding.provider,embedding.model,embedding.dimensions]));
+      await client.query(`UPDATE memory_ingestion_jobs SET status='ready', creation_pending=false, ready_at=statement_timestamp(),
+        finalized_at=statement_timestamp(), lease_token=NULL, lease_expires_at=NULL, failure_category=NULL,
+        last_error_code=NULL, inline_ready=$2 WHERE memory_id=$1`, [job.memory_id,job.inline===true]);
+      await auditReady(client,job,false);
+    }
+    return true;
+  });
+}
+
+export async function embedBatchWithinBudget(contents: string[], budget: number, signal?: AbortSignal, embed = embedBatchWithProfile): Promise<EmbeddingResult[]> {
+  const controller=new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
+  const combined=signal ? AbortSignal.any([signal,controller.signal]) : controller.signal;
+  try {
+    return await Promise.race([embed(contents,ACTIVE_EMBEDDING_PROFILE,combined),new Promise<never>((_,reject) => {
+      timer=setTimeout(() => { controller.abort(); reject(new DOMException('Embedding budget exhausted','TimeoutError')); },budget);
+    })]);
+  } finally { if (timer) clearTimeout(timer); controller.abort(); }
+}
+
+export async function tryInlineDocument(documentId: string, count: number, auth: AuthContext): Promise<void> {
+  let jobs: IngestionJob[]=[];
+  try {
+    const budget=inlineBudgetMs();
+    if (!budget || count>documentInlineMaxChunks()) return;
+    jobs=await claimIngestionJobs(dbScopeFromAuth(auth), { documentId,inline:true,limit:count,leaseMs:budget+30000 });
+    if (!jobs.length) return;
+    const embeddings=await embedBatchWithinBudget(jobs.map(job => job.content),budget);
+    await finalizeIngestionBatch(jobs,embeddings);
+  } catch (error) {
+    try { await failIngestionBatch(jobs,error); } catch { /* Durable leases recover. */ }
+    console.warn('[ingestion] outcome=document_inline_deferred');
+  }
 }
 
 /** Lease row lock and token fence cover dedupe, belief mutation, vector, outbox and audit together. */
@@ -496,6 +622,24 @@ export async function requeueIngestionJob(memoryId: string, auth: AuthContext): 
     return { requeued: true };
   });
 }
+export async function requeueDocument(documentId: string, auth: AuthContext): Promise<{ requeued: number }> {
+  checkPermission(auth,'admin');
+  return withScopedClient(dbScopeFromAuth(auth), async client => {
+    const updated = await client.query(`UPDATE memory_ingestion_jobs j SET status='pending', attempts=0,
+      next_attempt_at=statement_timestamp(), locked_at=NULL, lease_token=NULL, lease_expires_at=NULL,
+      failure_category=NULL, last_error_code=NULL, finalized_at=NULL, ready_at=NULL,
+      requeued_by=$2, requeued_at=statement_timestamp()
+      WHERE j.document_id=$1 AND j.status IN ('embedding_failed','cancelled')
+        AND ${accessLevelSql('j.access_level','$3')}
+        AND EXISTS (SELECT 1 FROM memories m WHERE m.id=j.memory_id AND m.document_id=$1
+          AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp())
+          AND ${accessLevelSql('m.access_level','$3')}) RETURNING j.namespace`, [documentId,auth.keyId,auth.maxAccessLevel]);
+    if (!updated.rows.length) throw new MemoryConflictError('Document jobs are unavailable or cannot be requeued in their current state');
+    await logAudit({ clientId:auth.keyId,action:'ingestion.document.requeue',namespace:updated.rows[0].namespace,
+      resourceType:'document',resourceId:documentId,details:{ requeued:updated.rows.length } },dbScopeFromAuth(auth),client);
+    return { requeued:updated.rows.length };
+  });
+}
 export async function setIngestionPaused(paused: boolean, auth: AuthContext): Promise<{ paused: boolean }> {
   checkPermission(auth, 'admin');
   return withScopedClient(dbScopeFromAuth(auth), async client => {
@@ -511,7 +655,7 @@ export async function ingestionStats(auth: AuthContext) {
   const monitoring = await withScopedClient(scope, async client => {
     await client.query("SET LOCAL statement_timeout = '5s'");
     const result = await client.query(`WITH live AS MATERIALIZED (
-        SELECT status, accepted_at, next_attempt_at, failure_category FROM memory_ingestion_jobs j
+        SELECT status, accepted_at, next_attempt_at, failure_category, (to_jsonb(j)->>'document_id')::uuid AS document_id FROM memory_ingestion_jobs j
         WHERE j.status IN ('pending','retry_wait','processing') AND ${visible}
       ), failures AS (
         SELECT failure_category FROM live WHERE failure_category IS NOT NULL
@@ -523,6 +667,7 @@ export async function ingestionStats(auth: AuthContext) {
         COALESCE((SELECT jsonb_object_agg(status, count) FROM (SELECT status, COUNT(*)::int AS count FROM live GROUP BY status) s), '{}'::jsonb) AS depth,
         (SELECT EXTRACT(EPOCH FROM statement_timestamp() - MIN(accepted_at))::double precision FROM live) AS oldest_pending_age_seconds,
         (SELECT MIN(next_attempt_at) FROM live WHERE status = 'retry_wait') AS next_retry_at,
+        (SELECT COUNT(DISTINCT document_id)::int FROM live) AS pending_documents,
         COALESCE((SELECT jsonb_object_agg(failure_category, count) FROM (SELECT failure_category, COUNT(*)::int AS count FROM failures GROUP BY failure_category) f), '{}'::jsonb) AS failure_categories`, [auth.maxAccessLevel]);
     const settings = (await client.query('SELECT ingestion_paused AS paused, ingestion_worker_seen_at AS last_worker_heartbeat FROM instance_settings WHERE singleton')).rows[0];
     return { ...result.rows[0], ...settings, attempts_histogram: {}, inline_hit_rate: null,
