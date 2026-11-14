@@ -628,7 +628,7 @@ export async function requeueDocument(documentId: string, auth: AuthContext): Pr
       next_attempt_at=statement_timestamp(), locked_at=NULL, lease_token=NULL, lease_expires_at=NULL,
       failure_category=NULL, last_error_code=NULL, finalized_at=NULL, ready_at=NULL,
       requeued_by=$2, requeued_at=statement_timestamp()
-      WHERE j.document_id=$1 AND j.status IN ('embedding_failed','cancelled')
+      WHERE j.status IN ('embedding_failed','cancelled')
         AND ${accessLevelSql('j.access_level','$3')}
         AND EXISTS (SELECT 1 FROM memories m WHERE m.id=j.memory_id AND m.document_id=$1
           AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp())

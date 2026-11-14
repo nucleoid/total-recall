@@ -61,12 +61,17 @@ export async function runIngestionWorker(options: IngestionWorkerOptions, signal
     if (!auth || !auth.permissions.includes('admin')) throw new Error('Enabled admin ingestion worker API key required');
     const scope: DbScope = dbScopeFromAuth(auth);
     const capacity = Math.min(options.concurrency, options.maxJobs - processed);
-    // Reserve each concurrent slot's maximum so --max-jobs remains a chunk limit.
-    const remaining=options.maxJobs-processed;
-    const slots=Math.min(capacity,Math.ceil(remaining/batchSize));
-    const claims = await Promise.allSettled(Array.from({ length: slots }, (_,index) => claimIngestionJobs(scope,{ limit: Math.min(batchSize,remaining-index*batchSize) })));
-    const batches = claims.flatMap(claim => claim.status === 'fulfilled' && claim.value.length ? [claim.value] : []);
-    const claimFailed = claims.some(claim => claim.status === 'rejected');
+    // Debit actual chunks so scalar work retains concurrency and batches cannot
+    // overrun --max-jobs. No provider work starts until these short claims end.
+    let remaining=options.maxJobs-processed;
+    const batches: IngestionJob[][]=[];
+    let claimFailed=false;
+    for (let index=0; index<capacity && remaining>0 && !signal.aborted; index++) {
+      try {
+        const jobs=await claimIngestionJobs(scope,{ limit:Math.min(batchSize,remaining) });
+        if (jobs.length) { batches.push(jobs); remaining-=jobs.length; }
+      } catch { claimFailed=true; }
+    }
     processed += batches.reduce((count,jobs) => count+jobs.length,0);
     // Stop new polls on SIGTERM; claimed work drains within the bounded lease/stop budget.
     const completions = await Promise.allSettled(batches.map(jobs => processIngestionBatch(jobs)));

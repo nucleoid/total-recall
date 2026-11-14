@@ -530,11 +530,12 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     await owner!.query("UPDATE memory_ingestion_jobs SET next_attempt_at=now()+interval '1 day' WHERE status IN ('pending','retry_wait')");
     const a=await acceptMemory(input('worker survives database blip'),auth,agent);
     let faults=0;
-    setPoolForTesting(faultingPool(pool!,sql=>sql.includes('WITH candidate AS') && faults++===0));
+    setPoolForTesting(faultingPool(pool!,sql=>sql.includes('WITH seed AS') && faults++===0));
     process.env.INGESTION_WORKER_API_KEY='tr_worker';
     t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({ embedding:{values:vector} })));
     try { assert.equal((await runIngestionWorker({ once:false,maxJobs:1,pollMs:100,concurrency:1 },new AbortController().signal)).processed,1); }
     finally { setPoolForTesting(pool!); delete process.env.INGESTION_WORKER_API_KEY; t.mock.restoreAll(); }
+    assert.ok(faults>=2,'claim failure was injected and the claim retried');
     assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'ready');
   });
   await t.test('rollback acceptance gate preserves deduplicated aliases and pending visibility', async () => {
@@ -1030,7 +1031,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     assert.equal(changed.body.created,false); assert.equal(changed.body.state,'ready'); assert.equal(changed.body.id,keyed.body.id);
     const details=(await owner!.query("SELECT details FROM audit_log WHERE memory_id=$1 AND action='memory.store' ORDER BY created_at DESC LIMIT 1",[keyed.body.id])).rows[0].details;
     assert.equal(details.created,false); assert.equal(details.idempotent,true);
-    setPoolForTesting(faultingPool(pool!,sql=>sql.includes('WITH candidate AS')));
+    setPoolForTesting(faultingPool(pool!,sql=>sql.includes('WITH seed AS')));
     try {
       const deferred=await request(app).post('/api/store').set('Authorization','Bearer tr_owner').send({ content:'durable claim fault',agent_name:'http',dedupe:false });
       assert.equal(deferred.status,200); assert.equal(deferred.body.state,'queued');
