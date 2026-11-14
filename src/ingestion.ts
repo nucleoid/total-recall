@@ -407,6 +407,16 @@ export async function finalizeIngestionBatch(jobs: IngestionJob[], embeddings: I
       for (const job of jobs) await finishJob(client,job,'embedding_failed','space_mismatch');
       return false;
     }
+    const incompleteExternal: IngestionJob[]=[];
+    for (const job of jobs) {
+      const memory=memories.find(memory => memory.id===job.memory_id)!;
+      if (memory.embedding !== null && !(await hasCurrentLocalEmbedding(client,job.memory_id))) incompleteExternal.push(job);
+    }
+    if (incompleteExternal.length) {
+      for (const job of incompleteExternal) await finishJob(client,job,'embedding_failed','space_mismatch');
+      await returnIngestionJobs(client,jobs.filter(job => !incompleteExternal.includes(job)));
+      return false;
+    }
     for (let index=0; index<jobs.length; index++) {
       const job=jobs[index], embedding=embeddings[index];
       const memory=memories.find(memory => memory.id===job.memory_id)!;
@@ -605,19 +615,21 @@ async function findIngestionDedupeCandidate(client: ScopedClient, job: Ingestion
           calculate_relevance(m.relevance_base_score,m.decay_rate,m.accessed_at,m.access_count) DESC, m.created_at ASC, m.id ASC
         LIMIT 1 FOR UPDATE`, [vector, job.namespace, job.access_level, embedding.provider, embedding.model, embedding.dimensions, job.memory_id])).rows[0];
 }
-async function completeExternalEmbedding(client: ScopedClient, job: IngestionJob, memory: Record<string, any>): Promise<StoreResult | null> {
-  if (localServingEnabled()) {
-    const complete = await client.query(`SELECT 1 FROM memory_embedding_manifests f
+async function hasCurrentLocalEmbedding(client: ScopedClient, memoryId: string): Promise<boolean> {
+  if (!localServingEnabled()) return true;
+  const complete = await client.query(`SELECT 1 FROM memory_embedding_manifests f
       JOIN memories m ON m.id=f.parent_id WHERE f.parent_id=$1 AND f.contract_id=$2
         AND f.is_current AND f.source_revision=m.revision
         AND f.source_sha256=encode(digest(convert_to(m.content,'UTF8'),'sha256'),'hex')
         AND f.source_bytes=octet_length(convert_to(m.content,'UTF8'))
         AND f.chunk_count=(SELECT count(*) FROM memory_embedding_chunks c WHERE c.parent_id=m.id AND c.contract_id=f.contract_id)
         AND COALESCE((SELECT min(c.ordinal)=0 AND max(c.ordinal)=f.chunk_count-1 FROM memory_embedding_chunks c
-          WHERE c.parent_id=m.id AND c.contract_id=f.contract_id),false)`, [job.memory_id, process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT]);
-    if (!complete.rows.length) {
-      await finishJob(client, job, 'embedding_failed', 'space_mismatch'); return null;
-    }
+          WHERE c.parent_id=m.id AND c.contract_id=f.contract_id),false)`, [memoryId, process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT]);
+  return complete.rows.length > 0;
+}
+async function completeExternalEmbedding(client: ScopedClient, job: IngestionJob, memory: Record<string, any>): Promise<StoreResult | null> {
+  if (!(await hasCurrentLocalEmbedding(client, job.memory_id))) {
+    await finishJob(client, job, 'embedding_failed', 'space_mismatch'); return null;
   }
   if (memory.embedding_provider !== job.embedding_provider || memory.embedding_model !== job.embedding_model ||
       memory.embedding_dimensions !== job.embedding_dimensions) {
