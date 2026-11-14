@@ -28,7 +28,7 @@ function fakeClient(onEmbed?:()=>Promise<void>) {
     }) as typeof fetch});
 }
 
-test('application writers publish complete local chunks, dedupe across later chunks, and fence stale authority',
+test('application writers publish complete local chunks, preserve distinct shared-chunk parents, and fence stale authority',
   {skip:!url},async()=>{
   assert.equal(new URL(url!).pathname,'/total_recall_reembedding_test','dedicated test database required');
   const pool=new pg.Pool({connectionString:url,max:4});
@@ -62,7 +62,9 @@ test('application writers publish complete local chunks, dedupe across later chu
       WHERE contract_id=$1 AND parent_id=$2`,[QWEN_CONTRACT_ID,first.id])).rows[0];
     assert.deepEqual(manifest,{is_current:true,source_bytes:bytes.length,chunk_count:chunks.rowCount});
 
-    const duplicate=await memoryStore(storeSchema.parse({content:'MATCH-LATER',namespace:'personal',source:prefix,dedupe:true}),auth);
+    const partial=await memoryStore(storeSchema.parse({content:'MATCH-LATER',namespace:'personal',source:prefix,dedupe:true}),auth);
+    assert.notEqual(partial.id,first.id);assert.equal(partial.deduplicated,false);
+    const duplicate=await memoryStore(storeSchema.parse({content,namespace:'personal',source:prefix,dedupe:true}),auth);
     assert.equal(duplicate.id,first.id);assert.equal(duplicate.deduplicated,true);
 
     const incomplete=randomUUID();
@@ -70,7 +72,7 @@ test('application writers publish complete local chunks, dedupe across later chu
       VALUES($1,'pending target',$2,'personal',$3::text,'normal','semantic',statement_timestamp())`,[incomplete,prefix,key]);
     await assert.rejects(memoryStore(storeSchema.parse({content:'orthogonal',namespace:'personal',source:prefix,dedupe:true}),auth),
       /shadow_embedding\.dedupe_scope_incomplete/);
-    assert.equal((await pool.query('SELECT count(*)::int n FROM memories WHERE source=$1',[prefix])).rows[0].n,2);
+    assert.equal((await pool.query('SELECT count(*)::int n FROM memories WHERE source=$1',[prefix])).rows[0].n,3);
     await pool.query('DELETE FROM memories WHERE id=$1',[incomplete]);
 
     setLocalServingClientForTesting(fakeClient(async()=>{await pool.query('UPDATE api_keys SET revoked_at=statement_timestamp() WHERE id=$1',[key]);}));
