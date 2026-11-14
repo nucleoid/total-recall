@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { MEMORY_DEDUPE_THRESHOLD } from './store-config.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { accessLevelSql, checkPermission, ensureAccessLevelAllowed, filterNamespaces } from './auth.js';
@@ -31,7 +32,7 @@ export interface IngestionJob {
   allowed_namespaces: string[]; agent_id: string; session_id: string | null; source_key: string | null;
   memory_created: boolean; dedupe: boolean; ttl_seconds: string | null; contradiction_eligible: boolean;
   embedding_provider: string; embedding_model: string; embedding_dimensions: number;
-  status: IngestionState; attempts: number; lease_token: string; accepted_at: Date;
+  status: IngestionState; attempts: number; last_error_code: string | null; lease_token: string; accepted_at: Date;
   content: string; expires_at: Date | null; inline?: boolean;
 }
 export interface AcceptMemoryInput {
@@ -78,14 +79,18 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
   const sourceKey = input.idempotency_key ? `discord-safe:v1:${createHash('sha256').update(auth.keyId).update('\0').update(input.idempotency_key).digest('hex')}` : null;
   try {
     return await withScopedClient(dbScopeFromAuth(auth), async client => {
-      let previous: { content: string; namespace: string; access_level: string } | undefined;
+      let previous: { content: string; namespace: string; access_level: string; source: string; tags: string[]; metadata: Record<string, unknown>; agent_id: string; session_id: string | null; expires_at: Date | null; memory_kind: string } | undefined;
       if (sourceKey) {
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`memory-store-key:${auth.keyId}:${sourceKey}`]);
         // Match finalize's job -> memory lock order, including namespace moves.
         await client.query(`SELECT j.memory_id FROM memory_ingestion_jobs j WHERE j.client_id = $1 AND j.source_key = $2 FOR UPDATE`, [auth.keyId, sourceKey]);
-        previous = (await client.query(`SELECT content, namespace, access_level FROM memories WHERE client_id = $1 AND source_key = $2 FOR UPDATE`, [auth.keyId, sourceKey])).rows[0];
+        previous = (await client.query(`SELECT content, namespace, access_level, source, tags, metadata, agent_id, session_id, expires_at, memory_kind FROM memories WHERE client_id = $1 AND source_key = $2 FOR UPDATE`, [auth.keyId, sourceKey])).rows[0];
       }
       const changed = !previous || previous.content !== input.content || previous.namespace !== input.namespace || previous.access_level !== input.access_level;
+      const auditChanged = changed || !previous || previous.source !== (input.source || auth.name) ||
+        !isDeepStrictEqual(previous.tags, input.tags) || !isDeepStrictEqual(previous.metadata, input.metadata) ||
+        previous.agent_id !== agentId || previous.session_id !== (input.session_id ?? null) ||
+        input.ttl !== undefined || previous.expires_at !== null || previous.memory_kind !== 'semantic';
       const conflict = sourceKey ? `ON CONFLICT (client_id, source_key) DO UPDATE SET
         content = EXCLUDED.content,
         embedding = CASE WHEN $13 THEN NULL ELSE memories.embedding END,
@@ -148,8 +153,8 @@ export async function acceptMemory(input: AcceptMemoryInput, auth: AuthContext, 
         input.dedupe !== false && !sourceKey && input.ttl === undefined, input.ttl ?? null, !sourceKey && input.ttl === undefined,
         profile.provider, profile.model, profile.dimensions, reset, changed, memory.accepted_at, memory.created])).rows[0];
       // Identical keyed retries do not create duplicate acceptance audit events.
-      if (changed) await logAudit({ clientId: auth.keyId, action: 'memory.store', namespace: input.namespace,
-        memoryId: memory.id, agentId, sessionId: input.session_id, details: { created: memory.created, deduplicated: false, queued: true, ...(sourceKey ? { idempotent: true } : {}) } }, dbScopeFromAuth(auth), client);
+      if (auditChanged) await logAudit({ clientId: auth.keyId, action: 'memory.store', namespace: input.namespace,
+        memoryId: memory.id, agentId, sessionId: input.session_id, details: { created: memory.created, deduplicated: false, queued: storeState(job.status) === 'queued', ...(sourceKey ? { idempotent: true } : {}) } }, dbScopeFromAuth(auth), client);
       return { id: memory.id, namespace: memory.namespace, expires_at: memory.expires_at ?? null,
         created: storeState(job.status) === 'queued' ? true : memory.created, deduplicated: false,
         state: storeState(job.status), accepted_at: job.accepted_at,
@@ -245,8 +250,10 @@ export async function failIngestionJob(job: IngestionJob, error: unknown): Promi
   const budgetHandoff = job.inline && error instanceof Error && ['TimeoutError','AbortError'].includes(error.name);
   const contention = failure.code === 'db_contention';
   const inlineHandoff = job.inline === true && (budgetHandoff || contention);
-  const terminal = !contention && !job.inline && (failure.terminal || (failure.category !== 'provider_auth' && job.attempts >= max));
-  const retry = contention ? new Date(Date.now() + 1000) : budgetHandoff ? new Date() : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter);
+  // Only the first consecutive contention failure gets a free short retry.
+  const freeContention = contention && !job.inline && job.last_error_code !== 'db_contention';
+  const terminal = !freeContention && !job.inline && (failure.terminal || (failure.category !== 'provider_auth' && job.attempts >= max));
+  const retry = freeContention ? new Date(Date.now() + 1000) : budgetHandoff ? new Date() : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter);
   await withScopedClient(ownerScope(job), client => client.query(`UPDATE memory_ingestion_jobs SET
     status = $3, failure_category = $4, last_error_code = $5,
     attempts = CASE WHEN $9::boolean THEN GREATEST(0, attempts - 1) ELSE attempts END,
@@ -254,7 +261,7 @@ export async function failIngestionJob(job: IngestionJob, error: unknown): Promi
     finalized_at = CASE WHEN $7 THEN statement_timestamp() ELSE NULL END,
     lease_token = NULL, lease_expires_at = NULL
     WHERE memory_id = $1 AND status = 'processing' AND lease_token = $2::uuid AND lease_expires_at > statement_timestamp()`,
-  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : inlineHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal, inlineHandoff, contention && !job.inline]).then(() => undefined));
+  [job.memory_id, job.lease_token, terminal ? 'embedding_failed' : inlineHandoff ? 'pending' : 'retry_wait', failure.category, budgetHandoff ? 'inline_budget_exhausted' : failure.code, retry, terminal, inlineHandoff, freeContention]).then(() => undefined));
 }
 
 /** Lease row lock and token fence cover dedupe, belief mutation, vector, outbox and audit together. */
@@ -462,8 +469,9 @@ export async function requeueIngestionJob(memoryId: string, auth: AuthContext): 
       failure_category = NULL, last_error_code = NULL, finalized_at = NULL, ready_at = NULL,
       requeued_by = $2, requeued_at = statement_timestamp()
       WHERE j.memory_id = $1 AND j.status IN ('embedding_failed','cancelled')
+        AND ${accessLevelSql('j.access_level', '$3')}
         AND EXISTS (SELECT 1 FROM memories m WHERE m.id = j.memory_id AND m.deleted_at IS NULL
-          AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())) RETURNING j.namespace`, [memoryId, auth.keyId]);
+          AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp()) AND ${accessLevelSql('m.access_level', '$3')}) RETURNING j.namespace`, [memoryId, auth.keyId, auth.maxAccessLevel]);
     if (!updated.rows.length) throw new MemoryConflictError('Ingestion job is unavailable or cannot be requeued in its current state');
     await logAudit({ clientId: auth.keyId, action: 'ingestion.requeue', namespace: updated.rows[0].namespace,
       memoryId, details: { requeued: true } }, dbScopeFromAuth(auth), client);
@@ -478,19 +486,21 @@ export async function setIngestionPaused(paused: boolean, auth: AuthContext): Pr
     return { paused };
   });
 }
-export async function ingestionStats(auth: AuthContext, existingClient?: ScopedClient) {
+export async function ingestionStats(auth: AuthContext) {
   checkPermission(auth, 'admin');
-  const load = async (client: ScopedClient) => {
+  return withScopedClient(dbScopeFromAuth(auth), async client => {
+    // Queue history must not inherit memory_stats' covering-index planner overrides.
+    await client.query("SET LOCAL statement_timeout = '5s'");
+    const visible = accessLevelSql('j.access_level', '$1');
     const result = await client.query(`SELECT
-      COALESCE((SELECT jsonb_object_agg(status, count) FROM (SELECT status, COUNT(*)::int AS count FROM memory_ingestion_jobs GROUP BY status) s), '{}'::jsonb) AS depth,
-      EXTRACT(EPOCH FROM statement_timestamp() - MIN(accepted_at) FILTER (WHERE status IN ('pending','retry_wait','processing')))::double precision AS oldest_pending_age_seconds,
-      MIN(next_attempt_at) FILTER (WHERE status = 'retry_wait') AS next_retry_at,
-      COALESCE((SELECT jsonb_object_agg(attempts, count) FROM (SELECT attempts, COUNT(*)::int AS count FROM memory_ingestion_jobs GROUP BY attempts) a), '{}'::jsonb) AS attempts_histogram,
-      COALESCE((SELECT jsonb_object_agg(failure_category, count) FROM (SELECT failure_category, COUNT(*)::int AS count FROM memory_ingestion_jobs WHERE failure_category IS NOT NULL GROUP BY failure_category) f), '{}'::jsonb) AS failure_categories,
+      COALESCE((SELECT jsonb_object_agg(status, count) FROM (SELECT status, COUNT(*)::int AS count FROM memory_ingestion_jobs j WHERE ${visible} GROUP BY status) s), '{}'::jsonb) AS depth,
+      (SELECT EXTRACT(EPOCH FROM statement_timestamp() - MIN(accepted_at))::double precision FROM memory_ingestion_jobs j WHERE j.status IN ('pending','retry_wait','processing') AND ${visible}) AS oldest_pending_age_seconds,
+      (SELECT MIN(next_attempt_at) FROM memory_ingestion_jobs j WHERE j.status IN ('pending','retry_wait','processing') AND j.status = 'retry_wait' AND ${visible}) AS next_retry_at,
+      COALESCE((SELECT jsonb_object_agg(attempts, count) FROM (SELECT attempts, COUNT(*)::int AS count FROM memory_ingestion_jobs j WHERE ${visible} GROUP BY attempts) a), '{}'::jsonb) AS attempts_histogram,
+      COALESCE((SELECT jsonb_object_agg(failure_category, count) FROM (SELECT failure_category, COUNT(*)::int AS count FROM memory_ingestion_jobs j WHERE failure_category IS NOT NULL AND ${visible} GROUP BY failure_category) f), '{}'::jsonb) AS failure_categories,
       COUNT(*) FILTER (WHERE inline_ready)::double precision / NULLIF(COUNT(*) FILTER (WHERE inline_attempted),0) AS inline_hit_rate
-      FROM memory_ingestion_jobs`);
+      FROM memory_ingestion_jobs j WHERE ${visible}`, [auth.maxAccessLevel]);
     const settings = (await client.query('SELECT ingestion_paused AS paused, ingestion_worker_seen_at AS last_worker_heartbeat FROM instance_settings WHERE singleton')).rows[0];
     return { ...result.rows[0], ...settings };
-  };
-  return existingClient ? load(existingClient) : withScopedClient(dbScopeFromAuth(auth), load);
+  });
 }

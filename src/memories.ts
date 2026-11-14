@@ -1,3 +1,4 @@
+import { attachIngestion, ingestionAlias } from './ingestion-read.js';
 import { accessLevelSql, checkPermission, filterNamespaces } from './auth.js';
 import { dbScopeFromAuth, queryScoped, withScopedClient, type DbScope, type ScopedClient } from './db.js';
 import type { AuthContext } from './types.js';
@@ -125,7 +126,7 @@ export async function listMemories(auth: AuthContext, filters: MemoryBrowseFilte
       clientId: auth.keyId, action: 'memory.list', resourceType: 'search', resultCount: rows.rows.length,
     }, scope, client);
     return {
-      memories: rows.rows,
+      memories: await attachIngestion(rows.rows, scope, client),
       total: Number(count.rows[0]?.total ?? 0),
       limit: filters.limit,
       offset: filters.offset,
@@ -135,18 +136,23 @@ export async function listMemories(auth: AuthContext, filters: MemoryBrowseFilte
 
 export async function getMemory(auth: AuthContext, id: string) {
   checkPermission(auth, 'read');
-  const { conditions, values } = baseConditions(auth, auth.namespaces, false);
-  values.push(id);
-  conditions.push(`m.id = $${values.length}::uuid`);
   const scope = dbScopeFromAuth(auth);
-  const result = await queryScoped(scope, `SELECT ${COLUMNS} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id WHERE ${conditions.join(' AND ')} LIMIT 1`, values);
-  if (result.rows[0]) {
-    await logAudit({
-      clientId: auth.keyId, action: 'memory.recall', resourceType: 'memory',
-      resourceId: id, memoryId: id, resultCount: 1,
-    }, scope);
-  }
-  return result.rows[0] ?? null;
+  return withScopedClient(scope, async client => {
+    const canonicalId = await ingestionAlias(id, scope, client);
+    const { conditions, values } = baseConditions(auth, auth.namespaces, false);
+    values.push(canonicalId ?? id);
+    conditions.push(`m.id = $${values.length}::uuid`);
+    const result = await client.query(`SELECT ${COLUMNS} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id WHERE ${conditions.join(' AND ')} LIMIT 1`, values);
+    if (!result.rows[0]) return null;
+    await logAudit({ clientId: auth.keyId, action: 'memory.recall', resourceType: 'memory',
+      resourceId: id, memoryId: id, resultCount: 1 }, scope, client);
+    const [memory] = await attachIngestion(result.rows, scope, client);
+    if (canonicalId) {
+      const [alias] = await attachIngestion([{ id }], scope, client);
+      return { ...memory, ingestion: (alias as { ingestion?: unknown }).ingestion };
+    }
+    return memory;
+  });
 }
 
 /** Fetch active, accessible trace result summaries in their recorded order. */

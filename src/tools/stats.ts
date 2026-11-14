@@ -29,7 +29,8 @@ export async function memoryStats(
   const scope = dbScopeFromAuth(auth);
   const values = [ns, visibleAccessLevels(auth.maxAccessLevel)];
 
-  return withScopedClient(scope, async (client) => {
+  let hasIngestion = false;
+  const stats = await withScopedClient(scope, async (client) => {
     await client.query("SELECT set_config('statement_timeout', $1, true)", [
       String(STATS_QUERY_STATEMENT_TIMEOUT_MS),
     ]);
@@ -117,8 +118,8 @@ export async function memoryStats(
       resultCount: parseInt(stats.total, 10),
     }, scope, client);
 
+    hasIngestion = await ingestionSchemaAvailable(scope, client);
     return {
-      ...(await ingestionSchemaAvailable(scope, client) ? { ingestion: await ingestionStats(auth, client) } : {}),
       total_memories: parseInt(stats.total, 10),
       by_namespace: stats.by_namespace,
       by_source: stats.by_source,
@@ -127,4 +128,9 @@ export async function memoryStats(
       newest_memory: stats.newest_memory,
     };
   });
+  if (hasIngestion) {
+    try { return { ...stats, ingestion: await ingestionStats(auth) }; }
+    catch { console.warn('[ingestion] outcome=stats_unavailable'); }
+  }
+  return stats;
 }

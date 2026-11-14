@@ -28,9 +28,10 @@ export async function attachIngestion<T extends { id: string }>(rows: T[], scope
   };
   return existingClient ? load(existingClient) : withScopedClient(scope, load);
 }
-export async function ingestionAlias(id: string, scope: DbScope): Promise<string | undefined> {
-  if (!await ingestionSchemaAvailable(scope)) return undefined;
-  const result = await queryScoped(scope, `SELECT canonical_memory_id FROM memory_ingestion_jobs
-    WHERE memory_id = $1 AND status = 'deduplicated' AND client_id = app_current_key_id()`, [id]);
+export async function ingestionAlias(id: string, scope: DbScope, client?: ScopedClient): Promise<string | undefined> {
+  if (!await ingestionSchemaAvailable(scope, client)) return undefined;
+  const sql = `SELECT canonical_memory_id FROM memory_ingestion_jobs
+    WHERE memory_id = $1 AND status = 'deduplicated' AND client_id = app_current_key_id()`;
+  const result = client ? await client.query(sql, [id]) : await queryScoped(scope, sql, [id]);
   return result.rows[0]?.canonical_memory_id;
 }

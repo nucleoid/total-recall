@@ -69,6 +69,9 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
   await owner.query('CREATE EXTENSION vector');
   await provisionDatabase(owner, { appPassword: 'app-test-only', rotateAppPassword: false });
   await runMigrations(owner, loadMigrationInventory(fileURLToPath(new URL('../migrations', import.meta.url))), { lockTimeoutMs: 5000 });
+  // Approved classifier canaries require the separately finalized validity contract.
+  const {finalizeMemoryValidity}=await import('../scripts/finalize-memory-validity.js');
+  await finalizeMemoryValidity(owner);
   pool = new pg.Pool({ connectionString: `postgresql://total_recall_app:app-test-only@127.0.0.1:${port}/postgres` });
   setPoolForTesting(pool);
   process.env.MEMORY_INGESTION_QUEUE_ENABLED = 'true'; process.env.MEMORY_STORE_INLINE_EMBED_MS = '0';

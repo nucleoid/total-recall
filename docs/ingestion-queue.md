@@ -17,15 +17,15 @@ Dedupe takes the existing namespace/access advisory lock, excludes the pending r
 ## Worker and retry policy
 
 ```sh
-npm run ingest:worker -- --concurrency 4
-npm run ingest:worker -- --once --max-jobs 100
+node dist/ingestion-worker.js --concurrency 4
+node dist/ingestion-worker.js --once --max-jobs 100
 ```
 
 The worker uses `INGESTION_WORKER_API_KEY`, a dedicated enabled admin key with the namespaces to drain. Claims use its admin scope, but content/finalization uses the accepting owner's ID and exactly one namespace. Revoking the accepting key after durable acceptance does not discard that write. Revoking the worker key stops new polls. Concurrency is 1–32, default 4; `--poll-ms` accepts 100–60000. Stopping API acceptance does not stop backlog drainage.
 
 429 retries as `rate_limited`; 408/425/5xx, timeouts and transport failures retry as `transient`; 401/403 retry as `provider_auth` at the twelve-hour cap so credential outages do not dead-letter the backlog. 400/404/413/422 and invalid vectors fail immediately on worker attempts. `MEMORY_INGESTION_MAX_ATTEMPTS` defaults to 12; inline attempts do not consume this allowance. Retries reuse the webhook schedule of 1m/5m/30m/2h/12h with positive jitter and Retry-After up to the twelve-hour cap. Raw provider messages, content and credentials never enter job errors or metrics.
 
-Database lock/statement timeouts, deadlocks and serialization failures (`55P03`, `57014`, `40P01`, `40001`) retain category `transient` with content-free code `db_contention`. They roll back finalization, refund that worker claim's attempt and retry after one second; they do not exhaust the provider-attempt allowance. Inline contention hands off immediately as pending. Monitor persistent contention separately from provider outages.
+Database lock/statement timeouts, deadlocks and serialization failures (`55P03`, `57014`, `40P01`, `40001`) retain category `transient` with content-free code `db_contention`. They roll back finalization. At most one failure in a consecutive contention streak receives a free one-second worker retry; repeated failures consume the normal attempt allowance and use its jittered 1m–12h backoff, eventually becoming embedding_failed. An inline contention handoff records the same code, so it also prevents a second free retry in that streak. Inline contention hands off immediately as pending. Monitor persistent contention separately from provider outages.
 
 Jobs snapshot the active provider/model/dimensions at acceptance. A changed space fails as `space_mismatch`, rather than writing an incompatible vector. Requeue preserves the accepted target; restore that profile to retry, or use the reviewed re-embedding procedure to repair vectors. Re-embedding does not rewrite terminal job history.
 
@@ -64,3 +64,12 @@ The first ready transition of a newly accepted memory may emit its subscription 
 Inline mutation preparation applies only to the approved normal-access namespace. Stores outside that scope, including sensitive and secret content, retain their healthy inline embedding fast path even when mutation is enabled elsewhere. Dashboard memory cards display the ingestion state as text; terminal states are also distinguished visually.
 
 Authentication never waits merely to update `last_used_at`: a busy key row skips that telemetry write and checks current committed key validity through the read-only path. The usage timestamp is therefore best-effort under contention; revocation and expiry checks remain mandatory. Finalization bounds each lock acquisition to five seconds and each SQL statement to fifteen seconds. A timeout rolls the transaction back and retries through the existing queue; accepted content remains durable. Keyed/TTL or other unlinked completions with no possible cross-memory effect take no key-row fence. Explicitly linked pending successors are embedded in place without revision or dedupe, so queue completion cannot delete the only successor in an existing belief chain.
+
+
+The REST Memories list and detail endpoints expose the same ingestion metadata as MCP; the accepting owner’s deduplicated ID resolves to its authorized live canonical row. Metadata-only keyed refreshes write a store audit when fields change, while identical no-op refreshes do not duplicate acceptance audits. The job’s original accepted actor/security snapshot remains the attribution for finishing that original work.
+
+Queue metrics run in a separate transaction with a five-second statement timeout and normal planner settings. A queue metrics failure omits the optional ingestion block from memory_stats without failing the committed base statistics. The dedicated ingestion endpoint can fail independently. Oldest-age and next-retry queries scan only nonterminal jobs using the existing partial claim index; history aggregates still depend on retained history size. Job history and owner aliases remain until the memory is purged; this change adds no automatic deletion policy. Monitor query latency and plan maintenance explicitly rather than deleting alias history to improve metrics. Admin metrics and requeue also enforce the key’s access-level ceiling.
+
+Release builds use npm run build, which compiles src/ingestion-worker.ts to dist/ingestion-worker.js with the existing server build. Deploy dist plus production dependencies in the immutable release, then point current at it; the systemd unit runs native Node and needs neither tsx nor TypeScript sources. npm run ingest:worker remains a development-source entrypoint.
+
+Transfers include failed and pending content and re-embed at the destination. If the destination provider also rejects a record, its entire import batch fails atomically, preserving the existing transfer contract. Archive the complete original feed, isolate the rejected records (ingestion_state can identify known failed candidates), and import the remaining validated records as a separate feed. No automatic skipping or content loss is introduced; a source failure does not prove the destination will reject it.

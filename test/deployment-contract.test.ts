@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -49,4 +50,10 @@ test('durable ingestion worker has a dedicated unit and bounded npm entrypoint',
   assert.match(service,/EnvironmentFile=/);
   assert.ok(Number(service.match(/TimeoutStopSec=(\d+)/)?.[1]) >= 210, 'shutdown must cover the maximum provider/classifier lease budget');
   assert.equal(manifest.scripts['ingest:worker'],'tsx scripts/ingestion-worker.ts');
+});
+
+
+test('release ingestion worker imports under native Node without a TypeScript loader', () => {
+  const result=spawnSync(process.execPath,['--input-type=module','--eval',"await import('./dist/ingestion-worker.js')"],{cwd:root,encoding:'utf8'});
+  assert.equal(result.status,0,result.stderr);
 });
