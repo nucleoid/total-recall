@@ -87,6 +87,20 @@ test('durable local writes publish complete chunks before readiness and fence qu
     const deduped = await finalizeIngestionJob(secondJob, await embedWithinBudget(secondJob.content, 5000));
     assert.equal(deduped?.deduplicated, true); assert.equal(deduped?.id, first.id);
 
+    // Every synthetic chunk has the same vector. A shared boilerplate chunk
+    // must not cause the rest of a different parent to be discarded.
+    const novel = await memoryStore(storeSchema.parse({ content: `${'a'.repeat(2500)}\n\nnovel queued fact`,
+      namespace: 'personal', source, dedupe: true }), auth);
+    const novelJob = await claim(novel.id);
+    const novelResult = await finalizeIngestionJob(novelJob, await embedWithinBudget(novelJob.content, 5000));
+    assert.equal(novelResult?.id, novel.id); assert.equal(novelResult?.deduplicated, false);
+    process.env.MEMORY_INGESTION_QUEUE_ENABLED = 'false';
+    const synchronousNovel = await memoryStore(storeSchema.parse({ content: `${'a'.repeat(2500)}\n\nanother novel fact`,
+      namespace: 'personal', source, dedupe: true }), auth);
+    assert.equal(synchronousNovel.deduplicated, false);
+    assert.notEqual(synchronousNovel.id, first.id);
+    process.env.MEMORY_INGESTION_QUEUE_ENABLED = 'true';
+
     const pendingUpdate = await memoryStore(storeSchema.parse({ content: 'never indexed original', namespace: 'personal', source, dedupe: false }), auth);
     await memoryUpdate({ id: pendingUpdate.id, content: 'replacement is not a creation event' }, auth);
     const replacementJob = await claim(pendingUpdate.id);
@@ -111,6 +125,20 @@ test('durable local writes publish complete chunks before readiness and fence qu
     await memoryUpdate({ id: first.id, content: 'authorized cross-key synchronous replacement' }, { ...auth, keyId: editorKey });
     const synchronous = await manifest(first.id);
     assert.equal(synchronous.is_current, true); assert.equal(synchronous.source_revision, synchronous.revision);
+
+    for (const temporalState of ['future', 'elapsed']) {
+      const inactive = await memoryStore(storeSchema.parse({ content: `inactive ${temporalState} original`,
+        namespace: 'personal', source, dedupe: false }), auth);
+      if (temporalState === 'future') {
+        await owner.query("UPDATE memories SET valid_from=statement_timestamp()+interval '1 day' WHERE id=$1", [inactive.id]);
+      } else {
+        await owner.query("UPDATE memories SET valid_from=statement_timestamp()-interval '2 days',valid_to=statement_timestamp()-interval '1 day' WHERE id=$1", [inactive.id]);
+      }
+      const edited = await memoryUpdate({ id: inactive.id, content: `inactive ${temporalState} replacement` }, auth);
+      assert.equal(edited.content, `inactive ${temporalState} replacement`);
+      const inactiveManifest = await manifest(inactive.id);
+      assert.ok(!inactiveManifest || !inactiveManifest.is_current, 'temporally inactive updates remain unindexed');
+    }
 
     process.env.MEMORY_INGESTION_UPDATE_ENABLED = 'true';
     await memoryUpdate({ id: first.id, content: 'authorized cross-key queued replacement' }, { ...auth, keyId: editorKey });

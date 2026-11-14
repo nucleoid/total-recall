@@ -102,9 +102,14 @@ export async function findLocalDocumentDuplicate(client: ScopedClient, prepared:
         FROM memory_embedding_chunks valid_chunk WHERE valid_chunk.parent_id=m.id AND valid_chunk.contract_id=$3),false)
     JOIN memory_embedding_chunks c ON c.parent_id=m.id AND c.contract_id=f.contract_id
     CROSS JOIN unnest($5::vector[]) q(vector)
-    WHERE ${eligibility} GROUP BY m.id,m.namespace
+    WHERE ${eligibility}
+      -- A matching paragraph is retrieval evidence, not proof that two parents
+      -- are duplicates. Multi-chunk parents require complete source identity.
+      AND ((f.chunk_count=1 AND $6::integer=1) OR f.source_sha256=$7)
+    GROUP BY m.id,m.namespace
     ORDER BY similarity DESC,calculate_relevance(m.relevance_base_score,m.decay_rate,m.accessed_at,m.access_count) DESC,
-      m.created_at,m.id LIMIT 1`, [namespace, accessLevel, QWEN_CONTRACT_ID, excludeParentId, vectors])).rows[0];
+      m.created_at,m.id LIMIT 1`, [namespace, accessLevel, QWEN_CONTRACT_ID, excludeParentId, vectors,
+      prepared.plan.chunks.length, prepared.plan.sourceSha256])).rows[0];
   if (!candidate) return undefined;
   const locked = await client.query(`SELECT m.id,m.revision FROM memories m
     JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$3 AND f.is_current AND f.source_revision=m.revision
