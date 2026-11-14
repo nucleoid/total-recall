@@ -269,6 +269,8 @@ Patch an active current memory by UUID. At least one of `content`, `tags`, `meta
 A supersession atomically closes the predecessor and creates one immutable successor link. Both rows must be active/current, distinct, visible, and in the same namespace. After validity schema deployment, manual `memory_update` uses one database timestamp for the predecessor's `valid_to`/`superseded_at` and the successor's `valid_from`, producing contiguous half-open intervals; linking an already stored successor establishes its temporal validity at that boundary rather than its original store time. Before migration 026, the writer probes the schema and uses the #52 shape without validity columns; a partial validity schema fails closed and unrelated SQL errors are never treated as compatibility fallback. Historical rows remain available through list and direct recall with `supersedes_id`, `superseded_by_id`, `superseded_at`, `is_superseded`, and `revision`, but a linked UUID is returned only when that linked row is itself active, in the requested namespace, and visible at the caller's access-level ceiling. When the separately reviewed `SUPERSEDED_SEARCH_DEMOTION_ENABLED=true` gate is enabled, ordinary search demotes history by `SUPERSEDED_SCORE_FACTOR` (default `0.25`) before final ordering and limiting. Forgetting or purging a successor never reopens its predecessor; the predecessor marker is durable, and its purge is blocked while a successor still references it.
 
 ### `memory_store_document`
+Durable document ingestion requires migration 052 and both `MEMORY_INGESTION_QUEUE_ENABLED=true` and `MEMORY_INGESTION_DOCUMENT_ENABLED=true`. All chunks and jobs commit before provider work. MCP adds `state: ready | queued | embedding_failed`; REST keeps `id`/`chunks` and adds `state`. Identical keyed retries return the same document and current state. `memory_document_status({ document_id })` returns owner-only counts and failure categories without content. See [document ingestion](docs/ingestion-queue.md#documents) for batching and rollout.
+
 Chunk and store a full document. Content must contain non-whitespace text and is limited to **1 MiB of decoded UTF-8**. Chunking prefers markdown headings and paragraph boundaries, then splits on Unicode code-point boundaries so every embedding chunk is at most **2,000 UTF-8 bytes** without dropping or changing source text. Chunks share a `document_id` for full-document retrieval.
 ```json
 {
@@ -389,6 +391,8 @@ All `/api/*` endpoints require `Authorization: Bearer tr_<key>`. `/health` is pu
 | POST | `/api/search` | Hybrid semantic + keyword search |
 | POST | `/api/store` | Store a single memory |
 | POST | `/api/store-document` | Store a chunked document |
+| GET | `/api/documents/{id}/status` | Owned, content-free document ingestion state (read) |
+| POST | `/api/ingestion/documents/{id}/requeue` | Requeue failed/cancelled live chunks (scoped admin) |
 | GET | `/api/transfer/export` | Stream the V1 memory-only JSONL feed (`export`) |
 | POST | `/api/transfer/import` | Preflight/import the V1 JSONL feed (`import`) |
 | DELETE | `/api/memories` | Soft-delete matching memories (explicit `delete` permission) |

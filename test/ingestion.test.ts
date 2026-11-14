@@ -42,11 +42,12 @@ test('durable acknowledgement survives a failure to record an inline provider fa
   t.after(() => { delete process.env.MEMORY_STORE_INLINE_EMBED_MS; setPoolForTesting(null); });
   let connects=0;
   const job = { memory_id:'33333333-3333-4333-8333-333333333333', namespace:'shared', client_id:auth.keyId,
+    access_level:'normal',
     lease_token:'44444444-4444-4444-8444-444444444444', attempts:0, accepted_at:new Date(),allowed_namespaces:['shared'] };
   setPoolForTesting({ connect:async () => {
     if (++connects===3) throw new Error('private failure-update detail');
     return { release() {},query:async (sql:string) => {
-      const rows = sql.includes('WITH candidate AS') ? [job] : sql.includes('SELECT 1 FROM memory_ingestion_jobs') ? [{}] :
+      const rows = sql.includes('WITH seed AS') ? [job] : sql.includes('SELECT 1 FROM memory_ingestion_jobs') ? [{}] :
         sql.includes('FROM memories WHERE') ? [{ content:'retained',embedding:null,expires_at:null,expired:false }] : [];
       return { rows,rowCount:rows.length };
     } };

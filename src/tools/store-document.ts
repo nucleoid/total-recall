@@ -3,7 +3,8 @@ import { z } from 'zod';
 import type pg from 'pg';
 import { dbScopeFromAuth, withScopedClient } from '../db.js';
 import { embedWithProfile, serializeEmbeddingVector, type EmbeddingResult } from '../embedding.js';
-import type { AuthContext } from '../types.js';
+import type { AuthContext, StoredDocumentResult } from '../types.js';
+import { acceptChunks, documentIngestionState, ingestionDocumentEnabled, documentInlineMaxChunks, inlineBudgetMs, tryInlineDocument } from '../ingestion.js';
 import { checkPermission, filterNamespaces } from '../auth.js';
 import { TombstonedSourceKeyConflictError } from '../errors.js';
 import { logAudit } from '../audit.js';
@@ -42,7 +43,6 @@ export const storeDocumentSchema = z.object({
 });
 
 type StoreDocumentParams = z.infer<typeof storeDocumentSchema>;
-type StoredDocumentResult = { document_id: string; chunks_stored: number; title: string };
 type ExistingDocumentRow = {
   id: string;
   title: string;
@@ -262,23 +262,34 @@ export async function memoryStoreDocument(
   }
 
   const requestHash = canonicalDocumentRequestHash(params);
+  const queued = ingestionDocumentEnabled();
+  // Validate operator limits before accepting any new document.
+  if (queued) { documentInlineMaxChunks(); inlineBudgetMs(); }
+  const existingResult = async (client: pg.PoolClient, row: ExistingDocumentRow): Promise<StoredDocumentResult> => {
+    const result = completedExistingResult(row, requestHash);
+    // Schema presence, not the acceptance gate, controls backlog visibility.
+    const schema = await client.query("SELECT to_regclass('public.memory_ingestion_jobs') IS NOT NULL AS available");
+    if (!schema.rows[0]?.available) return result;
+    return { ...result, state: (await documentIngestionState(client,row.id)).state };
+  };
   if (params.idempotency_key) {
     const existing = await withScopedClient(dbScopeFromAuth(auth), async (client) =>
-      findExistingDocument(client, auth, ns, params.idempotency_key!)
+      { const row = await findExistingDocument(client, auth, ns, params.idempotency_key!); return row ? existingResult(client,row) : null; }
     );
     if (existing) {
-      return completedExistingResult(existing, requestHash);
+      return existing;
     }
   }
 
   // EmbeddingResult carries vector and ACTIVE_EMBEDDING_DESCRIPTOR together.
   const embeddings: EmbeddingResult[] = [];
-  for (let i = 0; i < chunks.length; i++) {
+  for (let i = 0; !queued && i < chunks.length; i++) {
     const embedding = await embedWithProfile(chunks[i]);
     validateEmbedding(embedding.vector, i);
     embeddings.push(embedding);
   }
 
+  let createdDocument = false;
   const commitDocument = (beliefAware: boolean) => withScopedClient(dbScopeFromAuth(auth), async (client) => {
     const docRes = await client.query(
       `INSERT INTO documents (title, source, namespace, tags, client_id, idempotency_key, request_hash)
@@ -298,13 +309,14 @@ export async function memoryStoreDocument(
       if (!existing) {
         throw new StoreDocumentConflictError('Document idempotency conflict could not be resolved');
       }
-      return completedExistingResult(existing, requestHash);
+      return existingResult(client,existing);
     }
 
     const id = docRes.rows[0].id as string;
+    createdDocument = true;
 
     for (let i = 0; i < chunks.length; i++) {
-      const vecStr = serializeEmbeddingVector(embeddings[i].vector);
+      const vecStr = queued ? null : serializeEmbeddingVector(embeddings[i].vector);
 
       const beliefColumns = beliefAware ? ', memory_kind, valid_from' : '';
       const beliefValues = beliefAware ? ", 'document_chunk', statement_timestamp()" : '';
@@ -322,12 +334,14 @@ export async function memoryStoreDocument(
           auth.keyId,
           id,
           i,
-          embeddings[i].provider,
-          embeddings[i].model,
-          embeddings[i].dimensions,
+          queued ? null : embeddings[i].provider,
+          queued ? null : embeddings[i].model,
+          queued ? null : embeddings[i].dimensions,
         ]
       );
     }
+
+    if (queued) await acceptChunks(client,id,auth);
 
     const countRes = await client.query(
       `UPDATE documents SET chunk_count = $1 WHERE id = $2 AND client_id = $3::uuid AND namespace = $4`,
@@ -344,18 +358,23 @@ export async function memoryStoreDocument(
       resourceType: 'document',
       resourceId: id,
       resultCount: chunks.length,
-      details: { chunks: chunks.length },
+      details: { chunks: chunks.length, ...(queued ? { queued: true } : {}) },
     }, dbScopeFromAuth(auth), client);
 
-    return { document_id: id, chunks_stored: chunks.length, title: params.title };
+    return { document_id: id, chunks_stored: chunks.length, title: params.title, ...(queued ? { state: 'queued' as const } : {}) };
   });
 
   try {
-    return await commitDocument(true);
+    const result = await commitDocument(true);
+    if (!queued || !createdDocument || result.state !== 'queued') return result;
+    await tryInlineDocument(result.document_id,chunks.length,auth);
+    try {
+      return { ...result, state: (await withScopedClient(dbScopeFromAuth(auth),client => documentIngestionState(client,result.document_id))).state };
+    } catch { return result; } // Acceptance already committed; leases recover.
   } catch (error) {
     // Keep older migration-focused integration harnesses usable. Operators must
     // still apply migration 026 before deploying this writer in production.
-    if (typeof error !== 'object' || error === null ||
+    if (queued || typeof error !== 'object' || error === null ||
         !('code' in error) || error.code !== '42703' ||
         !('message' in error) || typeof error.message !== 'string' || !error.message.includes('memory_kind')) throw error;
     return commitDocument(false);

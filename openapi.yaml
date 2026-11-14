@@ -420,6 +420,54 @@ paths:
         "409":
           description: Missing, expired, deleted, ready or otherwise ineligible job
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  /api/documents/{id}/status:
+    get:
+      operationId: getDocumentStatus
+      summary: Return owned document ingestion counts without content (read required)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Current derived document state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentStatus" }
+        "400": { description: Invalid document UUID }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Document not found or not owned in the authorized scope }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/ingestion/documents/{id}/requeue:
+    post:
+      operationId: requeueDocument
+      summary: Requeue failed or cancelled live document chunks in admin scope
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Number of jobs requeued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requeued]
+                properties:
+                  requeued: { type: integer, minimum: 1 }
+        "400": { description: Invalid document UUID }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "Missing, inaccessible or no eligible live jobs" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /api/stats:
     get:
       operationId: getMemoryStats
@@ -1216,6 +1264,27 @@ components:
         chunks:
           type: integer
           minimum: 1
+        state:
+          $ref: "#/components/schemas/DocumentState"
+          description: Present with durable ingestion; keyed retries report current state after acceptance is disabled.
+    DocumentState:
+      type: string
+      enum: [ready, queued, embedding_failed]
+    DocumentStatus:
+      type: object
+      required: [document_id, state, chunk_count, ready, queued, failed, cancelled, oldest_pending_age_seconds, failure_categories]
+      properties:
+        document_id: { type: string, format: uuid }
+        state: { $ref: "#/components/schemas/DocumentState" }
+        chunk_count: { type: integer, minimum: 0 }
+        ready: { type: integer, minimum: 0 }
+        queued: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        cancelled: { type: integer, minimum: 0 }
+        oldest_pending_age_seconds: { type: [number, "null"], minimum: 0 }
+        failure_categories:
+          type: object
+          additionalProperties: { type: integer, minimum: 0 }
     ForgetRequest:
       type: object
       properties:

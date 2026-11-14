@@ -9,6 +9,7 @@ import { dbScopeFromAuth } from '../db.js';
 import { checkPermission } from '../auth.js';
 import { MAX_MEMORY_TTL_SECONDS, storeSchema, memoryStore } from './store.js';
 import { MAX_DOCUMENT_CONTENT_BYTES, storeDocumentSchema, memoryStoreDocument } from './store-document.js';
+import { documentStatusSchema, memoryDocumentStatus } from './document-status.js';
 import { searchSchema, memorySearch } from './search.js';
 import { recallSchema, memoryRecall } from './recall.js';
 import { listNamespacesSchema, memoryListNamespaces } from './list-namespaces.js';
@@ -132,7 +133,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_store_document',
-    description: 'Store up to 1 MiB of decoded UTF-8 document content. Markdown headings and paragraph boundaries are preferred; every lossless embedding chunk is at most 2,000 UTF-8 bytes.',
+    description: 'Store up to 1 MiB of decoded UTF-8 document content. Markdown headings and paragraph boundaries are preferred; every lossless embedding chunk is at most 2,000 UTF-8 bytes. Durable ingestion returns state ready, queued or embedding_failed; retries return the same document and its current state.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -148,6 +149,15 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ['title', 'content'],
+    },
+  },
+  {
+    name: 'memory_document_status',
+    description: 'Inspect an owned document ingestion state, chunk counts and failure categories without returning content.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: { document_id: { type: 'string', format: 'uuid' } },
+      required: ['document_id'],
     },
   },
   {
@@ -425,6 +435,10 @@ export function registerTools(server: Server, getAuth: AuthResolver): void {
         case 'memory_store_document': {
           const params = storeDocumentSchema.parse(args);
           const result = await memoryStoreDocument(params, auth);
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+        }
+        case 'memory_document_status': {
+          const result = await memoryDocumentStatus(documentStatusSchema.parse(args),auth);
           return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
         case 'memory_store_session': {

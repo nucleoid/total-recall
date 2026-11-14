@@ -1,5 +1,15 @@
 # Rollout 049: durable memory ingestion
 
+## Document ingestion (052)
+
+052 must be applied before deploying either the new API or worker, including deployments with the document sub-gate disabled. Scalar store/update claims use the new columns too; a new worker on pre-052 schema cannot drain. Keep older binaries until the owner migration completes. This is a schema prerequisite, not an acceptance-gate fallback.
+
+Apply additive migration 052 after 051 using the owner migration runner. It adds nullable job document/chunk provenance, a partial `(document_id,status)` index, and a trigger-function correction so `document` jobs retain chunk creation events while `update` jobs stay suppressed. No backfill or memory reindex. The transactional ALTER/index takes a table lock and scans the existing job table for index construction; the five-second lock timeout bounds acquisition, not the scan duration. Measure retained-job volume and schedule a maintenance window if needed. Existing subscription trigger enablement is preserved.
+
+Deploy the new worker first (`--batch-size 16`, range 1–64), then API, then canary both queue/document gates. Inline documents default to at most 8 chunks and the existing inline provider budget. Each batch is at most 64 physical chunks of at most 2,000 UTF-8 bytes. Current Qwen serving prepares every token-bounded target chunk through the pinned local runtime, then publishes all eligible manifests under the ingestion leases in the same transaction as readiness. Gemini/Ollama retain their validated batch adapters; approved Gemini rollback additionally reserves legacy inputs before inference and still publishes current Qwen targets. Check profile identity, local runtime and provider budget/availability before enabling. Canary offline acceptance, a large queued document reaching ready, content-free owner status, FTS/recall/export, failed-chunk requeue and target chunk subscription events. Actual main's 051-aware scalar workers can process document jobs singly on 052; this does not authorize pre-shadow workers after target cutover. Rollback should retain migration 052 and new workers until backlog drains. Disable only the document sub-gate to restore synchronous new document stores, retaining current main's shadow capture/repair requirements. Re-embedding skips active queue jobs; drain them with the worker before using reembed for repairs. No reauthentication, secret or permission changes. Sessions remain unchanged for #161.
+
+This document migration follows actual merged main e0d96d9 (PR158): shadow/versioned migrations 037–048, byte-identical ingestion migrations 049/050, and compatibility migration 051. Only the unapplied #160 document migration moves to 052. Existing applied migration history must never be renamed or rewritten.
+
 This is an operator procedure, not authorization to migrate a live database. No production migration, merge or deployment is part of implementation #157.
 
 ## Integration prerequisite
