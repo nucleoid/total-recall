@@ -125,6 +125,7 @@ test('reembed rejects oversized batches before inventory or inference', async ()
 test('rollback policy denial aborts a batch without per-row fallback', async () => {
   let selectCalls = 0, embeddingCalls = 0;
   const client = { async query(sql: string) {
+    if (/to_regclass\('public\.memory_ingestion_jobs'\)/i.test(sql)) return { rows: [{ present: false }] };
     if (/GROUP BY namespace/i.test(sql)) return { rows: [{ namespace: 'personal', count: '2' }] };
     if (/SELECT id, content, namespace/i.test(sql)) return { rows: selectCalls++ === 0 ? [
       { id: 'a', content: 'first', namespace: 'personal', updated_at: '2026-01-01 00:00:00+00', revision: 0 },
@@ -142,6 +143,7 @@ test('rollback policy denial aborts a batch without per-row fallback', async () 
 
 test('environment runner binds its embedder to the identity-checked write client', async () => {
   const client = { async connect() {}, async end() {}, async query(sql: string) {
+    if (/to_regclass\('public\.memory_ingestion_jobs'\)/i.test(sql)) return { rows: [{ present: false }] };
     if (/current_database\(\)/i.test(sql)) return { rows: [{ database: 'selected', user: 'owner', server: 'db:5432' }] };
     if (/SELECT count\(\*\)::text AS count FROM public\.memories/i.test(sql)) return { rows: [{ count: '0' }] };
     if (/GROUP BY namespace/i.test(sql)) return { rows: [] };
