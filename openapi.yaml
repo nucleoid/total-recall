@@ -464,7 +464,7 @@ paths:
         "400": { description: Invalid document UUID }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { description: Missing, inaccessible or no eligible live jobs }
+        "409": { description: "Missing, inaccessible or no eligible live jobs" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }

@@ -78,7 +78,7 @@ export async function documentIngestionState(client: ScopedClient, documentId: s
       COALESCE((SELECT jsonb_object_agg(failure_category,count) FROM (
         SELECT failure_category,COUNT(*)::int AS count FROM chunks WHERE failure_category IS NOT NULL GROUP BY failure_category
       ) categories),'{}'::jsonb) AS failure_categories FROM chunks`, [documentId])).rows[0];
-  return { document_id:documentId,...counts,state:counts.queued ? 'queued' : counts.failed || counts.cancelled ? 'embedding_failed' : 'ready' };
+  return { document_id:documentId,...counts,state:counts.ready===counts.chunk_count ? 'ready' : !counts.queued && counts.failed ? 'embedding_failed' : 'queued' };
 }
 
 /** Called under the patch transaction after locking jobs before memories. */
@@ -243,7 +243,7 @@ export async function claimIngestionJobs(scope: DbScope, options: { memoryId?: s
     }
     const token = randomUUID();
     const jobs = (await client.query(`WITH seed AS MATERIALIZED (
-      SELECT j.memory_id, CASE WHEN j.kind='document' THEN j.document_id END AS document_id FROM memory_ingestion_jobs j
+      SELECT j.memory_id, j.client_id, j.namespace, CASE WHEN j.kind='document' THEN j.document_id END AS document_id FROM memory_ingestion_jobs j
       WHERE ($1::uuid IS NULL OR j.memory_id = $1)
         AND ($5::uuid IS NULL OR j.document_id = $5)
         AND (($2 AND j.client_id = app_current_key_id()) OR NOT $2)
@@ -253,6 +253,7 @@ export async function claimIngestionJobs(scope: DbScope, options: { memoryId?: s
     ), candidate AS MATERIALIZED (
       SELECT j.memory_id FROM memory_ingestion_jobs j CROSS JOIN seed s
       WHERE (j.memory_id=s.memory_id OR ($1::uuid IS NULL AND s.document_id IS NOT NULL AND j.kind='document' AND j.document_id=s.document_id))
+        AND j.client_id=s.client_id AND j.namespace=s.namespace
         AND (($2 AND j.client_id=app_current_key_id()) OR NOT $2)
         AND ((j.status IN ('pending','retry_wait') AND j.next_attempt_at <= statement_timestamp())
           OR (j.status='processing' AND j.lease_expires_at < statement_timestamp()))
@@ -307,7 +308,7 @@ export function classifyIngestionFailure(error: unknown): { category: FailureCat
   // Error text can contain content, tokens and URLs. Never persist or emit it.
   return { category: 'transient', code: 'provider_unavailable', terminal: false };
 }
-export async function failIngestionJob(job: IngestionJob, error: unknown, batch?: { client: ScopedClient; now: Date; retries: Map<string, Date> }): Promise<void> {
+export async function failIngestionJob(job: IngestionJob, error: unknown, batch?: { client: ScopedClient; retry: Date }): Promise<void> {
   const failure = classifyIngestionFailure(error);
   const max = ingestionMaxAttempts();
   const budgetHandoff = job.inline && error instanceof Error && ['TimeoutError','AbortError'].includes(error.name);
@@ -316,10 +317,7 @@ export async function failIngestionJob(job: IngestionJob, error: unknown, batch?
   // Only the first consecutive contention failure gets a free short retry.
   const freeContention = contention && !job.inline && job.last_error_code !== 'db_contention';
   const terminal = !freeContention && !job.inline && (failure.terminal || (failure.category !== 'provider_auth' && job.attempts >= max));
-  const now = batch?.now ?? new Date();
-  const retryKey = `${failure.category}:${job.attempts}:${failure.retryAfter ?? ''}:${freeContention}:${budgetHandoff}`;
-  const retry = batch?.retries.get(retryKey) ?? (freeContention ? new Date(now.getTime() + 1000) : budgetHandoff ? now : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter, now));
-  batch?.retries.set(retryKey,retry);
+  const retry = batch?.retry ?? (freeContention ? new Date(Date.now() + 1000) : budgetHandoff ? new Date() : retryAtForAttempt(failure.category === 'provider_auth' ? 5 : Math.max(1, job.attempts), failure.retryAfter));
   const update = (client: ScopedClient) => client.query(`UPDATE memory_ingestion_jobs SET
     status = $3, failure_category = $4, last_error_code = $5,
     attempts = CASE WHEN $9::boolean THEN GREATEST(0, attempts - 1) ELSE attempts END,
@@ -333,11 +331,12 @@ export async function failIngestionJob(job: IngestionJob, error: unknown, batch?
 
 export async function failIngestionBatch(jobs: IngestionJob[], error: unknown): Promise<void> {
   if (!jobs.length) return;
-  const now = new Date();
-  const retries = new Map<string, Date>();
+  const failure=classifyIngestionFailure(error);
+  const freeContention=failure.code==='db_contention' && jobs.every(job => !job.inline && job.last_error_code!=='db_contention');
+  const retry=freeContention ? new Date(Date.now()+1000) : retryAtForAttempt(failure.category==='provider_auth' ? 5 : Math.max(1,...jobs.map(job => job.attempts)),failure.retryAfter);
   await withScopedClient(ownerScope(jobs[0]), async client => {
     await client.query('SELECT memory_id FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[]) ORDER BY memory_id FOR UPDATE', [jobs.map(job => job.memory_id)]);
-    for (const job of jobs) await failIngestionJob(job, error, { client, now, retries });
+    for (const job of jobs) await failIngestionJob(job, error, { client, retry });
   });
 }
 

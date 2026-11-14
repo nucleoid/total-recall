@@ -11,10 +11,10 @@ import { ContextService } from './context.js';
 import { MyLifeProvider } from './my-life.js';
 
 const PASSTHROUGH=new Set(['memory_search','memory_recall','memory_store','memory_update','memory_store_document',
-  'memory_store_session','memory_session_status','memory_list','memory_list_namespaces','memory_stats','memory_forget',
+  'memory_store_session','memory_session_status','memory_document_status','memory_list','memory_list_namespaces','memory_stats','memory_forget',
   'memory_export','memory_import','memory_graph','media_search','agent_register','agent_list',
   'agent_subscribe','agent_list_subscriptions','agent_unsubscribe']);
-const READ_ONLY=new Set(['memory_search','memory_recall','memory_session_status','memory_list','memory_list_namespaces',
+const READ_ONLY=new Set(['memory_search','memory_recall','memory_session_status','memory_document_status','memory_list','memory_list_namespaces',
   'memory_stats','memory_export','memory_graph','media_search','agent_list','agent_list_subscriptions']);
 export interface MemoryUpstream {
   list():Promise<Tool[]>;call(name:string,args:Record<string,unknown>):Promise<any>;close():Promise<void>;

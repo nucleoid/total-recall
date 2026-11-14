@@ -15,6 +15,7 @@ export async function memoryDocumentStatus(input: z.infer<typeof documentStatusS
   checkPermission(auth,'read');
   return withScopedClient(dbScopeFromAuth(auth), async client => {
     const document = await client.query(`SELECT d.id FROM documents d WHERE d.id=$1 AND d.client_id=$2::uuid
+      AND ${accessLevelSql('d.access_level','$3')}
       AND NOT EXISTS (SELECT 1 FROM memories m WHERE m.document_id=d.id AND NOT (${accessLevelSql('m.access_level','$3')}))`,
     [params.document_id,auth.keyId,auth.maxAccessLevel]);
     if (!document.rows.length) throw new DocumentNotFoundError();

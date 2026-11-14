@@ -33,6 +33,14 @@ test('memory patch and read schemas include queued update ingestion metadata', a
   assert.equal(api.components.schemas.Memory.properties.ingestion.$ref, '#/components/schemas/IngestionStatus');
   assert.ok(api.components.schemas.IngestionStatus.properties.state.enum.includes('queued'));
 });
+test('document state, owner status and scoped requeue are published', async () => {
+  const api = await document();
+  assert.equal(api.components.schemas.StoreDocumentResponse.properties.state.$ref,'#/components/schemas/DocumentState');
+  assert.deepEqual(api.components.schemas.DocumentState.enum,['ready','queued','embedding_failed']);
+  assert.ok(api.paths['/api/documents/{id}/status'].get);
+  assert.ok(api.paths['/api/ingestion/documents/{id}/requeue'].post);
+  assert.equal(api.components.schemas.DocumentStatus.properties.content,undefined);
+});
 
 test('OpenAPI 3.1 document validates and has unique stable operation IDs', async () => {
   const file = fileURLToPath(new URL('../openapi.yaml', import.meta.url));

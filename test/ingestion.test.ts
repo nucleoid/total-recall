@@ -46,7 +46,7 @@ test('durable acknowledgement survives a failure to record an inline provider fa
   setPoolForTesting({ connect:async () => {
     if (++connects===3) throw new Error('private failure-update detail');
     return { release() {},query:async (sql:string) => {
-      const rows = sql.includes('WITH candidate AS') ? [job] : sql.includes('SELECT 1 FROM memory_ingestion_jobs') ? [{}] :
+      const rows = sql.includes('WITH seed AS') ? [job] : sql.includes('SELECT 1 FROM memory_ingestion_jobs') ? [{}] :
         sql.includes('FROM memories WHERE') ? [{ content:'retained',embedding:null,expires_at:null,expired:false }] : [];
       return { rows,rowCount:rows.length };
     } };
