@@ -173,8 +173,9 @@ test('queued content updates on isolated PostgreSQL preserve durable content and
   });
   await t.test('ACL and private job ownership permit another authorized namespace writer', async () => {
     const id = await create('shared old'); await memoryUpdate({ id, content: 'shared new' }, other);
-    assert.equal((await job(id)).client_id, otherId); assert.equal((await finalizeIngestionJob(await claim(id, other), embedding))?.state, 'ready');
-    assert.equal((await withScopedClient(dbScopeFromAuth(auth), c => c.query('SELECT * FROM memory_ingestion_jobs WHERE memory_id=$1', [id]))).rows.length, 0);
+    assert.equal((await job(id)).client_id, ownerId); assert.equal(await claimIngestionJob(dbScopeFromAuth(other), { memoryId: id, inline: true }), null);
+    assert.equal((await finalizeIngestionJob(await claim(id), embedding))?.state, 'ready');
+    assert.equal((await withScopedClient(dbScopeFromAuth(other), c => c.query('SELECT * FROM memory_ingestion_jobs WHERE memory_id=$1', [id]))).rows.length, 0);
     for (const actor of [{ ...auth, namespaces: ['private'] }, { ...auth, permissions: ['read'] }]) await assert.rejects(memoryUpdate({ id, content: 'denied' }, actor));
     await owner!.query("UPDATE memories SET access_level='secret' WHERE id=$1", [id]);
     await assert.rejects(memoryUpdate({ id, content: 'denied' }, { ...auth, maxAccessLevel: 'normal' }));

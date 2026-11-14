@@ -329,7 +329,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     // The current locked job/lease is the content generation fence, including ABA.
     // Public revision also tracks metadata and lifecycle edits, which do not
     // invalidate an update's historical vector or reset its durable job.
-    if (memory.content !== job.content || memory.access_level !== job.access_level ||
+    if (memory.content !== job.content || (memory.access_level ?? 'normal') !== job.access_level ||
         (job.kind !== 'update' && (memory.superseded_at || memory.consolidated_into_id))) {
       await finishJob(client, job, 'cancelled'); return null;
     }
@@ -380,7 +380,7 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     }
     if (!revised) requireMemoryUpdate(await client.query(`UPDATE memories SET embedding = $2::vector, embedding_provider = $3,
       embedding_model = $4, embedding_dimensions = $5${job.kind === 'update' ? '' : ', updated_at = statement_timestamp()'} WHERE id = $1
-        AND embedding IS NULL AND content = $6 AND namespace = $7 AND access_level = $8
+        AND embedding IS NULL AND content = $6 AND namespace = $7 AND COALESCE(access_level, 'normal') = $8
         AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())`,
     [job.memory_id, vector, embedding.provider, embedding.model, embedding.dimensions, job.content, job.namespace, job.access_level]));
     await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', creation_pending = false, ready_at = statement_timestamp(),

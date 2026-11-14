@@ -12,7 +12,9 @@ const id = '00000000-0000-4000-8000-000000000001';
 test('dashboard update announces ready or queued from returned ingestion state', async () => {
   const app = await readFile(new URL('../dashboard/app.ts', import.meta.url), 'utf8');
   assert.match(app, /const state = response.memory.ingestion\?\.state/);
-  assert.match(app, /state && state !== 'ready'[\s\S]*Memory updated; embedding queued\.[\s\S]*Memory updated; embedding ready\./);
+  assert.match(app, /state === 'queued'[\s\S]*Memory updated; embedding queued\./);
+  assert.match(app, /state === 'embedding_failed'[\s\S]*Memory updated; embedding failed\./);
+  assert.match(app, /state === 'cancelled'[\s\S]*Memory updated; embedding cancelled\./);
 });
 
 test('memory browsing query contract validates filters, deterministic sorting, and bounds', () => {

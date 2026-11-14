@@ -27,18 +27,19 @@ BEGIN
     (memory_id, namespace, client_id, access_level, allowed_namespaces, agent_id, session_id,
      source_key, dedupe, contradiction_eligible, embedding_provider, embedding_model,
      embedding_dimensions, kind, source_revision, memory_created, creation_pending, lease_token)
-  SELECT m.id, m.namespace, public.app_current_key_id(), m.access_level, ARRAY[m.namespace],
+  SELECT m.id, m.namespace, m.client_id, COALESCE(m.access_level, 'normal'), ARRAY[m.namespace],
     m.agent_id, m.session_id, m.source_key, false, false, p_provider, p_model, p_dimensions,
     'update', m.revision, false, false, gen_random_uuid()
   FROM public.memories m JOIN public.api_keys k ON k.id::text = public.app_current_key_id()
   WHERE m.id = p_id AND m.namespace = ANY(public.app_allowed_namespaces())
     AND m.namespace = ANY(k.namespaces) AND 'write' = ANY(k.permissions)
     AND k.enabled AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())
-    AND (m.access_level = 'normal' OR k.max_access_level = 'secret' OR (m.access_level = 'sensitive' AND k.max_access_level = 'sensitive'))
+    AND (COALESCE(m.access_level, 'normal') = 'normal' OR k.max_access_level = 'secret' OR (m.access_level = 'sensitive' AND k.max_access_level = 'sensitive'))
     AND m.embedding IS NULL AND m.deleted_at IS NULL AND m.superseded_at IS NULL
     AND m.consolidated_into_id IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
   ON CONFLICT (memory_id) DO UPDATE SET
-    namespace = EXCLUDED.namespace, client_id = EXCLUDED.client_id, access_level = EXCLUDED.access_level,
+    -- Preserve the creator's keyed-store ownership and job-before-memory lock.
+    namespace = EXCLUDED.namespace, access_level = EXCLUDED.access_level,
     allowed_namespaces = EXCLUDED.allowed_namespaces, agent_id = EXCLUDED.agent_id, session_id = EXCLUDED.session_id,
     source_key = EXCLUDED.source_key, dedupe = false, contradiction_eligible = false, ttl_seconds = NULL,
     embedding_provider = EXCLUDED.embedding_provider, embedding_model = EXCLUDED.embedding_model,
