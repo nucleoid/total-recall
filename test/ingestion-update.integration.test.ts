@@ -239,4 +239,47 @@ test('queued content updates on isolated PostgreSQL preserve durable content and
     assert.deepEqual(await row(id), before);
     assert.equal((await owner!.query("SELECT count(*)::int AS n FROM audit_log WHERE memory_id=$1 AND action='memory.update'", [id])).rows[0].n, audits);
   });
+  await t.test('a cross-key edit preserves the creator keyed-store retry and job-before-memory order', async () => {
+    const store = (content: string) => acceptMemory({ content, namespace: 'shared', access_level: 'normal', tags: [], metadata: {}, dedupe: false, idempotency_key: 'cross-key-retry' }, auth, agent);
+    const accepted = await store('key original'); await finalizeIngestionJob(await claim(accepted.id), embedding);
+    await memoryUpdate({ id: accepted.id, content: 'key edited by other' }, other);
+    const retry = await store('key original'); assert.equal(retry.id, accepted.id); assert.equal(retry.state, 'queued');
+    await memoryUpdate({ id: accepted.id, content: 'other again' }, other);
+    let reached!: () => void; let release!: () => void;
+    const locked = new Promise<void>(resolve => { reached = resolve; }); const resume = new Promise<void>(resolve => { release = resolve; });
+    let held = false;
+    setPoolForTesting({ connect: async () => {
+      const client = await pool!.connect(); return { release: (error?: Error) => client.release(error), query: async (sql: string, values?: unknown[]) => {
+        const result = await client.query(sql, values);
+        if (!held && sql.includes('WHERE j.client_id = $1 AND j.source_key = $2 FOR UPDATE')) { held = true; reached(); await resume; }
+        return result;
+      } };
+    } } as unknown as pg.Pool);
+    const storing = store('key concurrent'); let editing: Promise<unknown> | undefined;
+    try {
+      await locked; editing = memoryUpdate({ id: accepted.id, content: 'other concurrent' }, other);
+      await new Promise(resolve => setTimeout(resolve, 100)); release();
+      await Promise.all([storing, editing]);
+    } finally { release(); await Promise.allSettled([storing, ...(editing ? [editing] : [])]); setPoolForTesting(pool!); }
+    assert.equal((await row(accepted.id)).content, 'other concurrent');
+    assert.equal((await job(accepted.id)).client_id, ownerId);
+    await finalizeIngestionJob(await claim(accepted.id), embedding);
+  });
+  await t.test('a keyed synchronous memory with no original job remains retryable after a cross-key edit', async () => {
+    const id = await create('legacy keyed');
+    const sourceKey = `discord-safe:v1:${(await import('node:crypto')).createHash('sha256').update(ownerId).update('\0').update('legacy-keyed').digest('hex')}`;
+    await owner!.query('UPDATE memories SET source_key=$2 WHERE id=$1; ', [id, sourceKey]);
+    // Owner setup represents a pre-queue synchronous store, with no queue row.
+    await owner!.query('DELETE FROM memory_ingestion_jobs WHERE memory_id=$1', [id]);
+    await memoryUpdate({ id, content: 'legacy keyed edited' }, other);
+    const retry = await acceptMemory({ content: 'legacy keyed retry', namespace: 'shared', access_level: 'normal', tags: [], metadata: {}, idempotency_key: 'legacy-keyed' }, auth, agent);
+    assert.equal(retry.id, id); assert.equal((await job(id)).client_id, ownerId);
+  });
+  await t.test('nullable legacy access is normal for acceptance and embedding completion', async () => {
+    const id = await create('nullable access'); await owner!.query('UPDATE memories SET access_level=NULL WHERE id=$1', [id]);
+    const result = await memoryUpdate({ id, content: 'nullable revised' }, { ...auth, maxAccessLevel: 'normal' });
+    assert.equal(result.ingestion?.state, 'queued'); assert.equal((await job(id)).access_level, 'normal');
+    assert.equal((await finalizeIngestionJob(await claim(id), embedding))?.state, 'ready');
+    assert.equal((await row(id)).access_level, null);
+  });
 });
