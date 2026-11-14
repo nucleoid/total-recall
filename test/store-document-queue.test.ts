@@ -268,4 +268,69 @@ test('document queue acceptance and batching on disposable PostgreSQL', { timeou
     assert.equal((await status(doc.document_id)).failed,1);
     assert.deepEqual(await requeueDocument(doc.document_id,admin),{ requeued:1 });
   });
+  await t.test('one poison chunk is durably isolated without failing healthy siblings and requeue retries only it', async () => {
+    await reset(); process.env.MEMORY_INGESTION_DOCUMENT_ENABLED='true';
+    const input=params(16); input.content=input.content.slice(0,14000)+'poison'+input.content.slice(14006);
+    const doc=await memoryStoreDocument(input,auth); const calls:number[]=[];
+    globalThis.fetch=async (_,options) => {
+      const body=JSON.parse(String(options?.body)); const texts=body.requests.map((item:any) => item.content.parts[0].text as string);
+      calls.push(texts.length);
+      if (texts.some((text:string) => text.includes('poison'))) return new Response('rejected',{ status:400 });
+      return new Response(JSON.stringify({ embeddings:texts.map(() => ({ values:vector })) }));
+    };
+    await processIngestionBatch(await claim(doc.document_id));
+    const isolated=(await owner!.query('SELECT status,last_error_code,attempts FROM memory_ingestion_jobs WHERE document_id=$1',[doc.document_id])).rows;
+    assert.ok(isolated.every(job => job.status==='pending' && job.last_error_code==='batch_input_rejected' && job.attempts===0));
+    process.env.INGESTION_WORKER_API_KEY='tr_document-admin';
+    await runIngestionWorker({ once:true,maxJobs:16,pollMs:100,concurrency:1,batchSize:16 },new AbortController().signal);
+    const summary=await status(doc.document_id); assert.equal(summary.ready,15); assert.equal(summary.failed,1); assert.equal(summary.queued,0);
+    assert.deepEqual(calls,[16,...Array(16).fill(1)]); await invariant(doc.document_id);
+    assert.deepEqual(await requeueDocument(doc.document_id,admin),{ requeued:1 });
+    globalThis.fetch=async (_,options) => {
+      const body=JSON.parse(String(options?.body)); assert.equal(body.requests.length,1);
+      return new Response(JSON.stringify({ embeddings:[{ values:vector }] }));
+    };
+    await runIngestionWorker({ once:true,maxJobs:16,pollMs:100,concurrency:1,batchSize:16 },new AbortController().signal);
+    assert.equal((await status(doc.document_id)).state,'ready');
+  });
+  await t.test('superseded pending chunks cancel at claim without poisoning ready siblings', async () => {
+    await reset(); process.env.MEMORY_INGESTION_DOCUMENT_ENABLED='true'; const doc=await memoryStoreDocument(params(3),auth), successor=await memoryStoreDocument(params(1),auth);
+    const chunks=await memoryRecall({ document_id:doc.document_id },auth);
+    const target=(await memoryRecall({ document_id:successor.document_id },auth))[0];
+    await memoryUpdate({ id:target.id,supersedes:chunks[0].id },auth);
+    const jobs=await claim(doc.document_id); assert.equal(jobs.length,2);
+    await finalizeIngestionBatch(jobs,results(2));
+    const summary=await status(doc.document_id); assert.equal(summary.ready,2); assert.equal(summary.cancelled,1); assert.equal(summary.queued,0);
+    await invariant(doc.document_id);
+  });
+  await t.test('supersession after batch claim cancels only that generation and releases siblings with no partial vectors', async () => {
+    await reset(); process.env.MEMORY_INGESTION_DOCUMENT_ENABLED='true'; const doc=await memoryStoreDocument(params(3),auth), successor=await memoryStoreDocument(params(1),auth);
+    const jobs=await claim(doc.document_id);
+    const target=(await memoryRecall({ document_id:successor.document_id },auth))[0];
+    await memoryUpdate({ id:target.id,supersedes:jobs[0].memory_id },auth);
+    assert.equal(await finalizeIngestionBatch(jobs,results(3)),false);
+    const states=(await owner!.query('SELECT * FROM memory_ingestion_jobs WHERE document_id=$1 ORDER BY chunk_index',[doc.document_id])).rows;
+    assert.equal(states[0].status,'cancelled');
+    assert.ok(states.slice(1).every(job => job.status==='pending' && job.attempts===0 && !job.lease_token));
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM memories WHERE document_id=$1 AND embedding IS NOT NULL',[doc.document_id])).rows[0].n,0);
+    const remaining=await claim(doc.document_id); assert.equal(remaining.length,2);
+    await finalizeIngestionBatch(remaining,results(2)); assert.equal((await status(doc.document_id)).ready,2);
+  });
+  await t.test('a replaced generation cannot strand sibling leases or be reset by its stale batch', async () => {
+    await reset(); process.env.MEMORY_INGESTION_DOCUMENT_ENABLED='true'; process.env.MEMORY_INGESTION_UPDATE_ENABLED='true';
+    const doc=await memoryStoreDocument(params(3),auth); const jobs=await claim(doc.document_id);
+    await memoryUpdate({ id:jobs[0].memory_id,content:'new chunk generation' },auth);
+    const replacement=(await owner!.query('SELECT * FROM memory_ingestion_jobs WHERE memory_id=$1',[jobs[0].memory_id])).rows[0];
+    assert.equal(await finalizeIngestionBatch(jobs,results(3)),false);
+    assert.deepEqual((await owner!.query('SELECT * FROM memory_ingestion_jobs WHERE memory_id=$1',[jobs[0].memory_id])).rows[0],replacement);
+    const siblings=(await owner!.query('SELECT * FROM memory_ingestion_jobs WHERE document_id=$1 AND memory_id<>$2',[doc.document_id,jobs[0].memory_id])).rows;
+    assert.ok(siblings.every(job => job.status==='pending' && job.attempts===0 && !job.lease_token));
+    globalThis.fetch=async (_,options) => {
+      const body=JSON.parse(String(options?.body));
+      return new Response(JSON.stringify(body.requests ? { embeddings:body.requests.map(() => ({ values:vector })) } : { embedding:{ values:vector } }));
+    };
+    process.env.INGESTION_WORKER_API_KEY='tr_document-admin';
+    await runIngestionWorker({ once:true,maxJobs:3,pollMs:100,concurrency:1,batchSize:16 },new AbortController().signal);
+    assert.equal((await status(doc.document_id)).state,'ready');
+  });
 });
