@@ -3,7 +3,7 @@ import test from 'node:test';
 import {Readable} from 'node:stream';
 import {randomUUID} from 'node:crypto';
 import {protocolLines,recordSchema,manifestSchema,completeSchema,REQUIRED_EXCLUSIONS,digest,recordKey,type SyncRecord,type SyncManifest} from '../src/archive/sync-format.js';
-import {parseSyncArgs,embeddingRanges,safeFailureDetails,createEmbeddingPacer,createEmbeddingFailureBudget} from '../src/archive/sync-cli.js';
+import {parseSyncArgs,embeddingRanges,safeFailureDetails,safeCliFailure,createEmbeddingPacer,createEmbeddingFailureBudget} from '../src/archive/sync-cli.js';
 import {searchNamespaces} from '../src/tools/search.js';
 
 export const fixtureRecord=(id='one',content='Synthetic historical evidence'):SyncRecord=>({
@@ -62,6 +62,12 @@ test('failure diagnostics retain codes without exposing provider responses or da
   assert.deepEqual(safeFailureDetails(Object.assign(new Error('private source text'),{code:'23514',detail:'DO_NOT_LOG'})),{database_code:'23514'});
   assert.deepEqual(safeFailureDetails(new Error('unclassified private response')),{});
   assert.deepEqual(safeFailureDetails('DO_NOT_LOG'),{});
+  assert.deepEqual(safeCliFailure(Object.assign(new Error('private SQL statement'),{code:'57014',detail:'DO_NOT_LOG'})),
+    {event:'archive_sync.failed',database_code:'57014'});
+  assert.deepEqual(safeCliFailure(new Error('archive_sync.membership_mismatch')),
+    {event:'archive_sync.membership_mismatch'});
+  assert.equal(JSON.stringify(safeCliFailure(Object.assign(new Error('PRIVATE'),{code:'XX000',query:'DO_NOT_LOG'}))).includes('PRIVATE'),false);
+  assert.equal(JSON.stringify(safeCliFailure(Object.assign(new Error('PRIVATE'),{code:'XX000',query:'DO_NOT_LOG'}))).includes('DO_NOT_LOG'),false);
 });
 
 test('shared pacer spaces concurrent requests and applies one slowdown per throttled burst',async()=>{

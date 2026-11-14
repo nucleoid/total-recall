@@ -106,7 +106,7 @@ export interface SearchRankingConfig {
 export interface SearchQueryVector {
   profile: {
     name: string;
-    provider: 'gemini' | 'ollama';
+    provider: 'gemini' | 'ollama' | 'llama.cpp';
     model: string;
     dimensions: 768;
   };

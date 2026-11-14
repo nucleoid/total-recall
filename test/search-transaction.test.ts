@@ -26,6 +26,10 @@ class FakeClient {
   ): Promise<pg.QueryResult<T>> {
     this.calls.push({ text, params });
 
+    if (text.includes("to_regclass('public.embedding_serving_settings')")) {
+      return result([{ serving_table: null } as unknown as T]);
+    }
+
     if (text.includes('FROM pg_attribute') && text.includes('belief_schema')) {
       return result([this.capabilities as unknown as T]);
     }
@@ -113,22 +117,33 @@ test('hybridSearch sets local HNSW inside the scoped transaction before search a
     [
       "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
+      'SET TRANSACTION READ ONLY',
+      "SELECT set_config('app.allowed_namespaces', $1, true)",
+      "SELECT set_config('app.current_key_id', $1, true)",
+      "SELECT set_config('app.current_key_is_admin', $1, true)",
+      'SERVING CATALOG',
+      'COMMIT',
+      "SELECT set_config('app.allowed_namespaces', '', false)",
+      'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",
       "SELECT set_config('app.current_key_is_admin', $1, true)",
       "SELECT set_config('hnsw.ef_search', $1, true)",
       'SCHEMA',
+      'SERVING CATALOG',
+      'SERVING LOCK',
+      'SERVING CATALOG',
       'SEARCH',
       'UPDATE memories',
       "SELECT to_regclass('public.memory_ingestion_jobs') IS NOT NULL AS present",
       'COMMIT',
     ]
   );
-  assert.deepEqual(client.calls[5].params, ['321']);
-  assert.match(client.calls[7].text, /m\.expires_at IS NULL OR m\.expires_at > statement_timestamp\(\)/);
-  assert.match(client.calls[7].text, /r\.expires_at/);
-  assert.match(client.calls[8].text, /expires_at IS NULL OR expires_at > statement_timestamp\(\)/);
-  assert.deepEqual(client.calls[8].params, [['memory-1']]);
+  assert.deepEqual(client.calls[13].params, ['321']);
+  assert.match(client.calls[18].text, /m\.expires_at IS NULL OR m\.expires_at > statement_timestamp\(\)/);
+  assert.match(client.calls[18].text, /r\.expires_at/);
+  assert.match(client.calls[19].text, /expires_at IS NULL OR expires_at > statement_timestamp\(\)/);
+  assert.deepEqual(client.calls[19].params, [['memory-1']]);
   assert.deepEqual(client.releaseArgs, []);
 });
 
@@ -171,11 +186,22 @@ test('hybridSearch commits empty result searches without an access-count update'
     [
       "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
+      'SET TRANSACTION READ ONLY',
+      "SELECT set_config('app.allowed_namespaces', $1, true)",
+      "SELECT set_config('app.current_key_id', $1, true)",
+      "SELECT set_config('app.current_key_is_admin', $1, true)",
+      'SERVING CATALOG',
+      'COMMIT',
+      "SELECT set_config('app.allowed_namespaces', '', false)",
+      'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",
       "SELECT set_config('app.current_key_is_admin', $1, true)",
       "SELECT set_config('hnsw.ef_search', $1, true)",
       'SCHEMA',
+      'SERVING CATALOG',
+      'SERVING LOCK',
+      'SERVING CATALOG',
       'SEARCH',
       'COMMIT',
     ]
@@ -204,11 +230,22 @@ test('hybridSearch rolls back and releases when search or update fails', async (
     [
       "SELECT set_config('app.allowed_namespaces', '', false)",
       'BEGIN',
+      'SET TRANSACTION READ ONLY',
+      "SELECT set_config('app.allowed_namespaces', $1, true)",
+      "SELECT set_config('app.current_key_id', $1, true)",
+      "SELECT set_config('app.current_key_is_admin', $1, true)",
+      'SERVING CATALOG',
+      'COMMIT',
+      "SELECT set_config('app.allowed_namespaces', '', false)",
+      'BEGIN',
       "SELECT set_config('app.allowed_namespaces', $1, true)",
       "SELECT set_config('app.current_key_id', $1, true)",
       "SELECT set_config('app.current_key_is_admin', $1, true)",
       "SELECT set_config('hnsw.ef_search', $1, true)",
       'SCHEMA',
+      'SERVING CATALOG',
+      'SERVING LOCK',
+      'SERVING CATALOG',
       'SEARCH',
       'UPDATE memories',
       'ROLLBACK',
@@ -353,6 +390,8 @@ function assertContiguousParameters(call: QueryCall): void {
 }
 
 function summarize(sql: string): string {
+  if (sql.includes('pg_advisory_xact_lock_shared')) return 'SERVING LOCK';
+  if (sql.includes("to_regclass('public.embedding_serving_settings')")) return 'SERVING CATALOG';
   if (sql.includes('FROM pg_attribute') && sql.includes('belief_schema')) return 'SCHEMA';
   if (sql.includes('WITH vector_results')) return 'SEARCH';
   if (sql.startsWith('UPDATE memories')) return 'UPDATE memories';

@@ -108,6 +108,7 @@ const MIGRATION_OWNED_TABLES = [
   'api_keys',
   'api_key_daily_usage',
   'api_key_minute_usage',
+  'archive_sync_snapshot_memberships',
   'audit_log',
   'connector_credentials',
   'connector_sync_state',

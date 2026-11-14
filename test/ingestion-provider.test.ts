@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import type pg from 'pg';
+import { setPoolForTesting } from '../src/db.js';
 import { embedWithProfile } from '../src/embedding.js';
 
 test('provider failures retain typed HTTP status and Retry-After without response content', async t => {
+  setPoolForTesting({ query: async () => ({ rows: [] }) } as unknown as pg.Pool);
+  t.after(() => setPoolForTesting(null));
   t.mock.method(globalThis, 'fetch', async () => new Response('private-provider-payload', {
     status: 429, headers: { 'Retry-After': '123' },
   }));

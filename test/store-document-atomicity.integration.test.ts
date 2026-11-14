@@ -206,7 +206,11 @@ class FakePool {
     return client;
   }
 
-  async query(): Promise<never> {
+  async query(text: string, params: unknown[] = []) {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (normalized === "SELECT to_regclass('public.embedding_serving_settings')::text AS serving_table, to_regprocedure('public.reserve_embedding_rollback_inputs(integer)')::text AS reservation_function" && params.length === 0) {
+      return { command: 'SELECT', rowCount: 1, oid: 0, fields: [], rows: [{ serving_table: null, reservation_function: null }] };
+    }
     this.queryCalls += 1;
     throw new Error('store_document must not use pool-level query');
   }

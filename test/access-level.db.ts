@@ -241,6 +241,7 @@ try {
       tags: [],
       metadata: {},
       access_level: 'secret',
+      dedupe: true,
     }, auth('normal')),
     /Access level denied/
   );

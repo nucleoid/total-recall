@@ -977,7 +977,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     assert.ok((await owner!.query('SELECT superseded_at FROM memories WHERE id=$1',[previous.id])).rows[0].superseded_at);
     assert.equal((await owner!.query('SELECT access_count FROM memories WHERE id=$1',[canonical.id])).rows[0].access_count,0);
   });
-  await t.test('migration 037 bounds table lock waits and rolls back before a safe retry', async () => {
+  await t.test('migration 049 bounds table lock waits and rolls back before a safe retry', async () => {
     await owner!.query('CREATE DATABASE ingestion_lock_test');
     const lockUrl=new URL(url);lockUrl.pathname='/ingestion_lock_test';
     const migrator=new pg.Client({connectionString:lockUrl.href});const locker=new pg.Client({connectionString:lockUrl.href});
@@ -986,7 +986,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       await migrator.query('CREATE EXTENSION vector');
       await provisionDatabase(migrator,{appPassword:'app-test-only',rotateAppPassword:false});
       const inventory=loadMigrationInventory(fileURLToPath(new URL('../migrations',import.meta.url)));
-      await runMigrations(migrator,inventory,{throughNumber:36,lockTimeoutMs:5000});
+      await runMigrations(migrator,inventory,{throughNumber:47,lockTimeoutMs:5000});
       await migrator.query("SET statement_timeout = '8s'");
       await locker.query('BEGIN; LOCK TABLE memories IN ROW EXCLUSIVE MODE');
       const started=Date.now();
@@ -994,9 +994,9 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       finally {await locker.query('ROLLBACK');}
       assert.ok(Date.now()-started<10000,'DDL acquisition must be bounded independently of the advisory migration lock');
       assert.equal((await migrator.query("SELECT to_regclass('public.memory_ingestion_jobs') AS jobs")).rows[0].jobs,null);
-      assert.equal((await migrator.query("SELECT count(*)::int AS n FROM schema_migrations WHERE version='037_memory_ingestion_queue'")).rows[0].n,0);
+      assert.equal((await migrator.query("SELECT count(*)::int AS n FROM schema_migrations WHERE version='049_memory_ingestion_queue'")).rows[0].n,0);
       await runMigrations(migrator,inventory,{lockTimeoutMs:5000});
-      assert.equal((await migrator.query("SELECT count(*)::int AS n FROM schema_migrations WHERE version='037_memory_ingestion_queue'")).rows[0].n,1);
+      assert.equal((await migrator.query("SELECT count(*)::int AS n FROM schema_migrations WHERE version='049_memory_ingestion_queue'")).rows[0].n,1);
     } finally {await locker.end();await migrator.end();await owner!.query('DROP DATABASE ingestion_lock_test');}
   });
   await t.test('HTTP inline budget is independent of provider timeout and happy path remains ready', async () => {
@@ -1040,4 +1040,3 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     const stats = await request(app).get('/api/ingestion/stats').set('Authorization','Bearer tr_worker'); assert.equal(stats.status,200);
   });
 });
-

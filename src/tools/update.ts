@@ -1,3 +1,5 @@
+import { prepareLocalDocument, publishPreparedLocalDocument, type PreparedLocalDocument } from '../local-embedding-consumers.js';
+import { ACTIVE_EMBEDDING_PROFILE } from '../embedding.js';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { accessLevelSql } from '../auth.js';
@@ -125,10 +127,14 @@ export async function memoryUpdate(input: unknown, auth: AuthContext, expectedUp
   let initial: UpdateRow | undefined;
   let vector: string | undefined;
   let descriptor: unknown[] | undefined;
+  let localPrepared: PreparedLocalDocument | undefined;
   if (!queued && params.content !== undefined) {
     initial = await readCurrentTarget(params.id, auth);
     if (params.content !== initial.content) {
-      const embedding = await embedWithProfile(params.content);
+      localPrepared = await prepareLocalDocument(params.content);
+      const embedding = localPrepared && ACTIVE_EMBEDDING_PROFILE.provider === 'llama.cpp'
+        ? { vector: localPrepared.vectors[0], ...ACTIVE_EMBEDDING_PROFILE }
+        : await embedWithProfile(params.content);
       vector = serializeEmbeddingVector(embedding.vector);
       descriptor = [embedding.provider, embedding.model, embedding.dimensions];
     }
@@ -235,10 +241,15 @@ export async function memoryUpdate(input: unknown, auth: AuthContext, expectedUp
           `UPDATE memories SET ${assignments.join(', ')} WHERE id = $${values.length}::uuid
              AND (expires_at IS NULL OR expires_at > statement_timestamp())
              AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
-             AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'`,
+             AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'${localPrepared ? `
+             RETURNING (valid_from IS NULL OR valid_from<=statement_timestamp())
+               AND (valid_to IS NULL OR valid_to>statement_timestamp()) AS local_index_eligible` : ''}`,
           values,
         );
         if (queued && patched.rowCount !== 1) throw new MemoryConflictError('Memory changed while its patch was being committed');
+        if (!queued && contentChanged && localPrepared && patched.rows[0]?.local_index_eligible) {
+          await publishPreparedLocalDocument(client, target.id, localPrepared, { update: true });
+        }
         if (queued && contentChanged) acceptedAt = await enqueueReembed(client, target.id);
       }
 

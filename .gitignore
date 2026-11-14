@@ -13,3 +13,9 @@ __pycache__/
 eval/private/
 *.eval-report.json
 *.eval-baseline.json
+# Local re-embedding verification and private operational receipts.
+/.reembedding/
+/.local/verification/
+/reembedding-test-output.log
+/reembedding-verification.tar
+/docs/local-reembedding-execution.md

@@ -47,6 +47,6 @@ test('baseline comparison reports every incompatible dimension', () => {
     execution: { as_of: 'a', ef_search: 200, ranking_hash: 'r', config_hash: 'c' },
   } as EvaluationReport;
   const changed = structuredClone(report);
-  changed.dataset.hash = 'b'; changed.embedding.model = 'other'; changed.execution.as_of = 'b'; changed.execution.ef_search = 300;
-  assert.deepEqual(baselineMismatches(report, changed), ['dataset hash', 'as_of', 'ef_search', 'embedding model']);
+  changed.dataset.hash = 'b'; changed.embedding.model = 'other'; changed.embedding.profile='other-profile';changed.execution.as_of = 'b'; changed.execution.ef_search = 300;
+  assert.deepEqual(baselineMismatches(report, changed), ['dataset hash', 'as_of', 'ef_search', 'embedding model','embedding profile']);
 });

@@ -66,7 +66,15 @@ class FakePool {
       throw new Error(`Unexpected SQL: ${sql}`);
     }, release() {} };
   }
-  async query(): Promise<never> { throw new Error('must use scoped client'); }
+  async query(text: string, params: unknown[] = []) {
+    const sql = text.replace(/\s+/g, ' ').trim();
+    const capabilityDiscovery = "SELECT to_regclass('public.embedding_serving_settings')::text AS serving_table, to_regprocedure('public.reserve_embedding_rollback_inputs(integer)')::text AS reservation_function";
+    if (sql === capabilityDiscovery && params.length === 0) {
+      this.sql.push(sql);
+      return result([{ serving_table: null, reservation_function: null }], 'SELECT');
+    }
+    throw new Error('must use scoped client');
+  }
 }
 function result(rows: any[], command = 'MOCK') { return { command, rowCount: rows.length, oid: 0, fields: [], rows }; }
 function sourceKey(auth: AuthContext, key: string) { return `discord-safe:v1:${createHash('sha256').update(`${auth.keyId}\0${key}`).digest('hex')}`; }

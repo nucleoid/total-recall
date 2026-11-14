@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-test('038 adds update generations without rewriting history or exposing private jobs', async () => {
-  const sql = await readFile(new URL('../migrations/038_memory_ingestion_update_kind.sql', import.meta.url), 'utf8');
+test('050 adds update generations without rewriting history or exposing private jobs', async () => {
+  const sql = await readFile(new URL('../migrations/050_memory_ingestion_update_kind.sql', import.meta.url), 'utf8');
   assert.match(sql, /kind TEXT NOT NULL DEFAULT 'store' CHECK \(kind IN \('store','update','document'\)\)/);
   assert.match(sql, /source_revision INTEGER NOT NULL DEFAULT 0/);
   assert.match(sql, /j\.kind <> 'store'/);
