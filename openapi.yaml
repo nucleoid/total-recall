@@ -349,6 +349,77 @@ paths:
         "428":
           description: If-Match is required
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  /api/ingestion/stats:
+    get:
+      operationId: getIngestionStats
+      summary: Return content-free ingestion metrics (admin required)
+      responses:
+        "200":
+          description: Ingestion result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestionStats" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/ingestion/pause:
+    post:
+      operationId: pauseIngestion
+      summary: Pause new worker claims (admin required)
+      responses:
+        "200":
+          description: Ingestion result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestionPause" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/ingestion/resume:
+    post:
+      operationId: resumeIngestion
+      summary: Resume worker claims (admin required)
+      responses:
+        "200":
+          description: Ingestion result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestionPause" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /api/ingestion/jobs/{memory_id}/requeue:
+    post:
+      operationId: requeueIngestionJob
+      summary: Requeue a failed or cancelled live memory (admin required)
+      parameters:
+        - name: memory_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Ingestion result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestionRequeue" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "400":
+          description: Invalid memory UUID
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: Missing, expired, deleted, ready or otherwise ineligible job
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
   /api/stats:
     get:
       operationId: getMemoryStats
@@ -1077,6 +1148,14 @@ components:
       type: object
       required: [id, namespace, created, deduplicated, expires_at]
       properties:
+        state:
+          type: string
+          enum: [ready, queued, embedding_failed, cancelled]
+          description: Present when durable ingestion is enabled. Queued acknowledges committed content awaiting indexing; terminal states preserve the same ID and require recovery instead of promising automatic processing.
+        accepted_at:
+          type: string
+          format: date-time
+          description: Durable acceptance time, present with state.
         id:
           type: string
           format: uuid
@@ -1343,6 +1422,8 @@ components:
         - relevance
         - final_score
       properties:
+        ingestion:
+          $ref: "#/components/schemas/IngestionStatus"
         id:
           type: string
           format: uuid
@@ -1433,6 +1514,8 @@ components:
       type: object
       required: [total_memories, by_namespace, by_source, total_documents, oldest_memory, newest_memory]
       properties:
+        ingestion:
+          $ref: "#/components/schemas/IngestionStats"
         total_memories:
           type: integer
           minimum: 0
@@ -1855,3 +1938,44 @@ components:
           type: array
           items:
             type: string
+
+    IngestionStatus:
+      type: object
+      required: [state]
+      description: Namespace readers see state only. Accepting owner also sees timestamps, attempts, failure and canonical identity.
+      properties:
+        state: { type: string, enum: [pending, processing, retry_wait, ready, deduplicated, embedding_failed, cancelled] }
+        accepted_at: { type: string, format: date-time }
+        ready_at: { type: [string, "null"], format: date-time }
+        attempts: { type: integer, minimum: 0 }
+        next_retry_at: { type: [string, "null"], format: date-time }
+        failure_category: { type: [string, "null"], enum: [transient, rate_limited, provider_auth, input_rejected, space_mismatch, expired, null] }
+        canonical_memory_id: { type: [string, "null"], format: uuid }
+        similarity: { type: [number, "null"] }
+    IngestionStats:
+      type: object
+      required: [depth, oldest_pending_age_seconds, attempts_histogram, failure_categories, next_retry_at, inline_hit_rate, paused, last_worker_heartbeat, history_available, depth_scope]
+      properties:
+        history_available: { type: boolean, description: Whether retained-history aggregates are available. }
+        depth_scope: { type: string, enum: [all, nonterminal], description: States covered by depth counts. }
+        depth: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+        oldest_pending_age_seconds: { type: [number, "null"] }
+        attempts_histogram: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+        failure_categories:
+          type: object
+          description: Current nonterminal failures plus terminal failures finalized in the last 24 hours.
+          additionalProperties: { type: integer, minimum: 0 }
+        next_retry_at: { type: [string, "null"], format: date-time }
+        inline_hit_rate: { type: [number, "null"], minimum: 0, maximum: 1 }
+        paused: { type: boolean }
+        last_worker_heartbeat: { type: [string, "null"], format: date-time }
+    IngestionPause:
+      type: object
+      required: [paused]
+      properties:
+        paused: { type: boolean }
+    IngestionRequeue:
+      type: object
+      required: [requeued]
+      properties:
+        requeued: { type: boolean, const: true }

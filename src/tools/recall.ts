@@ -1,3 +1,4 @@
+import { attachIngestion, ingestionAlias } from '../ingestion-read.js';
 import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
@@ -20,6 +21,9 @@ export async function memoryRecall(
   const namespaces = auth.namespaces;
 
   if (params.id) {
+    const originalId = params.id;
+    const canonicalId = await ingestionAlias(originalId, dbScopeFromAuth(auth));
+    const lookupId = canonicalId ?? originalId;
     const res = await queryScoped(
       dbScopeFromAuth(auth),
       `SELECT m.id, m.content, m.source, m.namespace, m.tags, m.metadata, m.access_level,
@@ -54,14 +58,19 @@ export async function memoryRecall(
        WHERE m.id = $1 AND m.deleted_at IS NULL
          AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
          AND m.namespace = ANY($2) AND ${accessLevelSql('m.access_level', '$3')}`,
-      [params.id, namespaces, auth.maxAccessLevel, auth.keyId]
+      [lookupId, namespaces, auth.maxAccessLevel, auth.keyId]
     );
     if (res.rows.length === 0) throw new Error('Memory not found or access denied');
     await logAudit({
       clientId: auth.keyId, action: 'memory.recall', resourceType: 'memory',
       resourceId: params.id, memoryId: params.id, resultCount: 1,
     }, dbScopeFromAuth(auth));
-    return res.rows[0];
+    const [memory] = await attachIngestion(res.rows, dbScopeFromAuth(auth));
+    if (canonicalId) {
+      const [alias] = await attachIngestion([{ id: originalId }], dbScopeFromAuth(auth));
+      return { ...memory, ingestion: (alias as { ingestion?: unknown }).ingestion };
+    }
+    return memory;
   }
 
   const res = await queryScoped(
@@ -106,5 +115,5 @@ export async function memoryRecall(
     clientId: auth.keyId, action: 'memory.recall', resourceType: 'document',
     resourceId: params.document_id, resultCount: res.rows.length,
   }, dbScopeFromAuth(auth));
-  return res.rows;
+  return attachIngestion(res.rows, dbScopeFromAuth(auth));
 }

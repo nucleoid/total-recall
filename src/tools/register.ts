@@ -67,7 +67,7 @@ const TOOL_DEFINITIONS = [
     description:
       'Store a memory with automatic embedding generation. Near-duplicates in the same namespace, ' +
       'access level, and embedding space reuse and boost the canonical memory by default; the result ' +
-      'reports created/deduplicated and similarity. Optional ttl is a positive integer lifetime in seconds; ' +
+      'reports created/deduplicated and similarity. With the ingestion queue enabled, state is ready, queued, embedding_failed or cancelled and accepted_at is the durable acceptance time. Queued content is recallable before semantic indexing; terminal states retain the ID but require recovery. Optional ttl is a positive integer lifetime in seconds; ' +
       'expiring writes bypass semantic dedupe and return their database-computed expires_at. For accurate provenance, pass agent_name identifying ' +
       'the agent storing this memory (e.g. "openclaw", "cursor-dev"). When omitted, the API key name is used as a fallback.',
     inputSchema: {
@@ -303,7 +303,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_stats',
-    description: 'Get statistics about the memory store (admin-only).',
+    description: 'Get statistics about the memory store (admin-only). Includes a content-free ingestion block when the ingestion schema is installed.',
     inputSchema: {
       type: 'object' as const,
       properties: {},

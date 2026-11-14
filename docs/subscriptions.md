@@ -1,6 +1,6 @@
 # Memory subscriptions and webhook delivery
 
-Memory subscriptions are prospective semantic interests. A new `normal` memory whose stamped embedding space and cosine score match an active subscription creates an outbox row in the same database transaction. Updates, deletes, boosts, historical rows, `sensitive`/`secret` rows, unstamped vectors, and vectors from another embedding space do not create events. Matching is deterministic and capped at 100 subscriptions per inserted memory.
+Memory subscriptions are prospective semantic interests. A new `normal` memory whose stamped embedding space and cosine score match an active subscription creates an outbox row in the same database transaction. Content updates after first readiness, deletes, boosts, historical rows, `sensitive`/`secret` rows, unstamped vectors, and vectors from another embedding space do not create events. The first pending-to-ready embedding transition is the creation event for a newly accepted queued memory, even if keyed content was replaced before that first readiness. Later keyed replacements cannot create newly matching events. Matching is deterministic and capped at 100 subscriptions per created memory.
 
 ## Enablement and operation
 
@@ -53,3 +53,5 @@ Only public HTTPS destinations on port 443 are accepted. URLs with user-info or 
 5. Enable creation for keys restricted to one approved namespace, then widen deliberately.
 
 There is no backfill or query replay. Rollback by disabling creation, stopping the worker, and disabling the `memories_subscription_enqueue` trigger. Retain encrypted subscriptions, content-free outbox history, and audit rows. Delivery/truncation rows intentionally do not hold a foreign key to `memories`: hard deletion may remove memory content while retaining only its former opaque ID in notification history. Disabling a subscription/key or narrowing an ACL wins before a new connection, but cannot recall an HTTP request already in flight. Content-bearing payloads and private-network destinations require a separate policy and contract review.
+
+With migration 037 and durable ingestion enabled, enable `memories_subscription_ready_enqueue` together with `memories_subscription_enqueue`. The new trigger ships disabled and excludes episode chunks. Rollback disables both triggers. The shared transactional outbox identity prevents duplicate creation events when finalization is replayed. See [ingestion rollout](rollouts/037-memory-ingestion-queue.md).

@@ -1071,3 +1071,9 @@ the last completed ISO week. No MCP/HTTP trigger or in-process scheduler is inst
 ## My Life historical context
 
 See [My Life gateway](docs/my-life-gateway.md) for a local stdio connection that combines Total Recall memories with historical evidence from all authorized My Life sources.
+
+### Durable memory ingestion (default off)
+
+`memory_store` / `POST /api/store` support a durable queue behind `MEMORY_INGESTION_QUEUE_ENABLED=true`. Apply migration 037 and start `npm run ingest:worker` with a dedicated `INGESTION_WORKER_API_KEY` (admin, scoped namespaces) before enabling. `MEMORY_STORE_INLINE_EMBED_MS` defaults to 3000 (0 = always async); `MEMORY_INGESTION_MAX_ATTEMPTS` defaults to 12. Provider timeout remains independently controlled by `EMBEDDING_TIMEOUT_MS`.
+
+Enabled stores add `state: ready | queued` and `accepted_at`. Queued content is immediately recallable, listable, full-text searchable and exportable. The bounded worker finishes semantic indexing, dedupe and eligible belief revision. Admins can inspect `/api/ingestion/stats`, pause/resume claims and requeue terminal jobs. `memory_stats` includes ingestion metrics; dashboard Memories show state badges. See [queue contracts](docs/ingestion-queue.md) and [rollout/recovery](docs/rollouts/037-memory-ingestion-queue.md), including the unmerged PR #158 migration-number collision.

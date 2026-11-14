@@ -56,6 +56,8 @@ main { padding-top: 1.25rem; }
 .memory-card, .trace { margin: .75rem 0; padding: 1rem; border: 1px solid var(--line); border-radius: .75rem; background: var(--surface-2); }
 .memory-card { border-left: 3px solid var(--accent); }
 .memory-card h3 { margin: 0 0 .5rem; font-size: .95rem; color: var(--accent); }
+.ingestion-badge { display: inline-block; margin-left: .4rem; border: 1px solid var(--line); border-radius: .4rem; padding: .15rem .4rem; font-size: .75rem; color: var(--text); background: var(--accent-soft); font-weight: 500; }
+.ingestion-badge.error { border-color: var(--danger); color: var(--danger); }
 .memory-agent { margin: -.15rem 0 .7rem; color: var(--text); font-size: .86rem; font-weight: 700; }
 .memory-content { white-space: pre-wrap; line-height: 1.55; }
 .tags { color: var(--accent); font-size: .85rem; }

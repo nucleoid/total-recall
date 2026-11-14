@@ -1,3 +1,4 @@
+import { attachIngestion } from './ingestion-read.js';
 import { getPoolGeneration, withScopedClient, type DbScope, type ScopedClient } from './db.js';
 import {
   ACTIVE_EMBEDDING_PROFILE,
@@ -520,7 +521,7 @@ export async function executeHybridSearch(
       );
     }
 
-    return res.rows as SearchResult[];
+    return attachIngestion(res.rows as SearchResult[], scope, client);
   }, { readOnly: !trackAccess });
 }
 

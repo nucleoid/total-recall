@@ -37,6 +37,11 @@ export interface Memory {
   insight_content_hash?: string | null;
   expires_at?: Date | null;
   provenance?: MemoryProvenance | null;
+  ingestion?: {
+    state: import('./ingestion.js').IngestionState;
+    accepted_at?: string; ready_at?: string | null; attempts?: number; next_retry_at?: string | null;
+    failure_category?: string | null; canonical_memory_id?: string | null; similarity?: number | null;
+  };
 }
 
 export interface ApiKey {
@@ -138,6 +143,8 @@ export interface StoreParams {
 }
 
 export interface StoreResult {
+  state?: 'ready' | 'queued' | 'embedding_failed' | 'cancelled';
+  accepted_at?: Date;
   id: string;
   namespace: string;
   created: boolean;

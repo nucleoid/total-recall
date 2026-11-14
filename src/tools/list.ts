@@ -1,3 +1,4 @@
+import { attachIngestion } from '../ingestion-read.js';
 import { z } from 'zod';
 import { dbScopeFromAuth, queryScoped } from '../db.js';
 import type { AuthContext } from '../types.js';
@@ -110,7 +111,7 @@ export async function memoryList(
   }, scope);
 
   return {
-    memories: res.rows,
+    memories: await attachIngestion(res.rows, scope),
     total: parseInt(countRes.rows[0].total, 10),
     limit: params.limit,
     offset: params.offset,

@@ -120,6 +120,7 @@ test('hybridSearch sets local HNSW inside the scoped transaction before search a
       'SCHEMA',
       'SEARCH',
       'UPDATE memories',
+      "SELECT to_regclass('public.memory_ingestion_jobs') IS NOT NULL AS present",
       'COMMIT',
     ]
   );

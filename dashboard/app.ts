@@ -1,5 +1,5 @@
 import './styles.css';
-import { api, ApiError, clearKey, hasKey, isRemembered, restoreKey, setKey, toApiDateTime } from './api.js';
+import { api, getIngestionStats, ApiError, clearKey, hasKey, isRemembered, restoreKey, setKey, toApiDateTime } from './api.js';
 import type { AgentRecord, Capabilities, MediaStats, MemoryRecord, PagedMemories, TraceRecord } from './types.js';
 
 type View = 'overview' | 'memories' | 'search' | 'traces' | 'media' | 'agents' | 'audit';
@@ -134,6 +134,21 @@ async function renderOverview(): Promise<void> {
       card('Newest', formatDate(stats.newest_memory)),
     );
     section.append(metrics, el('h3', 'By namespace'), table(stats.by_namespace ?? [], ['namespace', 'count']));
+    try {
+    const queue = await getIngestionStats();
+    section.append(el('h3', 'Ingestion queue'), el('p', queue.paused ? 'Worker paused' : 'Worker accepting jobs'),
+      table(Object.entries(queue.depth).map(([state, count]) => ({ state, count })), ['state', 'count']),
+      el('p', `Oldest queued: ${queue.oldest_pending_age_seconds == null ? 'none' : Math.round(queue.oldest_pending_age_seconds) + ' seconds'} · Last worker heartbeat: ${formatDate(queue.last_worker_heartbeat)}`),
+      el('p', `Inline ready: ${queue.history_available === false ? 'history unavailable' : queue.inline_hit_rate == null ? 'no attempts' : Math.round(queue.inline_hit_rate * 100) + '%'} · Next retry: ${formatDate(queue.next_retry_at)}`));
+    if (queue.history_available === false) section.append(el('p', 'Historical metrics unavailable; counts show active jobs only.', 'muted'));
+    const toggle = el('button', queue.paused ? 'Resume ingestion worker' : 'Pause ingestion worker');
+    toggle.addEventListener('click', () => void (async () => {
+      toggle.disabled = true;
+      try { await api(`/api/ingestion/${queue.paused ? 'resume' : 'pause'}`, { method: 'POST' }); await renderOverview(); }
+      catch (error) { fail(error); }
+    })());
+    section.append(toggle);
+    } catch { section.append(el('h3', 'Ingestion queue'), el('p', 'Queue status unavailable. Core memory statistics remain available.', 'muted')); }
   } else {
     const stats = await api<PagedMemories>('/api/memories?limit=1');
     metrics.append(
@@ -210,6 +225,11 @@ function sequencePager(offset: number, limit: number, received: number, onPage: 
 function memoryCard(memory: MemoryRecord): HTMLElement {
   const article = el('article', undefined, 'memory-card');
   const heading = el('h3', `${memory.namespace} · ${memory.source}`);
+  if (memory.ingestion) {
+    const badge = el('span', `Ingestion: ${memory.ingestion.state.replace(/_/g, ' ')}`, 'ingestion-badge');
+    if (['embedding_failed', 'cancelled'].includes(memory.ingestion.state)) badge.classList.add('error');
+    heading.append(' ', badge);
+  }
   const content = el('p', memory.content, 'memory-content');
   const provenance = el('p', `Agent: ${agentName(memory)}`, 'memory-agent');
   provenance.title = memory.agent_id ?? 'No agent GUID recorded';
