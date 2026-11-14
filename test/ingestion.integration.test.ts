@@ -80,7 +80,12 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
   const agent = (await owner.query(`INSERT INTO agents (name,type,api_key_id) VALUES ('test','system',$1) RETURNING id`,[ownerId])).rows[0].id;
   const claim = async (id: string) => {
     const job = await claimIngestionJob(dbScopeFromAuth(auth), { memoryId: id, inline: true });
-    assert.ok(job); return job;
+    assert.ok(job, job ? undefined : JSON.stringify((await owner!.query(`SELECT j.status,j.next_attempt_at,
+      j.lease_token,j.lease_expires_at,statement_timestamp() AS db_now,
+      EXTRACT(EPOCH FROM statement_timestamp()-j.next_attempt_at) AS due_seconds,
+      m.embedding IS NOT NULL AS embedded,m.deleted_at,m.expires_at
+      FROM memory_ingestion_jobs j JOIN memories m ON m.id=j.memory_id WHERE j.memory_id=$1`,[id])).rows[0]));
+    return job;
   };
   await t.test('accept commits memory, job and audit; pending rows are recall/list/FTS/export visible', async () => {
     const accepted = await acceptMemory(input('quasar durable text'), auth, agent);
