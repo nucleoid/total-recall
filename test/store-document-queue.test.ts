@@ -256,4 +256,16 @@ test('document queue acceptance and batching on disposable PostgreSQL', { timeou
     await finalizeIngestionBatch(await claim(doc.document_id),results(2)); assert.equal((await status(doc.document_id)).state,'ready');
     process.env.MEMORY_INGESTION_DOCUMENT_ENABLED='true';
   });
+  await t.test('document requeue also finds failed update jobs on older synchronous chunks', async () => {
+    await reset(); process.env.MEMORY_INGESTION_DOCUMENT_ENABLED='false'; process.env.MEMORY_INGESTION_UPDATE_ENABLED='true';
+    globalThis.fetch=async () => new Response(JSON.stringify({ embedding:{ values:vector } }));
+    const doc=await memoryStoreDocument(params(2),auth);
+    const chunk=(await memoryRecall({ document_id:doc.document_id },auth))[0];
+    await memoryUpdate({ id:chunk.id,content:'updated legacy chunk' },auth);
+    const jobs=await claimIngestionJobs(dbScopeFromAuth(admin),{ memoryId:chunk.id });
+    assert.equal(jobs.length,1); assert.equal(jobs[0].kind,'update'); assert.equal(jobs[0].document_id,null);
+    await failIngestionBatch(jobs,new EmbeddingProviderError(400));
+    assert.equal((await status(doc.document_id)).failed,1);
+    assert.deepEqual(await requeueDocument(doc.document_id,admin),{ requeued:1 });
+  });
 });
