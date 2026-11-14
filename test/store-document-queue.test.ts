@@ -112,7 +112,8 @@ test('document queue acceptance and batching on disposable PostgreSQL', { timeou
     await finalizeIngestionBatch(first,results(1));
     let state=await status(doc.document_id); assert.equal(state.ready,1); assert.equal(state.queued,2);
     assert.equal((await memoryStoreDocument(input,auth)).state,'queued');
-    const rest=await claim(doc.document_id); await failIngestionBatch(rest,new EmbeddingProviderError(400));
+    const rest=await claim(doc.document_id);
+    for (const job of rest) await failIngestionBatch([job],new EmbeddingProviderError(400));
     assert.equal((await memoryStoreDocument(input,auth)).state,'embedding_failed');
     await assert.rejects(memoryStoreDocument({ ...input,title:'changed' },auth),/different document/);
     assert.deepEqual(await requeueDocument(doc.document_id,admin),{ requeued:2 });

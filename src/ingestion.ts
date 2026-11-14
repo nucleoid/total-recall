@@ -243,7 +243,8 @@ export async function claimIngestionJobs(scope: DbScope, options: { memoryId?: s
     }
     const token = randomUUID();
     const jobs = (await client.query(`WITH seed AS MATERIALIZED (
-      SELECT j.memory_id, j.client_id, j.namespace, CASE WHEN j.kind='document' THEN j.document_id END AS document_id FROM memory_ingestion_jobs j
+      SELECT j.memory_id, j.client_id, j.namespace, j.last_error_code,
+        CASE WHEN j.kind='document' THEN j.document_id END AS document_id FROM memory_ingestion_jobs j
       WHERE ($1::uuid IS NULL OR j.memory_id = $1)
         AND ($5::uuid IS NULL OR j.document_id = $5)
         AND (($2 AND j.client_id = app_current_key_id()) OR NOT $2)
@@ -252,7 +253,8 @@ export async function claimIngestionJobs(scope: DbScope, options: { memoryId?: s
       ORDER BY j.next_attempt_at, j.accepted_at, j.chunk_index, j.memory_id FOR UPDATE SKIP LOCKED LIMIT 1
     ), candidate AS MATERIALIZED (
       SELECT j.memory_id FROM memory_ingestion_jobs j CROSS JOIN seed s
-      WHERE (j.memory_id=s.memory_id OR ($1::uuid IS NULL AND s.document_id IS NOT NULL AND j.kind='document' AND j.document_id=s.document_id))
+      WHERE (j.memory_id=s.memory_id OR ($1::uuid IS NULL AND s.document_id IS NOT NULL AND j.kind='document' AND j.document_id=s.document_id
+        AND s.last_error_code IS DISTINCT FROM 'batch_input_rejected' AND j.last_error_code IS DISTINCT FROM 'batch_input_rejected'))
         AND j.client_id=s.client_id AND j.namespace=s.namespace
         AND (($2 AND j.client_id=app_current_key_id()) OR NOT $2)
         AND ((j.status IN ('pending','retry_wait') AND j.next_attempt_at <= statement_timestamp())
@@ -283,8 +285,15 @@ export async function claimIngestionJobs(scope: DbScope, options: { memoryId?: s
         WHERE memory_id = $1 AND lease_token = $2`, [job.memory_id, job.lease_token]);
       return null;
     }
+    if (!job.allowed_namespaces.includes(job.namespace)) {
+      await finishJob(client,job,'cancelled'); return null;
+    }
     if (memory.embedding !== null) {
       await completeExternalEmbedding(client, job, memory); return null;
+    }
+    if ((memory.access_level ?? 'normal') !== job.access_level ||
+        (job.kind !== 'update' && (memory.superseded_at || memory.consolidated_into_id))) {
+      await finishJob(client,job,'cancelled'); return null;
     }
     return { ...job, content: memory.content, expires_at: memory.expires_at, inline: options.inline === true };
   });
@@ -336,8 +345,24 @@ export async function failIngestionBatch(jobs: IngestionJob[], error: unknown): 
   const retry=freeContention ? new Date(Date.now()+1000) : retryAtForAttempt(failure.category==='provider_auth' ? 5 : Math.max(1,...jobs.map(job => job.attempts)),failure.retryAfter);
   await withScopedClient(ownerScope(jobs[0]), async client => {
     await client.query('SELECT memory_id FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[]) ORDER BY memory_id FOR UPDATE', [jobs.map(job => job.memory_id)]);
+    if (jobs.length>1 && jobs.every(job => job.kind==='document') && failure.category==='input_rejected') {
+      // A batch response cannot identify the rejected input. Durable single-job
+      // claims isolate it without spending each healthy chunk's retry allowance.
+      await returnIngestionJobs(client,jobs,'batch_input_rejected'); return;
+    }
     for (const job of jobs) await failIngestionJob(job, error, { client, retry });
   });
+}
+
+/** No vectors have landed: release only the still-owned generation for a fresh claim. */
+async function returnIngestionJobs(client: ScopedClient, jobs: IngestionJob[], code?: 'batch_input_rejected'): Promise<void> {
+  for (const job of jobs) await client.query(`UPDATE memory_ingestion_jobs SET status='pending',
+    attempts=GREATEST(0,attempts-$3::int), next_attempt_at=transaction_timestamp(),
+    locked_at=NULL, lease_token=NULL, lease_expires_at=NULL, finalized_at=NULL,
+    last_error_code=COALESCE($4::text,last_error_code),
+    failure_category=CASE WHEN $4::text IS NULL THEN failure_category ELSE 'input_rejected' END
+    WHERE memory_id=$1 AND lease_token=$2::uuid AND status='processing' AND lease_expires_at>statement_timestamp()`,
+  [job.memory_id,job.lease_token,job.inline ? 0 : 1,code ?? null]);
 }
 
 /** All leases and memories are locked before any vector/outbox/audit is written. */
@@ -352,10 +377,24 @@ export async function finalizeIngestionBatch(jobs: IngestionJob[], embeddings: E
     const ids = jobs.map(job => job.memory_id);
     const leases = (await client.query(`SELECT *, lease_expires_at > statement_timestamp() AS live
       FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[]) ORDER BY memory_id FOR UPDATE`, [ids])).rows;
-    if (leases.length !== jobs.length || jobs.some(job => !leases.some(lease => lease.memory_id===job.memory_id && lease.status==='processing' && lease.live && lease.lease_token===job.lease_token))) return false;
+    const owned=jobs.filter(job => leases.some(lease => lease.memory_id===job.memory_id && lease.status==='processing' && lease.live && lease.lease_token===job.lease_token));
+    if (owned.length!==jobs.length) { await returnIngestionJobs(client,owned); return false; }
     const memories = (await client.query(`SELECT *, expires_at <= statement_timestamp() AS expired
       FROM memories WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE`, [ids])).rows;
-    if (memories.length !== jobs.length || jobs.some(job => !memories.some(memory => memory.id===job.memory_id && memory.namespace===job.namespace && memory.content===job.content && (memory.access_level ?? 'normal')===job.access_level && !memory.deleted_at && !memory.expired && !memory.superseded_at && !memory.consolidated_into_id && job.allowed_namespaces.includes(job.namespace)))) return false;
+    const invalid=jobs.filter(job => {
+      const memory=memories.find(memory => memory.id===job.memory_id);
+      if (!memory || memory.namespace!==job.namespace || memory.deleted_at || memory.expired || !job.allowed_namespaces.includes(job.namespace)) return true;
+      if (memory.embedding!==null) return memory.embedding_provider!==job.embedding_provider || memory.embedding_model!==job.embedding_model || memory.embedding_dimensions!==job.embedding_dimensions;
+      return memory.content!==job.content || (memory.access_level ?? 'normal')!==job.access_level || memory.superseded_at || memory.consolidated_into_id;
+    });
+    if (invalid.length) {
+      for (const job of invalid) {
+        const memory=memories.find(memory => memory.id===job.memory_id);
+        await finishJob(client,job,'cancelled',!memory || memory.deleted_at || memory.expired ? 'expired' : undefined);
+      }
+      await returnIngestionJobs(client,jobs.filter(job => !invalid.includes(job)));
+      return false;
+    }
     if (jobs.some((job,index) => embeddingIdentity({ provider:job.embedding_provider, model:job.embedding_model, dimensions:job.embedding_dimensions })!==embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) || embeddingIdentity(embeddings[index])!==embeddingIdentity(ACTIVE_EMBEDDING_PROFILE))) {
       for (const job of jobs) await finishJob(client,job,'embedding_failed','space_mismatch');
       return false;
