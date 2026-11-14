@@ -1291,6 +1291,8 @@ components:
       type: object
       required: [id, content, source, namespace, tags, metadata, access_level, client_id, created_at, updated_at, accessed_at, access_count]
       properties:
+        ingestion:
+          $ref: "#/components/schemas/IngestionStatus"
         id: { type: string, format: uuid }
         content: { type: string }
         source: { type: string }
@@ -1942,9 +1944,9 @@ components:
     IngestionStatus:
       type: object
       required: [state]
-      description: Namespace readers see state only. Accepting owner also sees timestamps, attempts, failure and canonical identity.
+      description: Namespace readers see state only. Accepting owner also sees timestamps, attempts, failure and canonical identity. Update responses summarize pending, processing and retry_wait as queued; read endpoints retain the detailed state.
       properties:
-        state: { type: string, enum: [pending, processing, retry_wait, ready, deduplicated, embedding_failed, cancelled] }
+        state: { type: string, enum: [queued, pending, processing, retry_wait, ready, deduplicated, embedding_failed, cancelled] }
         accepted_at: { type: string, format: date-time }
         ready_at: { type: [string, "null"], format: date-time }
         attempts: { type: integer, minimum: 0 }

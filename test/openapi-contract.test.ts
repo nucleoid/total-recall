@@ -27,6 +27,13 @@ async function document(): Promise<any> {
   return parse(await readFile(new URL('../openapi.yaml', import.meta.url), 'utf8'));
 }
 
+test('memory patch and read schemas include queued update ingestion metadata', async () => {
+  const api = await document();
+  assert.equal(api.components.schemas.MemoryRecord.properties.ingestion.$ref, '#/components/schemas/IngestionStatus');
+  assert.equal(api.components.schemas.Memory.properties.ingestion.$ref, '#/components/schemas/IngestionStatus');
+  assert.ok(api.components.schemas.IngestionStatus.properties.state.enum.includes('queued'));
+});
+
 test('OpenAPI 3.1 document validates and has unique stable operation IDs', async () => {
   const file = fileURLToPath(new URL('../openapi.yaml', import.meta.url));
   const api = await SwaggerParser.validate(file) as any;

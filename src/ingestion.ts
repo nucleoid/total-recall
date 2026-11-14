@@ -34,12 +34,24 @@ export interface IngestionJob {
   embedding_provider: string; embedding_model: string; embedding_dimensions: number;
   status: IngestionState; attempts: number; last_error_code: string | null; lease_token: string; accepted_at: Date;
   content: string; expires_at: Date | null; inline?: boolean;
+  kind?: 'store' | 'update' | 'document'; source_revision?: number;
 }
 export interface AcceptMemoryInput {
   content: string; namespace: string; source?: string; tags: string[]; metadata: Record<string, unknown>;
   access_level: AccessLevel; session_id?: string; idempotency_key?: string; dedupe?: boolean; ttl?: number;
 }
 export function ingestionEnabled(): boolean { return process.env.MEMORY_INGESTION_QUEUE_ENABLED === 'true'; }
+export function ingestionUpdateEnabled(): boolean {
+  return ingestionEnabled() && process.env.MEMORY_INGESTION_UPDATE_ENABLED === 'true';
+}
+
+/** Called under the patch transaction after locking jobs before memories. */
+export async function enqueueReembed(client: ScopedClient, memoryId: string): Promise<Date> {
+  const profile = ACTIVE_EMBEDDING_PROFILE;
+  const result = await client.query('SELECT app_enqueue_memory_reembed($1::uuid, $2, $3, $4) AS accepted_at',
+    [memoryId, profile.provider, profile.model, profile.dimensions]);
+  return result.rows[0].accepted_at;
+}
 export function ingestionInteger(raw: string | undefined, fallback: number, name: string, min = 0, max = 120_000): number {
   const value = raw === undefined ? fallback : Number(raw);
   if (raw?.trim() === '' || !Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer from ${min} to ${max}`);
@@ -314,7 +326,11 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
     }
     if (memory.embedding !== null) return completeExternalEmbedding(client, job, memory);
     // A later synchronous writer must never receive an older content vector.
-    if (memory.content !== job.content || memory.access_level !== job.access_level || memory.superseded_at || memory.consolidated_into_id) {
+    // The current locked job/lease is the content generation fence, including ABA.
+    // Public revision also tracks metadata and lifecycle edits, which do not
+    // invalidate an update's historical vector or reset its durable job.
+    if (memory.content !== job.content || memory.access_level !== job.access_level ||
+        (job.kind !== 'update' && (memory.superseded_at || memory.consolidated_into_id))) {
       await finishJob(client, job, 'cancelled'); return null;
     }
     if (embeddingIdentity(target) !== embeddingIdentity(ACTIVE_EMBEDDING_PROFILE) || embeddingIdentity(target) !== embeddingIdentity(embedding)) {
@@ -363,8 +379,10 @@ export async function finalizeIngestionJob(job: IngestionJob, embedding: Embeddi
       }
     }
     if (!revised) requireMemoryUpdate(await client.query(`UPDATE memories SET embedding = $2::vector, embedding_provider = $3,
-      embedding_model = $4, embedding_dimensions = $5, updated_at = statement_timestamp() WHERE id = $1`,
-    [job.memory_id, vector, embedding.provider, embedding.model, embedding.dimensions]));
+      embedding_model = $4, embedding_dimensions = $5${job.kind === 'update' ? '' : ', updated_at = statement_timestamp()'} WHERE id = $1
+        AND embedding IS NULL AND content = $6 AND namespace = $7 AND access_level = $8
+        AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())`,
+    [job.memory_id, vector, embedding.provider, embedding.model, embedding.dimensions, job.content, job.namespace, job.access_level]));
     await client.query(`UPDATE memory_ingestion_jobs SET status = 'ready', creation_pending = false, ready_at = statement_timestamp(),
       finalized_at = statement_timestamp(), lease_token = NULL, lease_expires_at = NULL,
       failure_category = NULL, last_error_code = NULL, inline_ready = $3

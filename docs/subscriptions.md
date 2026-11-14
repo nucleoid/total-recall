@@ -4,6 +4,8 @@ Memory subscriptions are prospective semantic interests. A new `normal` memory w
 
 ## Enablement and operation
 
+With migration 038, `memory_update` content replacements use `kind='update'` and never create a `memory.stored` event, including when they replace an original store that has not reached first readiness. Keyed `memory_store` replacements retain their existing first-creation rules. Both insert and pending-to-ready triggers keep this distinction.
+
 Creation and delivery have separate fail-closed gates:
 
 ```dotenv
