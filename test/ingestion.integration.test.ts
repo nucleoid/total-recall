@@ -242,6 +242,25 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
     await assert.rejects(requeueIngestionJob(a.id,normal),/unavailable/);
     assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[a.id])).rows[0].status,'embedding_failed');
   });
+  await t.test('actionable queue metrics survive a history-aggregate timeout', async () => {
+    await acceptMemory(input('live backlog during history timeout'),auth,agent);
+    await owner!.query('UPDATE instance_settings SET ingestion_worker_seen_at=now() WHERE singleton');
+    setPoolForTesting(faultingPool(pool!,sql=>sql.includes('AS attempts_histogram')));
+    try {
+      const stats=await ingestionStats(admin);
+      assert.equal(stats.history_available,false);assert.equal(stats.depth_scope,'nonterminal');
+      assert.ok(Number(stats.depth.pending)>0);assert.equal(typeof stats.paused,'boolean');assert.ok(stats.last_worker_heartbeat);
+      assert.ok(Object.keys(stats.depth).every(state=>['pending','processing','retry_wait'].includes(state)));
+    } finally {setPoolForTesting(pool!);}
+  });
+  await t.test('queue failure alerts exclude old terminal history', async () => {
+    const old=await acceptMemory(input('old terminal failure'),auth,agent);
+    const recent=await acceptMemory(input('recent terminal failure'),auth,agent);
+    await owner!.query(`UPDATE memory_ingestion_jobs SET status='embedding_failed',failure_category='input_rejected',
+      finalized_at=CASE WHEN memory_id=$1 THEN now()-interval '2 days' ELSE now() END WHERE memory_id=ANY($2::uuid[])`,[old.id,[old.id,recent.id]]);
+    const stats=await ingestionStats(admin);
+    assert.equal(stats.failure_categories.input_rejected,1);
+  });
   await t.test('persistent database contention backs off and bounds provider and classifier spend through the worker', async () => {
     const {runIngestionWorker}=await import('../scripts/ingestion-worker.js');
     const {resetContradictionRuntimeForTesting,contradictionPolicyFromEnv,contradictionRuntimeSnapshot}=await import('../src/contradictions.js');

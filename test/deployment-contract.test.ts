@@ -1,3 +1,4 @@
+import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -56,4 +57,24 @@ test('durable ingestion worker has a dedicated unit and bounded npm entrypoint',
 test('release ingestion worker imports under native Node without a TypeScript loader', () => {
   const result=spawnSync(process.execPath,['--input-type=module','--eval',"await import('./dist/ingestion-worker.js')"],{cwd:root,encoding:'utf8'});
   assert.equal(result.status,0,result.stderr);
+});
+
+
+test('compiled and development workers execute through a current-release directory symlink', async () => {
+  const temporary=await fs.mkdtemp(path.join(os.tmpdir(),'total-recall-worker-link-'));
+  const current=path.join(temporary,'current');
+  try {
+    await fs.symlink(root,current,process.platform==='win32'?'junction':'dir');
+    for(const [relative,loader] of [['dist/ingestion-worker.js',[]],['scripts/ingestion-worker.ts',['--import','tsx']]] as const) {
+      const result=spawnSync(process.execPath,[...loader,path.join(current,relative),'--once'],{
+        cwd:root,encoding:'utf8',env:{...process.env,INGESTION_WORKER_API_KEY:''},
+      });
+      assert.equal(result.status,1,`${relative} must enter main and reject the missing worker key`);
+      assert.match(result.stderr,/\[ingestion-worker\] failed/);
+    }
+  } finally {
+    // Remove only the link, never recurse through a junction into the checkout.
+    await fs.unlink(current).catch(error=>{if(error.code!=='ENOENT')throw error;});
+    await fs.rmdir(temporary);
+  }
 });
