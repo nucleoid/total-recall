@@ -55,7 +55,15 @@ test('the complete migration history parses and executes on PostgreSQL 16', { ti
   assert.equal((await owner.query(
     "SELECT count(*)::int AS count FROM schema_migrations WHERE version = '032_memory_ttl'",
   )).rows[0].count, 0);
+  await runMigrations(owner, inventory, { lockTimeoutMs: 5_000, throughNumber: 47 });
+  const retainedLineage = (await owner.query(
+    'SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version',
+  )).rows;
   await runMigrations(owner, inventory, { lockTimeoutMs: 5_000 });
+  assert.deepEqual((await owner.query(
+    'SELECT version, checksum, applied_at FROM schema_migrations WHERE version < $1 ORDER BY version',
+    ['048'],
+  )).rows, retainedLineage, 'appending ingestion must not rewrite applied shadow migration identities');
 
   const ledger = await owner.query<{ version: string; checksum: string }>(
     'SELECT version, checksum FROM schema_migrations ORDER BY version',
@@ -75,4 +83,30 @@ test('the complete migration history parses and executes on PostgreSQL 16', { ti
     'app_transfer_source_key_access',
     'validate_memory_insight_evidence',
   ]);
+
+  await t.test('separate ingestion 037/038 history is rejected without rewriting or replaying it', async () => {
+    await owner.query('CREATE DATABASE divergent_ingestion_history_test');
+    const divergent = await connectWhenReady(ownerUrl.replace(/\/postgres$/, '/divergent_ingestion_history_test'));
+    try {
+      await divergent.query('CREATE EXTENSION vector');
+      await runMigrations(divergent, inventory, { lockTimeoutMs: 5_000, throughNumber: 36 });
+      for (const [current, original] of [
+        ['048_memory_ingestion_queue', '037_memory_ingestion_queue'],
+        ['049_memory_ingestion_update_kind', '038_memory_ingestion_update_kind'],
+      ]) {
+        const migration = inventory.find(item => item.version === current)!;
+        await divergent.query(migration.sql);
+        await divergent.query('INSERT INTO schema_migrations(version,checksum) VALUES($1,$2)',
+          [original, migration.checksum]);
+      }
+      const before = (await divergent.query('SELECT * FROM schema_migrations ORDER BY version')).rows;
+      await assert.rejects(runMigrations(divergent, inventory, { lockTimeoutMs: 5_000 }),
+        /Unknown applied migration 037_memory_ingestion_queue/);
+      assert.deepEqual((await divergent.query('SELECT * FROM schema_migrations ORDER BY version')).rows, before);
+      assert.equal((await divergent.query("SELECT to_regclass('public.embedding_contracts') AS relation")).rows[0].relation, null);
+      assert.equal((await divergent.query('SELECT count(*)::int AS count FROM memory_ingestion_jobs')).rows[0].count, 0);
+    } finally {
+      await divergent.end();
+    }
+  });
 });
