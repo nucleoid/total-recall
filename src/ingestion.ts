@@ -370,8 +370,9 @@ async function returnIngestionJobs(client: ScopedClient, jobs: IngestionJob[], c
 }
 
 /** All leases and memories are locked before any vector/outbox/audit is written. */
-export async function finalizeIngestionBatch(jobs: IngestionJob[], embeddings: EmbeddingResult[]): Promise<boolean> {
+export async function finalizeIngestionBatch(jobs: IngestionJob[], embeddings: IngestionEmbeddingResult[]): Promise<boolean> {
   if (!jobs.length) return false;
+  if (localServingEnabled() && embeddings.some(embedding => !embedding.localPrepared)) throw new Error('shadow_embedding.ingestion_vectors_required');
   validateEmbeddingBatch(embeddings.map(item => item.vector), jobs.length);
   const first = jobs[0];
   if (!first.document_id || jobs.some(job => job.kind !== 'document' || job.document_id !== first.document_id || job.client_id !== first.client_id || job.namespace !== first.namespace)) throw new Error('Document batch must share owner and document');
@@ -383,7 +384,10 @@ export async function finalizeIngestionBatch(jobs: IngestionJob[], embeddings: E
       FROM memory_ingestion_jobs WHERE memory_id=ANY($1::uuid[]) ORDER BY memory_id FOR UPDATE`, [ids])).rows;
     const owned=jobs.filter(job => leases.some(lease => lease.memory_id===job.memory_id && lease.status==='processing' && lease.live && lease.lease_token===job.lease_token));
     if (owned.length!==jobs.length) { await returnIngestionJobs(client,owned); return false; }
-    const memories = (await client.query(`SELECT *, expires_at <= statement_timestamp() AS expired
+    const memories = (await client.query(`SELECT *, expires_at <= statement_timestamp() AS expired,
+      superseded_at IS NULL AND consolidated_into_id IS NULL
+        AND (valid_from IS NULL OR valid_from<=statement_timestamp())
+        AND (valid_to IS NULL OR valid_to>statement_timestamp()) AS local_index_eligible
       FROM memories WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE`, [ids])).rows;
     const invalid=jobs.filter(job => {
       const memory=memories.find(memory => memory.id===job.memory_id);
@@ -410,6 +414,7 @@ export async function finalizeIngestionBatch(jobs: IngestionJob[], embeddings: E
       requireMemoryUpdate(await client.query(`UPDATE memories SET embedding=$2::vector, embedding_provider=$3,
         embedding_model=$4, embedding_dimensions=$5, updated_at=statement_timestamp()
         WHERE id=$1 AND embedding IS NULL`, [job.memory_id,serializeEmbeddingVector(embedding.vector),embedding.provider,embedding.model,embedding.dimensions]));
+      if (memory.local_index_eligible) await publishPreparedLocalDocument(client,job.memory_id,embedding.localPrepared,{ ingestionLease:job.lease_token });
       await client.query(`UPDATE memory_ingestion_jobs SET status='ready', creation_pending=false, ready_at=statement_timestamp(),
         finalized_at=statement_timestamp(), lease_token=NULL, lease_expires_at=NULL, failure_category=NULL,
         last_error_code=NULL, inline_ready=$2 WHERE memory_id=$1`, [job.memory_id,job.inline===true]);
@@ -419,11 +424,26 @@ export async function finalizeIngestionBatch(jobs: IngestionJob[], embeddings: E
   });
 }
 
-export async function embedBatchWithinBudget(contents: string[], budget: number, signal?: AbortSignal, embed = embedBatchWithProfile): Promise<EmbeddingResult[]> {
+export async function embedBatchWithinBudget(contents: string[], budget: number, signal?: AbortSignal, embed = embedBatchWithProfile): Promise<IngestionEmbeddingResult[]> {
   const controller=new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
   const combined=signal ? AbortSignal.any([signal,controller.signal]) : controller.signal;
   try {
-    return await Promise.race([embed(contents,ACTIVE_EMBEDDING_PROFILE,combined),new Promise<never>((_,reject) => {
+    const work=async ():Promise<IngestionEmbeddingResult[]> => {
+      if (embed===embedBatchWithProfile && localServingEnabled()) {
+        const prepared:PreparedLocalDocument[]=[];
+        for (const content of contents) {
+          const local=await prepareLocalDocument(content,combined);
+          if (!local) throw new Error('shadow_embedding.ingestion_vectors_required');
+          prepared.push(local);
+        }
+        const embeddings=ACTIVE_EMBEDDING_PROFILE.provider==='llama.cpp'
+          ? prepared.map(local => ({ ...ACTIVE_EMBEDDING_PROFILE,vector:local.vectors[0] }))
+          : await embed(contents,ACTIVE_EMBEDDING_PROFILE,combined);
+        return embeddings.map((embedding,index) => ({ ...embedding,localPrepared:prepared[index] }));
+      }
+      return embed(contents,ACTIVE_EMBEDDING_PROFILE,combined);
+    };
+    return await Promise.race([work(),new Promise<never>((_,reject) => {
       timer=setTimeout(() => { controller.abort(); reject(new DOMException('Embedding budget exhausted','TimeoutError')); },budget);
     })]);
   } finally { if (timer) clearTimeout(timer); controller.abort(); }
