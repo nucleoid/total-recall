@@ -133,6 +133,16 @@ test('durable document batches preserve versioned shadow publication on current 
     assert.equal(await finalizeIngestionBatch(jobs,prepared),false); assert.equal(await events(doc.document_id),3);
     assert.equal((await memoryStoreDocument(input,auth)).state,'ready');
   });
+  await t.test('external compatibility vectors without current targets cannot partially finalize a batch',async () => {
+    const doc=await memoryStoreDocument(params(3),auth),jobs=await claim(doc.document_id);
+    const prepared=await embedBatchWithinBudget(jobs.map(job => job.content),30000);
+    await owner!.query('UPDATE memories SET embedding=$2::vector,embedding_provider=$3,embedding_model=$4,embedding_dimensions=$5 WHERE id=$1',
+      [jobs[1].memory_id,JSON.stringify(prepared[1].vector),prepared[1].provider,prepared[1].model,prepared[1].dimensions]);
+    assert.equal(await finalizeIngestionBatch(jobs,prepared),false);
+    const state=await status(doc.document_id); assert.equal(state.ready,0); assert.equal(state.failed,1); assert.equal(state.queued,2);
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM memories WHERE document_id=$1 AND embedding IS NOT NULL',[doc.document_id])).rows[0].n,1);
+    assert.ok((await manifests(doc.document_id)).every(row => !row.is_current)); assert.equal(await events(doc.document_id),0);
+  });
   await t.test('wrong physical profile fails the whole batch without publishing any target manifest',async () => {
     const doc=await memoryStoreDocument(params(2),auth),jobs=await claim(doc.document_id);
     const prepared=await embedBatchWithinBudget(jobs.map(job => job.content),30000);
