@@ -32,6 +32,7 @@ test('application writers publish complete local chunks, preserve distinct share
   {skip:!url},async()=>{
   assert.equal(new URL(url!).pathname,'/total_recall_reembedding_test','dedicated test database required');
   const pool=new pg.Pool({connectionString:url,max:4});
+  const ownedParentIds:string[]=[];
   const key=randomUUID(),prefix=`writer-${randomUUID()}`;
   let attestationRun:string|undefined;
   const auth:AuthContext={keyId:key,name:prefix,namespaces:['personal'],permissions:['read','write'],maxAccessLevel:'normal'};
@@ -50,6 +51,7 @@ test('application writers publish complete local chunks, preserve distinct share
 
     const content=`${'a'.repeat(1600)}\n\nMATCH-LATER`;
     const first=await memoryStore(storeSchema.parse({content,namespace:'personal',source:prefix,dedupe:true}),auth);
+    ownedParentIds.push(first.id);
     assert.equal(first.created,true);
     const chunks=await pool.query(`SELECT ordinal,core_start,core_end,chunk_sha256 FROM memory_embedding_chunks
       WHERE contract_id=$1 AND parent_id=$2 ORDER BY ordinal`,[QWEN_CONTRACT_ID,first.id]);
@@ -63,11 +65,13 @@ test('application writers publish complete local chunks, preserve distinct share
     assert.deepEqual(manifest,{is_current:true,source_bytes:bytes.length,chunk_count:chunks.rowCount});
 
     const partial=await memoryStore(storeSchema.parse({content:'MATCH-LATER',namespace:'personal',source:prefix,dedupe:true}),auth);
+    ownedParentIds.push(partial.id);
     assert.notEqual(partial.id,first.id);assert.equal(partial.deduplicated,false);
     const duplicate=await memoryStore(storeSchema.parse({content,namespace:'personal',source:prefix,dedupe:true}),auth);
     assert.equal(duplicate.id,first.id);assert.equal(duplicate.deduplicated,true);
 
     const incomplete=randomUUID();
+    ownedParentIds.push(incomplete);
     await pool.query(`INSERT INTO memories(id,content,source,namespace,client_id,access_level,memory_kind,valid_from)
       VALUES($1,'pending target',$2,'personal',$3::text,'normal','semantic',statement_timestamp())`,[incomplete,prefix,key]);
     await assert.rejects(memoryStore(storeSchema.parse({content:'orthogonal',namespace:'personal',source:prefix,dedupe:true}),auth),
@@ -81,6 +85,7 @@ test('application writers publish complete local chunks, preserve distinct share
   }finally{
     setLocalServingClientForTesting(undefined);setPoolForTesting(null);process.env=originalEnv;
     await pool.query('DELETE FROM memories WHERE source=$1',[prefix]).catch(()=>{});
+    await pool.query("DELETE FROM embedding_work_items WHERE parent_type='memory' AND parent_id=ANY($1::uuid[])",[ownedParentIds]).catch(()=>{});
     await pool.query('DELETE FROM agents WHERE api_key_id=$1',[key]).catch(()=>{});
     await pool.query('DELETE FROM api_keys WHERE id=$1',[key]).catch(()=>{});
     await pool.query('DELETE FROM embedding_serving_settings WHERE cutover_attestation_run_id=$1',[attestationRun]).catch(()=>{});
