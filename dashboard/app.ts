@@ -284,7 +284,11 @@ async function editMemory(memory: MemoryRecord, dialog: HTMLDialogElement): Prom
     const response = await api<{ memory: MemoryRecord }>(`/api/memories/${memory.id}`, {
       method: 'PATCH', headers: { 'If-Match': `"${memory.updated_at}"` }, body: JSON.stringify({ content }),
     });
-    dialog.close(); announce('Memory updated and re-embedded.'); await renderMemories();
+    const state = response.memory.ingestion?.state;
+    dialog.close(); announce(state === 'queued' ? 'Memory updated; embedding queued.'
+      : state === 'embedding_failed' ? 'Memory updated; embedding failed.'
+      : state === 'cancelled' ? 'Memory updated; embedding cancelled.'
+      : 'Memory updated; embedding ready.'); await renderMemories();
     memory = response.memory;
   } catch (error) { fail(error); }
 }

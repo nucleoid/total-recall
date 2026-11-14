@@ -38,7 +38,7 @@ export interface Memory {
   expires_at?: Date | null;
   provenance?: MemoryProvenance | null;
   ingestion?: {
-    state: import('./ingestion.js').IngestionState;
+    state: import('./ingestion.js').IngestionState | 'queued';
     accepted_at?: string; ready_at?: string | null; attempts?: number; next_retry_at?: string | null;
     failure_category?: string | null; canonical_memory_id?: string | null; similarity?: number | null;
   };

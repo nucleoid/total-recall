@@ -116,7 +116,7 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
       properties: {
         id: { type: 'string', format: 'uuid', description: 'Active current memory UUID to patch' },
-        content: { type: 'string', minLength: 1, maxLength: MEMORY_CONTENT_MAX_CHARS, description: 'Replacement nonblank content; changed content is re-embedded' },
+        content: { type: 'string', minLength: 1, maxLength: MEMORY_CONTENT_MAX_CHARS, description: 'Replacement nonblank content; with queued updates enabled, changed content is re-embedded inline when possible, otherwise queued; see ingestion.state' },
         tags: { type: 'array', maxItems: TAG_MAX_COUNT, items: { type: 'string', maxLength: TAG_MAX_CHARS }, description: 'Complete replacement tag list' },
         metadata: { type: 'object', description: `Complete replacement metadata object (maximum ${METADATA_MAX_BYTES} serialized JSON bytes)` },
         supersedes: { type: 'string', format: 'uuid', description: 'Current predecessor UUID; creates an immutable one-to-one history link' },
