@@ -1,0 +1,181 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:net';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+import pg from 'pg';
+import request from 'supertest';
+import { loadMigrationInventory, runMigrations } from '../scripts/migrate.js';
+import { provisionDatabase } from '../scripts/provision-db.js';
+import { finalizeMemoryValidity } from '../scripts/finalize-memory-validity.js';
+import { hashKey } from '../src/auth.js';
+import { dbScopeFromAuth, setPoolForTesting, withScopedClient } from '../src/db.js';
+import { ACTIVE_EMBEDDING_PROFILE } from '../src/embedding.js';
+import { acceptMemory, claimIngestionJob, finalizeIngestionJob, failIngestionJob } from '../src/ingestion.js';
+import { hybridSearch } from '../src/search.js';
+import { memoryUpdate } from '../src/tools/update.js';
+import { memoryForget } from '../src/tools/forget.js';
+import type { AuthContext } from '../src/types.js';
+
+const ownerId = '11111111-1111-4111-8111-111111111111';
+const otherId = '22222222-2222-4222-8222-222222222222';
+const auth: AuthContext = { keyId: ownerId, name: 'update-owner', namespaces: ['shared'], permissions: ['read', 'write'], maxAccessLevel: 'secret' };
+const other: AuthContext = { ...auth, keyId: otherId, name: 'update-other' };
+const vector = Array.from({ length: 768 }, (_, i) => i === 0 ? 1 : 0);
+const embedding = { ...ACTIVE_EMBEDDING_PROFILE, vector };
+
+test('queued content updates on isolated PostgreSQL preserve durable content and fences', { timeout: 180000 }, async t => {
+  execFileSync('docker', ['version'], { stdio: 'ignore' });
+  const port = await new Promise<number>((resolve, reject) => {
+    const server = createServer(); server.once('error', reject); server.listen(0, '127.0.0.1', () => {
+      const port = (server.address() as { port: number }).port;
+      server.close(error => error ? reject(error) : resolve(port));
+    });
+  });
+  const container = execFileSync('docker', ['run', '--rm', '-d', '-e', 'POSTGRES_PASSWORD=test-only', '-p', `127.0.0.1:${port}:5432`, process.env.POSTGRES_TEST_IMAGE || 'pgvector/pgvector:pg16'], { encoding: 'utf8' }).trim();
+  let owner: pg.Client | undefined; let pool: pg.Pool | undefined;
+  const env = { ...process.env }; const originalFetch = globalThis.fetch;
+  t.after(async () => {
+    setPoolForTesting(null); await pool?.end(); await owner?.end();
+    execFileSync('docker', ['rm', '-f', container], { stdio: 'ignore' });
+    process.env = env; globalThis.fetch = originalFetch;
+  });
+  for (let i = 0; i < 100; i++) {
+    const client = new pg.Client({ connectionString: `postgresql://postgres:test-only@127.0.0.1:${port}/postgres`, connectionTimeoutMillis: 2000 });
+    try { await client.connect(); owner = client; break; }
+    catch { await client.end(); await new Promise(resolve => setTimeout(resolve, 200)); }
+  }
+  assert.ok(owner);
+  await owner.query('CREATE EXTENSION vector');
+  await provisionDatabase(owner, { appPassword: 'app-test-only', rotateAppPassword: false });
+  await runMigrations(owner, loadMigrationInventory(fileURLToPath(new URL('../migrations', import.meta.url))), { lockTimeoutMs: 5000 });
+  await finalizeMemoryValidity(owner);
+  pool = new pg.Pool({ connectionString: `postgresql://total_recall_app:app-test-only@127.0.0.1:${port}/postgres` }); setPoolForTesting(pool);
+  for (const key of [auth, other]) await owner.query(`INSERT INTO api_keys(id,key_hash,name,namespaces,permissions,max_access_level) VALUES ($1,$2,$3,$4,$5,$6)`, [key.keyId, hashKey(`tr_${key.name}`), key.name, key.namespaces, key.permissions, key.maxAccessLevel]);
+  const agent = (await owner.query(`INSERT INTO agents(name,type,api_key_id) VALUES ('update-test','system',$1) RETURNING id`, [ownerId])).rows[0].id;
+  process.env.MEMORY_INGESTION_QUEUE_ENABLED = 'true'; process.env.MEMORY_INGESTION_UPDATE_ENABLED = 'true'; process.env.MEMORY_STORE_INLINE_EMBED_MS = '0';
+  const create = async (content: string, ready = true) => {
+    const accepted = await acceptMemory({ content, namespace: 'shared', access_level: 'normal', tags: [], metadata: {}, dedupe: false }, auth, agent);
+    if (ready) await finalizeIngestionJob(await claim(accepted.id), embedding);
+    return accepted.id;
+  };
+  const claim = async (id: string, actor = auth) => {
+    const job = await claimIngestionJob(dbScopeFromAuth(actor), { memoryId: id, inline: true }); assert.ok(job); return job;
+  };
+  const row = async (id: string) => (await owner!.query('SELECT * FROM memories WHERE id=$1', [id])).rows[0];
+  const job = async (id: string) => (await owner!.query('SELECT * FROM memory_ingestion_jobs WHERE memory_id=$1', [id])).rows[0];
+
+  await t.test('offline provider commits patch first, clears all vector identity and returns retry state', async () => {
+    const id = await create('old astronomy'); let calls = 0;
+    process.env.MEMORY_STORE_INLINE_EMBED_MS = '1000';
+    globalThis.fetch = async () => { calls++; assert.equal((await row(id)).content, 'quasar revised'); throw new Error('offline'); };
+    try {
+      const result = await memoryUpdate({ id, content: 'quasar revised', tags: ['new'], metadata: { fixed: true } }, auth);
+      assert.equal(result.content, 'quasar revised'); assert.deepEqual(result.tags, ['new']); assert.deepEqual(result.metadata, { fixed: true });
+      assert.equal(result.ingestion?.state, 'retry_wait'); assert.equal(calls, 1);
+      const memory = await row(id);
+      for (const field of ['embedding', 'embedding_provider', 'embedding_model', 'embedding_dimensions']) assert.equal(memory[field], null);
+      assert.equal((await job(id)).kind, 'update'); assert.equal((await job(id)).dedupe, false); assert.equal((await job(id)).contradiction_eligible, false);
+      const hits = await hybridSearch({ query: 'quasar', limit: 10, threshold: 0.3 }, auth.namespaces, dbScopeFromAuth(auth), auth.maxAccessLevel, { trackAccess: false, queryVectors: [{ profile: ACTIVE_EMBEDDING_PROFILE, vector }] });
+      assert.ok(hits.some(hit => hit.id === id && hit.vec_score === null));
+    } finally { process.env.MEMORY_STORE_INLINE_EMBED_MS = '0'; globalThis.fetch = originalFetch; }
+  });
+  await t.test('healthy inline finalize preserves updated_at and public revision', async () => {
+    const id = await create('inline old'); let committed: any;
+    process.env.MEMORY_STORE_INLINE_EMBED_MS = '1000';
+    globalThis.fetch = async () => { committed = await row(id); return new Response(JSON.stringify({ embedding: { values: vector } }), { status: 200 }); };
+    try {
+      const result = await memoryUpdate({ id, content: 'inline new' }, auth);
+      assert.equal(result.ingestion?.state, 'ready'); assert.equal((await row(id)).revision, committed.revision);
+      assert.equal(new Date(result.updated_at).getTime(), committed.updated_at.getTime());
+      assert.equal((await row(id)).updated_at.getTime(), committed.updated_at.getTime());
+    } finally { process.env.MEMORY_STORE_INLINE_EMBED_MS = '0'; globalThis.fetch = originalFetch; }
+  });
+  await t.test('tags and metadata leave queued generation untouched and do not cancel indexing', async () => {
+    const id = await create('metadata old'); await memoryUpdate({ id, content: 'metadata new' }, auth);
+    const leased = await claim(id); const before = await job(id); const revision = (await row(id)).revision;
+    globalThis.fetch = async () => { throw new Error('unexpected provider call'); };
+    try { await memoryUpdate({ id, tags: ['tag'], metadata: { a: 1 } }, auth); }
+    finally { globalThis.fetch = originalFetch; }
+    assert.deepEqual(await job(id), before); assert.equal((await row(id)).revision, revision + 1);
+    assert.equal((await finalizeIngestionJob(leased, embedding))?.state, 'ready');
+    const plain = (await owner!.query(`INSERT INTO memories(content,namespace,client_id,tags,metadata) VALUES ('plain','shared',$1,'{}','{}') RETURNING id`, [ownerId])).rows[0].id;
+    await memoryUpdate({ id: plain, tags: ['only'] }, auth); assert.equal(await job(plain), undefined);
+  });
+  await t.test('successive content changes including ABA fence old results and failures', async () => {
+    const id = await create('start'); await memoryUpdate({ id, content: 'A' }, auth); const a = await claim(id);
+    await memoryUpdate({ id, content: 'B' }, auth); const b = await claim(id);
+    await memoryUpdate({ id, content: 'A' }, auth); const current = await claim(id);
+    assert.notEqual(a.lease_token, current.lease_token);
+    assert.equal(await finalizeIngestionJob(a, embedding), null); assert.equal(await finalizeIngestionJob(b, embedding), null);
+    await failIngestionJob(a, new Error('stale')); assert.equal((await job(id)).status, 'processing');
+    assert.equal((await row(id)).embedding, null); assert.equal((await finalizeIngestionJob(current, embedding))?.state, 'ready');
+    assert.equal((await row(id)).content, 'A');
+  });
+  await t.test('pending store becomes update without creating subscription events', async () => {
+    const subscription = (await owner!.query(`INSERT INTO memory_subscriptions
+      (api_key_id,query_text,query_embedding,embedding_provider,embedding_model,embedding_dimensions,threshold,exclude_self,
+       webhook_url_ciphertext,webhook_url_iv,webhook_url_tag,signing_secret_ciphertext,signing_secret_iv,signing_secret_tag,
+       encryption_key_id,idempotency_key,request_hash)
+      VALUES ($1,'fixture',$2::vector,$3,$4,768,0.5,false,'x',decode(repeat('00',12),'hex'),decode(repeat('00',16),'hex'),
+        'x',decode(repeat('00',12),'hex'),decode(repeat('00',16),'hex'),'test','update',repeat('a',64)) RETURNING id`, [otherId, JSON.stringify(vector), embedding.provider, embedding.model])).rows[0].id;
+    await owner!.query('INSERT INTO subscription_namespaces(subscription_id,api_key_id,namespace) VALUES ($1,$2,$3)', [subscription, otherId, 'shared']);
+    await owner!.query('ALTER TABLE memories ENABLE TRIGGER memories_subscription_enqueue; ALTER TABLE memories ENABLE TRIGGER memories_subscription_ready_enqueue');
+    const id = await create('pending store', false); const old = await claim(id);
+    await memoryUpdate({ id, content: 'updated before readiness' }, auth);
+    assert.equal(await finalizeIngestionJob(old, embedding), null); await finalizeIngestionJob(await claim(id), embedding);
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1', [id])).rows[0].n, 0);
+    const ready = await create('new stored event'); assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1', [ready])).rows[0].n, 1);
+    await memoryUpdate({ id: ready, content: 'ready edited' }, auth); await finalizeIngestionJob(await claim(ready), embedding);
+    assert.equal((await owner!.query('SELECT count(*)::int AS n FROM webhook_deliveries WHERE memory_id=$1', [ready])).rows[0].n, 1);
+  });
+  await t.test('supersession with provider down commits and later historical embedding preserves links', async () => {
+    const predecessor = await create('history before'); const successor = await create('history after');
+    await memoryUpdate({ id: predecessor, content: 'history updated' }, auth); const pending = await claim(predecessor);
+    await memoryUpdate({ id: successor, content: 'successor revised', supersedes: predecessor }, auth);
+    assert.equal((await row(successor)).supersedes_id, predecessor); assert.ok((await row(predecessor)).superseded_at);
+    assert.equal((await finalizeIngestionJob(pending, embedding))?.state, 'ready'); assert.ok((await row(predecessor)).superseded_at);
+    await finalizeIngestionJob(await claim(successor), embedding); assert.equal((await row(successor)).supersedes_id, predecessor);
+  });
+  await t.test('consolidation keeps pending historical indexing without reopening visibility', async () => {
+    const id = await create('member'); const summary = await create('summary');
+    await memoryUpdate({ id, content: 'member updated' }, auth); const pending = await claim(id);
+    await owner!.query('UPDATE memories SET consolidated_into_id=$2, consolidated_at=now() WHERE id=$1', [id, summary]);
+    assert.equal((await finalizeIngestionJob(pending, embedding))?.state, 'ready'); assert.equal((await row(id)).consolidated_into_id, summary);
+  });
+  await t.test('forget, purge and expiry cannot resurrect a queued row', async () => {
+    for (const action of ['forget', 'purge', 'expire']) {
+      const id = await create(action); await memoryUpdate({ id, content: `${action} revised` }, auth); const pending = await claim(id);
+      if (action === 'forget') await memoryForget({ ids: [id] }, auth);
+      if (action === 'purge') await owner!.query('DELETE FROM memories WHERE id=$1', [id]);
+      if (action === 'expire') await owner!.query("UPDATE memories SET expires_at=now()-interval '1 second' WHERE id=$1", [id]);
+      assert.equal(await finalizeIngestionJob(pending, embedding), null);
+      if (action === 'purge') assert.equal(await job(id), undefined); else assert.equal((await row(id)).embedding, null);
+    }
+  });
+  await t.test('ACL and private job ownership permit another authorized namespace writer', async () => {
+    const id = await create('shared old'); await memoryUpdate({ id, content: 'shared new' }, other);
+    assert.equal((await job(id)).client_id, otherId); assert.equal((await finalizeIngestionJob(await claim(id, other), embedding))?.state, 'ready');
+    assert.equal((await withScopedClient(dbScopeFromAuth(auth), c => c.query('SELECT * FROM memory_ingestion_jobs WHERE memory_id=$1', [id]))).rows.length, 0);
+    for (const actor of [{ ...auth, namespaces: ['private'] }, { ...auth, permissions: ['read'] }]) await assert.rejects(memoryUpdate({ id, content: 'denied' }, actor));
+    await owner!.query("UPDATE memories SET access_level='secret' WHERE id=$1", [id]);
+    await assert.rejects(memoryUpdate({ id, content: 'denied' }, { ...auth, maxAccessLevel: 'normal' }));
+    assert.equal((await row(id)).content, 'shared new');
+  });
+  await t.test('REST If-Match changes at patch commit and remains valid across indexing', async () => {
+    const { createApp } = await import('../src/server.js'); const app = createApp(); const id = await create('REST old');
+    const before = (await row(id)).updated_at.toISOString();
+    const patched = await request(app).patch(`/api/memories/${id}`).set('Authorization', `Bearer tr_${auth.name}`).set('If-Match', `"${before}"`).send({ content: 'REST new' });
+    assert.equal(patched.status, 200); assert.equal(patched.body.memory.ingestion.state, 'pending');
+    await finalizeIngestionJob(await claim(id), embedding);
+    assert.equal((await request(app).patch(`/api/memories/${id}`).set('Authorization', `Bearer tr_${auth.name}`).set('If-Match', `"${before}"`).send({ tags: ['stale'] })).status, 409);
+    assert.equal((await request(app).patch(`/api/memories/${id}`).set('Authorization', `Bearer tr_${auth.name}`).set('If-Match', `"${patched.body.memory.updated_at}"`).send({ tags: ['fresh'] })).status, 200);
+  });
+  await t.test('sub-gate off preserves synchronous failure and leaves job unchanged', async () => {
+    const id = await create('gate old'); const before = await job(id);
+    process.env.MEMORY_INGESTION_UPDATE_ENABLED = 'false'; globalThis.fetch = async () => { throw new Error('offline'); };
+    try { await assert.rejects(memoryUpdate({ id, content: 'not committed' }, auth)); }
+    finally { process.env.MEMORY_INGESTION_UPDATE_ENABLED = 'true'; globalThis.fetch = originalFetch; }
+    assert.equal((await row(id)).content, 'gate old'); assert.deepEqual(await job(id), before);
+  });
+});
