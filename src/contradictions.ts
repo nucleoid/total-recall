@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer';
 import { z } from 'zod';
 import { accessLevelSql } from './auth.js';
 import { logAudit } from './audit.js';
-import { dbScopeFromAuth, withScopedClient } from './db.js';
+import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR } from './embedding.js';
 import { localServingEnabled } from './local-embedding-runtime.js';
 import { QWEN_CONTRACT_ID, validateLocalStoredVector } from './local-embedding-contract.js';
@@ -568,18 +568,47 @@ export async function classifyContradiction(
  * high-confidence contradiction mutation. null always means the caller should
  * execute its normal unlinked insert.
  */
-export async function maybeReviseBelief(
-  memory: SemanticMemoryInsert,
-  auth: AuthContext,
-  options: {
+export interface BeliefRevisionOptions {
+    /** Per-call execution budget; does not alter the approved runtime configuration. */
+    timeoutMs?: number;
+    /** A shorter request deadline must defer mutation work rather than become no-match. */
+    throwOnTimeout?: boolean;
     policy?: ContradictionPolicy;
     provider?: GenerationProvider;
     allowMutation?: boolean;
     excludeCandidateId?: string;
     metric?: (reason: ContradictionReason) => void;
     findCandidates?: typeof findContradictionCandidates;
-  } = {},
+    finalizeExisting?: { id: string; client: ScopedClient };
+  }
+
+export async function maybeReviseBelief(
+  memory: SemanticMemoryInsert,
+  auth: AuthContext,
+  options: BeliefRevisionOptions = {},
 ): Promise<RevisionResult | null> {
+  const predecessorId = await prepareBeliefRevision(memory, auth, options);
+  if (!predecessorId) return null;
+  const metric = options.metric ?? emitContradictionMetric;
+  let result: RevisionResult | null;
+  try {
+    result = await commitAutomaticRevision(memory, predecessorId, auth, options.finalizeExisting);
+  } catch (error) {
+    if (options.finalizeExisting) throw error;
+    const code = databaseErrorCode(error);
+    if (!['23503', '23505', '23514', '40001', '40P01'].includes(code ?? '')) throw error;
+    metric('stale_candidate'); return null;
+  }
+  metric(result ? 'mutated' : 'stale_candidate');
+  return result;
+}
+
+/** Network classification only. Callers must revalidate the selected predecessor before mutation. */
+export async function prepareBeliefRevision(
+  memory: SemanticMemoryInsert,
+  auth: AuthContext,
+  options: BeliefRevisionOptions = {},
+): Promise<string | null> {
   const policy = options.policy ?? contradictionPolicyFromEnv();
   const metric = options.metric ?? emitContradictionMetric;
   if (!policyAllowsScope(policy, memory.namespace, memory.accessLevel)) {
@@ -596,6 +625,7 @@ export async function maybeReviseBelief(
     return null;
   }
   const classificationStartedAt = Date.now();
+  const timeoutMs = Math.min(policy.timeoutMs, options.timeoutMs ?? policy.timeoutMs);
 
   try {
   let candidates: ContradictionCandidate[];
@@ -605,11 +635,13 @@ export async function maybeReviseBelief(
       memory.namespace,
       auth,
       options.excludeCandidateId ?? null,
-      policy.timeoutMs,
+      timeoutMs,
       memory.localPrepared,
     );
   } catch (error) {
-    metric(databaseErrorCode(error) === '57014' ? 'candidate_timeout' : 'candidate_query_error');
+    const timedOut = databaseErrorCode(error) === '57014';
+    metric(timedOut ? 'candidate_timeout' : 'candidate_query_error');
+    if (timedOut && options.throwOnTimeout) throw new DOMException('Inline classifier budget exhausted', 'TimeoutError');
     return null;
   }
   if (candidates.length === 0) {
@@ -621,9 +653,10 @@ export async function maybeReviseBelief(
     metric('shadow_shutdown');
     return null;
   }
-  const remainingTimeoutMs = policy.timeoutMs - (Date.now() - classificationStartedAt);
+  const remainingTimeoutMs = timeoutMs - (Date.now() - classificationStartedAt);
   if (remainingTimeoutMs < 1) {
     metric('provider_timeout');
+    if (options.throwOnTimeout) throw new DOMException('Inline classifier budget exhausted', 'TimeoutError');
     return null;
   }
 
@@ -644,7 +677,10 @@ export async function maybeReviseBelief(
     );
   } catch (error) {
     if (error instanceof ContradictionBudgetExhaustedError) metric('budget_exhausted');
-    else if (error instanceof GenerationTimeoutError) metric('provider_timeout');
+    else if (error instanceof GenerationTimeoutError) {
+      metric('provider_timeout');
+      if (options.throwOnTimeout) throw new DOMException('Inline classifier budget exhausted', 'TimeoutError');
+    }
     else if (error instanceof GenerationLimitError && error.message.includes('input exceeds')) metric('input_too_large');
     else if (error instanceof GenerationLimitError) metric('output_too_large');
     else if (error instanceof Error &&
@@ -670,20 +706,7 @@ export async function maybeReviseBelief(
     return null;
   }
 
-  let result: RevisionResult | null;
-  try {
-    result = await commitAutomaticRevision(memory, classification.candidate_id!, auth);
-  } catch (error) {
-    // Constraint/serialization conflicts are known rolled-back stale outcomes.
-    // Do not swallow connection/commit uncertainty, which could duplicate a
-    // successfully committed successor on fallback.
-    const code = databaseErrorCode(error);
-    if (!['23503', '23505', '23514', '40001', '40P01'].includes(code ?? '')) throw error;
-    metric('stale_candidate');
-    return null;
-  }
-  metric(result ? 'mutated' : 'stale_candidate');
-  return result;
+  return classification.candidate_id!;
   } finally {
     finishClassification(runtime);
   }
@@ -693,8 +716,9 @@ export async function commitAutomaticRevision(
   memory: SemanticMemoryInsert,
   predecessorId: string,
   auth: AuthContext,
+  existing?: { id: string; client: ScopedClient },
 ): Promise<RevisionResult | null> {
-  return withScopedClient(dbScopeFromAuth(auth), async client => {
+  const commit = async (client: ScopedClient): Promise<RevisionResult | null> => {
     const predecessor = await client.query<{ id: string }>(
       `SELECT m.id
        FROM memories m
@@ -736,7 +760,13 @@ export async function commitAutomaticRevision(
     );
     if (closed.rowCount !== 1) return null;
 
-    const inserted = await client.query<RevisionResult>(
+    const inserted = existing ? await client.query<RevisionResult>(
+      `UPDATE memories SET embedding = $2::vector, embedding_provider = $3, embedding_model = $4,
+         embedding_dimensions = $5, supersedes_id = $6::uuid, valid_from = $7::timestamptz,
+         updated_at = statement_timestamp() WHERE id = $1 RETURNING id, namespace`,
+      [existing.id, memory.vector, ACTIVE_EMBEDDING_DESCRIPTOR.provider, ACTIVE_EMBEDDING_DESCRIPTOR.model,
+       ACTIVE_EMBEDDING_DESCRIPTOR.dimensions, predecessorId, revisionAt],
+    ) : await client.query<RevisionResult>(
       `INSERT INTO memories (
          content, embedding, source, namespace, tags, metadata, access_level,
          client_id, agent_id, session_id, embedding_provider, embedding_model,
@@ -775,7 +805,8 @@ export async function commitAutomaticRevision(
       sessionId: memory.sessionId ?? undefined,
     }, dbScopeFromAuth(auth), client);
     return successor;
-  });
+  };
+  return existing ? commit(existing.client) : withScopedClient(dbScopeFromAuth(auth), commit);
 }
 
 class ContradictionBudgetExhaustedError extends Error {

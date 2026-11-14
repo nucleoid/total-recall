@@ -67,7 +67,7 @@ const TOOL_DEFINITIONS = [
     description:
       'Store a memory with automatic embedding generation. Near-duplicates in the same namespace, ' +
       'access level, and embedding space reuse and boost the canonical memory by default; the result ' +
-      'reports created/deduplicated and similarity. Optional ttl is a positive integer lifetime in seconds; ' +
+      'reports created/deduplicated and similarity. With the ingestion queue enabled, state is ready, queued, embedding_failed or cancelled and accepted_at is the durable acceptance time. Queued content is recallable before semantic indexing; terminal states retain the ID but require recovery. Optional ttl is a positive integer lifetime in seconds; ' +
       'expiring writes bypass semantic dedupe and return their database-computed expires_at. For accurate provenance, pass agent_name identifying ' +
       'the agent storing this memory (e.g. "openclaw", "cursor-dev"). When omitted, the API key name is used as a fallback.',
     inputSchema: {
@@ -116,7 +116,7 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
       properties: {
         id: { type: 'string', format: 'uuid', description: 'Active current memory UUID to patch' },
-        content: { type: 'string', minLength: 1, maxLength: MEMORY_CONTENT_MAX_CHARS, description: 'Replacement nonblank content; changed content is re-embedded' },
+        content: { type: 'string', minLength: 1, maxLength: MEMORY_CONTENT_MAX_CHARS, description: 'Replacement nonblank content; with queued updates enabled, changed content is re-embedded inline when possible, otherwise queued; see ingestion.state' },
         tags: { type: 'array', maxItems: TAG_MAX_COUNT, items: { type: 'string', maxLength: TAG_MAX_CHARS }, description: 'Complete replacement tag list' },
         metadata: { type: 'object', description: `Complete replacement metadata object (maximum ${METADATA_MAX_BYTES} serialized JSON bytes)` },
         supersedes: { type: 'string', format: 'uuid', description: 'Current predecessor UUID; creates an immutable one-to-one history link' },
@@ -303,7 +303,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: 'memory_stats',
-    description: 'Get statistics about the memory store (admin-only).',
+    description: 'Get statistics about the memory store (admin-only). Includes a content-free ingestion block when the ingestion schema is installed.',
     inputSchema: {
       type: 'object' as const,
       properties: {},

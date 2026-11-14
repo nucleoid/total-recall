@@ -137,3 +137,19 @@ test('concurrent memoryStats requests each use one checkout and one aggregate', 
   assert.equal(pool.calls.filter(call => call.text.includes('WITH grouped AS')).length, 12);
   assert.equal(pool.calls.filter(call => call.text.includes('INSERT INTO audit_log')).length, 12);
 });
+
+
+test('queue metrics failure cannot abort committed memory statistics', async () => {
+  class FailingQueuePool extends StatsPool {
+    async connect() {
+      const client=await super.connect();const query=client.query;
+      return {...client,query:async(text:string,params?:unknown[])=>{
+        if(text.includes("to_regclass('public.memory_ingestion_jobs')"))return rows([{present:true}]);
+        if(text.includes('FROM memory_ingestion_jobs'))throw Object.assign(new Error('private database timeout'),{code:'57014'});
+        return query(text,params);
+      }};
+    }
+  }
+  setPoolForTesting(new FailingQueuePool() as unknown as pg.Pool);
+  assert.equal((await memoryStats({},auth)).total_memories,7);
+});

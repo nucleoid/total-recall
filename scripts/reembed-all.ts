@@ -123,6 +123,7 @@ async function selectBatch(
   fullRepair: boolean,
   lastId: string | null,
   batchSize: number,
+  ingestionGuard: string,
 ): Promise<MemoryRow[]> {
   await client.query('BEGIN');
   try {
@@ -134,6 +135,7 @@ async function selectBatch(
         AND to_jsonb(memories)->>'superseded_at' IS NULL
         AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
         AND (cardinality($1::text[]) = 0 OR namespace = ANY($1))
+        ${ingestionGuard}
         AND ${eligiblePredicate(6, 2, 3, 4)}
         AND ($5::uuid IS NULL OR id > $5::uuid)
       ORDER BY id
@@ -155,6 +157,7 @@ async function updateEmbedding(
   namespaces: string[],
   profile: Pick<MaintenanceEmbeddingProfile, 'provider' | 'model' | 'dimensions'>,
   fullRepair: boolean,
+  ingestionGuard: string,
 ): Promise<'updated' | 'concurrent_change'> {
   const result = await client.query(`
     UPDATE public.memories
@@ -172,6 +175,7 @@ async function updateEmbedding(
       AND content = $7
       AND revision = $8
       AND (cardinality($9::text[]) = 0 OR namespace = ANY($9))
+      ${ingestionGuard}
       AND ${eligiblePredicate(10, 2, 3, 4)}
   `, [vectorText(embedding), profile.provider, profile.model, profile.dimensions, row.id, row.updated_at, row.content, row.revision, namespaces, fullRepair]);
   return result.rowCount === 1 ? 'updated' : 'concurrent_change';
@@ -230,6 +234,12 @@ export async function reembedWithClient(
     throw new Error('maxErrors must be a nonnegative integer');
   }
 
+  const ingestionSchema = await client.query<{ present: boolean }>(
+    "SELECT to_regclass('public.memory_ingestion_jobs') IS NOT NULL AS present",
+  );
+  const ingestionGuard = ingestionSchema.rows[0]?.present
+    ? "AND NOT EXISTS (SELECT 1 FROM public.memory_ingestion_jobs j WHERE j.memory_id = memories.id AND j.status IN ('pending','processing','retry_wait'))"
+    : '';
   const initialInventory = await inventoryNamespaces(client);
   const selectedByNamespace: Record<string, number> = {};
   const succeededByNamespace: Record<string, number> = {};
@@ -245,7 +255,7 @@ export async function reembedWithClient(
   const writeOne = async (row: MemoryRow, embedding: number[]) => {
     try {
       await client.query('BEGIN');
-      const result = await updateEmbedding(client, row, embedding, namespaces, profile, fullRepair);
+      const result = await updateEmbedding(client, row, embedding, namespaces, profile, fullRepair, ingestionGuard);
       await client.query('COMMIT');
       if (result === 'updated') increment(succeededByNamespace, row.namespace);
       else recordFailure(row, 'concurrent_change');
@@ -256,7 +266,7 @@ export async function reembedWithClient(
   };
 
   for (;;) {
-    const batch = await selectBatch(client, namespaces, profile, fullRepair, lastId, batchSize);
+    const batch = await selectBatch(client, namespaces, profile, fullRepair, lastId, batchSize, ingestionGuard);
     if (batch.length === 0) break;
     lastId = batch.at(-1)!.id;
     selected += batch.length;

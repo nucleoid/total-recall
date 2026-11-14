@@ -42,6 +42,15 @@ export interface EmbeddingProfile {
   baseUrl?: string;
 }
 
+export class EmbeddingProviderError extends Error {
+  constructor(public readonly status: number, public readonly retryAfter?: string, operation = 'Embedding provider') {
+    super(`${operation} failed (${status})`);
+    this.name = 'EmbeddingProviderError';
+  }
+}
+
+export class EmbeddingValidationError extends Error {}
+
 export interface EmbeddingResult {
   vector: number[];
   provider: string;
@@ -184,17 +193,17 @@ export function findEmbeddingProfile(identity: { provider: string; model: string
 }
 
 export function validateEmbeddingVector(values: unknown, context: string, dimensions = PHYSICAL_VECTOR_DIMENSIONS): number[] {
-  if (!Array.isArray(values)) throw new Error(`${context} embedding response did not contain a vector array`);
-  if (values.length !== dimensions) throw new Error(`${context} embedding length ${values.length} does not match ${dimensions}`);
+  if (!Array.isArray(values)) throw new EmbeddingValidationError(`${context} embedding response did not contain a vector array`);
+  if (values.length !== dimensions) throw new EmbeddingValidationError(`${context} embedding length ${values.length} does not match ${dimensions}`);
   return values.map((value, index) => {
-    if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${context} embedding value at index ${index} must be finite`);
+    if (typeof value !== 'number' || !Number.isFinite(value)) throw new EmbeddingValidationError(`${context} embedding value at index ${index} must be finite`);
     return value;
   });
 }
 
 export function validateEmbeddingBatch(values: unknown, expectedCount: number, dimensions = PHYSICAL_VECTOR_DIMENSIONS): number[][] {
-  if (!Array.isArray(values)) throw new Error('Batch embedding response did not contain an embeddings array');
-  if (values.length !== expectedCount) throw new Error(`Batch embedding count ${values.length} does not match requested count ${expectedCount}`);
+  if (!Array.isArray(values)) throw new EmbeddingValidationError('Batch embedding response did not contain an embeddings array');
+  if (values.length !== expectedCount) throw new EmbeddingValidationError(`Batch embedding count ${values.length} does not match requested count ${expectedCount}`);
   return values.map((value, index) => validateEmbeddingVector(value, `batch[${index}]`, dimensions));
 }
 
@@ -237,7 +246,7 @@ async function requestProfile(profile: EmbeddingProfile, texts: string[], signal
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${profile.model}:${path}?key=${profile.apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: requestSignal,
       });
-      if (!response.ok) throw new Error(`Gemini ${path} failed (${response.status})`);
+      if (!response.ok) throw new EmbeddingProviderError(response.status, response.headers.get('retry-after') ?? undefined, `Gemini ${path}`);
       const data = await response.json() as { embedding?: { values?: unknown }; embeddings?: Array<{ values?: unknown }> };
       if (!batch) return [validateEmbeddingVector(data.embedding?.values, 'Gemini scalar', profile.dimensions)];
       return validateEmbeddingBatch(data.embeddings?.map(item => item.values), texts.length, profile.dimensions);
@@ -248,7 +257,7 @@ async function requestProfile(profile: EmbeddingProfile, texts: string[], signal
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: profile.model, input: texts }), signal: requestSignal,
     });
-    if (!response.ok) throw new Error(`Ollama embed failed (${response.status})`);
+    if (!response.ok) throw new EmbeddingProviderError(response.status, response.headers.get('retry-after') ?? undefined, 'Ollama embed');
     const data = await response.json() as { embeddings?: unknown };
     return validateEmbeddingBatch(data.embeddings, texts.length, profile.dimensions);
   });

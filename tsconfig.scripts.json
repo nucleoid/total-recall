@@ -45,7 +45,11 @@
     "test/gemini-key-repair.integration.test.ts",
     "test/repair-watcher-orphans.integration.test.ts",
     "test/migrate-runner.integration.test.ts",
-    "test/provisioning.integration.test.ts"
+    "test/provisioning.integration.test.ts",
+    "scripts/ingestion-worker.ts"
   ],
-  "exclude": ["node_modules", "dist"]
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }

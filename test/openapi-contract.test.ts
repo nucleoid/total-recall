@@ -27,6 +27,13 @@ async function document(): Promise<any> {
   return parse(await readFile(new URL('../openapi.yaml', import.meta.url), 'utf8'));
 }
 
+test('memory patch and read schemas include queued update ingestion metadata', async () => {
+  const api = await document();
+  assert.equal(api.components.schemas.MemoryRecord.properties.ingestion.$ref, '#/components/schemas/IngestionStatus');
+  assert.equal(api.components.schemas.Memory.properties.ingestion.$ref, '#/components/schemas/IngestionStatus');
+  assert.ok(api.components.schemas.IngestionStatus.properties.state.enum.includes('queued'));
+});
+
 test('OpenAPI 3.1 document validates and has unique stable operation IDs', async () => {
   const file = fileURLToPath(new URL('../openapi.yaml', import.meta.url));
   const api = await SwaggerParser.validate(file) as any;
@@ -103,7 +110,7 @@ test('representative runtime response fixtures satisfy the published schemas', a
   const now = '2026-07-16T00:00:00.000Z';
   const fixtures: Record<string, unknown> = {
     Health: { status: 'ok', version: '1.0.0' },
-    StoreResponse: { id, namespace: 'shared', created: true, deduplicated: false, expires_at: null, idempotency_key_honored: true },
+    StoreResponse: { state: 'ready', accepted_at: now, id, namespace: 'shared', created: true, deduplicated: false, expires_at: null, idempotency_key_honored: true },
     StoreDocumentResponse: { id, chunks: 2 },
     ForgetResponse: { forgotten: [id], count: 1 },
     Stats: {

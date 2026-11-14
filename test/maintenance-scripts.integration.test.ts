@@ -24,6 +24,7 @@ test('reembed processes every selected namespace and reports concurrent insert d
   let inventoryCalls = 0;
   let selectCalls = 0;
   const client = { async query(sql: string, values?: unknown[]) {
+    if (sql.includes("to_regclass('public.memory_ingestion_jobs')")) return { rows: [{ present: false }] };
     if (/SELECT id, content, namespace/i.test(sql)) return { rows: selectCalls++ === 0 ? [
       { id: 'p', content: 'personal secret', namespace: 'personal', updated_at: '2026-01-01 00:00:00.000001+00' },
       { id: 'm', content: 'media secret', namespace: 'media', updated_at: '2026-01-01 00:00:00.000002+00' },
@@ -58,6 +59,7 @@ test('reembed emits durable batch progress for long-running full-store operation
     [],
   ];
   const client = { async query(sql: string) {
+    if (sql.includes("to_regclass('public.memory_ingestion_jobs')")) return { rows: [{ present: false }] };
     if (/SELECT id, content, namespace/i.test(sql)) return { rows: batches[selectCalls++] };
     if (/UPDATE public\.memories/i.test(sql)) return { rows: [], rowCount: 1 };
     if (/COUNT\(\*\) FILTER/i.test(sql)) return { rows: [{ unknown_count: '0', legacy_count: '0' }] };
@@ -87,6 +89,7 @@ test('provider mismatch falls back safely, counts each selected row once, and sa
   const updates: string[] = [];
   let selectCalls = 0;
   const client = { async query(sql: string, values?: unknown[]) {
+    if (sql.includes("to_regclass('public.memory_ingestion_jobs')")) return { rows: [{ present: false }] };
     if (/SELECT id, content, namespace/i.test(sql)) return { rows: selectCalls++ === 0 ? [
       { id: 'a', content: 'TOP SECRET A', namespace: 'media', updated_at: '2026-01-01 00:00:00.000001+00' },
       { id: 'b', content: 'TOP SECRET B', namespace: 'future', updated_at: '2026-01-01 00:00:00.000002+00' },

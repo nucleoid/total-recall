@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { IngestionPersistenceError, ingestionStats, requeueIngestionJob, setIngestionPaused } from './ingestion.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -532,7 +534,9 @@ function permissionDenied(err: any): boolean {
 }
 
 function sendApiError(res: express.Response, label: string, err: any): void {
-  if (err.name === 'ZodError') {
+  if (err instanceof IngestionPersistenceError) {
+    res.status(503).json({ error: err.message, code: err.code });
+  } else if (err.name === 'ZodError') {
     res.status(400).json({ error: 'Invalid request', details: err.errors });
   } else if (typeof err.message === 'string' && err.message.startsWith('Invalid ')) {
     res.status(400).json({ error: err.message });
@@ -589,6 +593,7 @@ registerRestRoute(app, 'post', '/api/store', async (req, res) => {
       created: result.created,
       deduplicated: result.deduplicated,
       expires_at: result.expires_at,
+      ...(result.state && { state: result.state, accepted_at: result.accepted_at }),
       ...(result.similarity !== undefined && { similarity: result.similarity }),
       ...(result.idempotency_key_honored && { idempotency_key_honored: true }),
     });
@@ -670,6 +675,24 @@ registerRestRoute(app, 'delete', '/api/memories', async (req, res) => {
   } catch (err: any) {
     sendApiError(res, '/api/memories DELETE', err);
   }
+});
+
+registerRestRoute(app, 'get', '/api/ingestion/stats', async (req, res) => {
+  try { const auth = await authenticateRequest(req, res); if (!auth) return; res.json(await ingestionStats(auth)); }
+  catch (err) { sendApiError(res, '/api/ingestion/stats', err); }
+});
+registerRestRoute(app, 'post', '/api/ingestion/jobs/:memory_id/requeue', async (req, res) => {
+  try { const auth = await authenticateRequest(req, res); if (!auth) return; checkPermission(auth, 'admin');
+    res.json(await requeueIngestionJob(z.string().uuid().parse(req.params.memory_id), auth)); }
+  catch (err) { sendApiError(res, '/api/ingestion/requeue', err); }
+});
+registerRestRoute(app, 'post', '/api/ingestion/pause', async (req, res) => {
+  try { const auth = await authenticateRequest(req, res); if (!auth) return; res.json(await setIngestionPaused(true, auth)); }
+  catch (err) { sendApiError(res, '/api/ingestion/pause', err); }
+});
+registerRestRoute(app, 'post', '/api/ingestion/resume', async (req, res) => {
+  try { const auth = await authenticateRequest(req, res); if (!auth) return; res.json(await setIngestionPaused(false, auth)); }
+  catch (err) { sendApiError(res, '/api/ingestion/resume', err); }
 });
 
 registerRestRoute(app, 'get', '/api/stats', async (req, res) => {

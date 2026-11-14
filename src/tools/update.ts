@@ -1,3 +1,5 @@
+import { prepareLocalDocument, publishPreparedLocalDocument, type PreparedLocalDocument } from '../local-embedding-consumers.js';
+import { ACTIVE_EMBEDDING_PROFILE } from '../embedding.js';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { accessLevelSql } from '../auth.js';
@@ -5,6 +7,8 @@ import { logAudit } from '../audit.js';
 import { dbScopeFromAuth, queryScoped, withScopedClient, type ScopedClient } from '../db.js';
 import { embedWithProfile, serializeEmbeddingVector } from '../embedding.js';
 import { AuthorizationError, MemoryConflictError, MemoryNotFoundError } from '../errors.js';
+import { enqueueReembed, ingestionUpdateEnabled, tryInlineIngestion } from '../ingestion.js';
+import { attachIngestion } from '../ingestion-read.js';
 import {
   MEMORY_CONTENT_MAX_CHARS,
   TAG_MAX_CHARS,
@@ -115,24 +119,31 @@ export async function memoryUpdate(input: unknown, auth: AuthContext, expectedUp
     throw new AuthorizationError("Permission denied: requires 'write'");
   }
   const scope = dbScopeFromAuth(auth);
+  const queued = ingestionUpdateEnabled();
+  let acceptedAt: Date | undefined;
 
   // Embedding providers are called before locks are held. The revision guard
   // below makes the resulting content/vector pair optimistic but atomic.
   let initial: UpdateRow | undefined;
   let vector: string | undefined;
   let descriptor: unknown[] | undefined;
-  if (params.content !== undefined) {
+  let localPrepared: PreparedLocalDocument | undefined;
+  if (!queued && params.content !== undefined) {
     initial = await readCurrentTarget(params.id, auth);
     if (params.content !== initial.content) {
-      const embedding = await embedWithProfile(params.content);
+      localPrepared = await prepareLocalDocument(params.content);
+      const embedding = localPrepared && ACTIVE_EMBEDDING_PROFILE.provider === 'llama.cpp'
+        ? { vector: localPrepared.vectors[0], ...ACTIVE_EMBEDDING_PROFILE }
+        : await embedWithProfile(params.content);
       vector = serializeEmbeddingVector(embedding.vector);
       descriptor = [embedding.provider, embedding.model, embedding.dimensions];
     }
   }
 
   try {
-    return await withScopedClient(scope, async client => {
+    const updated = await withScopedClient(scope, async client => {
       const lockIds = [params.id, ...(params.supersedes ? [params.supersedes] : [])].sort();
+      if (queued) await client.query('SELECT app_lock_memory_ingestion($1::uuid[])', [lockIds]);
       const locked = await client.query<UpdateRow>(
         `SELECT m.*, m.embedding::text AS embedding
          FROM memories m
@@ -213,10 +224,10 @@ export async function memoryUpdate(input: unknown, auth: AuthContext, expectedUp
         const parameter = (value: unknown) => { values.push(value); return `$${values.length}`; };
         if (contentChanged) {
           assignments.push(`content = ${parameter(params.content)}`);
-          assignments.push(`embedding = ${parameter(vector)}::vector`);
-          assignments.push(`embedding_provider = ${parameter(descriptor![0])}`);
-          assignments.push(`embedding_model = ${parameter(descriptor![1])}`);
-          assignments.push(`embedding_dimensions = ${parameter(descriptor![2])}`);
+          assignments.push(`embedding = ${parameter(queued ? null : vector)}::vector`);
+          assignments.push(`embedding_provider = ${parameter(queued ? null : descriptor![0])}`);
+          assignments.push(`embedding_model = ${parameter(queued ? null : descriptor![1])}`);
+          assignments.push(`embedding_dimensions = ${parameter(queued ? null : descriptor![2])}`);
         }
         if (tagsChanged) assignments.push(`tags = ${parameter(params.tags)}::text[]`);
         if (metadataChanged) assignments.push(`metadata = ${parameter(JSON.stringify(params.metadata))}::jsonb`);
@@ -226,13 +237,16 @@ export async function memoryUpdate(input: unknown, auth: AuthContext, expectedUp
         }
         assignments.push(`updated_at = ${parameter(timestamp)}::timestamptz`);
         values.push(target.id);
-        await client.query(
+        const patched = await client.query(
           `UPDATE memories SET ${assignments.join(', ')} WHERE id = $${values.length}::uuid
              AND (expires_at IS NULL OR expires_at > statement_timestamp())
              AND to_jsonb(memories)->>'consolidated_into_id' IS NULL
              AND to_jsonb(memories)->>'memory_kind' IS DISTINCT FROM 'consolidation'`,
           values,
         );
+        if (queued && patched.rowCount !== 1) throw new MemoryConflictError('Memory changed while its patch was being committed');
+        if (!queued && contentChanged) await publishPreparedLocalDocument(client, target.id, localPrepared, { update: true });
+        if (queued && contentChanged) acceptedAt = await enqueueReembed(client, target.id);
       }
 
       if (predecessor) {
@@ -255,6 +269,7 @@ export async function memoryUpdate(input: unknown, auth: AuthContext, expectedUp
           action: 'memory.update',
           namespace: target.namespace,
           memoryId: target.id,
+          ...(queued && contentChanged ? { details: { queued: true } } : {}),
         }, scope, client);
       }
       if (predecessor) {
@@ -286,6 +301,17 @@ export async function memoryUpdate(input: unknown, auth: AuthContext, expectedUp
       );
       return result.rows[0] as Memory;
     });
+    if (!queued) return updated;
+    if (acceptedAt) await tryInlineIngestion({ id: updated.id, namespace: updated.namespace, expires_at: updated.expires_at ?? null,
+      created: false, deduplicated: false, state: 'queued', accepted_at: acceptedAt }, auth);
+    // Acceptance is already committed; status-read failure cannot undo it.
+    try {
+      const memory = (await attachIngestion([updated], scope))[0];
+      if (memory.ingestion && ['pending', 'processing', 'retry_wait'].includes(memory.ingestion.state)) {
+        return { ...memory, ingestion: { ...memory.ingestion, state: 'queued' } };
+      }
+      return memory;
+    } catch { return acceptedAt ? { ...updated, ingestion: { state: 'queued', accepted_at: acceptedAt.toISOString() } } : updated; }
   } catch (error) {
     if (typeof error === 'object' && error !== null && 'code' in error &&
         (error.code === '23505' || error.code === '23514' || error.code === '23503')) {

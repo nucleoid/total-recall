@@ -1071,3 +1071,11 @@ the last completed ISO week. No MCP/HTTP trigger or in-process scheduler is inst
 ## My Life historical context
 
 See [My Life gateway](docs/my-life-gateway.md) for a local stdio connection that combines Total Recall memories with historical evidence from all authorized My Life sources.
+
+### Durable memory ingestion (default off)
+
+`memory_store` / `POST /api/store` support a durable queue behind `MEMORY_INGESTION_QUEUE_ENABLED=true`. Apply migration 048 and start `npm run ingest:worker` with a dedicated `INGESTION_WORKER_API_KEY` (admin, scoped namespaces) before enabling. `MEMORY_STORE_INLINE_EMBED_MS` defaults to 3000 (0 = always async); `MEMORY_INGESTION_MAX_ATTEMPTS` defaults to 12. Provider timeout remains independently controlled by `EMBEDDING_TIMEOUT_MS`.
+
+Enabled stores add `state: ready | queued` and `accepted_at`. Queued content is immediately recallable, listable, full-text searchable and exportable. The bounded worker finishes semantic indexing, dedupe and eligible belief revision. Admins can inspect `/api/ingestion/stats`, pause/resume claims and requeue terminal jobs. `memory_stats` includes ingestion metrics; dashboard Memories show state badges. See [queue contracts](docs/ingestion-queue.md) and [rollout/recovery](docs/rollouts/048-memory-ingestion-queue.md), including the divergent-history upgrade fence.
+
+After migration 049 and deploying the #159 worker, additionally enable `MEMORY_INGESTION_UPDATE_ENABLED=true` for `memory_update` / `PATCH /api/memories/{id}`. Content changes commit the patch and clear the old vector atomically, then try the same inline budget. Responses retain `{ memory }`, adding `memory.ingestion.state: ready | queued` (or the actual terminal failure state). Non-content edits do not reset jobs or call the provider. Final indexing preserves `updated_at`/revision and creates no subscription events. See [update rollout and compatibility](docs/rollouts/049-memory-ingestion-updates.md).

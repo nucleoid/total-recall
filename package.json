@@ -86,7 +86,8 @@
     "browser:sync": "tsx scripts/browser-history-sync.ts",
     "preflight:media-keys": "tsx scripts/preflight-media-keys.ts",
     "test:plex": "node --test --import tsx test/connectors/plex-connector.test.ts",
-    "test:python": "tsx scripts/run-python-tests.ts"
+    "test:python": "tsx scripts/run-python-tests.ts",
+    "ingest:worker": "tsx scripts/ingestion-worker.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
