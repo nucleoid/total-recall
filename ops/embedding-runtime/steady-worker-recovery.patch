@@ -1,0 +1,87 @@
+--- a/codex-local-worker-20261119.mjs
++++ b/codex-local-worker-20261119.mjs
+@@ -7,6 +7,9 @@
+ import { ShadowEmbeddingStore } from '/app/dist/shadow-embedding-store.js';
+ import { runShadowBatch } from '/app/dist/shadow-embedding-worker.js';
+ import { setTimeout as delay } from 'node:timers/promises';
++import {recoverGuardPausedSteadyWorker} from '/app/dist/shadow-embedding-steady.js';
++import {SteadyRecoveryGate,recoveryErrorCode} from '/evidence/steady-recovery-policy.mjs';
++import {fetchBeaconHealth} from '/evidence/beacon-health.js';
+ 
+ const mode = process.argv.includes('--steady') ? 'steady' : 'backfill';
+ const cfg = JSON.parse(await readFile('/run/repair-config.json', 'utf8'));
+@@ -39,12 +42,12 @@
+   bearerToken: cfg.bearerToken, runtime: cfg.runtime,
+   expectedRuntimeHost: plan.runtime.expectedRuntimeHost, expectedRuntimeMode: 'cpu' });
+ let lastEth = 0;
++let lastGuardDiagnostic;
+ const guard = async () => {
+-  await baseGuard();
++  try { await baseGuard(); lastGuardDiagnostic=undefined; }
++  catch(error) { lastGuardDiagnostic=error.diagnostic; throw error; }
+   if (Date.now() - lastEth > 20_000) {
+-    const response = await fetch('http://10.20.0.19:3500/eth/v1/node/syncing', { signal: AbortSignal.timeout(3000) });
+-    if (!response.ok) throw Error('ethereum_health');
+-    const { data } = await response.json();
++    const data = await fetchBeaconHealth();
+     if (data.is_syncing || data.is_optimistic || data.el_offline) throw Error('ethereum_health');
+     lastEth = Date.now();
+   }
+@@ -60,6 +63,7 @@
+   await writeFile('/state/status.json', JSON.stringify(status, null, 2));
+ };
+ let resumed = false;
++const recoveryGate = new SteadyRecoveryGate(binding.id);
+ try {
+   if (!(await pool.query("SELECT pg_try_advisory_lock(hashtext('validator-local-repair-20261118')) locked")).rows[0].locked) throw Error('local_worker_overlap');
+   const store = new ShadowEmbeddingStore(pool, binding.id, 120, mode);
+@@ -73,18 +77,45 @@
+   }
+   do {
+     if (mode === 'steady') {
+-      const row = (await pool.query('SELECT steady_worker_enabled,steady_worker_last_error FROM embedding_serving_settings WHERE singleton AND cutover_attestation_run_id=$1', [binding.id])).rows[0];
+-      if (!row?.steady_worker_enabled) { await save({ state: 'fenced_paused', error: row?.steady_worker_last_error }); await sleep(30_000); continue; }
++      const row = (await pool.query('SELECT steady_worker_enabled,steady_worker_last_error,cutover_attestation_run_id,updated_at::text AS updated_at_token FROM embedding_serving_settings WHERE singleton AND cutover_attestation_run_id=$1', [binding.id])).rows[0];
++      if (!row?.steady_worker_enabled) {
++        if (!recoveryGate.eligible(row)) {
++          recoveryGate.reset();
++          await save({state:'fenced_paused',error:row?.steady_worker_last_error ?? 'embedding.steady_fence'});
++          await sleep(30_000);continue;
++        }
++        try {
++          // Recovery requires a fresh ETH check at every healthy sample, not the request-path cache.
++          lastEth=0;await guard();
++          if (!recoveryGate.observe(row,true,Date.now(),abort.signal.aborted)) {
++            await save({state:'recovery_healthy_cooldown',error:row.steady_worker_last_error});
++            await sleep(30_000);continue;
++          }
++          if (abort.signal.aborted) break;
++          const c=await pool.connect();
++          try {
++            const recovered=await recoverGuardPausedSteadyWorker(c,'total_recall',binding.id,envelope,
++              {error:row.steady_worker_last_error,updatedAtToken:row.updated_at_token});
++            await save({state:recovered.recovered?'guard_pause_recovered':'recovery_fence_changed'});
++          } finally {c.release();recoveryGate.reset();}
++        } catch(error) {
++          recoveryGate.observe(row,false,Date.now());
++          await save({state:'recovery_waiting_for_full_guard',error:recoveryErrorCode(error),...(lastGuardDiagnostic?{guardDiagnostic:lastGuardDiagnostic}:{})});
++        }
++        // Re-read serving state even after recovery; never run a batch from an old paused snapshot.
++        await sleep(30_000);continue;
++      }
++      recoveryGate.reset();
+       try { await guard(); }
+       catch (error) {
+         if (error.code === 'embedding.gateway_busy') { await save({ state: 'waiting_for_local_model_slot' }); await sleep(1000); continue; }
+-        await save({ state: 'waiting_for_verified_local_model' }); await sleep(30_000); continue;
++        await save({ state: 'waiting_for_verified_local_model',error:recoveryErrorCode(error),...(lastGuardDiagnostic?{guardDiagnostic:lastGuardDiagnostic}:{}) }); await sleep(30_000); continue;
+       }
+     }
+     const r = plan.resources;
+     const receipt = await runShadowBatch(store, embedding, { maxParents: r.maxParentsPerBatch, maxSourceBytes: r.maxSourceBytesPerBatch,
+       maxTokens: r.maxTokensPerBatch, maxElapsedMs: r.maxElapsedMsPerBatch, maxAttempts: r.maxAttempts }, guard, abort.signal);
+-    await save({ state: receipt.state, receipt });
++    await save({ state: receipt.state, receipt,...(lastGuardDiagnostic?{guardDiagnostic:lastGuardDiagnostic}:{}) });
+     if (mode === 'backfill') { if (receipt.state === 'paused' || receipt.failedParents || receipt.retriedParents) process.exitCode = 2; break; }
+     await sleep(receipt.claimedParents ? 5000 : 30_000);
+   } while (!abort.signal.aborted);

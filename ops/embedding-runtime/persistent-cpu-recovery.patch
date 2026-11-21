@@ -1,0 +1,118 @@
+--- a/persistent-cpu-gateway.js
++++ b/persistent-cpu-gateway.js
+@@ -1,6 +1,7 @@
+ ﻿import { createHash } from 'node:crypto';
+ import { lstat, readFile, statfs, writeFile } from 'node:fs/promises';
+ import { hostname, loadavg } from 'node:os';
++import { fetchBeaconResponse } from './beacon-health.js';
+ import { LocalEmbeddingGateway, verifyGatewayReceipt } from './local-embedding-gateway.js';
+ const GiB = 1024 ** 3, MiB = 1024 ** 2;
+ export const CPU_STEADY_RESOURCE_END = '2027-10-30T10:03:00.000Z';
+@@ -27,8 +28,10 @@
+         this.validate(s);
+     }
+     catch (error) {
+-        await this.trip('gateway.persistent_guard', guardFailureDiagnostic(s, this.baselineSwap, this.deps.now(), error));
+-        throw new Error('gateway.persistent_guard');
++        const diagnostic = guardFailureDiagnostic(s, this.baselineSwap, this.deps.now(), error);
++        const code = this.recoverable(s, diagnostic) ? 'gateway.retryable_guard' : 'gateway.persistent_guard';
++        await this.trip(code, diagnostic);
++        throw new Error(this.fatal);
+     } return s; }
+     start() { if (this.timer)
+         throw new Error('persistent.started'); this.timer = this.deps.setInterval(() => { if (this.checking || this.fatal)
+@@ -38,11 +41,42 @@
+     async fail(error) { await this.trip('gateway.persistent_guard', guardFailureDiagnostic(undefined, this.baselineSwap, this.deps.now(), error)); }
+     validate(s) { const now = this.deps.now(), b = this.baselineSwap ??= s.swapUsedBytes, distance = Number(s.beacon.sync_distance); if (now >= new Date(this.receipt.authorizedUntil).getTime() || s.hostId !== this.receipt.hostId || ![s.timestamp, s.availableBytes, s.diskFreeBytes, s.swapUsedBytes, s.memorySwapCurrent, s.memoryPsiAvg10, s.cgroupMemoryPsiAvg10, s.cpuPsiAvg10, s.load1, s.cpuQuota, s.cpuPeriod, s.memoryMax, s.memorySwapMax, distance].every(Number.isFinite) || Math.abs(now - s.timestamp) > 5000 || s.availableBytes < 8 * GiB || s.diskFreeBytes < 100 * GiB || s.swapUsedBytes < 0 || s.swapUsedBytes > 14 * GiB || s.memoryPsiAvg10 < 0 || s.cgroupMemoryPsiAvg10 < 0 || s.cgroupMemoryPsiAvg10 >= 5 || s.cpuPsiAvg10 < 0 || s.cpuPsiAvg10 >= 20 || s.load1 < 0 || s.load1 >= 16 || s.cpuQuota !== 200000 || s.cpuPeriod !== 100000 || s.memoryMax !== 8 * GiB || s.memorySwapMax !== 0 || s.memorySwapCurrent !== 0 || s.dockerSocketPresent || s.beacon.is_syncing !== false || s.beacon.is_optimistic !== false || s.beacon.el_offline !== false || distance < 0 || distance > 2)
+         throw new Error('gateway.persistent_guard'); }
+-    async trip(code, diagnostic = null) { if (this.fatal)
+-        return; this.fatal = code; this.stop(); await this.closeOwned().catch(() => { }); await this.deps.writeFatal({ status: 'fatal', code, diagnostic, at: new Date(this.deps.now()).toISOString(), hostIdHash: createHash('sha256').update(this.receipt.hostId).digest('hex'), contentFree: true }); this.deps.onFatal?.(); }
++    recoverable(sample, diagnostic) {
++        const now = this.deps.now();
++        // Retry only within the original authorization; restart never renews authority.
++        if (!Number.isFinite(now) || now >= new Date(this.receipt.authorizedUntil).getTime()) return false;
++        if (diagnostic.sampleStage === 'beacon_fetch' && (
++            ['ECONNREFUSED','ECONNRESET','ETIMEDOUT','EHOSTUNREACH','ENETUNREACH','EAI_AGAIN','ENOTFOUND','ETIMEOUT','ESERVFAIL','UND_ERR_CONNECT_TIMEOUT'].includes(diagnostic.osCode)
++            || ['TimeoutError','AbortError'].includes(diagnostic.exceptionType))) return true;
++        // A CPU-only pressure event is temporary only when every independent guard passes.
++        if (sample && Number.isFinite(sample.cpuPsiAvg10) && sample.cpuPsiAvg10 >= 20) {
++            try { this.validate({ ...sample, cpuPsiAvg10: 0 }); return true; } catch { return false; }
++        }
++        return false;
++    }
++    async trip(code, diagnostic = null) {
++        if (this.fatal) return;
++        this.fatal = code; this.stop();
++        // A backend that cannot be stopped is not eligible for an automatic restart.
++        try { await this.closeOwned(); }
++        catch { code = this.fatal = 'gateway.persistent_guard'; diagnostic = { ...diagnostic, closeOwnedFailed: true }; }
++        const retryable = code === 'gateway.retryable_guard';
++        const record = { status: retryable ? 'retryable' : 'fatal', code, diagnostic, at: new Date(this.deps.now()).toISOString(), hostIdHash: createHash('sha256').update(this.receipt.hostId).digest('hex'), contentFree: true };
++        try {
++            if (retryable) {
++                if (typeof this.deps.writeTransient !== 'function') throw new Error('persistent.transient_receipt_missing');
++                await this.deps.writeTransient(record);
++            } else await this.deps.writeFatal(record);
++        } catch (error) {
++            this.fatal = 'gateway.persistent_guard';
++            this.deps.onFatal?.(1);
++            throw error;
++        }
++        this.deps.onFatal?.(retryable ? 75 : 1);
++    }
+ }
+ const sampleFailureStages = new WeakMap();
+-async function sampleStep(stage, action) {
++export async function sampleStep(stage, action) {
+  try { return await action(); } catch(error) {
+   if(error && (typeof error==='object'||typeof error==='function')) sampleFailureStages.set(error,stage);
+   throw error;
+@@ -53,7 +87,7 @@
+  out.sampleStage=error && typeof error==='object' ? sampleFailureStages.get(error)??null : null;
+  out.exceptionType=['Error','TypeError','SyntaxError','TimeoutError','AbortError','RangeError'].includes(error?.name)?error.name:'other';
+  const osCode=error?.cause?.code??error?.code;
+- out.osCode=['EADDRINUSE','ENOENT','EACCES','EPERM','EIO','EMFILE','ENOMEM','ECONNREFUSED','ECONNRESET','ETIMEDOUT','EHOSTUNREACH','ENETUNREACH'].includes(osCode)?osCode:null;
++ out.osCode=['EADDRINUSE','ENOENT','EACCES','EPERM','EIO','EMFILE','ENOMEM','ECONNREFUSED','ECONNRESET','ETIMEDOUT','EHOSTUNREACH','ENETUNREACH','EAI_AGAIN','ENOTFOUND','ETIMEOUT','ESERVFAIL','UND_ERR_CONNECT_TIMEOUT'].includes(osCode)?osCode:null;
+  if(!sample||typeof sample!=='object')return out;
+  const values={};for(const key of ['timestamp','availableBytes','diskFreeBytes','swapUsedBytes','memoryPsiAvg10','cgroupMemoryPsiAvg10','cpuPsiAvg10','load1','cpuQuota','cpuPeriod','memoryMax','memorySwapMax','memorySwapCurrent'])if(Number.isFinite(sample[key]))values[key]=sample[key];
+  if(Number.isFinite(baselineSwap)){values.baselineSwapUsedBytes=baselineSwap;if(Number.isFinite(sample.swapUsedBytes))values.hostSwapGrowthBytes=sample.swapUsedBytes-baselineSwap;}
+@@ -86,7 +120,7 @@
+         return false;
+     throw e;
+ } }
+-export function systemSampler(receipt, beaconUrl, fetcher = fetch) { return async () => { const [mem, mpsi, cpsi, cpu, memory, memorySwap, memorySwapCurrent, cgroupMemoryPsi, disk, beaconResponse, dockerSocketPresent] = await Promise.all([sampleStep('meminfo',()=>readFile('/proc/meminfo', 'utf8')), sampleStep('host_memory_pressure',()=>readFile('/proc/pressure/memory', 'utf8')), sampleStep('host_cpu_pressure',()=>readFile('/proc/pressure/cpu', 'utf8')), sampleStep('cpu_limit',()=>readFile('/sys/fs/cgroup/cpu.max', 'utf8')), sampleStep('memory_limit',()=>readFile('/sys/fs/cgroup/memory.max', 'utf8')), sampleStep('swap_limit',()=>readFile('/sys/fs/cgroup/memory.swap.max', 'utf8')), sampleStep('swap_current',()=>readFile('/sys/fs/cgroup/memory.swap.current', 'utf8')), sampleStep('owned_memory_pressure',()=>readFile('/sys/fs/cgroup/memory.pressure', 'utf8')), sampleStep('disk',()=>statfs(receipt.host.diskPath)), sampleStep('beacon_fetch',()=>fetcher(beaconUrl, { redirect: 'error', signal: AbortSignal.timeout(3000) })), sampleStep('docker_socket',()=>socketExists())]); if (!beaconResponse.ok)
++export function systemSampler(receipt, beaconUrl, fetcher = fetch) { return async () => { const [mem, mpsi, cpsi, cpu, memory, memorySwap, memorySwapCurrent, cgroupMemoryPsi, disk, beaconResponse, dockerSocketPresent] = await Promise.all([sampleStep('meminfo',()=>readFile('/proc/meminfo', 'utf8')), sampleStep('host_memory_pressure',()=>readFile('/proc/pressure/memory', 'utf8')), sampleStep('host_cpu_pressure',()=>readFile('/proc/pressure/cpu', 'utf8')), sampleStep('cpu_limit',()=>readFile('/sys/fs/cgroup/cpu.max', 'utf8')), sampleStep('memory_limit',()=>readFile('/sys/fs/cgroup/memory.max', 'utf8')), sampleStep('swap_limit',()=>readFile('/sys/fs/cgroup/memory.swap.max', 'utf8')), sampleStep('swap_current',()=>readFile('/sys/fs/cgroup/memory.swap.current', 'utf8')), sampleStep('owned_memory_pressure',()=>readFile('/sys/fs/cgroup/memory.pressure', 'utf8')), sampleStep('disk',()=>statfs(receipt.host.diskPath)), sampleStep('beacon_fetch',()=>fetchBeaconResponse(beaconUrl, { fetch: fetcher })), sampleStep('docker_socket',()=>socketExists())]); if (!beaconResponse.ok)
+     throw new Error('beacon'); const beacon = (await sampleStep('beacon_json',()=>boundedJson(beaconResponse)))?.data, parsed = parseLinuxGuardFiles(mem, mpsi, cpsi, cpu, memory, memorySwap, memorySwapCurrent, cgroupMemoryPsi); return { hostId: hostname(), timestamp: Date.now(), ...parsed, diskFreeBytes: Number(disk.bavail) * Number(disk.bsize), load1: loadavg()[0], beacon, dockerSocketPresent }; }; }
+ export async function startGuardedOwned(guard, gateway) { try {
+     await guard.check();
+@@ -99,4 +133,4 @@
+     await guard.fail(error);
+     throw error;
+ } }
+-export async function launchPersistentCpu(receiptRaw, frontendSecret, backendPort, beaconUrl, fatalReceiptPath, onFatal) { let gateway; const receipt = await verifyGatewayReceipt(receiptRaw); const guard = new PersistentCpuGuard(receipt, async () => gateway?.close(), { now: Date.now, sample: systemSampler(receipt, beaconUrl), setInterval, clearInterval, writeFatal: v => writeFile(fatalReceiptPath, JSON.stringify(v), { mode: 0o600, flag: 'wx' }), onFatal }); gateway = new LocalEmbeddingGateway(receipt, frontendSecret, backendPort, { telemetry: () => guard.telemetry(), commonTelemetry: () => guard.telemetry() }); await startGuardedOwned(guard, gateway); return { gateway, guard, close: async () => { guard.stop(); await gateway.close(); } }; }
++export async function launchPersistentCpu(receiptRaw, frontendSecret, backendPort, beaconUrl, fatalReceiptPath, onFatal) { let gateway; const receipt = await verifyGatewayReceipt(receiptRaw); const guard = new PersistentCpuGuard(receipt, async () => gateway?.close(), { now: Date.now, sample: systemSampler(receipt, beaconUrl), setInterval, clearInterval, writeFatal: v => writeFile(fatalReceiptPath, JSON.stringify(v), { mode: 0o600, flag: 'wx' }), writeTransient: v => writeFile(`${fatalReceiptPath}.transient`, JSON.stringify(v), { mode: 0o600 }), onFatal }); gateway = new LocalEmbeddingGateway(receipt, frontendSecret, backendPort, { telemetry: () => guard.telemetry(), commonTelemetry: () => guard.telemetry() }); await startGuardedOwned(guard, gateway); return { gateway, guard, close: async () => { guard.stop(); await gateway.close(); } }; }
+--- a/run-persistent-cpu-gateway.js
++++ b/run-persistent-cpu-gateway.js
+@@ -23,7 +23,7 @@
+ if (![config.receiptPath, config.frontendSecretPath, config.fatalReceiptPath].every(isAbsolute) || !Number.isSafeInteger(config.backendPort) || config.backendPort < 1024 || config.backendPort > 65535)
+     throw new Error('persistent.config');
+ const beacon = new URL(config.beaconUrl), ip = beacon.hostname.split('.').map(Number), privateIp = ip.length === 4 && ip.every((n, i) => Number.isInteger(n) && n >= 0 && n <= 255 && String(n) === beacon.hostname.split('.')[i]) && (ip[0] === 10 || (ip[0] === 172 && ip[1] >= 16 && ip[1] <= 31) || (ip[0] === 192 && ip[1] === 168));
+-if (config.beaconUrl !== config.expectedBeaconUrl || beacon.protocol !== 'http:' || beacon.username || beacon.password || beacon.search || beacon.hash || !privateIp || !beacon.port || beacon.pathname !== '/eth/v1/node/syncing')
++if (config.beaconUrl !== config.expectedBeaconUrl || beacon.protocol !== 'http:' || beacon.username || beacon.password || beacon.search || beacon.hash || (!privateIp && beacon.hostname !== 'beacon-chain.lodestar.dappnode.private') || !beacon.port || beacon.pathname !== '/eth/v1/node/syncing')
+     throw new Error('persistent.beacon');
+ await secure(config.receiptPath, 1024 * 1024);
+ await secure(config.frontendSecretPath, 4096);
+@@ -43,9 +43,11 @@
+ const receipt = JSON.parse(await readFile(config.receiptPath, 'utf8')), secret = Buffer.from((await readFile(config.frontendSecretPath, 'utf8')).trim(), 'utf8');
+ let owned;
+ try {
+-    owned = await launchPersistentCpu(receipt, secret, config.backendPort, beacon.toString(), config.fatalReceiptPath, () => { process.exitCode = 1; setImmediate(() => process.exit(1)); });
++    owned = await launchPersistentCpu(receipt, secret, config.backendPort, beacon.toString(), config.fatalReceiptPath, (exitCode = 1) => { process.exitCode = exitCode; setImmediate(() => process.exit(exitCode)); });
+ }
+-catch {
++catch (error) {
++    // Retryable failures have a separate receipt and must not manufacture a fatal latch.
++    if (error?.message === 'gateway.retryable_guard') process.exit(75);
+     await writeFile(config.fatalReceiptPath, JSON.stringify({ status: 'fatal', code: 'gateway.startup_failed', at: new Date().toISOString(), contentFree: true }), { mode: 0o600, flag: 'wx' }).catch(() => { });
+     throw new Error('gateway.startup_failed');
+ }

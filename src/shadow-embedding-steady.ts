@@ -36,3 +36,21 @@ export async function pauseSteadyWorker(client:pg.PoolClient,expectedDatabase:st
     [QWEN_CONTRACT_ID,runId,errorCode]);if(result.rowCount!==1)throw new Error('embedding.steady_fence');await client.query('COMMIT');return result.rows[0];
   }catch(error){await client.query('ROLLBACK');throw error;}
 }
+
+/** Recover only an unchanged, automatically guard-paused serving generation. */
+export async function recoverGuardPausedSteadyWorker(client:pg.PoolClient,expectedDatabase:string,runId:string,envelope:ManifestEnvelope,expected:{error:string;updatedAtToken:string}){
+  if(!['embedding.resource_guard','embedding.runtime_health','ethereum_health'].includes(expected.error)
+    ||typeof expected.updatedAtToken!=='string'||!expected.updatedAtToken||expected.updatedAtToken.length>128)
+    throw new Error('embedding.steady_recovery_reason');
+  await client.query('BEGIN');try{
+    await client.query("SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='10s'");
+    await lock(client,expectedDatabase,runId,envelope);
+    const result=await client.query(`UPDATE embedding_serving_settings
+      SET steady_worker_enabled=true,steady_worker_last_error=NULL,updated_at=statement_timestamp()
+      WHERE singleton AND contract_id=$1 AND cutover_attestation_run_id=$2
+        AND steady_worker_enabled=false AND steady_worker_last_error=$3 AND updated_at::text=$4
+      RETURNING steady_worker_enabled,steady_worker_last_error`,[QWEN_CONTRACT_ID,runId,expected.error,expected.updatedAtToken]);
+    await client.query('COMMIT');
+    return {recovered:result.rowCount===1,...(result.rows[0]??{})};
+  }catch(error){await client.query('ROLLBACK');throw error;}
+}
