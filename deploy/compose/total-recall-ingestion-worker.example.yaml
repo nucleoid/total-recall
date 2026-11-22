@@ -1,0 +1,32 @@
+# Container deployments should merge this service into the same Compose project
+# as the API and database. Keep worker credentials in untracked env files.
+services:
+  ingestion-worker:
+    image: node:24-bookworm-slim
+    restart: unless-stopped
+    working_dir: /app
+    command: [node, dist/ingestion-worker.js, --concurrency, '1', --batch-size, '16', --poll-ms, '1000']
+    env_file:
+      - path: ./app.env
+        format: raw
+      # Optional deployment-specific DATABASE_URL override. This is needed when
+      # host networking reaches a host-local model but app.env names Compose db.
+      - path: ./ingestion-worker.env
+        format: raw
+        required: false
+    volumes:
+      - ./release:/app:ro
+    cpus: 0.25
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    read_only: true
+    tmpfs: [/tmp:size=16m]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 240s
+    depends_on:
+      db: {condition: service_healthy}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}
