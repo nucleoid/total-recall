@@ -132,8 +132,14 @@ test('failure hook uses official CLI once, retains refusal, and blocks unchanged
   const stateRoot = path.join(root, 'state');
   let notifications = 0;
   let remoteInvocations = 0;
-  const runFile = async (file: string, args: readonly string[]) => {
-    if (file.endsWith('/openclaw')) { notifications += 1; throw new Error('capability refused'); }
+  const runFile = async (file: string, args: readonly string[], timeoutMs?: number) => {
+    if (file.endsWith('/openclaw')) {
+      notifications += 1;
+      assert.equal(timeoutMs, 60_000);
+      const persisted = JSON.parse(await readFile(path.join(stateRoot, 'session.state.json'), 'utf8'));
+      assert.equal(persisted.blockedFailure.errorCode, 'native_cli_failed');
+      throw new Error('capability refused');
+    }
     const remote = args.at(-1) ?? '';
     if (remote.includes("'/usr/bin/docker'") && remote.includes("'/usr/bin/stat'")) {
       return { stdout: `${Buffer.byteLength(sessionPolicyJson)}\n`, stderr: '' };

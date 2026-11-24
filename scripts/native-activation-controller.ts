@@ -116,7 +116,7 @@ export async function notifyFailure(
   const args = ['message', 'send', '--channel', 'discord', '--target', DISCORD_CHANNEL,
     '--message', message, '--json', ...(dryRun ? ['--dry-run'] : [])];
   try {
-    const result = await runFile(OPENCLAW_CLI, args, 30_000);
+    const result = await runFile(OPENCLAW_CLI, args, 60_000);
     const parsed: unknown = JSON.parse(result.stdout);
     if (!isAcceptedNotificationReceipt(parsed, dryRun)) throw new Error('notification_receipt_invalid');
     return { status: dryRun ? 'dry_run_accepted' : 'cli_accepted' };
@@ -218,9 +218,11 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
       const stateToken = errorCode === 'generation_budget_exhausted' ? currentStateToken : undefined;
       const fingerprint = configHash(`${config.feature}\0${errorCode}\0${hash}\0${laneBinding?.policySha256 ?? ''}\0${stateToken ?? ''}`);
       const duplicate = state.blockedFailure?.fingerprint === fingerprint;
-      const notification = duplicate ? undefined : await notifyFailure(config.feature, errorCode, cli.notificationDryRun, runFile);
+      // Persist the stop decision before the external CLI attempt. A crash,
+      // process timeout, or ambiguous send must never retry unchanged failure.
       await atomicJson(stateFile, { version: 1, nextLane: laneIndex,
         blockedFailure: { fingerprint, configHash: hash, errorCode, stateToken } } satisfies FeatureState);
+      const notification = duplicate ? undefined : await notifyFailure(config.feature, errorCode, cli.notificationDryRun, runFile);
       const receipt = await writeReceipt(root, { ...base(), status: 'failed', errorCode,
         generationCallsReserved: reserved, commandsCompleted: completed,
         finishedAt: now().toISOString(), notification });
