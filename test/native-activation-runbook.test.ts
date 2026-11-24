@@ -25,4 +25,8 @@ test('runbook keeps product scheduling separate from conversation continuation a
   assert.match(runbook, /sourceGraphCoverage: "pending"/);
   assert.match(runbook, /zero generation reservation, and zero native CLI invocation/i);
   assert.match(runbook, /Success never sends a notification/i);
+  assert.match(runbook, /do not create one service or timer per lane/i);
+  assert.match(runbook, /native-maintenance-owner-launcher\.py/);
+  assert.match(runbook, /run-reviewed/);
+  assert.match(runbook, /official_cli_timeout|timeout, nonzero exit/i);
 });

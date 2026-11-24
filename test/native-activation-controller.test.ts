@@ -197,6 +197,75 @@ test('policy scope mismatch fails before reservation or native feature dispatch'
   await assert.rejects(readFile(path.join(stateRoot, 'generation-budget-2026-11-24.json')), /ENOENT/);
 });
 
+test('one owner rotates lanes and uses the same selected binding for preflight and dispatch', async t => {
+  const { root, configFile, value } = await fixture(t);
+  const workPolicy = JSON.stringify({ ...sessionPolicy, scope: { namespaces: ['work'], accessLevel: 'normal' } });
+  const workSha = createHash('sha256').update(workPolicy).digest('hex');
+  delete value.environmentFile;
+  delete value.policyFile;
+  delete value.policySha256;
+  delete value.policyEnvironment;
+  value.lanes = [
+    { namespace: 'shared', accessLevel: 'normal', profile: 'queued-session', mode: 'once', binding: {
+      environmentFile: '/private/session-shared.env', policyFile: '/policies/shared.json',
+      policySha256: sessionPolicySha256, policyEnvironment: 'test',
+    } },
+    { namespace: 'work', accessLevel: 'normal', profile: 'queued-session', mode: 'once', binding: {
+      environmentFile: '/private/session-work.env', policyFile: '/policies/work.json',
+      policySha256: workSha, policyEnvironment: 'test',
+    } },
+  ];
+  await writeFile(configFile, JSON.stringify(value));
+  const dispatched: string[] = [];
+  const runFile = async (_file: string, args: readonly string[]) => {
+    const remote = args.at(-1) ?? '';
+    if (remote.includes("'/usr/bin/stat'") && !remote.includes("'/usr/bin/docker'")) return { stdout: '600\n', stderr: '' };
+    if (remote.includes("'/usr/bin/docker'") && remote.includes("'/usr/bin/stat'")) {
+      return { stdout: `${Buffer.byteLength(remote.includes('work.json') ? workPolicy : sessionPolicyJson)}\n`, stderr: '' };
+    }
+    if (remote.includes("'/usr/bin/sha256sum'")) return {
+      stdout: `${remote.includes('work.json') ? workSha : sessionPolicySha256}  policy.json\n`, stderr: '',
+    };
+    if (remote.includes("'/usr/bin/cat'")) return {
+      stdout: remote.includes('work.json') ? workPolicy : sessionPolicyJson, stderr: '',
+    };
+    dispatched.push(remote);
+    return { stdout: '[session-distill] stopped { processed: 1 }', stderr: '' };
+  };
+  const stateRoot = path.join(root, 'bound-state');
+  const first = await runNativeActivation({ configFile, execute: true, notificationDryRun: false },
+    { stateRoot, now: () => NOW, runFile });
+  const second = await runNativeActivation({ configFile, execute: true, notificationDryRun: false },
+    { stateRoot, now: () => NOW, runFile });
+  assert.equal(first.policyHash, sessionPolicySha256);
+  assert.equal(second.policyHash, workSha);
+  assert.match(dispatched[0], /session-shared\.env/);
+  assert.match(dispatched[0], /SESSION_DISTILLATION_POLICY_FILE=\/policies\/shared\.json/);
+  assert.doesNotMatch(dispatched[0], /session-work\.env|work\.json/);
+  assert.match(dispatched[1], /session-work\.env/);
+  assert.match(dispatched[1], /SESSION_DISTILLATION_POLICY_FILE=\/policies\/work\.json/);
+});
+
+test('maintenance dispatches only the fixed host launcher without container credentials', async t => {
+  const { root, configFile, value } = await fixture(t, 'webhook');
+  value.feature = 'maintenance';
+  delete value.environmentFile;
+  value.lanes = [{ namespace: 'shared', accessLevel: 'normal', profile: 'bounded-owner', mode: 'once' }];
+  await writeFile(configFile, JSON.stringify(value));
+  let remote = '';
+  const receipt = await runNativeActivation({ configFile, execute: true, notificationDryRun: false }, {
+    stateRoot: path.join(root, 'maintenance-state'), now: () => NOW,
+    runFile: async (_file, args) => {
+      remote = args.at(-1) ?? '';
+      return { stdout: JSON.stringify({ version: 1, kind: 'bounded_native_decay', status: 'pass_complete',
+        classificationsFinalized: true }), stderr: '' };
+    },
+  });
+  assert.equal(receipt.status, 'succeeded');
+  assert.equal(remote, "'/usr/bin/python3' '/home/cass/total-recall-move-20261117/release/scripts/native-maintenance-owner-launcher.py'");
+  assert.doesNotMatch(remote, /docker|env-file|DATABASE_URL/);
+});
+
 test('official notification carries only exact feature and error code', async () => {
   let sent: readonly string[] = [];
   const result = await notifyFailure('webhook', 'native_cli_failed', true, async (_file, args) => {
@@ -219,4 +288,13 @@ test('official notification receipt rejects generic JSON and failed delivery', (
     payload: {}, deliveryStatus: 'sent' }, false), false);
   assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: false,
     payload: {}, deliveryStatus: 'sent', messageId: '1' }, false), true);
+});
+
+test('notification failures retain safe timeout and invalid-receipt classifications', async () => {
+  assert.deepEqual(await notifyFailure('webhook', 'native_cli_failed', false, async () => {
+    throw Object.assign(new Error('private detail'), { code: 'ETIMEDOUT', killed: true });
+  }), { status: 'refused', code: 'official_cli_timeout' });
+  assert.deepEqual(await notifyFailure('webhook', 'native_cli_failed', false, async () => ({
+    stdout: '{"ok":true}', stderr: 'private detail',
+  })), { status: 'refused', code: 'official_cli_invalid_receipt' });
 });

@@ -8,11 +8,13 @@ import {
   buildInvocationPlan,
   configHash,
   parseNativeActivationConfig,
+  resolveLaneBinding,
   validateNativePolicyForLane,
   validateKnownCliReceipt,
   type NativeActivationConfig,
   type NativeCommand,
   type NativeFeature,
+  type NativeLaneBinding,
 } from './native-activation-contract.js';
 
 const execFile = promisify(execFileCallback);
@@ -118,9 +120,20 @@ export async function notifyFailure(
     const parsed: unknown = JSON.parse(result.stdout);
     if (!isAcceptedNotificationReceipt(parsed, dryRun)) throw new Error('notification_receipt_invalid');
     return { status: dryRun ? 'dry_run_accepted' : 'cli_accepted' };
-  } catch {
-    return { status: 'refused', code: 'official_cli_refused' };
+  } catch (error) {
+    return { status: 'refused', code: classifyNotificationFailure(error) };
   }
+}
+
+function classifyNotificationFailure(error: unknown): string {
+  if (error instanceof Error && error.message === 'notification_receipt_invalid') return 'official_cli_invalid_receipt';
+  if (error instanceof SyntaxError) return 'official_cli_invalid_receipt';
+  const value = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+  if (value?.killed || value?.code === 'ETIMEDOUT' || value?.signal === 'SIGTERM') return 'official_cli_timeout';
+  if (typeof value?.code === 'number' || (typeof value?.code === 'string' && /^\d+$/.test(value.code))) {
+    return 'official_cli_exit_nonzero';
+  }
+  return 'official_cli_refused';
 }
 
 export function isAcceptedNotificationReceipt(value: unknown, expectedDryRun: boolean): boolean {
@@ -156,9 +169,10 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
     const state = await readFeatureState(stateFile);
     const laneIndex = state.nextLane % config.lanes.length;
     const plan = buildInvocationPlan(config, laneIndex);
+    const laneBinding = resolveLaneBinding(config, plan.lane);
     let receiptScopeBinding: Receipt['scopeBinding'] = 'unverified';
     const base = (): Omit<Receipt, 'status' | 'finishedAt'> => ({
-      version: 1, feature: config.feature, configHash: hash, policyHash: config.policySha256,
+      version: 1, feature: config.feature, configHash: hash, policyHash: laneBinding?.policySha256,
       approvalReference: config.approval.reference,
       lane: { namespace: plan.lane.namespace, accessLevel: plan.lane.accessLevel,
         profile: plan.lane.profile, mode: plan.lane.mode },
@@ -178,7 +192,7 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
     let reserved = 0;
     let completed = 0;
     try {
-      const policyBinding = await preflight(config, plan.lane, now(), runFile);
+      const policyBinding = await preflight(config, plan.lane, laneBinding, now(), runFile);
       receiptScopeBinding = policyBinding.scopeBinding;
       const generationCallHardMax = policyBinding.generationCallHardMax;
       if (generationCallHardMax > config.dailyGenerationCallCap) {
@@ -190,7 +204,7 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
         reserved = generationCallHardMax;
       }
       for (const command of plan.commands) {
-        const result = await runRemoteFeature(config, command, runFile);
+        const result = await runRemoteFeature(config, laneBinding, command, runFile);
         validateKnownCliReceipt(command.receiptKind, result.stdout, result.stderr);
         completed += 1;
       }
@@ -202,7 +216,7 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
       // Daily budget exhaustion may resume only after the UTC budget state rolls
       // to a new day. All other static failures require config or explicit state repair.
       const stateToken = errorCode === 'generation_budget_exhausted' ? currentStateToken : undefined;
-      const fingerprint = configHash(`${config.feature}\0${errorCode}\0${hash}\0${config.policySha256 ?? ''}\0${stateToken ?? ''}`);
+      const fingerprint = configHash(`${config.feature}\0${errorCode}\0${hash}\0${laneBinding?.policySha256 ?? ''}\0${stateToken ?? ''}`);
       const duplicate = state.blockedFailure?.fingerprint === fingerprint;
       const notification = duplicate ? undefined : await notifyFailure(config.feature, errorCode, cli.notificationDryRun, runFile);
       await atomicJson(stateFile, { version: 1, nextLane: laneIndex,
@@ -220,29 +234,32 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
 async function preflight(
   config: NativeActivationConfig,
   lane: ReturnType<typeof buildInvocationPlan>['lane'],
+  binding: NativeLaneBinding | undefined,
   now: Date,
   runFile: NonNullable<ControllerDependencies['runFile']>,
 ): Promise<{ generationCallHardMax: number; scopeBinding: Receipt['scopeBinding'] }> {
-  const mode = await runSsh(['/usr/bin/stat', '--format=%a', '--', config.environmentFile], config.timeoutSeconds, runFile);
-  if (!/^(?:400|600)\s*$/.test(mode.stdout)) throw new Error('private_env_permissions_invalid');
-  if (config.policyFile) {
+  if (binding) {
+    const mode = await runSsh(['/usr/bin/stat', '--format=%a', '--', binding.environmentFile], config.timeoutSeconds, runFile);
+    if (!/^(?:400|600)\s*$/.test(mode.stdout)) throw new Error('private_env_permissions_invalid');
+  }
+  if (binding?.policyFile) {
     const sizeResult = await runSsh(['/usr/bin/docker', 'exec', config.container, '/usr/bin/stat',
-      '--format=%s', '--', config.policyFile], config.timeoutSeconds, runFile);
+      '--format=%s', '--', binding.policyFile], config.timeoutSeconds, runFile);
     const sizeText = sizeResult.stdout.trim();
     if (!/^\d+$/.test(sizeText) || Number(sizeText) < 2 || Number(sizeText) > 64 * 1024) {
       throw new Error('policy_size_invalid');
     }
-    const result = await runSsh(['/usr/bin/docker', 'exec', config.container, '/usr/bin/sha256sum', '--', config.policyFile],
+    const result = await runSsh(['/usr/bin/docker', 'exec', config.container, '/usr/bin/sha256sum', '--', binding.policyFile],
       config.timeoutSeconds, runFile);
     const actual = result.stdout.trim().split(/\s+/)[0];
-    if (actual !== config.policySha256) throw new Error('policy_hash_mismatch');
-    const policyResult = await runSsh(['/usr/bin/docker', 'exec', config.container, '/usr/bin/cat', '--', config.policyFile],
+    if (actual !== binding.policySha256) throw new Error('policy_hash_mismatch');
+    const policyResult = await runSsh(['/usr/bin/docker', 'exec', config.container, '/usr/bin/cat', '--', binding.policyFile],
       config.timeoutSeconds, runFile);
-    if (configHash(policyResult.stdout) !== config.policySha256) throw new Error('policy_hash_mismatch');
+    if (configHash(policyResult.stdout) !== binding.policySha256) throw new Error('policy_hash_mismatch');
     let value: unknown;
     try { value = JSON.parse(policyResult.stdout); }
     catch { throw new Error('policy_json_invalid'); }
-    return validateNativePolicyForLane(config, lane, value, now);
+    return validateNativePolicyForLane({ ...config, policyEnvironment: binding.policyEnvironment }, lane, value, now);
   }
   if (config.feature === 'contradiction-shadow') {
     return { generationCallHardMax: 1, scopeBinding: 'exact-lane' };
@@ -252,12 +269,29 @@ async function preflight(
 
 async function runRemoteFeature(
   config: NativeActivationConfig,
+  binding: NativeLaneBinding | undefined,
   command: NativeCommand,
   runFile: NonNullable<ControllerDependencies['runFile']>,
 ): Promise<ExecResult> {
-  const argv = ['/usr/bin/docker', 'exec', '--env-file', config.environmentFile, config.container,
-    '/usr/bin/timeout', '--signal=TERM', '--kill-after=15s', `${config.timeoutSeconds}s`, ...command.argv];
+  if (command.transport === 'host') return runSsh(command.argv, config.timeoutSeconds + 30, runFile);
+  if (!binding) throw new Error('lane_binding_missing');
+  const argv = ['/usr/bin/docker', 'exec', '--env-file', binding.environmentFile];
+  const policyKey = nativePolicyEnvironmentKey(config.feature);
+  if (policyKey && binding.policyFile && binding.policyEnvironment) {
+    argv.push('--env', `${policyKey}=${binding.policyFile}`, '--env', `DEPLOYMENT_ENVIRONMENT=${binding.policyEnvironment}`);
+  }
+  if (config.feature === 'taste') argv.push('--env', 'NODE_OPTIONS=--v8-pool-size=1');
+  argv.push(config.container,
+    '/usr/bin/timeout', '--signal=TERM', '--kill-after=15s', `${config.timeoutSeconds}s`, ...command.argv);
   return runSsh(argv, config.timeoutSeconds + 30, runFile);
+}
+
+function nativePolicyEnvironmentKey(feature: NativeFeature): string | undefined {
+  return {
+    reflection: 'REFLECTION_POLICY_FILE', consolidation: 'CONSOLIDATION_POLICY_FILE',
+    session: 'SESSION_DISTILLATION_POLICY_FILE', entity: 'ENTITY_EXTRACTION_POLICY_FILE',
+    taste: 'TASTE_PROFILE_POLICY_FILE',
+  }[feature];
 }
 
 async function runSsh(

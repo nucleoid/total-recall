@@ -17,6 +17,14 @@ export interface NativeLane {
   artifactPath?: string;
   maxAnchors?: number;
   maxClusters?: number;
+  binding?: NativeLaneBinding;
+}
+
+export interface NativeLaneBinding {
+  environmentFile: string;
+  policyFile?: string;
+  policySha256?: string;
+  policyEnvironment?: string;
 }
 
 export interface NativeActivationConfig {
@@ -24,7 +32,7 @@ export interface NativeActivationConfig {
   feature: NativeFeature;
   enabled: boolean;
   container: string;
-  environmentFile: string;
+  environmentFile?: string;
   policyFile?: string;
   policySha256?: string;
   policyEnvironment?: string;
@@ -39,6 +47,7 @@ export interface NativeActivationConfig {
 export interface NativeCommand {
   argv: string[];
   receiptKind: Exclude<NativeFeature, 'contradiction-shadow'> | 'entity-requeue';
+  transport: 'container' | 'host';
 }
 
 export interface InvocationPlan {
@@ -62,12 +71,12 @@ const PROFILE: Record<NativeFeature, readonly string[]> = {
   reflection: ['weekly'], consolidation: ['bounded-clusters'], session: ['queued-session'],
   entity: ['entity-enrichment'], taste: ['monthly-media'],
   'contradiction-shadow': ['read-only-auditor'],
-  maintenance: ['lifecycle-finalize', 'supersession-finalize'], webhook: ['delivery'],
+  maintenance: ['bounded-owner'], webhook: ['delivery'],
 };
 const MODE: Record<NativeFeature, readonly string[]> = {
   reflection: ['dry-run', 'run'], consolidation: ['selection-only', 'preview', 'apply'],
-  session: ['once'], entity: ['once'], taste: ['dry-run', 'preview', 'apply'],
-  'contradiction-shadow': ['once'], maintenance: ['verify'], webhook: ['once'],
+  session: ['once'], entity: ['once'], taste: ['dry-run', 'preview', 'apply', 'run-reviewed'],
+  'contradiction-shadow': ['once'], maintenance: ['once'], webhook: ['once'],
 };
 
 export function parseNativeActivationConfig(value: unknown, now = new Date()): NativeActivationConfig {
@@ -80,7 +89,7 @@ export function parseNativeActivationConfig(value: unknown, now = new Date()): N
   const feature = raw.feature as NativeFeature;
   if (typeof raw.enabled !== 'boolean') throw new Error('config.enabled must be boolean');
   const container = token(raw.container, 'container', /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/);
-  const environmentFile = absolutePath(raw.environmentFile, 'environmentFile');
+  const environmentFile = raw.environmentFile === undefined ? undefined : absolutePath(raw.environmentFile, 'environmentFile');
   const timeoutSeconds = boundedInteger(raw.timeoutSeconds ?? 120, 'timeoutSeconds', 30, 600);
   const dailyGenerationCallCap = boundedInteger(raw.dailyGenerationCallCap ?? 6, 'dailyGenerationCallCap', 1, 24);
 
@@ -88,17 +97,10 @@ export function parseNativeActivationConfig(value: unknown, now = new Date()): N
   let policySha256: string | undefined;
   let policyEnvironment: string | undefined;
   let adapterProfile: 'openclaw-main-subscription' | undefined;
-  if (feature === 'contradiction-shadow') {
-    if (raw.policyFile !== undefined || raw.policyEnvironment !== undefined) {
-      throw new Error('contradiction auditor uses its hash-bound runtime policy');
-    }
-    policySha256 = token(raw.policySha256, 'policySha256', /^[0-9a-f]{64}$/);
-    if (raw.adapterProfile !== 'openclaw-main-subscription') throw new Error('private_adapter_profile_required');
-    adapterProfile = raw.adapterProfile;
-  } else if (GENERATION_FEATURES.has(feature)) {
-    policyFile = absolutePath(raw.policyFile, 'policyFile');
-    policySha256 = token(raw.policySha256, 'policySha256', /^[0-9a-f]{64}$/);
-    policyEnvironment = text(raw.policyEnvironment, 'policyEnvironment', 1, 128);
+  if (GENERATION_FEATURES.has(feature)) {
+    if (raw.policyFile !== undefined) policyFile = absolutePath(raw.policyFile, 'policyFile');
+    if (raw.policySha256 !== undefined) policySha256 = token(raw.policySha256, 'policySha256', /^[0-9a-f]{64}$/);
+    if (raw.policyEnvironment !== undefined) policyEnvironment = text(raw.policyEnvironment, 'policyEnvironment', 1, 128);
     if (raw.adapterProfile !== 'openclaw-main-subscription') throw new Error('private_adapter_profile_required');
     adapterProfile = raw.adapterProfile;
   } else if (raw.policyFile !== undefined || raw.policySha256 !== undefined ||
@@ -123,6 +125,7 @@ export function parseNativeActivationConfig(value: unknown, now = new Date()): N
   const lanes = raw.lanes.map((item, index) => parseLane(feature, item, index));
   const identities = lanes.map(lane => `${lane.namespace}\0${lane.accessLevel}\0${lane.profile}\0${lane.mode}\0${lane.category ?? ''}\0${lane.period ?? ''}`);
   if (new Set(identities).size !== identities.length) throw new Error('lanes must not contain duplicates');
+  validateBindingLayout(feature, lanes, { environmentFile, policyFile, policySha256, policyEnvironment });
 
   let entityHistoricalRecovery: NativeActivationConfig['entityHistoricalRecovery'];
   if (raw.entityHistoricalRecovery !== undefined) {
@@ -144,7 +147,7 @@ export function parseNativeActivationConfig(value: unknown, now = new Date()): N
 function parseLane(feature: NativeFeature, value: unknown, index: number): NativeLane {
   const raw = object(value, `lanes[${index}]`);
   exactKeys(raw, ['namespace', 'accessLevel', 'profile', 'mode', 'category', 'period',
-    'artifactPath', 'maxAnchors', 'maxClusters'], `lanes[${index}]`);
+    'artifactPath', 'maxAnchors', 'maxClusters', 'binding'], `lanes[${index}]`);
   const namespace = text(raw.namespace, `lanes[${index}].namespace`, 1, 512);
   if (namespace.includes(',') || namespace.trim() !== namespace) throw new Error('lane namespace must be exact');
   if (!['normal', 'sensitive', 'secret'].includes(String(raw.accessLevel))) throw new Error('lane accessLevel is invalid');
@@ -154,6 +157,7 @@ function parseLane(feature: NativeFeature, value: unknown, index: number): Nativ
   const mode = text(raw.mode, `lanes[${index}].mode`, 1, 32);
   if (!MODE[feature].includes(mode)) throw new Error('feature_mode_not_allowed');
   const lane: NativeLane = { namespace, accessLevel, profile, mode };
+  if (raw.binding !== undefined) lane.binding = parseLaneBinding(feature, raw.binding, index);
   if (feature === 'taste') {
     if (raw.category !== 'music' && raw.category !== 'viewing') throw new Error('taste lane requires one exact category');
     lane.category = raw.category;
@@ -170,11 +174,72 @@ function parseLane(feature: NativeFeature, value: unknown, index: number): Nativ
   return lane;
 }
 
+function parseLaneBinding(feature: NativeFeature, value: unknown, index: number): NativeLaneBinding {
+  const raw = object(value, `lanes[${index}].binding`);
+  exactKeys(raw, ['environmentFile', 'policyFile', 'policySha256', 'policyEnvironment'],
+    `lanes[${index}].binding`);
+  const binding: NativeLaneBinding = {
+    environmentFile: absolutePath(raw.environmentFile, `lanes[${index}].binding.environmentFile`),
+    policySha256: token(raw.policySha256, `lanes[${index}].binding.policySha256`, /^[0-9a-f]{64}$/),
+  };
+  if (feature === 'contradiction-shadow') {
+    if (raw.policyFile !== undefined || raw.policyEnvironment !== undefined) {
+      throw new Error('contradiction auditor lane binding uses its hash-bound runtime policy');
+    }
+  } else {
+    binding.policyFile = absolutePath(raw.policyFile, `lanes[${index}].binding.policyFile`);
+    binding.policyEnvironment = text(raw.policyEnvironment, `lanes[${index}].binding.policyEnvironment`, 1, 128);
+  }
+  return binding;
+}
+
+function validateBindingLayout(
+  feature: NativeFeature,
+  lanes: NativeLane[],
+  legacy: { environmentFile?: string; policyFile?: string; policySha256?: string; policyEnvironment?: string },
+): void {
+  const boundCount = lanes.filter(lane => lane.binding).length;
+  if (!GENERATION_FEATURES.has(feature)) {
+    if (boundCount !== 0) throw new Error('lane bindings are generation-feature only');
+    if (feature === 'webhook' && !legacy.environmentFile) throw new Error('webhook environmentFile is required');
+    if (feature === 'maintenance' && legacy.environmentFile) throw new Error('maintenance uses only the fixed host launcher');
+    return;
+  }
+  if (boundCount !== 0 && boundCount !== lanes.length) throw new Error('every lane must have an immutable binding');
+  if (lanes.length > 1 && boundCount !== lanes.length) throw new Error('multi-lane generation config requires per-lane bindings');
+  if (boundCount === lanes.length) {
+    if (legacy.environmentFile || legacy.policyFile || legacy.policySha256 || legacy.policyEnvironment) {
+      throw new Error('lane-bound config must not declare shared environment or policy fields');
+    }
+    return;
+  }
+  if (!legacy.environmentFile || !legacy.policySha256) throw new Error('single-lane generation config requires environment and policy hash');
+  if (feature === 'contradiction-shadow') {
+    if (legacy.policyFile || legacy.policyEnvironment) throw new Error('contradiction auditor uses its hash-bound runtime policy');
+  } else if (!legacy.policyFile || !legacy.policyEnvironment) {
+    throw new Error('single-lane generation config requires policy file and environment');
+  }
+}
+
+export function resolveLaneBinding(config: NativeActivationConfig, lane: NativeLane): NativeLaneBinding | undefined {
+  if (lane.binding) return lane.binding;
+  if (!config.environmentFile) return undefined;
+  if (!GENERATION_FEATURES.has(config.feature)) {
+    return { environmentFile: config.environmentFile };
+  }
+  return {
+    environmentFile: config.environmentFile,
+    policyFile: config.policyFile,
+    policySha256: config.policySha256!,
+    policyEnvironment: config.policyEnvironment,
+  };
+}
+
 export function buildInvocationPlan(config: NativeActivationConfig, laneIndex: number): InvocationPlan {
   if (!Number.isSafeInteger(laneIndex) || laneIndex < 0 || laneIndex >= config.lanes.length) throw new Error('invalid lane index');
   const lane = config.lanes[laneIndex];
   const command = (script: string, args: string[], receiptKind: NativeCommand['receiptKind'] = config.feature): NativeCommand => ({
-    argv: ['/usr/bin/npm', 'run', script, '--', ...args], receiptKind,
+    argv: ['/usr/bin/npm', 'run', script, '--', ...args], receiptKind, transport: 'container',
   });
   const exact = ['--namespace', lane.namespace, '--access-level', lane.accessLevel];
   let commands: NativeCommand[];
@@ -203,9 +268,11 @@ export function buildInvocationPlan(config: NativeActivationConfig, laneIndex: n
     }
     case 'contradiction-shadow': commands = [command('contradiction:audit', ['--once',
       '--namespace', lane.namespace, '--access-level', lane.accessLevel,
-      '--expected-policy-hash', config.policySha256!])]; break;
-    case 'maintenance': commands = [command(lane.profile === 'lifecycle-finalize'
-      ? 'finalize:memory-lifecycle' : 'finalize:memory-supersession', [])]; break;
+      '--expected-policy-hash', resolveLaneBinding(config, lane).policySha256!])]; break;
+    case 'maintenance': commands = [{
+      argv: ['/usr/bin/python3', '/home/cass/total-recall-move-20261117/release/scripts/native-maintenance-owner-launcher.py'],
+      receiptKind: 'maintenance', transport: 'host',
+    }]; break;
     case 'webhook': commands = [command('webhooks:deliver',
       ['--once', '--max-jobs', '1', '--concurrency', '1', '--poll-ms', '100'])]; break;
   }
@@ -271,11 +338,13 @@ export function validateNativePolicyForLane(
         if (!Array.isArray(policy.scope.namespaces) ||
             !policy.scope.namespaces.includes(policy.scope.sourceNamespace) ||
             !policy.scope.namespaces.includes(policy.scope.targetNamespace)) throw new Error('policy_scope_invalid');
+        if (!Array.isArray(policy.scope.accessLevels)) throw new Error('policy_scope_invalid');
         if (policy.scope.sourceNamespace !== lane.namespace || !policy.scope.accessLevels.includes(lane.accessLevel)) {
           throw new Error('policy_scope_mismatch');
         }
         boundedPolicyInteger(policy.budget.maxCallsPerRun, 2, 2);
-        return { generationCallHardMax: lane.mode === 'preview' ? 2 : 0,
+        if (lane.mode === 'run-reviewed') requireStandingTasteAutomation(policy, now);
+        return { generationCallHardMax: lane.mode === 'preview' || lane.mode === 'run-reviewed' ? 2 : 0,
           scopeBinding: 'policy-broader' };
       }
       case 'contradiction-shadow': throw new Error('policy_not_applicable');
@@ -333,6 +402,26 @@ function boundedPolicyInteger(value: unknown, min: number, max: number): number 
   return Number(value);
 }
 
+function requireStandingTasteAutomation(policy: Record<string, any>, now: Date): void {
+  const authority = object(policy.standingAutomation, 'policy.standingAutomation');
+  if (authority.enabled !== true) throw new Error('standing_automation_disabled');
+  const owner = object(authority.ownerInstruction, 'policy.standingAutomation.ownerInstruction');
+  const operator = object(authority.operator, 'policy.standingAutomation.operator');
+  if (typeof owner.reference !== 'string' || owner.reference.trim() === '' ||
+      typeof operator.identity !== 'string' || operator.identity.trim() === '' ||
+      typeof operator.authorizationReference !== 'string' || operator.authorizationReference.trim() === '') {
+    throw new Error('standing_automation_invalid');
+  }
+  const ownerEffectiveAt = Date.parse(String(owner.effectiveAt));
+  const operatorAuthorizedAt = Date.parse(String(operator.authorizedAt));
+  const operatorExpiresAt = Date.parse(String(operator.expiresAt));
+  if (!Number.isFinite(ownerEffectiveAt) || ownerEffectiveAt > now.getTime() ||
+      !Number.isFinite(operatorAuthorizedAt) || operatorAuthorizedAt > now.getTime() ||
+      !Number.isFinite(operatorExpiresAt) || operatorExpiresAt <= now.getTime()) {
+    throw new Error('standing_automation_not_current');
+  }
+}
+
 function exactPolicyLane(namespaces: readonly string[], accessLevel: AccessLevel, lane: NativeLane): void {
   if (namespaces.length !== 1 || namespaces[0] !== lane.namespace || accessLevel !== lane.accessLevel) {
     throw new Error('policy_scope_mismatch');
@@ -347,9 +436,9 @@ export function validateKnownCliReceipt(kind: NativeCommand['receiptKind'], stdo
     session: /\[session-distill\] stopped/,
     entity: /\[entity-enrich\] stopped/,
     'entity-requeue': /"selection":"completed-without-links"/,
-    taste: /\[taste-profile\]/,
+    taste: /\[taste-profile\]\s+\{/,
     'contradiction-shadow': /\[contradiction-shadow-audit\] stopped/,
-    maintenance: /"allValid":true/,
+    maintenance: /"kind":"bounded_native_decay"[\s\S]*"status":"(?:already_complete_today|pass_complete|page_applied)"[\s\S]*"classificationsFinalized":true/,
     webhook: /\[webhook-delivery\] stopped/,
   };
   if (!accepted[kind].test(combined)) throw new Error('cli_receipt_unparseable');
