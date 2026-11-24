@@ -4,24 +4,38 @@ import { connectMaintenanceClient, inventoryNamespaces } from './lib/maintenance
 import {
   purgeExpiredMemories,
   ttlPurgeBatchSizeFromEnv,
+  updateDecayBatchWithClient,
   updateDecayWithClient,
   type DecaySummary,
 } from '../src/maintenance.js';
 
-export { purgeExpiredMemories, ttlPurgeBatchSizeFromEnv, updateDecayWithClient } from '../src/maintenance.js';
+export { purgeExpiredMemories, ttlPurgeBatchSizeFromEnv, updateDecayBatchWithClient, updateDecayWithClient } from '../src/maintenance.js';
 export type { DecaySummary, TtlPurgeSummary } from '../src/maintenance.js';
 
 dotenv.config();
 
+export function parseDecayCli(args: string[]): { asOf: string; afterId: string | null; limit: number; apply: boolean } {
+  let asOf = '', afterId: string | null = null, limit = 100, apply = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--as-of') asOf = args[++index] ?? '';
+    else if (arg === '--after') afterId = args[++index] ?? '';
+    else if (arg === '--limit') limit = Number(args[++index]);
+    else if (arg === '--apply') apply = true;
+    else if (arg === '--dry-run') apply = false;
+    else throw new Error(`Unknown decay option: ${arg}`);
+  }
+  if (!asOf) throw new Error('--as-of is required');
+  return { asOf, afterId, limit, apply };
+}
+
 async function main() {
+  const options = parseDecayCli(process.argv.slice(2));
   const { client, identity } = await connectMaintenanceClient();
   try {
     console.log('[decay] Maintenance database', identity);
-    console.log('[decay] Initial namespace inventory', await inventoryNamespaces(client));
-    const purge = await purgeExpiredMemories(client, ttlPurgeBatchSizeFromEnv(process.env.TTL_PURGE_BATCH_SIZE));
-    console.log('[decay] TTL purge totals', purge);
-    const summary: DecaySummary = await updateDecayWithClient(client);
-    console.log('[decay] Actual updated totals', summary);
+    const summary = await updateDecayBatchWithClient(client, options);
+    console.log('[decay] Bounded logical decay', summary);
   } finally {
     await client.end();
   }
