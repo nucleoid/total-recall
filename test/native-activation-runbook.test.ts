@@ -20,6 +20,9 @@ test('runbook keeps product scheduling separate from conversation continuation a
   const runbook = await readFile('docs/native-activation-owner-runbook.md', 'utf8');
   assert.match(runbook, /does not create an OpenClaw automation, model turn, task continuation/i);
   assert.match(runbook, /official command only/i);
+  assert.match(runbook, /openclaw gateway call send --json --timeout 15000/);
+  assert.match(runbook, /stable idempotency key derived from the feature and durable failure fingerprint/i);
+  assert.match(runbook, /parent must read back the channel independently/i);
   assert.match(runbook, /notification\.status="refused"/);
   assert.match(runbook, /completedBefore/);
   assert.match(runbook, /sourceGraphCoverage: "pending"/);
