@@ -185,6 +185,19 @@ function unbracket(hostname: string): string {
   return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
 }
 
+/**
+ * Return exactly the already-reviewed address in the shape requested by Node.
+ * Node 24's connection auto-selection asks custom lookup functions for
+ * `{ all: true }`; returning the legacy scalar shape in that mode is interpreted
+ * as an undefined address and fails before any socket is opened.
+ */
+export function createPinnedWebhookLookup(pinned: { address: string; family: 4 | 6 }): net.LookupFunction {
+  return (_hostname, options, callback) => {
+    if (options.all === true) callback(null, [{ address: pinned.address, family: pinned.family }]);
+    else callback(null, pinned.address, pinned.family);
+  };
+}
+
 async function withDeadline<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -225,7 +238,10 @@ export async function postWebhook(
       },
       timeout: timeoutMs,
       maxRedirects: 0,
-      lookup: (_hostname, _options, callback) => callback(null, pinned.address, pinned.family),
+      // Keep TLS SNI/hostname validation bound to destination.url while the
+      // socket address remains pinned to the public DNS answer reviewed above.
+      autoSelectFamily: false,
+      lookup: createPinnedWebhookLookup(pinned),
     } as https.RequestOptions, response => {
       let bytes = 0;
       response.on('data', (chunk: Buffer) => {
