@@ -46,6 +46,15 @@ test('supported key management provisions scoped session distillation permission
   assert.equal(parsed.maxAccessLevel, 'secret');
 });
 
+test('supported key management provisions scoped entity extraction permission', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'entity-extractor', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'financial,my-life', '--permissions', 'read,entity_extract', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'entity_extract']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
 test('expiry rejects past, loose, and offset-free timestamps', () => {
   assert.throws(() => parseExpiry('2025-12-31T23:59:59Z', now), /future/);
   assert.throws(() => parseExpiry('2026-01-02', now), /offset-aware/);
