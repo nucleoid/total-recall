@@ -22,7 +22,7 @@ const PRIVATE_MODEL = 'openclaw/total-recall-synthesis';
 export interface ContradictionAuditCliOptions {
   once: true;
   namespace: string;
-  accessLevel: 'normal';
+  accessLevel: 'normal' | 'sensitive' | 'secret';
   expectedPolicyHash: string;
 }
 
@@ -66,9 +66,11 @@ export function parseContradictionAuditCli(args: string[]): ContradictionAuditCl
   if (!namespace.trim() || namespace.includes(',') || namespace !== namespace.trim()) {
     throw new Error('--namespace must name exactly one namespace');
   }
-  if (accessLevel !== 'normal') throw new Error('--access-level must be exactly normal');
+  if (!['normal', 'sensitive', 'secret'].includes(accessLevel)) {
+    throw new Error('--access-level must be normal, sensitive, or secret');
+  }
   if (!/^[a-f0-9]{64}$/.test(expectedPolicyHash)) throw new Error('--expected-policy-hash must be lowercase SHA-256');
-  return { once: true, namespace, accessLevel: 'normal', expectedPolicyHash };
+  return { once: true, namespace, accessLevel: accessLevel as ContradictionAuditCliOptions['accessLevel'], expectedPolicyHash };
 }
 
 export function contradictionAuditPolicyHash(policy: ContradictionPolicy): string {
@@ -81,6 +83,7 @@ export function contradictionAuditPolicyHash(policy: ContradictionPolicy): strin
     policy.provider,
     policy.model,
     policy.namespace,
+    (policy as ContradictionPolicy & { accessLevel?: string }).accessLevel ?? 'normal',
     policy.timeoutMs,
     policy.budget.fingerprint,
   ])).digest('hex');
@@ -91,8 +94,9 @@ export function assertContradictionAuditAuthority(
   policy: ContradictionPolicy,
   options: ContradictionAuditCliOptions,
 ): void {
+  const policyAccessLevel = (policy as ContradictionPolicy & { accessLevel?: string }).accessLevel ?? 'normal';
   if (!policy.classificationEnabled || policy.provider !== PRIVATE_PROVIDER || policy.model !== PRIVATE_MODEL ||
-      policy.namespace !== options.namespace || options.accessLevel !== 'normal') {
+      policy.namespace !== options.namespace || policyAccessLevel !== options.accessLevel) {
     throw new Error('contradiction_audit_policy_mismatch');
   }
   if (contradictionAuditPolicyHash(policy) !== options.expectedPolicyHash) {
@@ -101,7 +105,7 @@ export function assertContradictionAuditAuthority(
   const permissions = [...auth.permissions].sort();
   if (auth.namespaces.length !== 1 || auth.namespaces[0] !== options.namespace ||
       auth.maxAccessLevel !== options.accessLevel ||
-      permissions.length !== 2 || permissions[0] !== 'contradiction_resolve' || permissions[1] !== 'read') {
+      permissions.length !== 2 || permissions[0] !== 'contradiction_audit' || permissions[1] !== 'read') {
     throw new Error('contradiction_audit_authority_mismatch');
   }
 }

@@ -19,6 +19,9 @@ test('migration 062 provides bounded append-only contradiction auditing', {
   const owner = new pg.Client({ connectionString: ownerUrl });
   await owner.connect();
   const keyId = randomUUID();
+  const sensitiveKeyId = randomUUID();
+  const secretKeyId = randomUUID();
+  const resolverKeyId = randomUUID();
   const subjectId = randomUUID();
   const candidateId = randomUUID();
   const policyHash = 'a'.repeat(64);
@@ -29,8 +32,13 @@ test('migration 062 provides bounded append-only contradiction auditing', {
     await runMigrations(owner, loadMigrationInventory(join(process.cwd(), 'migrations')), { lockTimeoutMs: 10_000 });
     await owner.query('SET session_replication_role = replica');
     await owner.query(`INSERT INTO api_keys(id,key_hash,name,namespaces,permissions,max_access_level)
-      VALUES($1,$2,'contradiction-review',ARRAY['shared'],ARRAY['read','contradiction_resolve'],'normal')`,
+      VALUES($1,$2,'contradiction-audit-normal',ARRAY['shared'],ARRAY['read','contradiction_audit'],'normal')`,
     [keyId, sha('test-key')]);
+    await owner.query(`INSERT INTO api_keys(id,key_hash,name,namespaces,permissions,max_access_level) VALUES
+      ($1,$2,'contradiction-audit-sensitive',ARRAY['shared'],ARRAY['read','contradiction_audit'],'sensitive'),
+      ($3,$4,'contradiction-audit-secret',ARRAY['shared'],ARRAY['read','contradiction_audit'],'secret'),
+      ($5,$6,'contradiction-resolver',ARRAY['shared'],ARRAY['read','contradiction_resolve'],'secret')`,
+    [sensitiveKeyId, sha('sensitive-key'), secretKeyId, sha('secret-key'), resolverKeyId, sha('resolver-key')]);
     await owner.query('INSERT INTO embedding_contracts(id,canonical_json,capture_enabled) VALUES($1,$2,true)',
       [QWEN_CONTRACT_ID, JSON.stringify(QWEN_CHUNK_CONTRACT)]);
     await owner.query(`CREATE TABLE memory_embedding_chunks_contradiction_test
@@ -49,7 +57,32 @@ test('migration 062 provides bounded append-only contradiction auditing', {
 
       assert.equal((await app.query('SELECT content FROM memories')).rowCount, 0);
       await assert.rejects(app.query('SELECT * FROM contradiction_shadow_receipts'), /permission denied/i);
+      assert.equal((await app.query("SELECT app_contradiction_audit_scope_allowed('shared','normal') AS allowed"))
+        .rows[0].allowed, true);
+      assert.equal((await app.query("SELECT app_contradiction_audit_scope_allowed('shared','sensitive') AS allowed"))
+        .rows[0].allowed, false);
     } finally { await app.end(); }
+
+    for (const [exactKeyId, level] of [[sensitiveKeyId, 'sensitive'], [secretKeyId, 'secret']] as const) {
+      const lane = new pg.Client({ connectionString: appUrl });
+      await lane.connect();
+      try {
+        await scope(lane, exactKeyId);
+        assert.equal((await lane.query('SELECT app_contradiction_audit_scope_allowed($1,$2) AS allowed',
+          ['shared', level])).rows[0].allowed, true);
+        assert.equal((await lane.query('SELECT app_contradiction_audit_scope_allowed($1,$2) AS allowed',
+          ['shared', level === 'sensitive' ? 'normal' : 'sensitive'])).rows[0].allowed, false);
+        assert.equal((await lane.query('SELECT content FROM memories')).rowCount, 0);
+      } finally { await lane.end(); }
+    }
+
+    const resolver = new pg.Client({ connectionString: appUrl });
+    await resolver.connect();
+    try {
+      await scope(resolver, resolverKeyId);
+      assert.equal((await resolver.query('SELECT content FROM memories')).rowCount, 1,
+        'auditor raw-deny policy must not alter the existing resolver read path');
+    } finally { await resolver.end(); }
 
     await owner.query('SET session_replication_role = replica');
     await insertMemory(owner, candidateId, 'The office moved from Austin', '2026-01-01T00:00:00Z');

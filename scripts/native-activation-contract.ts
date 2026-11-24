@@ -163,8 +163,6 @@ function parseLane(feature: NativeFeature, value: unknown, index: number): Nativ
     lane.maxAnchors = boundedInteger(raw.maxAnchors ?? 10, 'maxAnchors', 1, 100);
     lane.maxClusters = boundedInteger(raw.maxClusters ?? 1, 'maxClusters', 1, 10);
     if (mode === 'preview') lane.artifactPath = absolutePath(raw.artifactPath, 'consolidation preview artifact');
-  } else if (feature === 'contradiction-shadow') {
-    if (accessLevel !== 'normal') throw new Error('contradiction auditor requires normal access');
   } else if (raw.category !== undefined || raw.period !== undefined || raw.artifactPath !== undefined ||
       raw.maxAnchors !== undefined || raw.maxClusters !== undefined) {
     throw new Error('lane contains fields not supported by its feature');

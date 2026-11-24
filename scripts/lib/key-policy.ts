@@ -1,4 +1,4 @@
-export const KEY_PERMISSIONS = ['read', 'write', 'delete', 'admin', 'consolidate', 'reflection', 'session_distill', 'entity_extract', 'webhook_worker', 'export', 'import'] as const;
+export const KEY_PERMISSIONS = ['read', 'write', 'delete', 'admin', 'consolidate', 'reflection', 'session_distill', 'entity_extract', 'contradiction_audit', 'webhook_worker', 'export', 'import'] as const;
 
 export function parseStrictDuration(value: string, option: string, allowZero = false): number {
   const match = /^(\d+)(s|m|h|d)$/.exec(value);

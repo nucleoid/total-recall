@@ -55,6 +55,15 @@ test('supported key management provisions scoped entity extraction permission', 
   assert.equal(parsed.maxAccessLevel, 'secret');
 });
 
+test('supported key management provisions an exact contradiction audit credential', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'contradiction-auditor', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'financial', '--permissions', 'read,contradiction_audit', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'contradiction_audit']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
 test('supported key management provisions a webhook-only worker credential', () => {
   const parsed = parseCreateKeyArgs([
     '--name', 'webhook-delivery', '--rpm', '6', '--daily-quota', '100',
