@@ -1,0 +1,20 @@
+[Unit]
+Description=Total Recall bounded OpenClaw synthesis adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fuego
+WorkingDirectory=%h/.local/share/total-recall/current
+EnvironmentFile=/etc/total-recall/generation-gateway.env
+ExecStart=/usr/bin/node %h/.local/share/total-recall/current/dist/generation-gateway-main.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

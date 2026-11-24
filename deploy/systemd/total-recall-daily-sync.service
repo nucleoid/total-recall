@@ -1,0 +1,16 @@
+[Unit]
+Description=Total Recall daily safety-net check (Dappnode owner)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cass
+WorkingDirectory=/home/cass/total-recall-current
+EnvironmentFile=/etc/total-recall/daily-sync.env
+ExecStart=/home/cass/total-recall-current/scripts/daily-sync.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/user/%U /tmp

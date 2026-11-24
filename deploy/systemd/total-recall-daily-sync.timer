@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Total Recall daily safety-net check
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Pacific/Auckland
+Persistent=true
+RandomizedDelaySec=5m
+Unit=total-recall-daily-sync.service
+
+[Install]
+WantedBy=timers.target
