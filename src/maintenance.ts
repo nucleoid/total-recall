@@ -193,6 +193,11 @@ export async function updateDecayBatchWithClient(
       UPDATE public.memories m SET relevance_score = c.computed_score, updated_at = statement_timestamp()
       FROM computed c
       WHERE m.id = c.id AND m.relevance_base_score IS NOT NULL
+        AND m.deleted_at IS NULL
+        AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+        AND m.superseded_at IS NULL AND m.valid_to IS NULL
+        AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
+        AND m.consolidated_into_id IS NULL
         AND m.updated_at IS NOT DISTINCT FROM c.updated_at
         AND m.relevance_base_score IS NOT DISTINCT FROM c.relevance_base_score
         AND m.decay_rate IS NOT DISTINCT FROM c.decay_rate
@@ -210,8 +215,10 @@ export async function updateDecayBatchWithClient(
       FROM public.memories
       WHERE relevance_base_score IS NOT NULL AND id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
         AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > $1::timestamptz)
+        AND (expires_at IS NULL OR expires_at > statement_timestamp())
         AND superseded_at IS NULL AND valid_to IS NULL
         AND (valid_from IS NULL OR valid_from <= $1::timestamptz)
+        AND (valid_from IS NULL OR valid_from <= statement_timestamp())
         AND consolidated_into_id IS NULL
       ORDER BY id LIMIT $3
       ${lockClause}
