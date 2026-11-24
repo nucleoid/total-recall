@@ -99,8 +99,9 @@ test('scoped entity worker extracts secret graph without source authority or rea
   const publicRawEntity=await withScopedClient(dbScopeFromAuth(normalReader),client => client.query<{display_name:string}>(
     "SELECT display_name FROM entities WHERE normalized_name='alice'"));
   assert.deepEqual(publicRawEntity.rows.map(row=>row.display_name),['alice']);
+  await owner.query("UPDATE entity_enrichment_queue SET completed_at='2019-01-01T00:00:00Z' WHERE memory_id=$1",[normal.rows[0].id]);
   const linkedRequeue=await withScopedClient(dbScopeFromAuth(lowerWorker),client => previewEntityRequeue(
-    client,'my-life','normal',[normal.rows[0].id]));
+    client,'my-life','normal','2020-01-01T00:00:00Z',[normal.rows[0].id]));
   assert.equal(linkedRequeue.rows,0);
 
   const ordinaryInsert=withScopedClient(dbScopeFromAuth(worker),client => client.query(`INSERT INTO memories
@@ -138,12 +139,12 @@ test('scoped entity worker extracts secret graph without source authority or rea
 
   const priorIneligible=await owner.query<{id:string}>(`INSERT INTO memories(content,source,namespace,access_level,client_id,memory_kind,valid_from)
     VALUES('Sensitive Dana supports Project Ember.','synthetic','my-life','sensitive',$1,'semantic',statement_timestamp()) RETURNING id`,['legacy-sensitive']);
-  await owner.query("UPDATE entity_enrichment_queue SET status='done',completed_at=statement_timestamp() WHERE memory_id=$1",[priorIneligible.rows[0].id]);
+  await owner.query("UPDATE entity_enrichment_queue SET status='done',completed_at='2019-01-01T00:00:00Z' WHERE memory_id=$1",[priorIneligible.rows[0].id]);
   const requeuePreview=await withScopedClient(dbScopeFromAuth(worker),client => previewEntityRequeue(
-    client,'my-life','sensitive',[priorIneligible.rows[0].id]));
+    client,'my-life','sensitive','2020-01-01T00:00:00Z',[priorIneligible.rows[0].id]));
   assert.equal(requeuePreview.rows,1);
   const reopened=await withScopedClient(dbScopeFromAuth(worker),client => enqueueEntityRequeue(
-    client,'my-life','sensitive',1,[priorIneligible.rows[0].id]));
+    client,'my-life','sensitive','2020-01-01T00:00:00Z',1,[priorIneligible.rows[0].id]));
   assert.equal(reopened.enqueued,1);
   const sensitiveProvider={name:'openclaw-adapter',generate:async () => JSON.stringify({entities:[
     {display_name:'Dana',type:'person',mention:'Dana',aliases:[],confidence:0.99},
@@ -154,5 +155,13 @@ test('scoped entity worker extracts secret graph without source authority or rea
     [priorIneligible.rows[0].id])).rows[0].n,1);
   assert.equal((await withScopedClient(dbScopeFromAuth(normalReader),client => client.query(
     'SELECT entity_id FROM memory_entities WHERE memory_id=$1',[priorIneligible.rows[0].id]))).rowCount,0);
+  const newlyEmpty=await owner.query<{id:string}>(`INSERT INTO memories(content,source,namespace,access_level,client_id,memory_kind,valid_from)
+    VALUES('No durable named identity here.','synthetic','my-life','sensitive',$1,'semantic',statement_timestamp()) RETURNING id`,['new-empty']);
+  const emptyProvider={name:'openclaw-adapter',generate:async()=>JSON.stringify({entities:[]})};
+  assert.equal((await runEntityWorker({once:true,maxJobs:1,pollMs:100,memoryIds:[newlyEmpty.rows[0].id]},new AbortController().signal,
+    {policy:policy('sensitive'),provider:emptyProvider,auth:worker})).providerCalls,1);
+  const excludedNewEmpty=await withScopedClient(dbScopeFromAuth(worker),client => previewEntityRequeue(
+    client,'my-life','sensitive','2020-01-01T00:00:00Z',[newlyEmpty.rows[0].id]));
+  assert.equal(excludedNewEmpty.rows,0);
 
 });

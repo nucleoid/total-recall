@@ -39,11 +39,11 @@ Backfill is separate and requires an effective `backfillApproval` in the same po
 
 For rows previously marked `done` by the old normal-only worker without links, use the explicit recovery selector; ordinary backfill intentionally does not reset them:
 
-- Preview the exact lane: `npm run entity:backfill -- --namespace <approved> --access-level <level> --requeue-completed-without-links --preview --limit 1000`
+- Preview the exact lane: `npm run entity:backfill -- --namespace <approved> --access-level <level> --requeue-completed-without-links --completed-before <reviewed-UTC-cutoff> --preview --limit 1000`
 - Prefer isolated IDs for canaries: append one or more `--memory-id <uuid>` arguments (maximum 100), execute with `--limit` no larger than that list, then run the worker with the same IDs.
-- Execute only an owner-reviewed bounded page: `npm run entity:backfill -- --namespace <approved> --access-level <level> --requeue-completed-without-links --execute --limit 1000`
+- Execute only an owner-reviewed bounded page: `npm run entity:backfill -- --namespace <approved> --access-level <level> --requeue-completed-without-links --completed-before <same-reviewed-UTC-cutoff> --execute --limit 1000`
 
-Recovery admits only `done`, unlocked, linkless rows whose current source revision, content hash, namespace, access level, lifecycle, and kind still match the durable queue snapshot. It resets only the selected rows to pending; it cannot blanket-reset processing/retry/dead rows or rows that already have links.
+Recovery requires a stable UTC `completed_before` cutoff chosen before the first new worker run, excludes NULL completion times, and admits only `done`, unlocked, linkless rows completed strictly before that cutoff whose current source revision, content hash, namespace, access level, lifecycle, and kind still match the durable queue snapshot. It resets only the selected rows to pending; it cannot blanket-reset processing/retry/dead rows or rows that already have links.
 
 Backfill only creates or explicitly reopens provenance-matching queue rows. It does not call generation, alter source content, widen namespaces, or merge access levels.
 

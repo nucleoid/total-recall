@@ -78,14 +78,15 @@ test('subscription entity policy is idempotent, all-level, strict, and OpenClaw-
 
 test('entity backfill selects one exact namespace and access-level lane', () => {
   assert.deepEqual(parseEntityBackfillCli(['--namespace','financial','--access-level','secret','--preview']),
-    {namespace:'financial',accessLevel:'secret',mode:'preview',limit:1000,selection:'missing',memoryIds:[]});
+    {namespace:'financial',accessLevel:'secret',mode:'preview',limit:1000,selection:'missing',memoryIds:[],completedBefore:null});
   assert.throws(() => parseEntityBackfillCli(['--namespace','financial','--access-level','root','--preview']), /access-level/);
   assert.throws(() => parseEntityBackfillCli(['--namespace','financial','--execute','--preview']), /exactly one/);
   const id='00000000-0000-4000-8000-000000000123';
   assert.deepEqual(parseEntityBackfillCli(['--namespace','financial','--access-level','sensitive',
-    '--requeue-completed-without-links','--memory-id',id,'--limit','1','--execute']),
+    '--requeue-completed-without-links','--completed-before','2020-01-01T00:00:00Z','--memory-id',id,'--limit','1','--execute']),
   {namespace:'financial',accessLevel:'sensitive',mode:'execute',limit:1,
-    selection:'completed-without-links',memoryIds:[id]});
+    selection:'completed-without-links',memoryIds:[id],completedBefore:'2020-01-01T00:00:00.000Z'});
+  assert.throws(() => parseEntityBackfillCli(['--namespace','financial','--requeue-completed-without-links','--preview']), /completed-before/);
   assert.deepEqual(parseEntityWorkerCli(['--once','--memory-id',id]),
     {once:true,maxJobs:100,pollMs:1000,memoryIds:[id]});
 });

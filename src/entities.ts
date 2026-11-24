@@ -419,14 +419,17 @@ export async function enqueueEntityBackfill(
 
 
 export async function previewEntityRequeue(
-  client: ScopedClient, namespace: string, accessLevel: AccessLevel, memoryIds: readonly string[] = [],
+  client: ScopedClient, namespace: string, accessLevel: AccessLevel, completedBefore: string,
+  memoryIds: readonly string[] = [],
 ): Promise<EntityBackfillPreview> {
   validateEntityTargetIds(memoryIds);
+  const cutoff = validateCompletedBefore(completedBefore);
   const result = await client.query<{ rows: string; input_bytes: string }>(`
     SELECT count(*)::text AS rows, COALESCE(sum(octet_length(m.content)), 0)::text AS input_bytes
     FROM entity_enrichment_queue q
     JOIN memories m ON m.id = q.memory_id AND m.namespace = q.namespace
     WHERE q.namespace = $1 AND q.source_access_level = $2 AND q.status = 'done' AND q.locked_at IS NULL
+      AND q.completed_at IS NOT NULL AND q.completed_at < $3::timestamptz
       AND q.source_revision = m.entity_source_revision AND q.source_content_hash = md5(m.content)
       AND q.source_access_level = m.access_level AND m.memory_kind <> 'episode_chunk'
       AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
@@ -434,18 +437,19 @@ export async function previewEntityRequeue(
       AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
       AND m.consolidated_into_id IS NULL
       AND NOT public.app_entity_memory_has_links(q.memory_id, q.namespace, q.source_access_level)
-      AND (cardinality($3::uuid[]) = 0 OR q.memory_id = ANY($3::uuid[]))
-  `, [namespace, accessLevel, memoryIds]);
+      AND (cardinality($4::uuid[]) = 0 OR q.memory_id = ANY($4::uuid[]))
+  `, [namespace, accessLevel, cutoff, memoryIds]);
   const rows = Number(result.rows[0]?.rows ?? 0);
   const inputBytes = Number(result.rows[0]?.input_bytes ?? 0);
   return { rows, inputBytes, estimatedTokens: Math.ceil(inputBytes / 4) };
 }
 
 export async function enqueueEntityRequeue(
-  client: ScopedClient, namespace: string, accessLevel: AccessLevel, limit: number,
+  client: ScopedClient, namespace: string, accessLevel: AccessLevel, completedBefore: string, limit: number,
   memoryIds: readonly string[] = [],
 ): Promise<{ enqueued: number; lastMemoryId: string | null }> {
   validateEntityTargetIds(memoryIds);
+  const cutoff = validateCompletedBefore(completedBefore);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error('Requeue limit must be 1 to 10000');
   const result = await client.query<{ enqueued: string; last_memory_id: string | null }>(`
     WITH candidates AS MATERIALIZED (
@@ -453,6 +457,7 @@ export async function enqueueEntityRequeue(
       FROM entity_enrichment_queue q
       JOIN memories m ON m.id = q.memory_id AND m.namespace = q.namespace
       WHERE q.namespace = $1 AND q.source_access_level = $3 AND q.status = 'done' AND q.locked_at IS NULL
+        AND q.completed_at IS NOT NULL AND q.completed_at < $4::timestamptz
         AND q.source_revision = m.entity_source_revision AND q.source_content_hash = md5(m.content)
         AND q.source_access_level = m.access_level AND m.memory_kind <> 'episode_chunk'
         AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
@@ -460,7 +465,7 @@ export async function enqueueEntityRequeue(
         AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
         AND m.consolidated_into_id IS NULL
         AND NOT public.app_entity_memory_has_links(q.memory_id, q.namespace, q.source_access_level)
-        AND (cardinality($4::uuid[]) = 0 OR q.memory_id = ANY($4::uuid[]))
+        AND (cardinality($5::uuid[]) = 0 OR q.memory_id = ANY($5::uuid[]))
       ORDER BY m.created_at, q.memory_id
       FOR UPDATE OF q SKIP LOCKED LIMIT $2
     ), reopened AS (
@@ -473,7 +478,7 @@ export async function enqueueEntityRequeue(
     )
     SELECT (SELECT count(*)::text FROM reopened) AS enqueued,
       (SELECT memory_id FROM candidates ORDER BY created_at DESC NULLS FIRST, memory_id DESC LIMIT 1) AS last_memory_id
-  `, [namespace, limit, accessLevel, memoryIds]);
+  `, [namespace, limit, accessLevel, cutoff, memoryIds]);
   return { enqueued: Number(result.rows[0]?.enqueued ?? 0), lastMemoryId: result.rows[0]?.last_memory_id ?? null };
 }
 
@@ -487,4 +492,13 @@ function validateEntityTargetIds(memoryIds: readonly string[]): void {
     if (seen.has(id)) throw new Error('Entity target memory IDs must be unique');
     seen.add(id);
   }
+}
+
+
+function validateCompletedBefore(value: string): string {
+  const parsed = new Date(value);
+  if (!/^\d{4}-\d{2}-\d{2}T.*Z$/.test(value) || !Number.isFinite(parsed.getTime()) || parsed.getTime() >= Date.now()) {
+    throw new Error('Completed-before cutoff must be a valid UTC timestamp before the current time');
+  }
+  return parsed.toISOString();
 }
