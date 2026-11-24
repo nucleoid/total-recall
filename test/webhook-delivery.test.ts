@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildWebhookPayload, type AuthorizedDelivery } from '../src/subscriptions.js';
+import { buildWebhookPayload, webhookWorkerScope, type AuthorizedDelivery } from '../src/subscriptions.js';
 import { isRetryableStatus, parseWebhookWorkerCli, retryAtForAttempt } from '../scripts/webhook-delivery.js';
 
 const delivery: AuthorizedDelivery = {
@@ -42,4 +42,17 @@ test('worker CLI enforces bounded concurrency and polling', () => {
     { once: true, maxJobs: 2, pollMs: 1000, concurrency: 1 });
   assert.throws(() => parseWebhookWorkerCli(['--concurrency', '33']));
   assert.throws(() => parseWebhookWorkerCli(['--poll-ms', '10']));
+});
+
+test('worker scope accepts only the dedicated permission and never becomes admin', () => {
+  const base = {
+    keyId: '10000000-0000-4000-8000-000000000001', name: 'worker', namespaces: ['shared'],
+    maxAccessLevel: 'normal' as const, requestsPerMinute: 10, requestsPerDay: 100, expiresAt: null,
+  };
+  assert.deepEqual(webhookWorkerScope({ ...base, permissions: ['webhook_worker'] }), {
+    keyId: base.keyId, namespaces: ['shared'], isAdmin: false,
+  });
+  for (const permissions of [[], ['read'], ['admin', 'read'], ['webhook_worker', 'read']]) {
+    assert.throws(() => webhookWorkerScope({ ...base, permissions }), /only webhook_worker/);
+  }
 });
