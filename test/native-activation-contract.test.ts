@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   buildInvocationPlan,
   parseNativeActivationConfig,
+  resolveLaneBinding,
   validateNativePolicyForLane,
   validateKnownCliReceipt,
 } from '../scripts/native-activation-contract.js';
@@ -53,6 +54,47 @@ test('worker profiles enforce one job and one concurrency where supported', () =
   const argv = buildInvocationPlan(parseNativeActivationConfig(raw, NOW), 0).commands[0].argv;
   assert.equal(argv[2], 'session:distill');
   assert.ok(argv.includes('--max-jobs') && argv.includes('1'));
+});
+
+test('multi-lane generation requires complete immutable per-lane bindings', () => {
+  const raw = config('session');
+  delete raw.environmentFile;
+  delete raw.policyFile;
+  delete raw.policySha256;
+  delete raw.policyEnvironment;
+  raw.lanes = ['shared', 'work'].map((namespace, index) => ({
+    namespace, accessLevel: 'normal', profile: 'queued-session', mode: 'once',
+    binding: {
+      environmentFile: `/etc/total-recall/private/session-${index}.env`,
+      policyFile: `/app/policies/session-${index}.json`, policySha256: String(index + 1).repeat(64),
+      policyEnvironment: 'test',
+    },
+  }));
+  const parsed = parseNativeActivationConfig(raw, NOW);
+  assert.equal(resolveLaneBinding(parsed, parsed.lanes[1])?.environmentFile,
+    '/etc/total-recall/private/session-1.env');
+  assert.equal(resolveLaneBinding(parsed, parsed.lanes[1])?.policySha256, '2'.repeat(64));
+  assert.throws(() => parseNativeActivationConfig({ ...raw, lanes: [raw.lanes[0], {
+    ...raw.lanes[1], binding: undefined,
+  }] }, NOW), /every lane|per-lane/);
+  assert.throws(() => parseNativeActivationConfig({ ...raw,
+    environmentFile: '/etc/total-recall/private/shared.env' }, NOW), /must not declare shared/);
+});
+
+test('maintenance invokes only the fixed host launcher', () => {
+  const raw = config('maintenance');
+  delete raw.environmentFile;
+  delete raw.policyFile;
+  delete raw.policySha256;
+  delete raw.policyEnvironment;
+  delete raw.adapterProfile;
+  raw.lanes = [{ namespace: 'shared', accessLevel: 'normal', profile: 'bounded-owner', mode: 'once' }];
+  const command = buildInvocationPlan(parseNativeActivationConfig(raw, NOW), 0).commands[0];
+  assert.deepEqual(command, {
+    argv: ['/usr/bin/python3',
+      '/home/cass/total-recall-move-20261117/release/scripts/native-maintenance-owner-launcher.py'],
+    receiptKind: 'maintenance', transport: 'host',
+  });
 });
 
 test('contradiction shadow invokes only the bounded read-only auditor', () => {
@@ -154,10 +196,25 @@ test('taste reports broader policy scope and reserves only its generating previe
   const apply = parseNativeActivationConfig({ ...raw, lanes: [{ ...raw.lanes[0], mode: 'apply',
     artifactPath: '/private/approved-selection.json' }] }, NOW);
   assert.equal(validateNativePolicyForLane(apply, apply.lanes[0], policy, NOW).generationCallHardMax, 0);
+  const reviewed = parseNativeActivationConfig({ ...raw,
+    lanes: [{ ...raw.lanes[0], mode: 'run-reviewed' }] }, NOW);
+  const standingPolicy = { ...policy, standingAutomation: {
+    enabled: true, ownerInstruction: { reference: 'owner-standing', effectiveAt: '2026-01-01T00:00:00Z' },
+    operator: { identity: 'native-owner', authorizationReference: 'operator-lease',
+      authorizedAt: '2026-11-01T00:00:00Z', expiresAt: '2026-12-01T00:00:00Z' },
+  } };
+  assert.equal(validateNativePolicyForLane(reviewed, reviewed.lanes[0], standingPolicy, NOW)
+    .generationCallHardMax, 2);
+  assert.ok(buildInvocationPlan(reviewed, 0).commands[0].argv.includes('--run-reviewed'));
+  assert.throws(() => validateNativePolicyForLane(reviewed, reviewed.lanes[0], policy, NOW),
+    /policy_contract_invalid/);
 });
 
 test('receipt validation recognizes only reviewed content-free contracts', () => {
   assert.doesNotThrow(() => validateKnownCliReceipt('session', '[session-distill] stopped { processed: 1 }', ''));
   assert.doesNotThrow(() => validateKnownCliReceipt('webhook', '[webhook-delivery] stopped { processed: 0 }', ''));
+  assert.doesNotThrow(() => validateKnownCliReceipt('maintenance', JSON.stringify({ version: 1,
+    kind: 'bounded_native_decay', status: 'page_applied', classificationsFinalized: true }), ''));
+  assert.throws(() => validateKnownCliReceipt('taste', '', '[taste-profile] Failed: denied'), /unparseable/);
   assert.throws(() => validateKnownCliReceipt('entity', 'source content and arbitrary success', ''), /unparseable/);
 });

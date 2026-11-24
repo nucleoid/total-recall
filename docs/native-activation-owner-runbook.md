@@ -8,10 +8,10 @@ Nothing in this branch installs, enables, starts, restarts, or schedules a unit.
 
 - Feature allowlist: `reflection`, `consolidation`, `session`, `entity`, `taste`, `contradiction-shadow`, `maintenance`, and `webhook`.
 - There is no configurable command string. Each feature/subprofile maps to a fixed npm script and validated argument vector. Remote arguments are individually quoted and passed to local `ssh` with `execFile`; command output is never evaluated.
-- Every configuration contains a private remote environment-file path and, except for contradiction audit, a policy-file path plus its exact SHA-256. It contains no API keys, adapter bearer, database URL, or signing secret. Contradiction audit instead binds `policySha256` to the hash of its already approved runtime policy fingerprint and forbids `policyFile`/`policyEnvironment`.
+- A single-lane generation configuration may retain the top-level environment/policy fields shown below. Every multi-lane generation configuration must instead bind `environmentFile`, `policyFile`, `policySha256`, and `policyEnvironment` inside every selected lane; contradiction lanes bind only their environment file and runtime-policy fingerprint hash. Shared or partially bound multi-lane configurations are rejected. Configurations contain no API keys, adapter bearer, database URL, or signing secret.
 - Generation features require `adapterProfile: "openclaw-main-subscription"`. Before dispatch, the controller verifies policy bytes and hash, exact environment and lane scope, current approvals, and the native hard call bound. These controller checks are pure and do not initialize an embedding provider. The native CLI remains responsible for its full policy-schema validation. Embeddings remain the deployed Qwen contract.
 - Approval timestamps and references are validated but never created, extended, or rewritten by the controller.
-- Reflection, consolidation, session, and entity bind one exact namespace/access-level lane through the native policy. Taste binds one category/access-level operation to the policy source namespace; its policy may authorize a broader exact namespace set for source ownership and target writes, so receipts label it `policy-broader` rather than claiming a single-namespace lane. The lane advances only after a verified native receipt.
+- Reflection, consolidation, session, and entity bind one exact namespace/access-level lane through the native policy. The same selected lane binding object is used for private-environment permission checks, policy byte/hash validation, hard-call derivation, and dispatch; the controller overrides the native policy-file/environment variables with that exact binding. Taste binds one category/access-level operation to the policy source namespace; its policy may authorize a broader exact namespace set for source ownership and target writes, so receipts label it `policy-broader`. The lane advances only after a verified native receipt.
 - Queue workers are fixed to one job. Webhook uses concurrency one. Contradiction shadow invokes only the bounded read-only auditor; it never starts an ingestion worker.
 - Kernel `flock` locks cover the global controller and the individual feature. Locks are held by open file descriptions and disappear on process death; PID files are not replayed or treated as ownership.
 - Executed success is silent and recorded only in the fsynced content-free ledger. Raw stdout/stderr, source text, prompts, IDs, model output, secrets, and webhook bodies are discarded.
@@ -47,6 +47,27 @@ Store each file as mode `0600` under `~/.config/total-recall/native-activation/<
 
 The remote environment file must be mode `0400` or `0600`. It supplies the existing feature key, private adapter credential, private CA settings, deployment environment, and policy environment variable expected by that native CLI. The controller checks only permissions and fixed paths; it never reads or records secret values.
 
+For multiple lanes, move the four binding fields into each lane:
+
+```json
+"lanes": [
+  {
+    "namespace": "shared",
+    "accessLevel": "normal",
+    "profile": "queued-session",
+    "mode": "once",
+    "binding": {
+      "environmentFile": "/etc/total-recall/private/session-shared-normal.env",
+      "policyFile": "/app/policies/session-shared-normal-HASH.json",
+      "policySha256": "REPLACE_WITH_64_LOWERCASE_HEX",
+      "policyEnvironment": "production"
+    }
+  }
+]
+```
+
+Keep all lanes for one feature in one configuration. The shared global/per-feature locks, lane cursor, failure state, and daily call ledger remain single-owner state; do not create one service or timer per lane. Operator policy files must be immutable/hash-named, and the environment file's native policy key must identify the same file recorded in the lane binding.
+
 Supported subprofiles/modes:
 
 | Feature | Subprofile | Modes | Native bound |
@@ -55,12 +76,16 @@ Supported subprofiles/modes:
 | consolidation | `bounded-clusters` | `selection-only`, `preview`, `apply` | exact policy namespace/access lane; reserves `min(maxClusters, policy maxCallsPerInvocation)` outside selection-only |
 | session | `queued-session` | `once` | exact policy namespace/access lane; `--once --max-jobs 1`, reserves one call |
 | entity | `entity-enrichment` | `once` | exact policy namespace/access lane; one job and at most one call |
-| taste | `monthly-media` | `dry-run`, `preview`, `apply` | policy source namespace plus selected access level; only preview reserves the policy's two-call validation allowance |
+| taste | `monthly-media` | `dry-run`, `preview`, `apply`, `run-reviewed` | policy source namespace plus selected access level; preview and `run-reviewed` reserve exactly two validation attempts; apply reserves zero |
 | contradiction-shadow | `read-only-auditor` | `once` | exact namespace/access lane; latest 50 current Qwen sources, one subject, at most five candidates, at most one private-adapter call; no memory mutation |
-| maintenance | `lifecycle-finalize`, `supersession-finalize` | `verify` | reviewed idempotent finalizer only |
+| maintenance | `bounded-owner` | `once` | host-only `/usr/bin/python3 /home/cass/total-recall-move-20261117/release/scripts/native-maintenance-owner-launcher.py`; no environment file, container exec, arguments, credentials, or generic command |
 | webhook | `delivery` | `once` | one delivery, concurrency one |
 
 Taste and consolidation artifact paths are container paths to owner-controlled files. The controller does not create approvals or copy artifacts.
+
+`run-reviewed` is the only routine taste mode. It requires the committed standing owner instruction to be effective, the bounded operator authorization lease to be current, and policy `maxCallsPerRun` to equal two. The CLI performs preview, schema/evidence-local validation, attributed service approval, full apply-time revalidation, and apply in one native operation. There is no unreviewed generation fallback. The controller fixes `NODE_OPTIONS=--v8-pool-size=1`; private lane environments retain the reviewed `GOMAXPROCS=2` and `UV_THREADPOOL_SIZE=1` resource settings. PID, memory, CPU, timeout, and no-restart guards are unchanged.
+
+Maintenance bypasses the ingestion-container dispatch path and invokes only the reviewed host launcher. That launcher independently enforces the fixed release, OS identity, passwordless local-trust database namespace, 256 MiB/0.25 CPU/64 PID container limits, one 100-row page, private cursor state, and no purge/global DDL contract. The controller does not accept a maintenance environment file or caller arguments.
 
 Contradiction audit requires migration 062 and a dedicated environment file containing `CONTRADICTION_REVIEW_API_KEY` plus the approved contradiction runtime policy. The auditor key must currently authorize exactly `read,contradiction_audit`, one namespace, and the selected maximum access level. A normal key cannot audit sensitive or secret evidence. The separate existing `read,contradiction_resolve` reviewer authority remains unchanged. Migration 062 adds an append-only claim/outcome ledger and auditor-only restrictive RLS; apply it once through the normal migration ledger after 061. Do not replay it, backfill the corpus, create new embeddings, or enable automatic resolution. Unchanged subject revision, evidence, and policy are never retried. A no-candidate claim makes zero provider calls.
 
@@ -114,7 +139,7 @@ It uses the installed official command only:
 openclaw message send --channel discord --target 1478120981435383808 --message ... --json
 ```
 
-No raw stderr, source content, IDs, secret, or policy body is included. A CLI refusal is retained as `notification.status="refused"`; it is not bypassed through Discord credentials, HTTP, a private fork, another channel, or an OpenClaw automation. Unchanged failure fingerprints suppress another send and all feature execution until the configuration hash changes or the parent explicitly repairs the state file. Success never sends a notification.
+No raw stderr, source content, IDs, secret, or policy body is included. A failed notification remains `notification.status="refused"` with only a fixed safe code: timeout, nonzero exit, invalid receipt, or generic refusal. The controller does not mislabel the observed timeout as an authentication refusal and does not retain exception text or stderr. Refusal is not bypassed through Discord credentials, HTTP, a private fork, another channel, or an OpenClaw automation. Unchanged failure fingerprints suppress another send and all feature execution until the configuration hash changes or the parent explicitly repairs the state file. Success never sends a notification.
 
 Parent bounded live failure canary, after reviewing the real configuration:
 
