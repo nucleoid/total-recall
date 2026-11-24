@@ -8,11 +8,11 @@ Nothing in this branch installs, enables, starts, restarts, or schedules a unit.
 
 - Feature allowlist: `reflection`, `consolidation`, `session`, `entity`, `taste`, `contradiction-shadow`, `maintenance`, and `webhook`.
 - There is no configurable command string. Each feature/subprofile maps to a fixed npm script and validated argument vector. Remote arguments are individually quoted and passed to local `ssh` with `execFile`; command output is never evaluated.
-- Every configuration contains paths to a private remote environment file and, for generation features, a policy file plus its exact SHA-256. It contains no API keys, adapter bearer, database URL, or signing secret.
-- Generation features require `adapterProfile: "openclaw-main-subscription"`. Before dispatch, the controller verifies the remote policy hash, rejects policy files larger than 64 KiB, parses the policy with the feature's native parser, verifies the configured environment and active lane scope, and derives the reservation from the native hard call bound. Embeddings remain the deployed local Qwen contract.
+- Every configuration contains a private remote environment-file path and, except for contradiction audit, a policy-file path plus its exact SHA-256. It contains no API keys, adapter bearer, database URL, or signing secret. Contradiction audit instead binds `policySha256` to the hash of its already approved runtime policy fingerprint and forbids `policyFile`/`policyEnvironment`.
+- Generation features require `adapterProfile: "openclaw-main-subscription"`. Before dispatch, the controller verifies policy bytes and hash, exact environment and lane scope, current approvals, and the native hard call bound. These controller checks are pure and do not initialize an embedding provider. The native CLI remains responsible for its full policy-schema validation. Embeddings remain the deployed Qwen contract.
 - Approval timestamps and references are validated but never created, extended, or rewritten by the controller.
 - Reflection, consolidation, session, and entity bind one exact namespace/access-level lane through the native policy. Taste binds one category/access-level operation to the policy source namespace; its policy may authorize a broader exact namespace set for source ownership and target writes, so receipts label it `policy-broader` rather than claiming a single-namespace lane. The lane advances only after a verified native receipt.
-- Queue workers are fixed to one job. Webhook uses concurrency one. Contradiction shadow has no execution profile because starting a second ingestion worker would compete with the dedicated owner; it remains blocked pending a native bounded read-only auditor.
+- Queue workers are fixed to one job. Webhook uses concurrency one. Contradiction shadow invokes only the bounded read-only auditor; it never starts an ingestion worker.
 - Kernel `flock` locks cover the global controller and the individual feature. Locks are held by open file descriptions and disappear on process death; PID files are not replayed or treated as ownership.
 - Executed success is silent and recorded only in the fsynced content-free ledger. Raw stdout/stderr, source text, prompts, IDs, model output, secrets, and webhook bodies are discarded.
 
@@ -56,11 +56,13 @@ Supported subprofiles/modes:
 | session | `queued-session` | `once` | exact policy namespace/access lane; `--once --max-jobs 1`, reserves one call |
 | entity | `entity-enrichment` | `once` | exact policy namespace/access lane; one job and at most one call |
 | taste | `monthly-media` | `dry-run`, `preview`, `apply` | policy source namespace plus selected access level; only preview reserves the policy's two-call validation allowance |
-| contradiction-shadow | `needs-native-auditor` | `blocked` | must remain disabled; no ingestion-worker command exists |
+| contradiction-shadow | `read-only-auditor` | `once` | exact normal-access namespace; latest 50 current Qwen sources, one subject, at most five candidates, at most one private-adapter call; no memory mutation |
 | maintenance | `lifecycle-finalize`, `supersession-finalize` | `verify` | reviewed idempotent finalizer only |
 | webhook | `delivery` | `once` | one delivery, concurrency one |
 
 Taste and consolidation artifact paths are container paths to owner-controlled files. The controller does not create approvals or copy artifacts.
+
+Contradiction audit requires migration 062 and a dedicated environment file containing the existing `CONTRADICTION_REVIEW_API_KEY` plus the approved contradiction runtime policy. The key must currently authorize exactly `read,contradiction_resolve`, one namespace, and normal access. Migration 062 adds an append-only claim/outcome ledger and restrictive RLS; apply it once through the normal migration ledger after 061. Do not replay it, backfill the corpus, create new embeddings, or enable automatic resolution. Unchanged subject revision, evidence, and policy are never retried. A no-candidate claim makes zero provider calls.
 
 ### Entity historical recovery
 
@@ -118,7 +120,7 @@ Parent bounded live failure canary, after reviewing the real configuration:
 
 1. First run with `--execute --notification-dry-run` and an intentionally incorrect policy hash. Confirm `policy_hash_mismatch`, one dry-run CLI receipt, zero generation reservation, and zero native CLI invocation.
 2. Run the same unchanged canary again. Confirm status `blocked`, no second CLI send, and still zero native invocation.
-3. For one explicitly approved live notification, repeat in a fresh canary state directory without `--notification-dry-run`. Confirm exactly one message in channel `1478120981435383808` and `notification.status="cli_accepted"`. This proves CLI acceptance, not Discord rendering; parent must read back the channel independently.
+3. For one explicitly approved live notification, repeat in a fresh canary state directory without `--notification-dry-run`. Confirm exactly one message in channel `1478120981435383808` and `notification.status="cli_accepted"`. This proves a schema-valid CLI delivery receipt, not Discord rendering; parent must read back the channel independently.
 4. Restore the correct policy hash. Run planning mode only. Do not activate the native feature as part of the failure canary.
 
 ## Durable receipts and rollback

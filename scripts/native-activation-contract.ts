@@ -1,9 +1,4 @@
 import { createHash } from 'node:crypto';
-import { parseConsolidationPolicy } from '../src/consolidation.js';
-import { parseEntityExtractionPolicy } from '../src/entity-extractor.js';
-import { parseReflectionPolicy } from '../src/reflection.js';
-import { parseSessionDistillationPolicy } from '../src/session-distillation.js';
-import { parseTasteProfilePolicy } from '../src/taste-profile.js';
 
 export const NATIVE_FEATURES = [
   'reflection', 'consolidation', 'session', 'entity', 'taste',
@@ -61,18 +56,18 @@ export interface NativePolicyBinding {
 }
 
 const GENERATION_FEATURES = new Set<NativeFeature>([
-  'reflection', 'consolidation', 'session', 'entity', 'taste',
+  'reflection', 'consolidation', 'session', 'entity', 'taste', 'contradiction-shadow',
 ]);
 const PROFILE: Record<NativeFeature, readonly string[]> = {
   reflection: ['weekly'], consolidation: ['bounded-clusters'], session: ['queued-session'],
   entity: ['entity-enrichment'], taste: ['monthly-media'],
-  'contradiction-shadow': ['needs-native-auditor'],
+  'contradiction-shadow': ['read-only-auditor'],
   maintenance: ['lifecycle-finalize', 'supersession-finalize'], webhook: ['delivery'],
 };
 const MODE: Record<NativeFeature, readonly string[]> = {
   reflection: ['dry-run', 'run'], consolidation: ['selection-only', 'preview', 'apply'],
   session: ['once'], entity: ['once'], taste: ['dry-run', 'preview', 'apply'],
-  'contradiction-shadow': ['blocked'], maintenance: ['verify'], webhook: ['once'],
+  'contradiction-shadow': ['once'], maintenance: ['verify'], webhook: ['once'],
 };
 
 export function parseNativeActivationConfig(value: unknown, now = new Date()): NativeActivationConfig {
@@ -93,7 +88,14 @@ export function parseNativeActivationConfig(value: unknown, now = new Date()): N
   let policySha256: string | undefined;
   let policyEnvironment: string | undefined;
   let adapterProfile: 'openclaw-main-subscription' | undefined;
-  if (GENERATION_FEATURES.has(feature)) {
+  if (feature === 'contradiction-shadow') {
+    if (raw.policyFile !== undefined || raw.policyEnvironment !== undefined) {
+      throw new Error('contradiction auditor uses its hash-bound runtime policy');
+    }
+    policySha256 = token(raw.policySha256, 'policySha256', /^[0-9a-f]{64}$/);
+    if (raw.adapterProfile !== 'openclaw-main-subscription') throw new Error('private_adapter_profile_required');
+    adapterProfile = raw.adapterProfile;
+  } else if (GENERATION_FEATURES.has(feature)) {
     policyFile = absolutePath(raw.policyFile, 'policyFile');
     policySha256 = token(raw.policySha256, 'policySha256', /^[0-9a-f]{64}$/);
     policyEnvironment = text(raw.policyEnvironment, 'policyEnvironment', 1, 128);
@@ -102,9 +104,6 @@ export function parseNativeActivationConfig(value: unknown, now = new Date()): N
   } else if (raw.policyFile !== undefined || raw.policySha256 !== undefined ||
       raw.policyEnvironment !== undefined || raw.adapterProfile !== undefined) {
     throw new Error('non-generation feature must not declare generation policy or adapter');
-  }
-  if (feature === 'contradiction-shadow' && raw.enabled !== false) {
-    throw new Error('contradiction_shadow_needs_native_auditor');
   }
 
   const approvalRaw = object(raw.approval, 'approval');
@@ -164,6 +163,8 @@ function parseLane(feature: NativeFeature, value: unknown, index: number): Nativ
     lane.maxAnchors = boundedInteger(raw.maxAnchors ?? 10, 'maxAnchors', 1, 100);
     lane.maxClusters = boundedInteger(raw.maxClusters ?? 1, 'maxClusters', 1, 10);
     if (mode === 'preview') lane.artifactPath = absolutePath(raw.artifactPath, 'consolidation preview artifact');
+  } else if (feature === 'contradiction-shadow') {
+    if (accessLevel !== 'normal') throw new Error('contradiction auditor requires normal access');
   } else if (raw.category !== undefined || raw.period !== undefined || raw.artifactPath !== undefined ||
       raw.maxAnchors !== undefined || raw.maxClusters !== undefined) {
     throw new Error('lane contains fields not supported by its feature');
@@ -202,7 +203,9 @@ export function buildInvocationPlan(config: NativeActivationConfig, laneIndex: n
       if (lane.mode === 'apply') args.push('--selection-file', lane.artifactPath!);
       commands = [command('taste-profile', args)]; break;
     }
-    case 'contradiction-shadow': commands = []; break;
+    case 'contradiction-shadow': commands = [command('contradiction:audit', ['--once',
+      '--namespace', lane.namespace, '--access-level', lane.accessLevel,
+      '--expected-policy-hash', config.policySha256!])]; break;
     case 'maintenance': commands = [command(lane.profile === 'lifecycle-finalize'
       ? 'finalize:memory-lifecycle' : 'finalize:memory-supersession', [])]; break;
     case 'webhook': commands = [command('webhooks:deliver',
@@ -224,44 +227,112 @@ export function validateNativePolicyForLane(
     throw new Error('policy_not_applicable');
   }
   try {
+    const policy = nativePolicyEnvelope(value, config.policyEnvironment, now);
     switch (config.feature) {
       case 'reflection': {
-        const policy = parseReflectionPolicy(value, config.policyEnvironment, now);
+        requireFeature(policy, 'memory-reflection');
+        requirePrivateGeneration(policy);
+        requireCurrentApprovals(policy, ['providerModelApproval', 'termsApproval', 'scopeApproval', 'budgetApproval'], now);
         exactPolicyLane(policy.scope.namespaces, policy.scope.accessLevel, lane);
-        return { generationCallHardMax: lane.mode === 'dry-run' ? 0 : policy.budget.maxCallsPerRun,
+        const hardMax = boundedPolicyInteger(policy.budget.maxCallsPerRun, 1, 10);
+        return { generationCallHardMax: lane.mode === 'dry-run' ? 0 : hardMax,
           scopeBinding: 'exact-lane' };
       }
       case 'consolidation': {
-        const policy = parseConsolidationPolicy(value, config.policyEnvironment, now);
+        requireFeature(policy, 'memory-consolidation');
+        requirePrivateGeneration(policy);
+        requireCurrentApprovals(policy, ['generationApproval'], now);
+        if (lane.mode === 'apply') requireCurrentApprovals(policy, ['writeApproval'], now);
         exactPolicyLane(policy.scope.namespaces, policy.scope.accessLevel, lane);
+        const policyMax = boundedPolicyInteger(policy.budget.maxCallsPerInvocation, 1, 10);
         const hardMax = lane.mode === 'selection-only' ? 0 :
-          Math.min(lane.maxClusters!, policy.budget.maxCallsPerInvocation);
+          Math.min(lane.maxClusters!, policyMax);
         return { generationCallHardMax: hardMax, scopeBinding: 'exact-lane' };
       }
       case 'session': {
-        const policy = parseSessionDistillationPolicy(value, config.policyEnvironment, now);
+        requireFeature(policy, 'memory-session-distillation');
+        requirePrivateGeneration(policy);
+        requireCurrentApprovals(policy, ['providerModelApproval', 'termsApproval', 'scopeApproval', 'budgetApproval'], now);
         exactPolicyLane(policy.scope.namespaces, policy.scope.accessLevel, lane);
         return { generationCallHardMax: 1, scopeBinding: 'exact-lane' };
       }
       case 'entity': {
-        const policy = parseEntityExtractionPolicy(value, config.policyEnvironment, now);
+        requireFeature(policy, 'memory-entity-extraction');
+        requirePrivateGeneration(policy);
+        requireCurrentApprovals(policy, ['providerModelApproval', 'termsApproval', 'scopeApproval', 'budgetApproval'], now);
+        if (config.entityHistoricalRecovery) requireCurrentApprovals(policy, ['backfillApproval'], now);
         exactPolicyLane(policy.scope.namespaces, policy.scope.accessLevel, lane);
-        return { generationCallHardMax: Math.min(1, policy.budget.maxCallsPerInvocation), scopeBinding: 'exact-lane' };
+        boundedPolicyInteger(policy.budget.maxCallsPerInvocation, 1, 100_000);
+        return { generationCallHardMax: 1, scopeBinding: 'exact-lane' };
       }
       case 'taste': {
-        const policy = parseTasteProfilePolicy(value, config.policyEnvironment, now);
+        requireFeature(policy, 'media-taste-profile');
+        if (policy.enabled !== true) throw new Error('policy_disabled');
+        requirePrivateGeneration(policy);
+        requireCurrentApprovals(policy, ['providerModelApproval', 'termsApproval', 'scopeApproval', 'budgetApproval'], now);
+        if (!Array.isArray(policy.scope.namespaces) ||
+            !policy.scope.namespaces.includes(policy.scope.sourceNamespace) ||
+            !policy.scope.namespaces.includes(policy.scope.targetNamespace)) throw new Error('policy_scope_invalid');
         if (policy.scope.sourceNamespace !== lane.namespace || !policy.scope.accessLevels.includes(lane.accessLevel)) {
           throw new Error('policy_scope_mismatch');
         }
-        return { generationCallHardMax: lane.mode === 'preview' ? policy.budget.maxCallsPerRun : 0,
+        boundedPolicyInteger(policy.budget.maxCallsPerRun, 2, 2);
+        return { generationCallHardMax: lane.mode === 'preview' ? 2 : 0,
           scopeBinding: 'policy-broader' };
       }
+      case 'contradiction-shadow': throw new Error('policy_not_applicable');
       default: throw new Error('policy_not_applicable');
     }
   } catch (error) {
     if (error instanceof Error && error.message === 'policy_scope_mismatch') throw error;
     throw new Error('policy_contract_invalid');
   }
+}
+
+function nativePolicyEnvelope(value: unknown, expectedEnvironment: string, now: Date): Record<string, any> {
+  const policy = object(value, 'policy');
+  if (policy.environment !== expectedEnvironment) throw new Error('policy_environment_mismatch');
+  const terms = object(policy.terms, 'policy.terms');
+  if (terms.privacyApproved !== true || terms.retentionApproved !== true || terms.trainingApproved !== true) {
+    throw new Error('policy_terms_invalid');
+  }
+  object(policy.scope, 'policy.scope');
+  object(policy.budget, 'policy.budget');
+  if (policy.budget.mode !== 'subscription') throw new Error('policy_budget_mode_invalid');
+  if (!Number.isFinite(now.getTime())) throw new Error('policy_clock_invalid');
+  return policy;
+}
+
+function requireFeature(policy: Record<string, any>, feature: string): void {
+  if (policy.feature !== feature) throw new Error('policy_feature_mismatch');
+}
+
+function requirePrivateGeneration(policy: Record<string, any>): void {
+  const generation = object(policy.generation, 'policy.generation');
+  if (generation.provider !== 'openclaw-adapter' || generation.model !== 'openclaw/total-recall-synthesis') {
+    throw new Error('policy_generation_invalid');
+  }
+}
+
+function requireCurrentApprovals(policy: Record<string, any>, names: string[], now: Date): void {
+  for (const name of names) {
+    const approval = object(policy[name], `policy.${name}`);
+    if (approval.approved !== true || typeof approval.approvedBy !== 'string' || approval.approvedBy.trim() === '') {
+      throw new Error('policy_approval_invalid');
+    }
+    const approvedAt = Date.parse(String(approval.approvedAt));
+    const expiresAt = Date.parse(String(approval.expiresAt));
+    if (!Number.isFinite(approvedAt) || !Number.isFinite(expiresAt) || approvedAt > now.getTime() || expiresAt <= now.getTime()) {
+      throw new Error('policy_approval_not_current');
+    }
+  }
+}
+
+function boundedPolicyInteger(value: unknown, min: number, max: number): number {
+  if (!Number.isSafeInteger(value) || Number(value) < min || Number(value) > max) {
+    throw new Error('policy_budget_invalid');
+  }
+  return Number(value);
 }
 
 function exactPolicyLane(namespaces: readonly string[], accessLevel: AccessLevel, lane: NativeLane): void {
@@ -279,6 +350,7 @@ export function validateKnownCliReceipt(kind: NativeCommand['receiptKind'], stdo
     entity: /\[entity-enrich\] stopped/,
     'entity-requeue': /"selection":"completed-without-links"/,
     taste: /\[taste-profile\]/,
+    'contradiction-shadow': /\[contradiction-shadow-audit\] stopped/,
     maintenance: /"allValid":true/,
     webhook: /\[webhook-delivery\] stopped/,
   };

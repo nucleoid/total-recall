@@ -1,17 +1,22 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, writeFile, chmod } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 import {
   buildRemoteCommand,
+  isAcceptedNotificationReceipt,
   notifyFailure,
   parseNativeActivationCli,
   quoteRemoteArg,
   reserveDailyGenerationCalls,
   runNativeActivation,
 } from '../scripts/native-activation-controller.js';
+
+const execFileAsync = promisify(execFile);
 
 const NOW = new Date('2026-11-24T12:00:00.000Z');
 const approval = { approved: true as const, approvedBy: 'owner', approvedAt: '2026-01-01T00:00:00Z',
@@ -85,6 +90,18 @@ test('default plan performs no SSH, Docker, notification, or invocation', async 
   assert.equal(calls, 0);
   const ledger = await readFile(path.join(root, 'state', 'ledger.jsonl'), 'utf8');
   assert.equal(ledger.includes('source content'), false);
+});
+
+test('planning startup does not require embedding configuration or the test setup importer', async t => {
+  const { root, configFile } = await fixture(t);
+  const env = { ...process.env, NATIVE_ACTIVATION_STATE_DIR: path.join(root, 'standalone-state') };
+  for (const key of ['EMBEDDING_PROVIDER', 'EMBEDDING_MODEL', 'EMBEDDING_DIMENSIONS', 'GEMINI_API_KEY',
+    'EMBEDDING_CURRENT_PROFILE', 'EMBEDDING_PROFILES_JSON']) delete env[key];
+  const result = await execFileAsync(process.execPath,
+    ['--import', 'tsx', 'scripts/native-activation-controller.ts', '--config', configFile],
+    { cwd: path.resolve('.'), env, timeout: 15_000, encoding: 'utf8' });
+  assert.equal(JSON.parse(result.stdout).status, 'planned');
+  assert.equal(result.stderr, '');
 });
 
 test('kernel lock prevents global overlap without PID state', async t => {
@@ -183,10 +200,23 @@ test('policy scope mismatch fails before reservation or native feature dispatch'
 test('official notification carries only exact feature and error code', async () => {
   let sent: readonly string[] = [];
   const result = await notifyFailure('webhook', 'native_cli_failed', true, async (_file, args) => {
-    sent = args; return { stdout: '{"ok":true}', stderr: '' };
+    sent = args; return { stdout: JSON.stringify({ action: 'send', channel: 'discord', dryRun: true,
+      handledBy: 'plugin', payload: { content: 'redacted' } }), stderr: '' };
   });
   assert.equal(result?.status, 'dry_run_accepted');
   const message = sent[sent.indexOf('--message') + 1];
   assert.equal(message, 'Total Recall native feature failure: feature=webhook error=native_cli_failed. Feature is stopped until its configuration or state changes.');
   assert.equal(message.includes('stderr'), false);
+});
+
+test('official notification receipt rejects generic JSON and failed delivery', () => {
+  assert.equal(isAcceptedNotificationReceipt({ ok: true }, true), false);
+  assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: true,
+    payload: { ok: false }, error: 'refused' }, true), false);
+  assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: false,
+    payload: {}, deliveryStatus: 'failed', messageId: '1' }, false), false);
+  assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: false,
+    payload: {}, deliveryStatus: 'sent' }, false), false);
+  assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: false,
+    payload: {}, deliveryStatus: 'sent', messageId: '1' }, false), true);
 });
