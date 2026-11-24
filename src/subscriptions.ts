@@ -230,16 +230,8 @@ async function loadCreatedSubscription(client: ScopedClient, keyId: string, id: 
 export interface ClaimedDelivery { id: string; eventId: string; subscriptionId: string; ownerKeyId: string; attempts: number }
 export async function claimWebhookDelivery(client: ScopedClient): Promise<ClaimedDelivery | null> {
   const result = await client.query<{ id: string; event_id: string; subscription_id: string; api_key_id: string; attempts: number }>(`
-    WITH candidate AS (
-      SELECT id FROM webhook_deliveries
-      WHERE ((status IN ('pending','retry') AND next_attempt_at <= statement_timestamp())
-        OR (status = 'processing' AND locked_at < statement_timestamp() - interval '5 minutes'))
-      ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1
-    )
-    UPDATE webhook_deliveries d SET status = 'processing', attempts = attempts + 1,
-      locked_at = statement_timestamp(), last_error_code = NULL, updated_at = statement_timestamp()
-    FROM candidate WHERE d.id = candidate.id
-    RETURNING d.id, d.event_id, d.subscription_id, d.api_key_id, d.attempts
+    SELECT id, event_id, subscription_id, api_key_id, attempts
+    FROM public.webhook_worker_claim_delivery()
   `);
   const row = result.rows[0];
   return row ? { id: row.id, eventId: row.event_id, subscriptionId: row.subscription_id, ownerKeyId: row.api_key_id, attempts: row.attempts } : null;
@@ -252,24 +244,7 @@ export interface AuthorizedDelivery {
 }
 export async function loadAuthorizedDelivery(client: ScopedClient, deliveryId: string): Promise<AuthorizedDelivery | null> {
   const result = await client.query<any>(`
-    SELECT d.id, d.event_id, d.subscription_id, d.api_key_id, d.memory_id, d.namespace,
-      d.similarity, d.created_at AS event_created_at, m.created_at AS memory_created_at,
-      s.webhook_url_ciphertext, s.webhook_url_iv, s.webhook_url_tag,
-      s.signing_secret_ciphertext, s.signing_secret_iv, s.signing_secret_tag, s.encryption_key_id
-    FROM webhook_deliveries d
-    JOIN memory_subscriptions s ON s.id = d.subscription_id AND s.api_key_id = d.api_key_id
-    JOIN subscription_namespaces sn ON sn.subscription_id = s.id AND sn.api_key_id = s.api_key_id AND sn.namespace = d.namespace
-    JOIN api_keys k ON k.id = s.api_key_id
-    JOIN memories m ON m.id = d.memory_id AND m.namespace = d.namespace
-    WHERE d.id = $1::uuid AND d.status = 'processing' AND s.status = 'active'
-      AND s.access_level_policy = 'normal' AND k.enabled = true AND 'read' = ANY(k.permissions)
-      AND d.namespace = ANY(k.namespaces) AND COALESCE(m.access_level, 'normal') = 'normal'
-      AND (NOT s.exclude_self OR m.client_id <> s.api_key_id::text)
-      AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
-      AND m.superseded_at IS NULL AND m.valid_to IS NULL
-      AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
-      AND m.consolidated_into_id IS NULL
-    FOR SHARE OF s, k, m
+    SELECT * FROM public.webhook_worker_load_delivery($1::uuid)
   `, [deliveryId]);
   const row = result.rows[0];
   if (!row) return null;
@@ -297,35 +272,38 @@ export function buildWebhookPayload(delivery: AuthorizedDelivery): {
 }
 
 export async function cancelUnauthorizedDelivery(client: ScopedClient, id: string): Promise<boolean> {
-  const result = await client.query(`UPDATE webhook_deliveries SET status = 'cancelled', locked_at = NULL,
-    last_error_code = 'authorization_revoked', updated_at = statement_timestamp()
-    WHERE id = $1::uuid AND status = 'processing'`, [id]);
-  return result.rowCount === 1;
+  const result = await client.query<{ changed: boolean }>(
+    'SELECT public.webhook_worker_cancel_unauthorized($1::uuid) AS changed', [id]);
+  return result.rows[0]?.changed === true;
 }
 export async function deliveryStillAuthorized(client: ScopedClient, id: string): Promise<boolean> {
-  return (await loadAuthorizedDelivery(client, id)) !== null;
+  const result = await client.query<{ authorized: boolean }>(
+    'SELECT public.webhook_worker_recheck_delivery($1::uuid) AS authorized', [id]);
+  return result.rows[0]?.authorized === true;
 }
 export async function markDeliveryDelivered(client: ScopedClient, delivery: AuthorizedDelivery, status: number): Promise<boolean> {
-  const result = await client.query(`UPDATE webhook_deliveries SET status = 'delivered', delivered_at = statement_timestamp(),
-    locked_at = NULL, last_http_status = $2, last_error_code = NULL, updated_at = statement_timestamp()
-    WHERE id = $1::uuid AND status = 'processing'`, [delivery.deliveryId, status]);
-  return result.rowCount === 1;
+  const result = await client.query<{ changed: boolean }>(
+    'SELECT public.webhook_worker_mark_delivered($1::uuid, $2::integer) AS changed',
+    [delivery.deliveryId, status]);
+  return result.rows[0]?.changed === true;
 }
 export async function markDeliveryFailed(client: ScopedClient, delivery: AuthorizedDelivery, options: {
   errorCode: string; httpStatus?: number; retryAt?: Date; terminal: boolean;
 }): Promise<boolean> {
   if (!/^[a-z0-9_.-]{1,64}$/.test(options.errorCode)) throw new Error('Invalid content-free webhook error code');
-  const terminal = options.terminal;
-  const result = await client.query(`UPDATE webhook_deliveries SET status = $2, next_attempt_at = COALESCE($3, next_attempt_at),
-    locked_at = NULL, last_http_status = $4, last_error_code = $5, updated_at = statement_timestamp()
-    WHERE id = $1::uuid AND status = 'processing'`,
-    [delivery.deliveryId, terminal ? 'dead' : 'retry', options.retryAt ?? null, options.httpStatus ?? null, options.errorCode]);
-  return result.rowCount === 1;
+  const result = options.terminal
+    ? await client.query<{ changed: boolean }>(
+      'SELECT public.webhook_worker_mark_dead($1::uuid, $2::text, $3::integer) AS changed',
+      [delivery.deliveryId, options.errorCode, options.httpStatus ?? null])
+    : await client.query<{ changed: boolean }>(
+      'SELECT public.webhook_worker_mark_retry($1::uuid, $2::text, $3::integer, $4::timestamptz) AS changed',
+      [delivery.deliveryId, options.errorCode, options.httpStatus ?? null, options.retryAt ?? null]);
+  return result.rows[0]?.changed === true;
 }
 
 export function webhookWorkerScope(auth: AuthContext): DbScope {
-  if (!auth.permissions.includes('admin') || !auth.permissions.includes('read')) {
-    throw new Error('Webhook worker requires a dedicated API key with admin and read permissions');
+  if (auth.permissions.length !== 1 || auth.permissions[0] !== 'webhook_worker') {
+    throw new Error('Webhook worker requires a dedicated API key with only webhook_worker permission');
   }
   return dbScopeFromAuth(auth);
 }

@@ -55,6 +55,16 @@ test('supported key management provisions scoped entity extraction permission', 
   assert.equal(parsed.maxAccessLevel, 'secret');
 });
 
+test('supported key management provisions a webhook-only worker credential', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'webhook-delivery', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'shared,work', '--permissions', 'webhook_worker', '--max-access-level', 'normal',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['webhook_worker']);
+  assert.equal(parsed.maxAccessLevel, 'normal');
+
+});
+
 test('expiry rejects past, loose, and offset-free timestamps', () => {
   assert.throws(() => parseExpiry('2025-12-31T23:59:59Z', now), /future/);
   assert.throws(() => parseExpiry('2026-01-02', now), /offset-aware/);
