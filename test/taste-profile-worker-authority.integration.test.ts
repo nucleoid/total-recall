@@ -7,6 +7,8 @@ import pg from 'pg';
 import { hashKey, validateKeyReadOnly } from '../src/auth.js';
 import { dbScopeFromAuth, setPoolForTesting, withScopedClient } from '../src/db.js';
 import { getMemory } from '../src/memories.js';
+import { mediaMonthPeriod, runTasteProfile } from '../src/taste-profile.js';
+import { QWEN_CONTRACT_ID } from '../src/local-embedding-contract.js';
 
 const WORKER='10000000-0000-4000-8000-000000000058';
 const EVENT_OWNER='20000000-0000-4000-8000-000000000058';
@@ -16,6 +18,7 @@ const SECRET_MEMORY='40000000-0000-4000-8000-000000000059';
 const EVENT_NORMAL='50000000-0000-4000-8000-000000000058';
 const EVENT_SENSITIVE='50000000-0000-4000-8000-000000000059';
 const EVENT_SECRET='50000000-0000-4000-8000-000000000060';
+const EVENT_SECRET_VIEWING='50000000-0000-4000-8000-000000000061';
 const NORMAL_READER='60000000-0000-4000-8000-000000000058';
 const SECRET='tr_taste_profile_worker_integration';
 const NORMAL_READER_SECRET='tr_taste_profile_normal_reader_integration';
@@ -30,6 +33,16 @@ async function wait(url:string):Promise<pg.Client>{
 
 test('taste worker performs scoped cross-owner synthesis without raw table authority',{timeout:180000},async t=>{
   if(!dockerAvailable()){t.skip('Docker is unavailable');return;}
+  const previousEmbeddingContract=process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+  const previousRollbackWrites=process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES;
+  process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT=QWEN_CONTRACT_ID;
+  delete process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES;
+  t.after(()=>{
+    if(previousEmbeddingContract===undefined)delete process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+    else process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT=previousEmbeddingContract;
+    if(previousRollbackWrites===undefined)delete process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES;
+    else process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES=previousRollbackWrites;
+  });
   const container=execFileSync('docker',['run','--rm','-d','-e','POSTGRES_PASSWORD=postgres','-p','127.0.0.1::5432',
     process.env.CONSOLIDATION_TEST_IMAGE||'pgvector/pgvector:pg16'],{encoding:'utf8'}).trim();
   t.after(()=>{try{execFileSync('docker',['rm','-f',container],{stdio:'ignore'});}catch{}});
@@ -55,8 +68,9 @@ test('taste worker performs scoped cross-owner synthesis without raw table autho
       (id,service,source_id,event_key,event_type,title,artist,played_at,client_id,namespace,memory_id) VALUES
       ($1,'plex','server-a','normal-event','play','Normal Album','Artist A','2026-06-02T00:00:00Z',$3,'media',NULL),
       ($2,'ytmusic','account-b','sensitive-event','play','Sensitive Track','Artist B','2026-06-03T00:00:00Z',$3,'media',$4),
-      ($5,'ytmusic','account-b','secret-event','play','Secret Track','Artist C','2026-06-04T00:00:00Z',$3,'media',$6)`,
-      [EVENT_NORMAL,EVENT_SENSITIVE,EVENT_OWNER,MEMORY,EVENT_SECRET,SECRET_MEMORY]);
+      ($5,'ytmusic','account-b','secret-event','play','Secret Track','Artist C','2026-06-04T00:00:00Z',$3,'media',$6),
+      ($7,'plex','server-a','secret-viewing-event','watch','Secret Film',NULL,'2026-06-05T00:00:00Z',$3,'media',$6)`,
+      [EVENT_NORMAL,EVENT_SENSITIVE,EVENT_OWNER,MEMORY,EVENT_SECRET,SECRET_MEMORY,EVENT_SECRET_VIEWING]);
     pool=new pg.Pool({connectionString:`postgresql://total_recall_app:app-password@127.0.0.1:${port}/postgres`,max:2});
     setPoolForTesting(pool);
     const auth=await validateKeyReadOnly(SECRET);assert.ok(auth);
@@ -118,7 +132,7 @@ test('taste worker performs scoped cross-owner synthesis without raw table autho
     const sourceOwnership=await owner.query(`SELECT
       (SELECT bool_and(client_id=$1) FROM media_events WHERE id=ANY($2::uuid[])) AS events_unchanged,
       (SELECT bool_and(client_id=$3) FROM memories WHERE id=ANY($4::uuid[])) AS linked_unchanged`,
-      [EVENT_OWNER,[EVENT_NORMAL,EVENT_SENSITIVE,EVENT_SECRET],LINKED_OWNER,[MEMORY,SECRET_MEMORY]]);
+      [EVENT_OWNER,[EVENT_NORMAL,EVENT_SENSITIVE,EVENT_SECRET,EVENT_SECRET_VIEWING],LINKED_OWNER,[MEMORY,SECRET_MEMORY]]);
     assert.equal(sourceOwnership.rows[0].events_unchanged,true);
     assert.equal(sourceOwnership.rows[0].linked_unchanged,true);
 
@@ -131,6 +145,48 @@ test('taste worker performs scoped cross-owner synthesis without raw table autho
       const hidden=await withScopedClient(scope,client=>client.query(`SELECT * FROM ${table}`));
       assert.equal(hidden.rowCount,0,`${table} must remain unavailable after protected-lane apply`);
     }
+
+    const approval={approved:true as const,approvedBy:'policy-owner-record',approvedAt:'2026-01-01T00:00:00Z',expiresAt:'2027-01-01T00:00:00Z'};
+    const recurringPolicy={version:2 as const,feature:'media-taste-profile' as const,enabled:true as const,environment:'test',
+      generation:{provider:'openclaw-adapter' as const,model:'openclaw/total-recall-synthesis' as const,
+        endpoint:'https://example.invalid/generate',credentialEnv:'TASTE_TEST_KEY',timeoutMs:1000},
+      terms:{reference:'terms-record',privacyApproved:true as const,retentionApproved:true as const,trainingApproved:true as const},
+      scope:{namespaces:['media','personal'],sourceNamespace:'media',targetNamespace:'personal',
+        accessLevels:['normal' as const,'sensitive' as const,'secret' as const]},
+      aggregation:{minimumEvents:1,topLimit:10,trendMinimumAbsoluteChange:3,trendMinimumShareChange:0.1},
+      budget:{mode:'subscription' as const,maxCallsPerRun:2 as const,maxOutputBytesPerRun:8192 as const,
+        usageControlReference:'private-subscription-control'},
+      selection:{previewTtlMinutes:60,maxMaterializedEvents:10},providerModelApproval:approval,termsApproval:approval,
+      scopeApproval:approval,budgetApproval:approval,standingAutomation:{enabled:true as const,
+        ownerInstruction:{reference:'owner-instruction:recurring-taste',effectiveAt:'2026-06-01T00:00:00Z',expiresAt:'2027-01-01T00:00:00Z'},
+        operator:{identity:'service:taste-profile-recurring',authorizationReference:'operator-authorization:90-day',
+          authorizedAt:'2026-06-15T00:00:00Z',expiresAt:'2026-09-13T00:00:00Z'}}};
+    let recurringProviderCalls=0;
+    const recurringProvider={name:'openclaw-adapter',generate:async(request:any)=>{
+      recurringProviderCalls+=1;
+      assert.equal(request.input.includes(EVENT_SECRET_VIEWING),false);
+      assert.equal(request.input.includes(SECRET_MEMORY),false);
+      assert.equal(request.input.includes(EVENT_OWNER),false);
+      assert.equal(request.input.includes(LINKED_OWNER),false);
+      assert.equal(request.input.includes('owner-instruction:recurring-taste'),false);
+      return '{"profile_style":"focused","evidence_ids":["E001"]}';
+    }};
+    const recurringOptions={auth,category:'viewing' as const,period:mediaMonthPeriod('2026-06','UTC'),timeZone:'UTC',
+      environment:'test',policy:recurringPolicy,mode:'run-reviewed' as const,accessLevel:'secret' as const,
+      now:new Date('2026-07-01T00:00:00Z'),provider:recurringProvider,embedProfile:async()=>Array(768).fill(0)};
+    const recurring=await runTasteProfile(recurringOptions);
+    assert.equal(recurring.status,'created');assert.equal(recurring.providerCalls,1);assert.equal(recurringProviderCalls,1);
+    assert.ok(recurring.memoryId);
+    const recurringStored=await owner.query('SELECT metadata FROM memories WHERE id=$1',[recurring.memoryId]);
+    assert.equal(recurringStored.rows[0].metadata.approval_mode,'standing-automation');
+    assert.equal(recurringStored.rows[0].metadata.approval_reference,'operator-authorization:90-day');
+    assert.equal(recurringStored.rows[0].metadata.owner_instruction_reference,'owner-instruction:recurring-taste');
+    assert.equal(recurringStored.rows[0].metadata.selection_approved_by,'service:taste-profile-recurring');
+    assert.deepEqual(recurringStored.rows[0].metadata.source_owner_key_ids,[EVENT_OWNER]);
+    assert.deepEqual(recurringStored.rows[0].metadata.linked_memory_owner_key_ids,[LINKED_OWNER]);
+    const recurringReplay=await runTasteProfile({...recurringOptions,now:new Date('2026-07-01T00:01:00Z')});
+    assert.equal(recurringReplay.status,'unchanged');assert.equal(recurringReplay.providerCalls,0);
+    assert.equal(recurringProviderCalls,1);
 
     await owner.query('UPDATE media_events SET title=title||\' changed\' WHERE id=$1',[EVENT_NORMAL]);
     await assert.rejects(apply('normal',normal.rows[0].source_fingerprint),/taste_source_changed/);

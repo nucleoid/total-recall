@@ -34,6 +34,16 @@ function policy() {
   };
 }
 
+function standingPolicy() {
+  return { ...policy(), standingAutomation: {
+    enabled: true as const,
+    ownerInstruction: { reference: 'owner-instruction:taste-profile-recurring',
+      effectiveAt: '2026-06-01T00:00:00Z', expiresAt: '2027-06-01T00:00:00Z' },
+    operator: { identity: 'service:taste-profile-recurring', authorizationReference: 'operator-ticket-42',
+      authorizedAt: '2026-06-15T00:00:00Z', expiresAt: '2026-09-13T00:00:00Z' },
+  } };
+}
+
 const mockFingerprint = 'a'.repeat(64);
 const mockAggregateRows = [
   { window_name: 'period', dimension: 'total', value: 'events', event_count: '20', rank: 1 },
@@ -192,6 +202,77 @@ test('preview retries invalid structured output once and never embeds or mutates
   } finally { setPoolForTesting(null); }
 });
 
+test('run-reviewed requires standing authority, applies an attributed deterministic receipt, and replays without generation', async () => {
+  const previousEmbeddingContract = process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+  const previousRollbackWrites = process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES;
+  process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT = QWEN_CONTRACT_ID;
+  delete process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES;
+  const period = mediaMonthPeriod('2026-06','UTC');
+  const auth = { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
+    namespaces: ['media','personal'], permissions: ['read','taste_profile'], maxAccessLevel: 'normal' as const };
+  await assert.rejects(runTasteProfile({ auth,category:'music',period,timeZone:'UTC',environment:'test',
+    policy:policy(),mode:'run-reviewed',accessLevel:'normal',now:new Date('2026-07-01T00:00:00Z') }),/not enabled/);
+  const expired={...standingPolicy(),standingAutomation:{...standingPolicy().standingAutomation,
+    operator:{...standingPolicy().standingAutomation.operator,expiresAt:'2026-06-30T23:59:59Z'}}};
+  await assert.rejects(runTasteProfile({ auth,category:'music',period,timeZone:'UTC',environment:'test',
+    policy:expired,mode:'run-reviewed',accessLevel:'normal',now:new Date('2026-07-01T00:00:00Z') }),/operator has expired/);
+
+  let storedAggregate:string|undefined;
+  let providerCalls=0;
+  let embeddingCalls=0;
+  let appliedMetadata:any;
+  const profileId='44444444-4444-4444-8444-444444444445';
+  const client={
+    query:async(text:string,values?:unknown[])=>{
+      if(text.includes('taste_profile_load_snapshot'))return mockSnapshot;
+      if(text.includes('taste_profile_aggregate_source'))return {rows:mockAggregateRows};
+      if(text.includes('taste_profile_existing_revision'))return {rows:storedAggregate?[{
+        id:profileId,aggregate_hash:storedAggregate,source_fingerprint:mockFingerprint,access_level:'normal'}]:[]};
+      if(text.includes('FROM api_keys WHERE id'))return {rows:[{namespaces:['media','personal'],
+        permissions:['read','taste_profile'],max_access_level:'normal',enabled:true,expires_at:null,revoked_at:null}]};
+      if(text.includes('taste_profile_apply_revision')){
+        appliedMetadata=JSON.parse(String(values?.[11]));
+        storedAggregate=appliedMetadata.aggregate_hash;
+        return {rows:[{id:profileId,outcome:'created',superseded_id:null}]};
+      }
+      return {rows:[],rowCount:1};
+    },release:()=>undefined,
+  };
+  setPoolForTesting({connect:async()=>client} as unknown as pg.Pool);
+  try{
+    const provider={name:'openclaw-adapter',generate:async(request:any)=>{
+      providerCalls+=1;
+      const input=JSON.parse(request.input);
+      assert.deepEqual(Object.keys(input).sort(),['category','evidence','period','schema']);
+      assert.equal(request.input.includes(auth.keyId),false);
+      assert.equal(request.input.includes(mockFingerprint),false);
+      assert.equal(request.input.includes('owner-instruction:taste-profile-recurring'),false);
+      return '{"profile_style":"focused","evidence_ids":["E001"]}';
+    }};
+    const first=await runTasteProfile({auth,category:'music',period,timeZone:'UTC',environment:'test',
+      policy:standingPolicy(),mode:'run-reviewed',accessLevel:'normal',now:new Date('2026-07-01T00:00:00Z'),provider,
+      embedProfile:async()=>{embeddingCalls+=1;return Array(768).fill(0);}});
+    assert.equal(first.mode,'run-reviewed');assert.equal(first.status,'created');assert.equal(first.providerCalls,1);
+    assert.equal(providerCalls,1);assert.equal(embeddingCalls,1);
+    assert.equal(appliedMetadata.approval_mode,'standing-automation');
+    assert.equal(appliedMetadata.approval_reference,'operator-ticket-42');
+    assert.equal(appliedMetadata.owner_instruction_reference,'owner-instruction:taste-profile-recurring');
+    assert.equal(appliedMetadata.selection_approved_by,'service:taste-profile-recurring');
+
+    const replay=await runTasteProfile({auth,category:'music',period,timeZone:'UTC',environment:'test',
+      policy:standingPolicy(),mode:'run-reviewed',accessLevel:'normal',now:new Date('2026-07-01T00:01:00Z'),provider,
+      embedProfile:async()=>{embeddingCalls+=1;return Array(768).fill(0);}});
+    assert.equal(replay.mode,'run-reviewed');assert.equal(replay.status,'unchanged');assert.equal(replay.providerCalls,0);
+    assert.equal(providerCalls,1);assert.equal(embeddingCalls,1);
+  }finally{
+    setPoolForTesting(null);
+    if(previousEmbeddingContract===undefined)delete process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+    else process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT=previousEmbeddingContract;
+    if(previousRollbackWrites===undefined)delete process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES;
+    else process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES=previousRollbackWrites;
+  }
+});
+
 test('apply embeds before one atomic agent/update/supersession/audit transaction', async () => {
   const previousEmbeddingContract = process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
   const previousRollbackWrites = process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES;
@@ -314,7 +395,10 @@ test('taste-profile CLI defaults to provider-free dry-run and keeps modes explic
   assert.deepEqual(parseTasteProfileCli(['--preview', '--category', 'viewing', '--period', '2026-06', '--json']),
     { mode: 'preview', category: 'viewing', period: '2026-06', accessLevel: 'all',
       force: false, json: true, selectionFile: undefined });
+  assert.deepEqual(parseTasteProfileCli(['--run-reviewed','--access-level','secret']),{
+    mode:'run-reviewed',category:'all',period:undefined,accessLevel:'secret',force:false,json:false,selectionFile:undefined});
   assert.throws(() => parseTasteProfileCli(['--preview', '--apply']), /mutually exclusive/);
+  assert.throws(() => parseTasteProfileCli(['--run-reviewed','--selection-file','review.json']),/only with --apply/);
   assert.throws(() => parseTasteProfileCli(['--force']), /dry-run/);
   assert.throws(() => parseTasteProfileCli(['--category', 'activity']), /music/);
   assert.throws(() => parseTasteProfileCli(['--apply']), /selection-file/);
