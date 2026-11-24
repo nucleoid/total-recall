@@ -89,7 +89,6 @@ export const tasteProfilePolicySchema = z.object({
     ownerInstruction: z.object({
       reference: z.string().trim().min(1).max(1024),
       effectiveAt: z.string().datetime({ offset: true }),
-      expiresAt: z.string().datetime({ offset: true }),
     }).strict(),
     operator: z.object({
       identity: z.string().trim().min(1).max(256),
@@ -638,7 +637,6 @@ async function runReviewedTasteProfile(
       approvedAt: approvalClock.toISOString(),
       expiresAt: new Date(Math.min(
         new Date(preview.selection!.expiresAt).getTime(),
-        new Date(authority.ownerInstruction.expiresAt).getTime(),
         new Date(authority.operator.expiresAt).getTime(),
       )).toISOString(),
     },
@@ -658,8 +656,9 @@ function assertStandingAutomationEffective(
 ): NonNullable<TasteProfilePolicy['standingAutomation']> {
   const authority = policy.standingAutomation;
   if (!authority?.enabled) throw new Error('Taste-profile standing automation is not enabled');
-  assertValidityWindow(authority.ownerInstruction.effectiveAt, authority.ownerInstruction.expiresAt,
-    now, 'owner instruction');
+  if (new Date(authority.ownerInstruction.effectiveAt).getTime() > now.getTime()) {
+    throw new Error('Taste-profile owner instruction is not yet effective');
+  }
   assertValidityWindow(authority.operator.authorizedAt, authority.operator.expiresAt,
     now, 'automation operator');
   return authority;

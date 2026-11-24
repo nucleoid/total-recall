@@ -38,7 +38,7 @@ function standingPolicy() {
   return { ...policy(), standingAutomation: {
     enabled: true as const,
     ownerInstruction: { reference: 'owner-instruction:taste-profile-recurring',
-      effectiveAt: '2026-06-01T00:00:00Z', expiresAt: '2027-06-01T00:00:00Z' },
+      effectiveAt: '2026-06-01T00:00:00Z' },
     operator: { identity: 'service:taste-profile-recurring', authorizationReference: 'operator-ticket-42',
       authorizedAt: '2026-06-15T00:00:00Z', expiresAt: '2026-09-13T00:00:00Z' },
   } };
@@ -75,6 +75,9 @@ test('taste-profile policy requires independent approvals and exact environment'
     provider: 'paid-gateway' } }, 'test', new Date('2026-06-01T00:00:00Z')));
   assert.throws(() => parseTasteProfilePolicy({ ...policy(), budget: { ...policy().budget,
     mode: 'paid' } }, 'test', new Date('2026-06-01T00:00:00Z')));
+  const fabricatedOwnerExpiry={...standingPolicy(),standingAutomation:{...standingPolicy().standingAutomation,
+    ownerInstruction:{...standingPolicy().standingAutomation.ownerInstruction,expiresAt:'2027-01-01T00:00:00Z'}}};
+  assert.throws(()=>parseTasteProfilePolicy(fabricatedOwnerExpiry,'test',new Date('2026-07-01T00:00:00Z')));
 });
 
 test('all-access lane authority remains exact and least-privileged', () => {

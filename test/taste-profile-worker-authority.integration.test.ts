@@ -158,10 +158,11 @@ test('taste worker performs scoped cross-owner synthesis without raw table autho
         usageControlReference:'private-subscription-control'},
       selection:{previewTtlMinutes:60,maxMaterializedEvents:10},providerModelApproval:approval,termsApproval:approval,
       scopeApproval:approval,budgetApproval:approval,standingAutomation:{enabled:true as const,
-        ownerInstruction:{reference:'owner-instruction:recurring-taste',effectiveAt:'2026-06-01T00:00:00Z',expiresAt:'2027-01-01T00:00:00Z'},
+        ownerInstruction:{reference:'owner-instruction:recurring-taste',effectiveAt:'2026-06-01T00:00:00Z'},
         operator:{identity:'service:taste-profile-recurring',authorizationReference:'operator-authorization:90-day',
           authorizedAt:'2026-06-15T00:00:00Z',expiresAt:'2026-09-13T00:00:00Z'}}};
     let recurringProviderCalls=0;
+    let providerMutation:(()=>Promise<void>)|undefined;
     const recurringProvider={name:'openclaw-adapter',generate:async(request:any)=>{
       recurringProviderCalls+=1;
       assert.equal(request.input.includes(EVENT_SECRET_VIEWING),false);
@@ -169,7 +170,11 @@ test('taste worker performs scoped cross-owner synthesis without raw table autho
       assert.equal(request.input.includes(EVENT_OWNER),false);
       assert.equal(request.input.includes(LINKED_OWNER),false);
       assert.equal(request.input.includes('owner-instruction:recurring-taste'),false);
-      return '{"profile_style":"focused","evidence_ids":["E001"]}';
+      await providerMutation?.();
+      const evidence=JSON.parse(request.input).evidence as Array<{id:string;kind:string}>;
+      const selected=evidence.find(fact=>fact.kind==='entity') ?? evidence.find(fact=>fact.kind!=='quality');
+      assert.ok(selected);
+      return JSON.stringify({profile_style:'focused',evidence_ids:[selected.id]});
     }};
     const recurringOptions={auth,category:'viewing' as const,period:mediaMonthPeriod('2026-06','UTC'),timeZone:'UTC',
       environment:'test',policy:recurringPolicy,mode:'run-reviewed' as const,accessLevel:'secret' as const,
@@ -184,9 +189,46 @@ test('taste worker performs scoped cross-owner synthesis without raw table autho
     assert.equal(recurringStored.rows[0].metadata.selection_approved_by,'service:taste-profile-recurring');
     assert.deepEqual(recurringStored.rows[0].metadata.source_owner_key_ids,[EVENT_OWNER]);
     assert.deepEqual(recurringStored.rows[0].metadata.linked_memory_owner_key_ids,[LINKED_OWNER]);
-    const recurringReplay=await runTasteProfile({...recurringOptions,now:new Date('2026-07-01T00:01:00Z')});
+    const beforeChanged=await owner.query(`SELECT content,metadata,client_id,agent_id,access_level,
+      embedding_provider,embedding_model FROM memories WHERE id=$1`,[recurring.memoryId]);
+
+    await owner.query("UPDATE media_events SET title='Secret Film changed before review' WHERE id=$1",[EVENT_SECRET_VIEWING]);
+    providerMutation=async()=>{await owner.query("UPDATE media_events SET title='Secret Film drifted' WHERE id=$1",[EVENT_SECRET_VIEWING]);};
+    await assert.rejects(runTasteProfile({...recurringOptions,now:new Date('2026-07-01T00:01:00Z')}),/source_changed/);
+    providerMutation=undefined;
+    const afterStale=await owner.query(`SELECT content,metadata,client_id,agent_id,access_level,
+      embedding_provider,embedding_model FROM memories WHERE id=$1`,[recurring.memoryId]);
+    assert.deepEqual(afterStale.rows[0],beforeChanged.rows[0]);
+
+    providerMutation=async()=>{await owner.query("UPDATE api_keys SET permissions=ARRAY['write'] WHERE id=$1",[EVENT_OWNER]);};
+    try{
+      await assert.rejects(runTasteProfile({...recurringOptions,now:new Date('2026-07-01T00:02:00Z')}),/expired_or_revoked/);
+    }finally{
+      providerMutation=undefined;
+      await owner.query("UPDATE api_keys SET permissions=ARRAY['read','write'] WHERE id=$1",[EVENT_OWNER]);
+    }
+    const afterAuthority=await owner.query(`SELECT content,metadata,client_id,agent_id,access_level,
+      embedding_provider,embedding_model FROM memories WHERE id=$1`,[recurring.memoryId]);
+    assert.deepEqual(afterAuthority.rows[0],beforeChanged.rows[0]);
+
+    const changed=await runTasteProfile({...recurringOptions,now:new Date('2026-07-01T00:03:00Z')});
+    assert.equal(changed.status,'updated');assert.equal(changed.memoryId,recurring.memoryId);assert.equal(changed.providerCalls,1);
+    const afterChanged=await owner.query(`SELECT content,metadata,client_id,agent_id,access_level,
+      embedding_provider,embedding_model FROM memories WHERE id=$1`,[recurring.memoryId]);
+    assert.match(afterChanged.rows[0].content,/Secret Film drifted/);
+    assert.notEqual(afterChanged.rows[0].metadata.aggregate_hash,beforeChanged.rows[0].metadata.aggregate_hash);
+    assert.notEqual(afterChanged.rows[0].metadata.source_fingerprint,beforeChanged.rows[0].metadata.source_fingerprint);
+    assert.equal(afterChanged.rows[0].client_id,WORKER);assert.equal(afterChanged.rows[0].access_level,'secret');
+    assert.equal(afterChanged.rows[0].embedding_provider,'llama.cpp');
+    assert.equal(afterChanged.rows[0].embedding_model,QWEN_CONTRACT_ID);
+    assert.equal((await owner.query('SELECT api_key_id FROM agents WHERE id=$1',[afterChanged.rows[0].agent_id])).rows[0].api_key_id,WORKER);
+    assert.deepEqual(afterChanged.rows[0].metadata.source_owner_key_ids,[EVENT_OWNER]);
+    assert.deepEqual(afterChanged.rows[0].metadata.linked_memory_owner_key_ids,[LINKED_OWNER]);
+    assert.equal((await owner.query("SELECT count(*)::int AS count FROM audit_log WHERE memory_id=$1 AND action='memory.taste-profile'",
+      [recurring.memoryId])).rows[0].count,2);
+    const recurringReplay=await runTasteProfile({...recurringOptions,now:new Date('2026-07-01T00:04:00Z')});
     assert.equal(recurringReplay.status,'unchanged');assert.equal(recurringReplay.providerCalls,0);
-    assert.equal(recurringProviderCalls,1);
+    assert.equal(recurringProviderCalls,4);
 
     await owner.query('UPDATE media_events SET title=title||\' changed\' WHERE id=$1',[EVENT_NORMAL]);
     await assert.rejects(apply('normal',normal.rows[0].source_fingerprint),/taste_source_changed/);
