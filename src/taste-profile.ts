@@ -84,6 +84,20 @@ export const tasteProfilePolicySchema = z.object({
   termsApproval: approvalSchema,
   scopeApproval: approvalSchema,
   budgetApproval: approvalSchema,
+  standingAutomation: z.object({
+    enabled: z.literal(true),
+    ownerInstruction: z.object({
+      reference: z.string().trim().min(1).max(1024),
+      effectiveAt: z.string().datetime({ offset: true }),
+      expiresAt: z.string().datetime({ offset: true }),
+    }).strict(),
+    operator: z.object({
+      identity: z.string().trim().min(1).max(256),
+      authorizationReference: z.string().trim().min(1).max(1024),
+      authorizedAt: z.string().datetime({ offset: true }),
+      expiresAt: z.string().datetime({ offset: true }),
+    }).strict(),
+  }).strict().optional(),
 }).strict();
 
 export type TasteProfilePolicy = z.infer<typeof tasteProfilePolicySchema>;
@@ -325,7 +339,7 @@ export function renderTasteProfile(
   return `${heading} taste profile for ${periodLabel}. ${statements.join(' ')}`;
 }
 
-export type TasteProfileMode = 'dry-run' | 'preview' | 'apply';
+export type TasteProfileMode = 'dry-run' | 'preview' | 'apply' | 'run-reviewed';
 const tasteProfileSelectionSchema = z.object({
   version: z.literal(1),
   feature: z.literal('media-taste-profile-selection'),
@@ -340,7 +354,15 @@ const tasteProfileSelectionSchema = z.object({
   issuedAt: z.string().datetime({ offset: true }),
   expiresAt: z.string().datetime({ offset: true }),
   approval: approvalSchema.optional(),
-}).strict();
+  approvalMode: z.enum(['manual', 'standing-automation']).optional(),
+  approvalReference: z.string().trim().min(1).max(1024).optional(),
+  ownerInstructionReference: z.string().trim().min(1).max(1024).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.approvalMode === 'standing-automation' &&
+      (!value.approval || !value.approvalReference || !value.ownerInstructionReference)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Standing automation receipts require attributed approval provenance' });
+  }
+});
 export type TasteProfileSelection = z.infer<typeof tasteProfileSelectionSchema>;
 export function parseTasteProfileSelection(input: unknown): TasteProfileSelection {
   return tasteProfileSelectionSchema.parse(input);
@@ -428,8 +450,9 @@ async function tasteAggregateForLane(
 export async function runTasteProfile(options: RunTasteProfileOptions): Promise<RunTasteProfileResult> {
   const mode = options.mode ?? 'dry-run';
   const clock = options.now ?? new Date();
-  if (!['dry-run', 'preview', 'apply'].includes(mode)) throw new Error('Invalid taste-profile mode');
+  if (!['dry-run', 'preview', 'apply', 'run-reviewed'].includes(mode)) throw new Error('Invalid taste-profile mode');
   if (options.force && mode === 'dry-run') throw new Error('--force cannot be combined with dry-run');
+  if (mode === 'run-reviewed') return runReviewedTasteProfile(options, clock);
   const policy = parseTasteProfilePolicy(options.policy, options.environment, clock);
   if (!policy.scope.accessLevels.includes(options.accessLevel)) throw new Error('Taste-profile access lane is not approved');
   assertTasteProfileAuthority(options.auth, policy);
@@ -567,8 +590,13 @@ export async function runTasteProfile(options: RunTasteProfileOptions): Promise<
     usage_control_reference: policy.budget.usageControlReference,
     selection_issued_at: selectionReceipt!.issuedAt,
     selection_approved_by: selectionReceipt!.approval!.approvedBy,
+    selection_approval_expires_at: selectionReceipt!.approval!.expiresAt,
+    approval_mode: selectionReceipt!.approvalMode ?? 'manual',
+    approval_reference: selectionReceipt!.approvalReference ?? null,
+    owner_instruction_reference: selectionReceipt!.ownerInstructionReference ?? null,
   };
   const written = await withScopedClient(scope, async client => {
+    assertApprovalEffective(selectionReceipt!.approval!, options.now ?? new Date(), 'selection');
     await assertTasteRuntimeAuthority(client, options.auth, policy);
     const current = await materializeTasteSource(client, options, policy);
     if (current.fingerprint !== materialized.fingerprint ||
@@ -589,6 +617,57 @@ export async function runTasteProfile(options: RunTasteProfileOptions): Promise<
   });
   return { ...base, status: written.outcome, providerCalls: calls,
     profile, memoryId: written.id, supersededId: written.supersededId };
+}
+
+async function runReviewedTasteProfile(
+  options: RunTasteProfileOptions,
+  clock: Date,
+): Promise<RunTasteProfileResult> {
+  if (options.approvedSelection) throw new Error('run-reviewed creates its own attributed selection receipt');
+  const policy = parseTasteProfilePolicy(options.policy, options.environment, clock);
+  assertStandingAutomationEffective(policy, clock);
+  const preview = await runTasteProfile({ ...options, policy, mode: 'preview' });
+  if (preview.status !== 'preview') return { ...preview, mode: 'run-reviewed' };
+  const approvalClock = options.now ?? new Date();
+  const authority = assertStandingAutomationEffective(policy, approvalClock);
+  const receipt = tasteProfileSelectionSchema.parse({
+    ...preview.selection,
+    approval: {
+      approved: true,
+      approvedBy: authority.operator.identity,
+      approvedAt: approvalClock.toISOString(),
+      expiresAt: new Date(Math.min(
+        new Date(preview.selection!.expiresAt).getTime(),
+        new Date(authority.ownerInstruction.expiresAt).getTime(),
+        new Date(authority.operator.expiresAt).getTime(),
+      )).toISOString(),
+    },
+    approvalMode: 'standing-automation',
+    approvalReference: authority.operator.authorizationReference,
+    ownerInstructionReference: authority.ownerInstruction.reference,
+  });
+  const applied = await runTasteProfile({
+    ...options, policy, mode: 'apply', approvedSelection: receipt,
+  });
+  return { ...applied, mode: 'run-reviewed', providerCalls: preview.providerCalls };
+}
+
+function assertStandingAutomationEffective(
+  policy: TasteProfilePolicy,
+  now: Date,
+): NonNullable<TasteProfilePolicy['standingAutomation']> {
+  const authority = policy.standingAutomation;
+  if (!authority?.enabled) throw new Error('Taste-profile standing automation is not enabled');
+  assertValidityWindow(authority.ownerInstruction.effectiveAt, authority.ownerInstruction.expiresAt,
+    now, 'owner instruction');
+  assertValidityWindow(authority.operator.authorizedAt, authority.operator.expiresAt,
+    now, 'automation operator');
+  return authority;
+}
+
+function assertValidityWindow(effectiveAt: string, expiresAt: string, now: Date, label: string): void {
+  if (new Date(effectiveAt).getTime() > now.getTime()) throw new Error(`Taste-profile ${label} is not yet effective`);
+  if (new Date(expiresAt).getTime() <= now.getTime()) throw new Error(`Taste-profile ${label} has expired`);
 }
 
 function assertApprovalEffective(

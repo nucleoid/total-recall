@@ -56,6 +56,7 @@ export function parseTasteProfileCli(args: string[]): TasteProfileCliOptions {
     if (arg === '--dry-run') setMode('dry-run');
     else if (arg === '--preview') setMode('preview');
     else if (arg === '--apply') setMode('apply');
+    else if (arg === '--run-reviewed') setMode('run-reviewed');
     else if (arg === '--category') {
       const parsed = value(index++, arg);
       if (!['music', 'viewing', 'all'].includes(parsed)) throw new Error('--category must be music, viewing, or all');
