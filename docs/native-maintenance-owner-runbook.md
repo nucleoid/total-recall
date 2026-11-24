@@ -11,7 +11,8 @@ The only supported launcher is `scripts/native-maintenance-owner-launcher.py`, r
 - image identity: read from the running `total-recall-ingestion-worker-1` container;
 - network namespace: `container:total-recall-db-1`;
 - database URLs: `postgresql://postgres@127.0.0.1:5432/total_recall`, with no password;
-- container identity `999:994`, read-only root, all capabilities dropped, `no-new-privileges`, 256 MiB memory, 0.25 CPU, 64 PIDs, and a 32 MiB noexec tmpfs.
+- container identity `999:994`, read-only root, all capabilities dropped, `no-new-privileges`, 256 MiB memory, 0.25 CPU, 64 PIDs, and a 32 MiB noexec tmpfs;
+- fixed thread caps `GOMAXPROCS=2`, `UV_THREADPOOL_SIZE=1`, and Node `--v8-pool-size=1`, preventing the tsx/esbuild startup path from exhausting the unchanged 64-PID budget.
 
 The launcher uses a nonblocking kernel `flock` in the fixed state directory, so overlapping scheduler/controller calls fail immediately. It invokes Docker with an argument vector, never a shell or caller-provided command. The parent controller may whitelist this exact launcher path; it must not expose a generic remote command facility.
 

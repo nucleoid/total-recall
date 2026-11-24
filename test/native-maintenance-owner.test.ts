@@ -85,6 +85,9 @@ test('fixed host launcher has no shell input and enforces the resource and names
   assert.match(source, /"--read-only"/); assert.match(source, /"--cap-drop=ALL"/);
   assert.match(source, /"--memory=256m"/); assert.match(source, /"--cpus=0\.25"/);
   assert.match(source, /"--pids-limit=64"/); assert.match(source, /size=32m/);
+  assert.match(source, /"--env", "GOMAXPROCS=2"/);
+  assert.match(source, /"--env", "UV_THREADPOOL_SIZE=1"/);
+  assert.match(source, /"node", "--v8-pool-size=1"/);
   assert.match(source, /container:\{DATABASE_CONTAINER\}/);
   assert.match(source, /postgresql:\/\/postgres@127\.0\.0\.1:5432\/total_recall/);
   assert.match(source, /inspect_value\(INGESTION_CONTAINER, "\{\{\.Image\}\}"\)/);

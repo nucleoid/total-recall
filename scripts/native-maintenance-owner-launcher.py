@@ -96,8 +96,10 @@ def main() -> int:
             "--env", f"DATABASE_URL={DATABASE_URL}",
             "--env", f"MAINTENANCE_DATABASE_URL={DATABASE_URL}",
             "--env", "NODE_ENV=production",
+            "--env", "GOMAXPROCS=2",
+            "--env", "UV_THREADPOOL_SIZE=1",
             image_id,
-            "node", "/app/node_modules/tsx/dist/cli.mjs", "/app/scripts/native-maintenance-owner.ts",
+            "node", "--v8-pool-size=1", "/app/node_modules/tsx/dist/cli.mjs", "/app/scripts/native-maintenance-owner.ts",
         ]
         return subprocess.run(command, check=False).returncode
     finally:
