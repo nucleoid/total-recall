@@ -23,6 +23,8 @@ const SSH_IDENTITY = '/home/fuego/.ssh/id_ed25519_dappnode';
 const SSH_TARGET = 'cass@10.0.0.21';
 const OPENCLAW_CLI = '/home/fuego/.npm-global/bin/openclaw';
 const DISCORD_CHANNEL = '1478120981435383808';
+const GATEWAY_SEND_TIMEOUT_MS = 15_000;
+const GATEWAY_PROCESS_TIMEOUT_MS = 30_000;
 
 interface Cli { configFile: string; execute: boolean; notificationDryRun: boolean }
 interface ExecResult { stdout: string; stderr: string }
@@ -109,20 +111,36 @@ export async function reserveDailyGenerationCalls(
 export async function notifyFailure(
   feature: NativeFeature,
   errorCode: string,
+  failureFingerprint: string,
   dryRun: boolean,
   runFile: NonNullable<ControllerDependencies['runFile']> = defaultRunFile,
 ): Promise<Receipt['notification']> {
+  // The gateway send method has no dry-run contract. Never turn a notification
+  // canary into a live send by silently dropping the caller's dry-run request.
+  if (dryRun) return { status: 'refused', code: 'official_gateway_dry_run_unsupported' };
   const message = `Total Recall native feature failure: feature=${feature} error=${errorCode}. Feature is stopped until its configuration or state changes.`;
-  const args = ['message', 'send', '--channel', 'discord', '--target', DISCORD_CHANNEL,
-    '--message', message, '--json', ...(dryRun ? ['--dry-run'] : [])];
+  const params = JSON.stringify({
+    to: DISCORD_CHANNEL,
+    message,
+    channel: 'discord',
+    accountId: 'default',
+    idempotencyKey: notificationIdempotencyKey(feature, failureFingerprint),
+  });
+  const args = ['gateway', 'call', 'send', '--json', '--timeout', String(GATEWAY_SEND_TIMEOUT_MS),
+    '--params', params];
   try {
-    const result = await runFile(OPENCLAW_CLI, args, 60_000);
+    const result = await runFile(OPENCLAW_CLI, args, GATEWAY_PROCESS_TIMEOUT_MS);
     const parsed: unknown = JSON.parse(result.stdout);
-    if (!isAcceptedNotificationReceipt(parsed, dryRun)) throw new Error('notification_receipt_invalid');
-    return { status: dryRun ? 'dry_run_accepted' : 'cli_accepted' };
+    if (!isAcceptedNotificationReceipt(parsed)) throw new Error('notification_receipt_invalid');
+    return { status: 'cli_accepted' };
   } catch (error) {
     return { status: 'refused', code: classifyNotificationFailure(error) };
   }
+}
+
+export function notificationIdempotencyKey(feature: NativeFeature, failureFingerprint: string): string {
+  if (!/^[a-f0-9]{64}$/.test(failureFingerprint)) throw new Error('failure_fingerprint_invalid');
+  return `total-recall-native-failure-${configHash(JSON.stringify([feature, failureFingerprint]))}`;
 }
 
 function classifyNotificationFailure(error: unknown): string {
@@ -136,17 +154,11 @@ function classifyNotificationFailure(error: unknown): string {
   return 'official_cli_refused';
 }
 
-export function isAcceptedNotificationReceipt(value: unknown, expectedDryRun: boolean): boolean {
+export function isAcceptedNotificationReceipt(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const receipt = value as Record<string, unknown>;
-  if (receipt.action !== 'send' || receipt.channel !== 'discord' || receipt.dryRun !== expectedDryRun) return false;
-  if ('error' in receipt || receipt.sentBeforeError === true) return false;
-  if (!receipt.payload || typeof receipt.payload !== 'object' || Array.isArray(receipt.payload)) return false;
-  if ((receipt.payload as Record<string, unknown>).ok === false) return false;
-  if (['failed', 'partial_failed', 'suppressed'].includes(String(receipt.deliveryStatus ?? ''))) return false;
-  if (expectedDryRun) return true;
-  return typeof receipt.messageId === 'string' && receipt.messageId.length > 0 &&
-    (receipt.deliveryStatus === undefined || receipt.deliveryStatus === 'sent');
+  return receipt.channel === 'discord' && typeof receipt.messageId === 'string' &&
+    /^\d{17,20}$/.test(receipt.messageId) && !('error' in receipt);
 }
 
 export async function runNativeActivation(cli: Cli, dependencies: ControllerDependencies = {}): Promise<Receipt> {
@@ -222,7 +234,8 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
       // process timeout, or ambiguous send must never retry unchanged failure.
       await atomicJson(stateFile, { version: 1, nextLane: laneIndex,
         blockedFailure: { fingerprint, configHash: hash, errorCode, stateToken } } satisfies FeatureState);
-      const notification = duplicate ? undefined : await notifyFailure(config.feature, errorCode, cli.notificationDryRun, runFile);
+      const notification = duplicate ? undefined : await notifyFailure(
+        config.feature, errorCode, fingerprint, cli.notificationDryRun, runFile);
       const receipt = await writeReceipt(root, { ...base(), status: 'failed', errorCode,
         generationCallsReserved: reserved, commandsCompleted: completed,
         finishedAt: now().toISOString(), notification });

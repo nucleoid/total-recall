@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import {
   buildRemoteCommand,
   isAcceptedNotificationReceipt,
+  notificationIdempotencyKey,
   notifyFailure,
   parseNativeActivationCli,
   quoteRemoteArg,
@@ -135,9 +136,17 @@ test('failure hook uses official CLI once, retains refusal, and blocks unchanged
   const runFile = async (file: string, args: readonly string[], timeoutMs?: number) => {
     if (file.endsWith('/openclaw')) {
       notifications += 1;
-      assert.equal(timeoutMs, 60_000);
+      assert.equal(timeoutMs, 30_000);
+      assert.deepEqual(args.slice(0, 7), ['gateway', 'call', 'send', '--json', '--timeout', '15000', '--params']);
+      const params = JSON.parse(args[7]);
+      assert.equal(params.to, '1478120981435383808');
+      assert.equal(params.channel, 'discord');
+      assert.equal(params.accountId, 'default');
+      assert.match(params.idempotencyKey, /^total-recall-native-failure-[a-f0-9]{64}$/);
       const persisted = JSON.parse(await readFile(path.join(stateRoot, 'session.state.json'), 'utf8'));
       assert.equal(persisted.blockedFailure.errorCode, 'native_cli_failed');
+      assert.equal(params.idempotencyKey,
+        notificationIdempotencyKey('session', persisted.blockedFailure.fingerprint));
       throw new Error('capability refused');
     }
     const remote = args.at(-1) ?? '';
@@ -272,35 +281,62 @@ test('maintenance dispatches only the fixed host launcher without container cred
   assert.doesNotMatch(remote, /docker|env-file|DATABASE_URL/);
 });
 
-test('official notification carries only exact feature and error code', async () => {
+test('official gateway notification uses fixed route, stable idempotency, and strict receipt', async () => {
   let sent: readonly string[] = [];
-  const result = await notifyFailure('webhook', 'native_cli_failed', true, async (_file, args) => {
-    sent = args; return { stdout: JSON.stringify({ action: 'send', channel: 'discord', dryRun: true,
-      handledBy: 'plugin', payload: { content: 'redacted' } }), stderr: '' };
+  let timeout = 0;
+  const fingerprint = 'a'.repeat(64);
+  const result = await notifyFailure('webhook', 'native_cli_failed', fingerprint, false,
+    async (file, args, timeoutMs) => {
+      assert.equal(file, '/home/fuego/.npm-global/bin/openclaw');
+      sent = args;
+      timeout = timeoutMs;
+      return { stdout: JSON.stringify({ runId: 'bounded-test', messageId: '1574776696404578336',
+        channel: 'discord' }), stderr: '' };
   });
-  assert.equal(result?.status, 'dry_run_accepted');
-  const message = sent[sent.indexOf('--message') + 1];
-  assert.equal(message, 'Total Recall native feature failure: feature=webhook error=native_cli_failed. Feature is stopped until its configuration or state changes.');
-  assert.equal(message.includes('stderr'), false);
+  assert.equal(result?.status, 'cli_accepted');
+  assert.equal(timeout, 30_000);
+  assert.deepEqual(sent.slice(0, 7), ['gateway', 'call', 'send', '--json', '--timeout', '15000', '--params']);
+  const params = JSON.parse(sent[7]);
+  assert.deepEqual(params, {
+    to: '1478120981435383808',
+    message: 'Total Recall native feature failure: feature=webhook error=native_cli_failed. Feature is stopped until its configuration or state changes.',
+    channel: 'discord', accountId: 'default',
+    idempotencyKey: notificationIdempotencyKey('webhook', fingerprint),
+  });
+  assert.equal(params.message.includes('stderr'), false);
+  assert.equal(notificationIdempotencyKey('webhook', fingerprint),
+    notificationIdempotencyKey('webhook', fingerprint));
+  assert.notEqual(notificationIdempotencyKey('webhook', fingerprint),
+    notificationIdempotencyKey('webhook', 'b'.repeat(64)));
 });
 
-test('official notification receipt rejects generic JSON and failed delivery', () => {
-  assert.equal(isAcceptedNotificationReceipt({ ok: true }, true), false);
-  assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: true,
-    payload: { ok: false }, error: 'refused' }, true), false);
-  assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: false,
-    payload: {}, deliveryStatus: 'failed', messageId: '1' }, false), false);
-  assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: false,
-    payload: {}, deliveryStatus: 'sent' }, false), false);
-  assert.equal(isAcceptedNotificationReceipt({ action: 'send', channel: 'discord', dryRun: false,
-    payload: {}, deliveryStatus: 'sent', messageId: '1' }, false), true);
+test('official gateway receipt rejects malformed, wrong-channel, and error responses', () => {
+  assert.equal(isAcceptedNotificationReceipt({ ok: true }), false);
+  assert.equal(isAcceptedNotificationReceipt({ channel: 'discord', messageId: '1' }), false);
+  assert.equal(isAcceptedNotificationReceipt({ channel: 'slack', messageId: '1574776696404578336' }), false);
+  assert.equal(isAcceptedNotificationReceipt({ channel: 'discord', messageId: '1574776696404578336',
+    error: 'refused' }), false);
+  assert.equal(isAcceptedNotificationReceipt({ channel: 'discord', messageId: '1574776696404578336' }), true);
 });
 
 test('notification failures retain safe timeout and invalid-receipt classifications', async () => {
-  assert.deepEqual(await notifyFailure('webhook', 'native_cli_failed', false, async () => {
+  const fingerprint = 'a'.repeat(64);
+  assert.deepEqual(await notifyFailure('webhook', 'native_cli_failed', fingerprint, false, async () => {
     throw Object.assign(new Error('private detail'), { code: 'ETIMEDOUT', killed: true });
   }), { status: 'refused', code: 'official_cli_timeout' });
-  assert.deepEqual(await notifyFailure('webhook', 'native_cli_failed', false, async () => ({
+  assert.deepEqual(await notifyFailure('webhook', 'native_cli_failed', fingerprint, false, async () => ({
     stdout: '{"ok":true}', stderr: 'private detail',
   })), { status: 'refused', code: 'official_cli_invalid_receipt' });
+  assert.deepEqual(await notifyFailure('webhook', 'native_cli_failed', fingerprint, false, async () => ({
+    stdout: JSON.stringify({ channel: 'slack', messageId: '1574776696404578336' }), stderr: '',
+  })), { status: 'refused', code: 'official_cli_invalid_receipt' });
+});
+
+test('notification dry-run fails closed without invoking the live gateway method', async () => {
+  let invoked = false;
+  assert.deepEqual(await notifyFailure('webhook', 'native_cli_failed', 'a'.repeat(64), true, async () => {
+    invoked = true;
+    throw new Error('must not run');
+  }), { status: 'refused', code: 'official_gateway_dry_run_unsupported' });
+  assert.equal(invoked, false);
 });
