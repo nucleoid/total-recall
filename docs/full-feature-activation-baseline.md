@@ -12,7 +12,7 @@ This is an activation plan, not a claim that dormant features work in production
 | Reflection | Bounded weekly windows; all-level policy/read/output support in this branch | Run table empty | Apply migration 054; provision a dedicated `read,reflection` key with source namespaces + `insights`, no `write/admin/delete`; dry run first |
 | Session distillation | Exact-lane all-level queue worker in this branch | No completed runs observed | Apply migration 056; provision a dedicated `read,session_distill` key without ordinary mutation permissions; canary one namespace/level lane |
 | Entity graph | Exact-lane all-level extraction queue and access-filtered graph in this branch | Entity/link tables empty | Apply migration 057; provision `read,entity_extract` without ordinary mutation permissions; preview and canary one lane |
-| Contradictions | Shadow classification and gated mutation | Classification/mutation gates off | Enable shadow classification only; mutation needs reviewed metrics and exact environment |
+| Contradictions | All-level subscription shadow classification plus reviewed reversible resolution | Classification/mutation gates off | Apply migration 060; provision `read,contradiction_resolve`; accept shadow metrics before exact receipt/decision canary |
 | Supersession | Finalizer and reversible search demotion | Demotion not proven active | Finalize schema, verify, then separately enable score factor |
 | Subscriptions/webhooks | Creation and bounded public-HTTPS delivery | Creation/delivery off | Encryption ring + exact worker key; creation and delivery are separate gates |
 | Taste profile | Evidence-bounded preview/apply | No native run evidence | Media-derived path remains normal-only; all-level/subscription policy support remains to implement |
@@ -75,14 +75,14 @@ Session distillation is a separate activation lane:
 - Entity: apply migration 057, preview one exact namespace/access lane, then canary at most 10 jobs with the dedicated non-admin worker.
 - Taste: dry run before apply; current media path remains normal-only.
 - Session distillation: apply migration 056, then canary one exact namespace/access-level lane with the dedicated non-admin key; derived facts remain owner-attributed and queue only local embedding work.
-- Contradiction: classification shadow only, in-flight 1 and queue 4; mutation remains off.
+- Contradiction: subscription shadow first, in-flight 1 and queue 4; legacy auto-mutation remains off; apply only exact expiring reviewed receipts through migration 060.
 - Supersession: run finalizer, inspect report, then canary search demotion.
 - Subscriptions: creation only after encryption/key backup review; delivery separately, concurrency 1 initially.
 - Decay/lifecycle: existing bounded daily batches only.
 
 ## Remaining implementation work
 
-This branch completes all-level, subscription-native reflection, consolidation, session distillation, and entity extraction/graph vertical slices. Each remains inactive until its migration, dedicated key, policy, deployment, and live canary are accepted. Taste profiling still has normal-only policy/query/worker gates and a legacy USD-only budget schema; do not schedule it yet.
+This branch completes all-level, subscription-native reflection, consolidation, session distillation, entity extraction/graph, taste profiling, and reviewed contradiction resolution vertical slices. Each remains inactive until its migration, dedicated key, policy, deployment, and live canary are accepted. Taste profiling still has normal-only policy/query/worker gates and a legacy USD-only budget schema; do not schedule it yet.
 
 ## Acceptance gates
 

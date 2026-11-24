@@ -119,6 +119,24 @@ test('no embedding or borrowed approval implicitly enables #53', () => {
   }).mutationEnabled, false);
 });
 
+test('subscription contradiction policy is OpenClaw-only, all-access, bounded, and never auto-mutates', () => {
+  const policy=contradictionPolicyFromEnv({
+    ...approvedEnv(),CONTRADICTION_PROVIDER:'openclaw-adapter',CONTRADICTION_MODEL:'openclaw/total-recall-synthesis',
+    CONTRADICTION_APPROVED_ACCESS_LEVEL:'secret',CONTRADICTION_BUDGET_MODE:'subscription',
+    CONTRADICTION_BUDGET_APPROVED:'true',CONTRADICTION_MAX_CALLS_PER_INVOCATION:'2',
+    CONTRADICTION_MAX_INPUT_BYTES_PER_INVOCATION:'131072',CONTRADICTION_MAX_OUTPUT_BYTES_PER_INVOCATION:'2048',
+    CONTRADICTION_USAGE_CONTROL_REFERENCE:'openclaw-subscription/contradictions',
+    CONTRADICTION_AUTO_MUTATION_ENABLED:'true',CONTRADICTION_MUTATION_APPROVED:'true',
+    CONTRADICTION_SHADOW_METRICS_REVIEWED:'true',DEPLOYMENT_ENVIRONMENT:'production',CONTRADICTION_MUTATION_ENVIRONMENT:'production',
+  });
+  assert.equal(policy.classificationEnabled,true);assert.equal(policy.accessLevel,'secret');assert.equal(policy.mutationEnabled,false);
+  assert.equal(policyAllowsScope(policy,'work','secret'),true);
+  assert.equal(contradictionPolicyFromEnv({...approvedEnv(),CONTRADICTION_PROVIDER:'direct-openai',
+    CONTRADICTION_MODEL:'gpt',CONTRADICTION_BUDGET_MODE:'subscription',CONTRADICTION_BUDGET_APPROVED:'true',
+    CONTRADICTION_MAX_CALLS_PER_INVOCATION:'1',CONTRADICTION_MAX_INPUT_BYTES_PER_INVOCATION:'1024',
+    CONTRADICTION_MAX_OUTPUT_BYTES_PER_INVOCATION:'1024',CONTRADICTION_USAGE_CONTROL_REFERENCE:'x'}).classificationEnabled,false);
+});
+
 test('conservative process-lifetime budget reserves before egress and fails closed on exhaustion', async () => {
   const policy = contradictionPolicyFromEnv({
     ...approvedEnv(),

@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { z } from 'zod';
-import { accessLevelSql } from './auth.js';
+import { accessLevelSql, canAccessLevel, isAccessLevel } from './auth.js';
 import { logAudit } from './audit.js';
 import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR } from './embedding.js';
@@ -15,6 +15,7 @@ import {
   type GenerationProvider,
 } from './generation.js';
 import type { AccessLevel, AuthContext } from './types.js';
+import { assertSubscriptionGeneration } from './synthesis-policy.js';
 
 const CANDIDATE_LIMIT = 5;
 const CANDIDATE_SIMILARITY = 0.85;
@@ -50,6 +51,7 @@ export interface ContradictionClassification {
 }
 
 export interface ConservativeBudgetConfig {
+  mode?: 'paid';
   /** Process-lifetime cap and configured conservative upper-bound pricing, in millionths of USD. */
   limitMicroUsd: bigint;
   requestMicroUsd: bigint;
@@ -57,6 +59,16 @@ export interface ConservativeBudgetConfig {
   outputMicroUsdPerMillionBytes: bigint;
   fingerprint: string;
 }
+
+export interface SubscriptionContradictionBudgetConfig {
+  mode: 'subscription';
+  maxCallsPerInvocation: number;
+  maxInputBytesPerInvocation: number;
+  maxOutputBytesPerInvocation: number;
+  usageControlReference: string;
+  fingerprint: string;
+}
+export type ContradictionBudgetConfig = ConservativeBudgetConfig | SubscriptionContradictionBudgetConfig;
 
 export interface ContradictionPolicy {
   classificationEnabled: boolean;
@@ -66,10 +78,11 @@ export interface ContradictionPolicy {
   endpoint?: string;
   apiKey?: string;
   namespace?: string;
+  accessLevel: AccessLevel;
   timeoutMs: number;
   mutationConfidence: number;
   mutationEnabled: boolean;
-  budget?: ConservativeBudgetConfig;
+  budget?: ContradictionBudgetConfig;
   shadowMaxInFlight: number;
   shadowMaxQueued: number;
 }
@@ -133,22 +146,35 @@ type ShadowJob = {
 
 class ConservativeRuntimeBudget {
   private reservedMicroUsd = 0n;
+  private calls = 0;
+  private inputBytes = 0;
+  private outputBytes = 0;
 
-  constructor(private readonly config: ConservativeBudgetConfig) {}
+  constructor(private readonly config: ContradictionBudgetConfig) {}
 
   tryReserve(inputBytes: number, maxOutputBytes: number): boolean {
+    if (this.config.mode === 'subscription') {
+      if (this.calls + 1 > this.config.maxCallsPerInvocation ||
+          this.inputBytes + inputBytes > this.config.maxInputBytesPerInvocation ||
+          this.outputBytes + maxOutputBytes > this.config.maxOutputBytesPerInvocation) return false;
+      this.calls += 1; this.inputBytes += inputBytes; this.outputBytes += maxOutputBytes;
+      return true;
+    }
     const estimate = this.estimate(inputBytes, maxOutputBytes);
     if (estimate <= 0n || this.reservedMicroUsd + estimate > this.config.limitMicroUsd) return false;
-    // JavaScript executes this synchronous section atomically within this process.
     this.reservedMicroUsd += estimate;
     return true;
   }
 
-  snapshot(): { limitMicroUsd: bigint; reservedMicroUsd: bigint } {
-    return { limitMicroUsd: this.config.limitMicroUsd, reservedMicroUsd: this.reservedMicroUsd };
+  snapshot(): { limitMicroUsd: bigint; reservedMicroUsd: bigint } |
+    { mode: 'subscription'; calls: number; inputBytes: number; outputBytes: number } {
+    return this.config.mode === 'subscription'
+      ? { mode: 'subscription', calls: this.calls, inputBytes: this.inputBytes, outputBytes: this.outputBytes }
+      : { limitMicroUsd: this.config.limitMicroUsd, reservedMicroUsd: this.reservedMicroUsd };
   }
 
   private estimate(inputBytes: number, maxOutputBytes: number): bigint {
+    if (this.config.mode === 'subscription') return 0n;
     return this.config.requestMicroUsd +
       roundUpRate(inputBytes, this.config.inputMicroUsdPerMillionBytes) +
       roundUpRate(maxOutputBytes, this.config.outputMicroUsdPerMillionBytes);
@@ -304,8 +330,15 @@ export async function resetContradictionRuntimeForTesting(): Promise<void> {
   contradictionRuntimeAccepting = true;
 }
 
+export function reserveContradictionUsage(
+  policy: ContradictionPolicy, inputBytes: number, maxOutputBytes: number,
+): boolean {
+  const state = runtimeState(policy);
+  return state ? state.budget.tryReserve(inputBytes, maxOutputBytes) : false;
+}
+
 export function contradictionRuntimeSnapshot(policy: ContradictionPolicy): {
-  budget: { limitMicroUsd: bigint; reservedMicroUsd: bigint };
+  budget: ReturnType<ConservativeRuntimeBudget['snapshot']>;
   shadows: { active: number; queued: number; accepting: boolean };
 } | null {
   const state = runtimeState(policy);
@@ -331,6 +364,7 @@ export function contradictionPolicyFromEnv(env: NodeJS.ProcessEnv = process.env)
     classificationEnabled: false,
     reason: 'disabled',
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    accessLevel: 'normal',
     mutationConfidence: DEFAULT_MUTATION_CONFIDENCE,
     mutationEnabled: false,
     shadowMaxInFlight: DEFAULT_SHADOW_MAX_IN_FLIGHT,
@@ -357,28 +391,42 @@ export function contradictionPolicyFromEnv(env: NodeJS.ProcessEnv = process.env)
   if (!namespace || namespace.includes(',') || env.CONTRADICTION_SCOPE_APPROVED !== 'true') {
     return { ...disabled, reason: 'scope_approval_missing' };
   }
-  const budgetLimit = parseUsdToMicroUsd(env.CONTRADICTION_COST_BUDGET_USD);
-  if (env.CONTRADICTION_COST_BUDGET_APPROVED !== 'true' || budgetLimit === null || budgetLimit <= 0n) {
-    return { ...disabled, reason: 'budget_approval_missing' };
+  const accessLevelRaw = env.CONTRADICTION_APPROVED_ACCESS_LEVEL?.trim() ?? 'normal';
+  if (!isAccessLevel(accessLevelRaw)) return { ...disabled, reason: 'scope_approval_missing' };
+  let budget: ContradictionBudgetConfig;
+  if (env.CONTRADICTION_BUDGET_MODE === 'subscription') {
+    const maxCalls = strictPositiveInteger(env.CONTRADICTION_MAX_CALLS_PER_INVOCATION, 1, 100);
+    const maxInput = strictPositiveInteger(env.CONTRADICTION_MAX_INPUT_BYTES_PER_INVOCATION, 1, 10_000_000);
+    const maxOutput = strictPositiveInteger(env.CONTRADICTION_MAX_OUTPUT_BYTES_PER_INVOCATION, 1, 1_000_000);
+    const usageRef = env.CONTRADICTION_USAGE_CONTROL_REFERENCE?.trim();
+    if (!maxCalls || !maxInput || !maxOutput || !usageRef || env.CONTRADICTION_BUDGET_APPROVED !== 'true') {
+      return { ...disabled, reason: 'budget_approval_missing' };
+    }
+    budget = { mode: 'subscription', maxCallsPerInvocation: maxCalls,
+      maxInputBytesPerInvocation: maxInput, maxOutputBytesPerInvocation: maxOutput,
+      usageControlReference: usageRef,
+      fingerprint: [provider, model, namespace, accessLevelRaw, maxCalls, maxInput, maxOutput, usageRef].join('\u0000') };
+    try { assertSubscriptionGeneration({ provider, model }, budget); }
+    catch { return { ...disabled, reason: 'provider_model_approval_missing' }; }
+  } else {
+    const budgetLimit = parseUsdToMicroUsd(env.CONTRADICTION_COST_BUDGET_USD);
+    if (env.CONTRADICTION_COST_BUDGET_APPROVED !== 'true' || budgetLimit === null || budgetLimit <= 0n) {
+      return { ...disabled, reason: 'budget_approval_missing' };
+    }
+    const requestCost = parseUsdToMicroUsd(env.CONTRADICTION_ESTIMATED_REQUEST_COST_USD);
+    const inputCost = parseUsdToMicroUsd(env.CONTRADICTION_ESTIMATED_INPUT_COST_USD_PER_MILLION_BYTES);
+    const outputCost = parseUsdToMicroUsd(env.CONTRADICTION_ESTIMATED_OUTPUT_COST_USD_PER_MILLION_BYTES);
+    if (requestCost === null || inputCost === null || outputCost === null || requestCost + inputCost + outputCost <= 0n) {
+      return { ...disabled, reason: 'budget_model_missing' };
+    }
+    budget = { mode: 'paid', limitMicroUsd: budgetLimit, requestMicroUsd: requestCost,
+      inputMicroUsdPerMillionBytes: inputCost, outputMicroUsdPerMillionBytes: outputCost,
+      fingerprint: [provider, model, namespace, accessLevelRaw, budgetLimit, requestCost, inputCost, outputCost].join('\u0000') };
   }
-  const requestCost = parseUsdToMicroUsd(env.CONTRADICTION_ESTIMATED_REQUEST_COST_USD);
-  const inputCost = parseUsdToMicroUsd(env.CONTRADICTION_ESTIMATED_INPUT_COST_USD_PER_MILLION_BYTES);
-  const outputCost = parseUsdToMicroUsd(env.CONTRADICTION_ESTIMATED_OUTPUT_COST_USD_PER_MILLION_BYTES);
-  if (requestCost === null || inputCost === null || outputCost === null ||
-      requestCost + inputCost + outputCost <= 0n) {
-    return { ...disabled, reason: 'budget_model_missing' };
-  }
-  const budget: ConservativeBudgetConfig = {
-    limitMicroUsd: budgetLimit,
-    requestMicroUsd: requestCost,
-    inputMicroUsdPerMillionBytes: inputCost,
-    outputMicroUsdPerMillionBytes: outputCost,
-    fingerprint: [provider, model, namespace, budgetLimit, requestCost, inputCost, outputCost].join('\u0000'),
-  };
 
   const deploymentEnvironment = env.DEPLOYMENT_ENVIRONMENT?.trim();
   const mutationEnvironment = env.CONTRADICTION_MUTATION_ENVIRONMENT?.trim();
-  const mutationEnabled = env.CONTRADICTION_AUTO_MUTATION_ENABLED === 'true' &&
+  const mutationEnabled = budget.mode !== 'subscription' && env.CONTRADICTION_AUTO_MUTATION_ENABLED === 'true' &&
     env.CONTRADICTION_MUTATION_APPROVED === 'true' &&
     env.CONTRADICTION_SHADOW_METRICS_REVIEWED === 'true' &&
     !!deploymentEnvironment && mutationEnvironment === deploymentEnvironment;
@@ -390,6 +438,7 @@ export function contradictionPolicyFromEnv(env: NodeJS.ProcessEnv = process.env)
     endpoint,
     apiKey: env.CONTRADICTION_GENERATION_API_KEY?.trim() || undefined,
     namespace,
+    accessLevel: accessLevelRaw,
     timeoutMs: boundedInteger(env.CONTRADICTION_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 100, 60_000),
     mutationConfidence: boundedNumber(
       env.CONTRADICTION_MUTATION_CONFIDENCE,
@@ -419,7 +468,7 @@ export function policyAllowsScope(
   namespace: string,
   accessLevel: AccessLevel,
 ): boolean {
-  return policy.classificationEnabled && policy.namespace === namespace && accessLevel === 'normal';
+  return policy.classificationEnabled && policy.namespace === namespace && canAccessLevel(accessLevel, policy.accessLevel);
 }
 
 export async function findContradictionCandidates(
@@ -429,13 +478,14 @@ export async function findContradictionCandidates(
   excludeMemoryId: string | null = null,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
   localPrepared?: PreparedLocalDocument,
+  candidateAccessCeiling: AccessLevel = auth.maxAccessLevel,
 ): Promise<ContradictionCandidate[]> {
   if (localServingEnabled()) {
     if (!localPrepared) throw new Error('shadow_embedding.contradiction_vectors_required');
     const vectors = localPrepared.vectors.map(value => { validateLocalStoredVector(value); return `[${value.join(',')}]`; });
     return withScopedClient(dbScopeFromAuth(auth), async client => {
       await client.query("SELECT set_config('statement_timeout',$1,true)", [String(timeoutMs)]);
-      await assertLocalContradictionScopeComplete(client, namespace, auth.maxAccessLevel);
+      await assertLocalContradictionScopeComplete(client, namespace, candidateAccessCeiling);
       const result = await client.query<ContradictionCandidate>(`SELECT m.id,m.content,
         max(1-(c.embedding<=>q.vector))::double precision AS similarity
         FROM memories m JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$5
@@ -449,13 +499,13 @@ export async function findContradictionCandidates(
         JOIN memory_embedding_chunks c ON c.parent_id=m.id AND c.contract_id=f.contract_id
         CROSS JOIN unnest($1::vector[]) q(vector)
         WHERE m.namespace=$2 AND m.namespace=ANY($3::text[]) AND ${accessLevelSql('m.access_level', '$4')}
-          AND m.access_level='normal' AND m.memory_kind='semantic' AND m.deleted_at IS NULL
+          AND m.memory_kind='semantic' AND m.deleted_at IS NULL
           AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp()) AND m.superseded_at IS NULL
           AND m.valid_to IS NULL AND m.valid_from<=statement_timestamp() AND m.consolidated_into_id IS NULL
           AND ($6::uuid IS NULL OR m.id<>$6::uuid)
         GROUP BY m.id HAVING max(1-(c.embedding<=>q.vector)) >= $7
         ORDER BY similarity DESC,m.id LIMIT $8`,
-      [vectors, namespace, auth.namespaces, auth.maxAccessLevel, QWEN_CONTRACT_ID, excludeMemoryId, CANDIDATE_SIMILARITY, CANDIDATE_LIMIT]);
+      [vectors, namespace, auth.namespaces, candidateAccessCeiling, QWEN_CONTRACT_ID, excludeMemoryId, CANDIDATE_SIMILARITY, CANDIDATE_LIMIT]);
       return result.rows;
     });
   }
@@ -480,7 +530,6 @@ export async function findContradictionCandidates(
            AND validity_constraint.convalidated
        )
        AND ${accessLevelSql('m.access_level', '$4')}
-       AND m.access_level = 'normal'
        AND m.memory_kind = 'semantic'
        AND m.deleted_at IS NULL
        AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
@@ -500,7 +549,7 @@ export async function findContradictionCandidates(
       vector,
       namespace,
       auth.namespaces,
-      auth.maxAccessLevel,
+      candidateAccessCeiling,
       ACTIVE_EMBEDDING_DESCRIPTOR.provider,
       ACTIVE_EMBEDDING_DESCRIPTOR.model,
       ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
@@ -637,6 +686,7 @@ export async function prepareBeliefRevision(
       options.excludeCandidateId ?? null,
       timeoutMs,
       memory.localPrepared,
+      memory.accessLevel,
     );
   } catch (error) {
     const timedOut = databaseErrorCode(error) === '57014';
@@ -725,7 +775,7 @@ export async function commitAutomaticRevision(
        WHERE m.id = $1::uuid
          AND m.namespace = $2
          AND m.namespace = ANY($3::text[])
-         AND m.access_level = 'normal'
+         AND ${accessLevelSql('m.access_level', '$4')}
          AND m.memory_kind = 'semantic'
          AND m.deleted_at IS NULL
          AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
@@ -735,7 +785,7 @@ export async function commitAutomaticRevision(
          AND m.consolidated_into_id IS NULL
          AND NOT EXISTS (SELECT 1 FROM memories successor WHERE successor.supersedes_id = m.id)
        FOR UPDATE`,
-      [predecessorId, memory.namespace, auth.namespaces],
+      [predecessorId, memory.namespace, auth.namespaces, memory.accessLevel],
     );
     if (predecessor.rows.length !== 1) return null;
 
@@ -839,6 +889,13 @@ function roundUpRate(bytes: number, rateMicroUsdPerMillionBytes: bigint): bigint
   if (bytes === 0 || rateMicroUsdPerMillionBytes === 0n) return 0n;
   return (BigInt(bytes) * rateMicroUsdPerMillionBytes + PRICING_UNITS_PER_MILLION - 1n) /
     PRICING_UNITS_PER_MILLION;
+}
+
+
+function strictPositiveInteger(raw: string | undefined, min: number, max: number): number | null {
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
 }
 
 function boundedInteger(raw: string | undefined, fallback: number, min: number, max: number): number {
