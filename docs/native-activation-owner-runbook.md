@@ -9,10 +9,10 @@ Nothing in this branch installs, enables, starts, restarts, or schedules a unit.
 - Feature allowlist: `reflection`, `consolidation`, `session`, `entity`, `taste`, `contradiction-shadow`, `maintenance`, and `webhook`.
 - There is no configurable command string. Each feature/subprofile maps to a fixed npm script and validated argument vector. Remote arguments are individually quoted and passed to local `ssh` with `execFile`; command output is never evaluated.
 - Every configuration contains paths to a private remote environment file and, for generation features, a policy file plus its exact SHA-256. It contains no API keys, adapter bearer, database URL, or signing secret.
-- Generation features require `adapterProfile: "openclaw-main-subscription"`. Their native policy parser remains authoritative for the private endpoint, exact OpenAI subscription model, current approval, scope, and no-paid-fallback rules. Embeddings remain the deployed local Qwen contract.
+- Generation features require `adapterProfile: "openclaw-main-subscription"`. Before dispatch, the controller verifies the remote policy hash, rejects policy files larger than 64 KiB, parses the policy with the feature's native parser, verifies the configured environment and active lane scope, and derives the reservation from the native hard call bound. Embeddings remain the deployed local Qwen contract.
 - Approval timestamps and references are validated but never created, extended, or rewritten by the controller.
-- One exact namespace/access-level lane runs per invocation. The lane advances only after a verified native receipt. No archive import, corpus walk, or broad replay profile exists.
-- Queue workers are fixed to one job. Contradiction shadow and webhook also use concurrency one. The default inner timeout is 120 seconds.
+- Reflection, consolidation, session, and entity bind one exact namespace/access-level lane through the native policy. Taste binds one category/access-level operation to the policy source namespace; its policy may authorize a broader exact namespace set for source ownership and target writes, so receipts label it `policy-broader` rather than claiming a single-namespace lane. The lane advances only after a verified native receipt.
+- Queue workers are fixed to one job. Webhook uses concurrency one. Contradiction shadow has no execution profile because starting a second ingestion worker would compete with the dedicated owner; it remains blocked pending a native bounded read-only auditor.
 - Kernel `flock` locks cover the global controller and the individual feature. Locks are held by open file descriptions and disappear on process death; PID files are not replayed or treated as ownership.
 - Executed success is silent and recorded only in the fsynced content-free ledger. Raw stdout/stderr, source text, prompts, IDs, model output, secrets, and webhook bodies are discarded.
 
@@ -29,10 +29,10 @@ Store each file as mode `0600` under `~/.config/total-recall/native-activation/<
   "environmentFile": "/etc/total-recall/private/session-native.env",
   "policyFile": "/app/policies/session-distillation-v1.json",
   "policySha256": "REPLACE_WITH_64_LOWERCASE_HEX",
+  "policyEnvironment": "production",
   "adapterProfile": "openclaw-main-subscription",
   "timeoutSeconds": 120,
   "dailyGenerationCallCap": 6,
-  "generationCallsPerRun": 1,
   "approval": {
     "reference": "OWNER_APPROVAL_REFERENCE",
     "approvedBy": "OWNER_IDENTITY",
@@ -51,12 +51,12 @@ Supported subprofiles/modes:
 
 | Feature | Subprofile | Modes | Native bound |
 |---|---|---|---|
-| reflection | `weekly` | `dry-run`, `run` | one exact namespace/window selected by native CLI |
-| consolidation | `bounded-clusters` | `selection-only`, `preview`, `apply` | max anchors 100, max clusters 10; preview/apply retain native approvals |
-| session | `queued-session` | `once` | `--once --max-jobs 1` |
-| entity | `entity-enrichment` | `once` | one generated job |
-| taste | `monthly-media` | `dry-run`, `preview`, `apply` | one category and access level; approved selection required for apply |
-| contradiction-shadow | `ingestion-shadow` | `shadow` | one ingestion job, concurrency/batch size one; mutation remains policy-gated off |
+| reflection | `weekly` | `dry-run`, `run` | exact policy namespace/access lane; dry-run reserves zero, run reserves policy `maxCallsPerRun` |
+| consolidation | `bounded-clusters` | `selection-only`, `preview`, `apply` | exact policy namespace/access lane; reserves `min(maxClusters, policy maxCallsPerInvocation)` outside selection-only |
+| session | `queued-session` | `once` | exact policy namespace/access lane; `--once --max-jobs 1`, reserves one call |
+| entity | `entity-enrichment` | `once` | exact policy namespace/access lane; one job and at most one call |
+| taste | `monthly-media` | `dry-run`, `preview`, `apply` | policy source namespace plus selected access level; only preview reserves the policy's two-call validation allowance |
+| contradiction-shadow | `needs-native-auditor` | `blocked` | must remain disabled; no ingestion-worker command exists |
 | maintenance | `lifecycle-finalize`, `supersession-finalize` | `verify` | reviewed idempotent finalizer only |
 | webhook | `delivery` | `once` | one delivery, concurrency one |
 
@@ -77,12 +77,14 @@ The cutoff is mandatory, fixed, UTC, and in the past. Limit is 1–100; it never
 
 ## Shared subscription-call reservation
 
-Before any generation-capable feature command, the global lock atomically reserves its configured call allowance in `generation-budget-YYYY-MM-DD.json`. The default shared cap is six calls per UTC day; the configured bound is 1–24 and must remain identical across feature owners for that day. Reservations are never refunded after dispatch, timeout, provider error, unknown CLI output, or ambiguous completion. There is no paid API fallback and no model/billing route in the controller.
+Before any generation-capable feature command, the global lock atomically reserves the hard maximum derived from the hash-pinned native policy and the fixed CLI bound in `generation-budget-YYYY-MM-DD.json`. There is no operator-supplied per-run reservation. If the derived maximum exceeds the daily cap, execution fails before dispatch. The default shared cap is six calls per UTC day; the configured bound is 1–24 and must remain identical across feature owners for that day. Reservations are never refunded after dispatch, timeout, provider error, unknown CLI output, or ambiguous completion. There is no paid API fallback and no model/billing route in the controller.
+
+The top-level `approval` is a bounded operator lease for this controller configuration. It does not create, renew, replace, or extend any provider/model, terms, scope, budget, write, backfill, or selection approval inside the native policy.
 
 ## Review and installation procedure
 
 1. Parent reviews the exact deployed container name, native policy, policy hash, private environment path/mode, namespace/access lane, approval expiry, timer cadence, call cap, and rollback.
-2. Run planning mode manually. This validates local configuration and writes a content-free `planned` receipt but performs no SSH or native invocation:
+2. Run planning mode manually. This validates local configuration and writes a content-free `planned` receipt with `scopeBinding: "unverified"`; it performs no SSH, remote policy verification, or native invocation:
 
    ```sh
    node --import tsx scripts/native-activation-controller.ts \

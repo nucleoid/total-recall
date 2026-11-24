@@ -8,6 +8,7 @@ import {
   buildInvocationPlan,
   configHash,
   parseNativeActivationConfig,
+  validateNativePolicyForLane,
   validateKnownCliReceipt,
   type NativeActivationConfig,
   type NativeCommand,
@@ -44,6 +45,7 @@ interface Receipt {
   policyHash?: string;
   approvalReference: string;
   lane: { namespace: string; accessLevel: string; profile: string; mode: string };
+  scopeBinding: 'unverified' | 'exact-lane' | 'policy-broader' | 'not-applicable';
   generationCallsReserved: number;
   sourceGraphCoverage: 'pending' | 'not-applicable';
   commandsCompleted: number;
@@ -141,11 +143,13 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
     const state = await readFeatureState(stateFile);
     const laneIndex = state.nextLane % config.lanes.length;
     const plan = buildInvocationPlan(config, laneIndex);
+    let receiptScopeBinding: Receipt['scopeBinding'] = 'unverified';
     const base = (): Omit<Receipt, 'status' | 'finishedAt'> => ({
       version: 1, feature: config.feature, configHash: hash, policyHash: config.policySha256,
       approvalReference: config.approval.reference,
       lane: { namespace: plan.lane.namespace, accessLevel: plan.lane.accessLevel,
         profile: plan.lane.profile, mode: plan.lane.mode },
+      scopeBinding: receiptScopeBinding,
       generationCallsReserved: 0, sourceGraphCoverage: plan.sourceGraphCoverage,
       commandsCompleted: 0, startedAt,
     });
@@ -161,11 +165,16 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
     let reserved = 0;
     let completed = 0;
     try {
-      await preflight(config, runFile);
-      if (plan.generationCallsReserved > 0) {
+      const policyBinding = await preflight(config, plan.lane, now(), runFile);
+      receiptScopeBinding = policyBinding.scopeBinding;
+      const generationCallHardMax = policyBinding.generationCallHardMax;
+      if (generationCallHardMax > config.dailyGenerationCallCap) {
+        throw new Error('generation_reservation_exceeds_daily_cap');
+      }
+      if (generationCallHardMax > 0) {
         const day = now().toISOString().slice(0, 10);
-        await reserveDailyGenerationCalls(root, day, config.dailyGenerationCallCap, plan.generationCallsReserved);
-        reserved = plan.generationCallsReserved;
+        await reserveDailyGenerationCalls(root, day, config.dailyGenerationCallCap, generationCallHardMax);
+        reserved = generationCallHardMax;
       }
       for (const command of plan.commands) {
         const result = await runRemoteFeature(config, command, runFile);
@@ -195,15 +204,34 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
   }
 }
 
-async function preflight(config: NativeActivationConfig, runFile: NonNullable<ControllerDependencies['runFile']>): Promise<void> {
+async function preflight(
+  config: NativeActivationConfig,
+  lane: ReturnType<typeof buildInvocationPlan>['lane'],
+  now: Date,
+  runFile: NonNullable<ControllerDependencies['runFile']>,
+): Promise<{ generationCallHardMax: number; scopeBinding: Receipt['scopeBinding'] }> {
   const mode = await runSsh(['/usr/bin/stat', '--format=%a', '--', config.environmentFile], config.timeoutSeconds, runFile);
   if (!/^(?:400|600)\s*$/.test(mode.stdout)) throw new Error('private_env_permissions_invalid');
   if (config.policyFile) {
+    const sizeResult = await runSsh(['/usr/bin/docker', 'exec', config.container, '/usr/bin/stat',
+      '--format=%s', '--', config.policyFile], config.timeoutSeconds, runFile);
+    const sizeText = sizeResult.stdout.trim();
+    if (!/^\d+$/.test(sizeText) || Number(sizeText) < 2 || Number(sizeText) > 64 * 1024) {
+      throw new Error('policy_size_invalid');
+    }
     const result = await runSsh(['/usr/bin/docker', 'exec', config.container, '/usr/bin/sha256sum', '--', config.policyFile],
       config.timeoutSeconds, runFile);
     const actual = result.stdout.trim().split(/\s+/)[0];
     if (actual !== config.policySha256) throw new Error('policy_hash_mismatch');
+    const policyResult = await runSsh(['/usr/bin/docker', 'exec', config.container, '/usr/bin/cat', '--', config.policyFile],
+      config.timeoutSeconds, runFile);
+    if (configHash(policyResult.stdout) !== config.policySha256) throw new Error('policy_hash_mismatch');
+    let value: unknown;
+    try { value = JSON.parse(policyResult.stdout); }
+    catch { throw new Error('policy_json_invalid'); }
+    return validateNativePolicyForLane(config, lane, value, now);
   }
+  return { generationCallHardMax: 0, scopeBinding: 'not-applicable' };
 }
 
 async function runRemoteFeature(
@@ -286,7 +314,9 @@ async function writeReceipt(root: string, receipt: Receipt): Promise<Receipt> {
 function classifyControllerError(error: unknown): string {
   const message = error instanceof Error ? error.message : '';
   const known = new Set(['generation_budget_exhausted', 'generation_budget_state_invalid',
-    'private_env_permissions_invalid', 'policy_hash_mismatch', 'cli_receipt_unparseable',
+    'generation_reservation_exceeds_daily_cap', 'private_env_permissions_invalid',
+    'policy_size_invalid', 'policy_hash_mismatch', 'policy_json_invalid',
+    'policy_scope_mismatch', 'policy_contract_invalid', 'cli_receipt_unparseable',
     'native_activation_overlap']);
   if (known.has(message)) return message;
   const code = (error as NodeJS.ErrnoException)?.code;

@@ -1,4 +1,9 @@
 import { createHash } from 'node:crypto';
+import { parseConsolidationPolicy } from '../src/consolidation.js';
+import { parseEntityExtractionPolicy } from '../src/entity-extractor.js';
+import { parseReflectionPolicy } from '../src/reflection.js';
+import { parseSessionDistillationPolicy } from '../src/session-distillation.js';
+import { parseTasteProfilePolicy } from '../src/taste-profile.js';
 
 export const NATIVE_FEATURES = [
   'reflection', 'consolidation', 'session', 'entity', 'taste',
@@ -27,10 +32,10 @@ export interface NativeActivationConfig {
   environmentFile: string;
   policyFile?: string;
   policySha256?: string;
+  policyEnvironment?: string;
   adapterProfile?: 'openclaw-main-subscription';
   timeoutSeconds: number;
   dailyGenerationCallCap: number;
-  generationCallsPerRun: number;
   approval: { reference: string; approvedBy: string; approvedAt: string; expiresAt: string };
   lanes: NativeLane[];
   entityHistoricalRecovery?: { completedBefore: string; limit: number };
@@ -38,7 +43,7 @@ export interface NativeActivationConfig {
 
 export interface NativeCommand {
   argv: string[];
-  receiptKind: NativeFeature | 'entity-requeue';
+  receiptKind: Exclude<NativeFeature, 'contradiction-shadow'> | 'entity-requeue';
 }
 
 export interface InvocationPlan {
@@ -46,30 +51,35 @@ export interface InvocationPlan {
   laneIndex: number;
   lane: NativeLane;
   commands: NativeCommand[];
-  generationCallsReserved: number;
+  scopeBinding: 'exact-lane' | 'policy-broader' | 'not-applicable';
   sourceGraphCoverage: 'pending' | 'not-applicable';
 }
 
+export interface NativePolicyBinding {
+  generationCallHardMax: number;
+  scopeBinding: 'exact-lane' | 'policy-broader';
+}
+
 const GENERATION_FEATURES = new Set<NativeFeature>([
-  'reflection', 'consolidation', 'session', 'entity', 'taste', 'contradiction-shadow',
+  'reflection', 'consolidation', 'session', 'entity', 'taste',
 ]);
 const PROFILE: Record<NativeFeature, readonly string[]> = {
   reflection: ['weekly'], consolidation: ['bounded-clusters'], session: ['queued-session'],
   entity: ['entity-enrichment'], taste: ['monthly-media'],
-  'contradiction-shadow': ['ingestion-shadow'],
+  'contradiction-shadow': ['needs-native-auditor'],
   maintenance: ['lifecycle-finalize', 'supersession-finalize'], webhook: ['delivery'],
 };
 const MODE: Record<NativeFeature, readonly string[]> = {
   reflection: ['dry-run', 'run'], consolidation: ['selection-only', 'preview', 'apply'],
   session: ['once'], entity: ['once'], taste: ['dry-run', 'preview', 'apply'],
-  'contradiction-shadow': ['shadow'], maintenance: ['verify'], webhook: ['once'],
+  'contradiction-shadow': ['blocked'], maintenance: ['verify'], webhook: ['once'],
 };
 
 export function parseNativeActivationConfig(value: unknown, now = new Date()): NativeActivationConfig {
   const raw = object(value, 'config');
   exactKeys(raw, ['version', 'feature', 'enabled', 'container', 'environmentFile', 'policyFile',
-    'policySha256', 'adapterProfile', 'timeoutSeconds', 'dailyGenerationCallCap',
-    'generationCallsPerRun', 'approval', 'lanes', 'entityHistoricalRecovery'], 'config');
+    'policySha256', 'policyEnvironment', 'adapterProfile', 'timeoutSeconds', 'dailyGenerationCallCap',
+    'approval', 'lanes', 'entityHistoricalRecovery'], 'config');
   if (raw.version !== 1) throw new Error('config.version must be 1');
   if (!NATIVE_FEATURES.includes(raw.feature as NativeFeature)) throw new Error('feature_not_allowed');
   const feature = raw.feature as NativeFeature;
@@ -78,25 +88,23 @@ export function parseNativeActivationConfig(value: unknown, now = new Date()): N
   const environmentFile = absolutePath(raw.environmentFile, 'environmentFile');
   const timeoutSeconds = boundedInteger(raw.timeoutSeconds ?? 120, 'timeoutSeconds', 30, 600);
   const dailyGenerationCallCap = boundedInteger(raw.dailyGenerationCallCap ?? 6, 'dailyGenerationCallCap', 1, 24);
-  const defaultCalls = GENERATION_FEATURES.has(feature) ? 1 : 0;
-  const generationCallsPerRun = boundedInteger(raw.generationCallsPerRun ?? defaultCalls,
-    'generationCallsPerRun', 0, 6);
-  if (!GENERATION_FEATURES.has(feature) && generationCallsPerRun !== 0) {
-    throw new Error('non-generation feature cannot reserve generation calls');
-  }
-  if (generationCallsPerRun > dailyGenerationCallCap) throw new Error('generation reservation exceeds daily cap');
 
   let policyFile: string | undefined;
   let policySha256: string | undefined;
+  let policyEnvironment: string | undefined;
   let adapterProfile: 'openclaw-main-subscription' | undefined;
   if (GENERATION_FEATURES.has(feature)) {
     policyFile = absolutePath(raw.policyFile, 'policyFile');
     policySha256 = token(raw.policySha256, 'policySha256', /^[0-9a-f]{64}$/);
+    policyEnvironment = text(raw.policyEnvironment, 'policyEnvironment', 1, 128);
     if (raw.adapterProfile !== 'openclaw-main-subscription') throw new Error('private_adapter_profile_required');
     adapterProfile = raw.adapterProfile;
-    if (generationCallsPerRun < 1) throw new Error('generation feature must reserve at least one call');
-  } else if (raw.policyFile !== undefined || raw.policySha256 !== undefined || raw.adapterProfile !== undefined) {
+  } else if (raw.policyFile !== undefined || raw.policySha256 !== undefined ||
+      raw.policyEnvironment !== undefined || raw.adapterProfile !== undefined) {
     throw new Error('non-generation feature must not declare generation policy or adapter');
+  }
+  if (feature === 'contradiction-shadow' && raw.enabled !== false) {
+    throw new Error('contradiction_shadow_needs_native_auditor');
   }
 
   const approvalRaw = object(raw.approval, 'approval');
@@ -130,8 +138,8 @@ export function parseNativeActivationConfig(value: unknown, now = new Date()): N
     };
   }
   return { version: 1, feature, enabled: raw.enabled, container, environmentFile,
-    policyFile, policySha256, adapterProfile, timeoutSeconds, dailyGenerationCallCap,
-    generationCallsPerRun, approval, lanes, entityHistoricalRecovery };
+    policyFile, policySha256, policyEnvironment, adapterProfile, timeoutSeconds,
+    dailyGenerationCallCap, approval, lanes, entityHistoricalRecovery };
 }
 
 function parseLane(feature: NativeFeature, value: unknown, index: number): NativeLane {
@@ -194,16 +202,72 @@ export function buildInvocationPlan(config: NativeActivationConfig, laneIndex: n
       if (lane.mode === 'apply') args.push('--selection-file', lane.artifactPath!);
       commands = [command('taste-profile', args)]; break;
     }
-    case 'contradiction-shadow': commands = [command('ingest:worker',
-      ['--once', '--max-jobs', '1', '--concurrency', '1', '--batch-size', '1', '--poll-ms', '100'])]; break;
+    case 'contradiction-shadow': commands = []; break;
     case 'maintenance': commands = [command(lane.profile === 'lifecycle-finalize'
       ? 'finalize:memory-lifecycle' : 'finalize:memory-supersession', [])]; break;
     case 'webhook': commands = [command('webhooks:deliver',
       ['--once', '--max-jobs', '1', '--concurrency', '1', '--poll-ms', '100'])]; break;
   }
   return { feature: config.feature, laneIndex, lane, commands,
-    generationCallsReserved: config.generationCallsPerRun,
+    scopeBinding: config.feature === 'taste' ? 'policy-broader' :
+      GENERATION_FEATURES.has(config.feature) ? 'exact-lane' : 'not-applicable',
     sourceGraphCoverage: config.feature === 'entity' ? 'pending' : 'not-applicable' };
+}
+
+export function validateNativePolicyForLane(
+  config: NativeActivationConfig,
+  lane: NativeLane,
+  value: unknown,
+  now = new Date(),
+): NativePolicyBinding {
+  if (!GENERATION_FEATURES.has(config.feature) || !config.policyEnvironment) {
+    throw new Error('policy_not_applicable');
+  }
+  try {
+    switch (config.feature) {
+      case 'reflection': {
+        const policy = parseReflectionPolicy(value, config.policyEnvironment, now);
+        exactPolicyLane(policy.scope.namespaces, policy.scope.accessLevel, lane);
+        return { generationCallHardMax: lane.mode === 'dry-run' ? 0 : policy.budget.maxCallsPerRun,
+          scopeBinding: 'exact-lane' };
+      }
+      case 'consolidation': {
+        const policy = parseConsolidationPolicy(value, config.policyEnvironment, now);
+        exactPolicyLane(policy.scope.namespaces, policy.scope.accessLevel, lane);
+        const hardMax = lane.mode === 'selection-only' ? 0 :
+          Math.min(lane.maxClusters!, policy.budget.maxCallsPerInvocation);
+        return { generationCallHardMax: hardMax, scopeBinding: 'exact-lane' };
+      }
+      case 'session': {
+        const policy = parseSessionDistillationPolicy(value, config.policyEnvironment, now);
+        exactPolicyLane(policy.scope.namespaces, policy.scope.accessLevel, lane);
+        return { generationCallHardMax: 1, scopeBinding: 'exact-lane' };
+      }
+      case 'entity': {
+        const policy = parseEntityExtractionPolicy(value, config.policyEnvironment, now);
+        exactPolicyLane(policy.scope.namespaces, policy.scope.accessLevel, lane);
+        return { generationCallHardMax: Math.min(1, policy.budget.maxCallsPerInvocation), scopeBinding: 'exact-lane' };
+      }
+      case 'taste': {
+        const policy = parseTasteProfilePolicy(value, config.policyEnvironment, now);
+        if (policy.scope.sourceNamespace !== lane.namespace || !policy.scope.accessLevels.includes(lane.accessLevel)) {
+          throw new Error('policy_scope_mismatch');
+        }
+        return { generationCallHardMax: lane.mode === 'preview' ? policy.budget.maxCallsPerRun : 0,
+          scopeBinding: 'policy-broader' };
+      }
+      default: throw new Error('policy_not_applicable');
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === 'policy_scope_mismatch') throw error;
+    throw new Error('policy_contract_invalid');
+  }
+}
+
+function exactPolicyLane(namespaces: readonly string[], accessLevel: AccessLevel, lane: NativeLane): void {
+  if (namespaces.length !== 1 || namespaces[0] !== lane.namespace || accessLevel !== lane.accessLevel) {
+    throw new Error('policy_scope_mismatch');
+  }
 }
 
 export function validateKnownCliReceipt(kind: NativeCommand['receiptKind'], stdout: string, stderr: string): void {
@@ -215,7 +279,6 @@ export function validateKnownCliReceipt(kind: NativeCommand['receiptKind'], stdo
     entity: /\[entity-enrich\] stopped/,
     'entity-requeue': /"selection":"completed-without-links"/,
     taste: /\[taste-profile\]/,
-    'contradiction-shadow': /\[ingestion-worker\] stopped/,
     maintenance: /"allValid":true/,
     webhook: /\[webhook-delivery\] stopped/,
   };
