@@ -1,44 +1,49 @@
 # Media taste profiles
 
-Taste profiles turn bounded `media_events` aggregates into recallable monthly memories. They do **not** parse media-rollup prose and are disabled unless an owner supplies a feature-specific approval policy.
+Taste profiles turn bounded `media_events` aggregates into monthly memories. Activation is subscription-only and fail-closed: generation is accepted only through the private OpenClaw adapter with provider `openclaw-adapter`, model `openclaw/total-recall-synthesis`, and budget mode `subscription`. There is no USD estimate or paid-provider fallback. Embeddings continue to use the active Qwen embedding contract.
 
-## Data disclosed to the generation provider
+## Evidence and sensitivity lanes
 
-For one category (`music` or `viewing`) and one completed calendar month, the job may disclose only:
+Only semantically relevant media evidence is materialized. Broad authorization for `financial`, secret My Life material, or other namespaces does **not** make those records taste evidence. Eligible music and viewing events are separated by explicit predicates.
 
-- the category and `YYYY-MM` period;
-- accepted event counts;
-- bounded top service, artist/show/title, and genre counts;
-- bounded 30-, 90-, 365-day, and all-time aggregate context;
-- trends that meet the configured evidence and effect thresholds; and
-- content-free quality warnings.
+Each run uses one exact `normal`, `sensitive`, or `secret` lane. An unlinked media event is normal. A linked event inherits the linked memory's access level. Aggregation, preview, source fingerprint, and stored output stay in that exact lane. The output access level is therefore the maximum classification of every materialized input, including evidence not selected by the model. Lanes have independent source keys and supersession chains.
 
-Raw events, event/account/source IDs, exact timestamps, connector metadata, memory content, credentials, and rollup prose are never included. Music and viewing use separate explicit predicates. Counts are distinct accepted events; duration, progress, and completion are not inferred.
+The provider receives only bounded aggregate facts: category, month, accepted counts, bounded services/artists/shows/titles/genres, time-window context, qualified trends, and content-free quality warnings. It never receives raw events, IDs, timestamps, credentials, source keys, ownership IDs, memory text, or control metadata. It can return only a four-value style and supplied evidence IDs; profile prose is rendered locally.
 
-The model can only choose evidence IDs and a four-value profile style. Entity names, numbers, and sentences are rendered locally from aggregate evidence. Unknown IDs, prose, extra fields, and malformed output are rejected. Validation is attempted at most twice; if both attempts fail, nothing is written.
+Local provenance records the source owner, source/target namespace, lane, materialized event count, aggregate hash, source fingerprint, policy hash, selection time/approval, adapter model, and active embedding descriptor. Before apply, the implementation re-reads every materialized source, the key, policy, and aggregate. Changed, missing, deleted, expired, superseded, out-of-scope, or revoked inputs fail without mutation.
 
-## Required approvals
+## Policy and key requirements
 
-Create an owner-only JSON policy and set `TASTE_PROFILE_POLICY_FILE`. Approval for embeddings, consolidation, contradiction processing, distillation, reflection, or any other feature does not apply. The policy must separately record unexpired approval for:
+Policy version 2 requires:
 
-1. the exact generation provider, model, endpoint, and dedicated credential variable;
-2. provider privacy, retention, and training terms;
-3. one low-sensitivity source namespace, one target namespace, and `normal` access only; and
-4. per-run/monthly cost limits and the reviewed pricing model.
+- exact adapter provider/model above and the private adapter endpoint/credential variable;
+- separately unexpired provider/model, terms, scope, and subscription-usage approvals;
+- the complete authorized namespace list, source/target namespace, and enabled lanes;
+- exactly two bounded preview attempts, 8192 total output bytes, an external subscription-usage control reference;
+- preview TTL (1–1440 minutes) and a local materialization cap.
 
-Example (replace every value after review):
+The runtime key must be genuine, enabled, unexpired, unrevoked, and have:
+
+- namespaces **exactly equal** to policy `scope.namespaces` (for the owner deployment this is the complete stored namespace set, including `financial` and My Life);
+- `max_access_level` exactly equal to the highest enabled lane (`secret` when all lanes are enabled);
+- permissions exactly `read,write`, with no `admin`, synthesis-worker, ingestion, delete, or scheduler permissions; and
+- ownership of the eligible `media_events`, because media-event RLS is owner-key isolated.
+
+That final point is an operational prerequisite, not something the job forges or bypasses. If the current event owner key has broader permissions, do not weaken isolation in deployment: reconcile ownership/key design explicitly before activation. No migration is required by this implementation.
+
+Minimal policy shape (approval objects omitted here but required):
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "feature": "media-taste-profile",
   "enabled": true,
   "environment": "production",
   "generation": {
-    "provider": "approved-gateway",
-    "model": "approved-model",
-    "endpoint": "https://gateway.example/generate",
-    "credentialEnv": "TASTE_PROFILE_GENERATION_KEY",
+    "provider": "openclaw-adapter",
+    "model": "openclaw/total-recall-synthesis",
+    "endpoint": "https://private-adapter.example/generate",
+    "credentialEnv": "TASTE_PROFILE_OPENCLAW_ADAPTER_KEY",
     "timeoutMs": 30000
   },
   "terms": {
@@ -48,9 +53,10 @@ Example (replace every value after review):
     "trainingApproved": true
   },
   "scope": {
+    "namespaces": ["activity", "financial", "insights", "media", "my-life", "personal", "projects", "shared", "work"],
     "sourceNamespace": "media",
     "targetNamespace": "personal",
-    "accessLevel": "normal"
+    "accessLevels": ["normal", "sensitive", "secret"]
   },
   "aggregation": {
     "minimumEvents": 10,
@@ -59,60 +65,41 @@ Example (replace every value after review):
     "trendMinimumShareChange": 0.1
   },
   "budget": {
+    "mode": "subscription",
     "maxCallsPerRun": 2,
-    "maxCostUsdPerRun": 1,
-    "maxCostUsdPerMonth": 5,
-    "estimatedRequestCostUsd": 0.001,
-    "estimatedInputCostUsdPerMillionBytes": 1,
-    "estimatedOutputCostUsdPerMillionBytes": 4,
-    "monthlyControlReference": "monthly scheduler/cost alert"
+    "maxOutputBytesPerRun": 8192,
+    "usageControlReference": "private OpenClaw subscription quota/control"
   },
-  "providerModelApproval": {
-    "approved": true, "approvedBy": "owner",
-    "approvedAt": "2026-01-01T00:00:00Z", "expiresAt": "2027-01-01T00:00:00Z"
-  },
-  "termsApproval": {
-    "approved": true, "approvedBy": "owner",
-    "approvedAt": "2026-01-01T00:00:00Z", "expiresAt": "2027-01-01T00:00:00Z"
-  },
-  "scopeApproval": {
-    "approved": true, "approvedBy": "owner",
-    "approvedAt": "2026-01-01T00:00:00Z", "expiresAt": "2027-01-01T00:00:00Z"
-  },
-  "budgetApproval": {
-    "approved": true, "approvedBy": "owner",
-    "approvedAt": "2026-01-01T00:00:00Z", "expiresAt": "2027-01-01T00:00:00Z"
-  }
+  "selection": { "previewTtlMinutes": 60, "maxMaterializedEvents": 10000 },
+  "providerModelApproval": { "approved": true, "approvedBy": "owner", "approvedAt": "...", "expiresAt": "..." },
+  "termsApproval": { "approved": true, "approvedBy": "owner", "approvedAt": "...", "expiresAt": "..." },
+  "scopeApproval": { "approved": true, "approvedBy": "owner", "approvedAt": "...", "expiresAt": "..." },
+  "budgetApproval": { "approved": true, "approvedBy": "owner", "approvedAt": "...", "expiresAt": "..." }
 }
 ```
 
-Use a dedicated enabled API key with exactly the approved source and target namespaces, `read,write`, and `max_access_level=normal`. The only additional permission accepted is `admin` when the same owner credential must use the authenticated media-ingest endpoints. Because media events are owner-isolated, this must be the deliberately authorized key that owns the eligible events. Configure the generation credential named by the policy separately from embedding credentials.
+## Preview and apply
 
-## Running and scheduling
-
-`MEDIA_TIME_ZONE` must be an IANA zone and defaults to UTC. Month windows are calculated in that zone, including DST boundary offsets.
+Dry-run performs bounded local selection only and never calls generation or embedding:
 
 ```sh
-# No provider or embedding call and no mutation (the default mode)
-npm run taste-profile -- --category all --dry-run
-
-# Calls the approved provider, writes nothing; --json explicitly reveals preview text
-npm run taste-profile -- --category music --period 2026-06 --preview --json
-
-# Generates, embeds, and atomically applies both profiles for the last completed month
-npm run taste-profile -- --category all --apply
+npm run taste-profile -- --category all --access-level all --dry-run
 ```
 
-Supported categories are `music`, `viewing`, and `all`. `--force` is valid for preview/apply only and bypasses the unchanged-aggregate no-op. Apply historical months oldest-to-newest per category so the immutable supersession chain remains chronological; an out-of-order apply fails without mutation. Without `--json`, logs contain only counts, statuses, cost estimates, and quality-warning codes.
+Preview calls the adapter and emits unsigned selection receipts with `--json`; it never embeds or writes:
 
-Schedule the idempotent apply command once per month with cron or systemd; there is no in-process scheduler. Keep the policy and API key out of command history. `maxCostUsdPerMonth` is an approved external ceiling, not an in-database spend ledger: enforce it through the required `monthlyControlReference` scheduler/provider billing control. The process enforces the per-run conservative reservation locally. Exactly two calls are allowed per category run so malformed structured output receives one retry and no more.
+```sh
+npm run taste-profile -- --category all --access-level all --period 2026-10 --preview --json > preview.json
+```
 
-## Storage and failure behavior
+Review each rendered profile. Copy the top-level `selections` array to a protected selection file and add an `approval` object (`approved: true`, owner identity, approval time, expiry) to each accepted receipt. Apply requires that file and makes **no generation call**:
 
-Profiles use `source=derived:media-taste`, normal access, a model-attributed `media-taste-profile` system agent, and `profile`, `taste`, category, and period tags. One deterministic source key exists per category/month. An unchanged aggregate hash is a no-op. Changed evidence updates that period's row. A newly created month supersedes the prior active profile in the same transaction as insert and audit.
+```sh
+npm run taste-profile -- --category all --access-level all --period 2026-10 --apply --selection-file approved-selections.json
+```
 
-Generation and embedding finish before the write transaction. Provider, validation, embedding, transaction, or audit failure leaves the prior profile active. Low-evidence categories write nothing. Single-service, missing-entity, and approximate-timestamp warnings are retained in profile metadata and bounded evidence.
+Apply rejects a changed aggregate/fingerprint, expired policy/preview/approval, wrong category/month/lane/policy, malformed output, disabled/revoked key, or changed scope. An unchanged replay returns `unchanged` before provider or embedding use. Apply months oldest-to-newest within each category/lane.
 
-## Disablement and rollback
+## Rollback
 
-Disable the cron/systemd entry and remove `TASTE_PROFILE_POLICY_FILE` or set no feature credential. Existing profile/history rows remain ordinary lifecycle-managed memories. Use supported memory lifecycle operations for rollback; do not hand-delete generated rows automatically.
+Disable/remove the external schedule, remove `TASTE_PROFILE_POLICY_FILE` and the adapter credential, and disable/revoke the taste key. Existing profile memories remain lifecycle-managed records. Use supported memory lifecycle operations to retire a bad profile; do not delete media events or hand-edit provenance. Because this change adds no migration, code rollback is a branch/deploy rollback plus policy/schedule disablement.
