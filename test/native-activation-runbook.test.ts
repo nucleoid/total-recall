@@ -10,7 +10,7 @@ test('systemd templates are resource-bounded and planning-only', async () => {
   assert.match(service, /CPUQuota=25%/);
   assert.match(service, /MemoryMax=384M/);
   assert.match(service, /MemorySwapMax=0/);
-  assert.match(service, /RuntimeMaxSec=150/);
+  assert.match(service, /RuntimeMaxSec=240/);
   assert.doesNotMatch(service, /ExecStart=.*--execute/);
   assert.match(timer, /Persistent=false/);
   assert.doesNotMatch(service + timer, /openclaw.*automation|cron/);
