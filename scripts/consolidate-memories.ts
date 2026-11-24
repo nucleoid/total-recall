@@ -13,12 +13,14 @@ import {
 } from '../src/consolidation.js';
 import { shutdown } from '../src/db.js';
 import { validateKeyReadOnly } from '../src/auth.js';
+import type { AccessLevel } from '../src/types.js';
 
 dotenv.config();
 
 interface CliOptions {
   namespace: string;
   mode: ConsolidationMode;
+  accessLevel: AccessLevel;
   anchorLimit?: number;
   clusterLimit?: number;
   cursor?: ConsolidationCursor;
@@ -28,6 +30,7 @@ interface CliOptions {
 export function parseConsolidationCli(args: string[]): CliOptions {
   let namespace = '';
   let mode: ConsolidationMode | undefined;
+  let accessLevel: AccessLevel = 'normal';
   let anchorLimit: number | undefined;
   let clusterLimit: number | undefined;
   let cursorCreatedAt: string | undefined;
@@ -42,7 +45,11 @@ export function parseConsolidationCli(args: string[]): CliOptions {
     const arg = args[index];
     if (arg === '--namespace') namespace = value(index++, arg);
     else if (arg === '--access-level') {
-      if (value(index++, arg) !== 'normal') throw new Error('Initial consolidation supports only --access-level normal');
+      const requested = value(index++, arg);
+      if (requested !== 'normal' && requested !== 'sensitive' && requested !== 'secret') {
+        throw new Error('--access-level must be normal, sensitive, or secret');
+      }
+      accessLevel = requested;
     } else if (arg === '--selection-only') mode = setMode(mode, 'selection-only');
     else if (arg === '--dry-run') mode = setMode(mode, 'dry-run');
     else if (arg === '--apply') mode = setMode(mode, 'apply');
@@ -62,7 +69,7 @@ export function parseConsolidationCli(args: string[]): CliOptions {
   }
   if (mode === 'dry-run' && !previewOutput) throw new Error('--dry-run requires --preview-output <owner-only-file>');
   if (mode !== 'dry-run' && previewOutput) throw new Error('--preview-output is valid only with --dry-run');
-  return { namespace, mode, anchorLimit, clusterLimit, previewOutput,
+  return { namespace, mode, accessLevel, anchorLimit, clusterLimit, previewOutput,
     cursor: cursorCreatedAt && cursorId ? { createdAt: cursorCreatedAt, id: cursorId } : undefined };
 }
 
@@ -88,7 +95,9 @@ async function loadPolicy(options: CliOptions): Promise<ConsolidationPolicy | un
   try { value = JSON.parse(await readFile(path, 'utf8')); }
   catch (error) { throw new Error(`Unable to load consolidation policy: ${error instanceof Error ? error.message : String(error)}`); }
   const policy = parseConsolidationPolicy(value, environment);
-  if (policy.scope.namespaces[0] !== options.namespace) throw new Error('Policy does not approve the exact requested namespace');
+  if (policy.scope.namespaces[0] !== options.namespace || policy.scope.accessLevel !== options.accessLevel) {
+    throw new Error('Policy does not approve the exact requested namespace and access level');
+  }
   if (options.mode === 'apply' && !policy.writeApproval) throw new Error('Apply is disabled without a separate write approval');
   return policy;
 }
@@ -118,19 +127,19 @@ async function main(): Promise<void> {
   process.once('SIGTERM', cancel);
   try {
     const result = await runConsolidation({
-      auth, namespace: options.namespace, mode: options.mode,
+      auth, namespace: options.namespace, mode: options.mode, accessLevel: options.accessLevel,
       environment: process.env.DEPLOYMENT_ENVIRONMENT?.trim() ?? '', policy,
       anchorLimit: options.anchorLimit, clusterLimit: options.clusterLimit,
       cursor: options.cursor, signal: controller.signal,
     });
     if (options.mode === 'dry-run') {
       await writeOwnerOnlyJson(options.previewOutput!, {
-        version: 1, feature: 'memory-consolidation', namespace: options.namespace,
+        version: 1, feature: 'memory-consolidation', namespace: options.namespace, accessLevel: options.accessLevel,
         policyHash: result.policyHash, createdAt: new Date().toISOString(), previews: result.previews,
       });
       console.log('[consolidation] Sensitive preview written', { file: options.previewOutput, clusters: result.previews.length });
     } else if (options.mode === 'selection-only') {
-      console.log(JSON.stringify({ namespace: options.namespace, anchorsExamined: result.selection.anchorsExamined,
+      console.log(JSON.stringify({ namespace: options.namespace, accessLevel: options.accessLevel, anchorsExamined: result.selection.anchorsExamined,
         readiness: result.selection.readiness, clusters: result.selection.clusters.map(cluster => ({
           members: cluster.members.map(member => ({ id: member.id, revision: member.revision,
             similarityToAnchor: member.similarityToAnchor })), oversized: cluster.oversized,

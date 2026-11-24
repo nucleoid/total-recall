@@ -33,16 +33,14 @@ function policy(): ConsolidationPolicy {
     feature: 'memory-consolidation',
     environment: 'test',
     generation: {
-      provider: 'test-gateway', model: 'test-model', endpoint: 'https://example.test/generate',
+      provider: 'openclaw-adapter', model: 'openclaw/total-recall-synthesis', endpoint: 'https://example.test/generate',
       credentialEnv: 'CONSOLIDATION_TEST_KEY',
     },
     terms: { reference: 'test-approval', privacyApproved: true, retentionApproved: true, trainingApproved: true },
-    scope: { namespaces: ['work'], accessLevel: 'normal' },
+    scope: { namespaces: ['work'], accessLevel: 'secret' },
     budget: {
-      maxCallsPerInvocation: 2, maxInputBytesPerInvocation: 131072,
-      maxOutputBytesPerInvocation: 32768, maxCostUsdPerInvocation: 1,
-      estimatedRequestCostUsd: 0.001, estimatedInputCostUsdPerMillionBytes: 1,
-      estimatedOutputCostUsdPerMillionBytes: 4, monthlyControlReference: 'test-provider-quota',
+      mode: 'subscription', maxCallsPerInvocation: 2, maxInputBytesPerInvocation: 131072,
+      maxOutputBytesPerInvocation: 32768, usageControlReference: 'test-subscription-quota',
     },
     generationApproval: {
       approved: true, approvedBy: 'test-owner', approvedAt: '2026-01-01T00:00:00Z',
@@ -86,14 +84,14 @@ test('app-role apply preserves provenance, hides originals, and exact deconsolid
       await owner.query(`INSERT INTO api_keys
         (id, key_hash, name, namespaces, permissions, max_access_level, enabled)
         VALUES ($1::uuid, 'test-hash', 'consolidation-test', ARRAY['work'],
-          ARRAY['read','write','delete','consolidate'], 'normal', true)`, [KEY]);
+          ARRAY['read','write','delete','consolidate'], 'secret', true)`, [KEY]);
       await owner.query(`INSERT INTO memories
         (id, content, embedding, source, namespace, tags, metadata, access_level, client_id,
          embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from, created_at)
         VALUES
-        ($1::uuid, 'The office is in Austin.', $3::vector, 'test', 'work', ARRAY['office'], '{}', 'normal', $5,
+        ($1::uuid, 'The office is in Austin.', $3::vector, 'test', 'work', ARRAY['office'], '{}', 'secret', $5,
          'gemini', 'gemini-embedding-2-preview', 768, 'semantic', statement_timestamp(), '2026-01-01T00:00:00Z'),
-        ($2::uuid, 'Our office location is Austin.', $4::vector, 'test', 'work', ARRAY['location'], '{}', 'normal', $5,
+        ($2::uuid, 'Our office location is Austin.', $4::vector, 'test', 'work', ARRAY['location'], '{}', 'secret', $5,
          'gemini', 'gemini-embedding-2-preview', 768, 'semantic', statement_timestamp(), '2026-01-02T00:00:00Z')`,
       [FIRST, SECOND, vectorText(vector()), vectorText(vector(0.01)), KEY]);
 
@@ -101,12 +99,12 @@ test('app-role apply preserves provenance, hides originals, and exact deconsolid
       setPoolForTesting(appPool);
       const auth: AuthContext = {
         keyId: KEY, name: 'consolidation-test', namespaces: ['work'],
-        permissions: ['read', 'write', 'delete', 'consolidate'], maxAccessLevel: 'normal',
+        permissions: ['read', 'write', 'delete', 'consolidate'], maxAccessLevel: 'secret',
       };
       const result = await runConsolidation({
         auth, namespace: 'work', mode: 'apply', environment: 'test', policy: policy(),
         provider: {
-          name: 'test-gateway',
+          name: 'openclaw-adapter',
           async generate(request) {
             const input = JSON.parse(request.input) as { memories: Array<{ id: string }> };
             return JSON.stringify({
@@ -132,6 +130,16 @@ test('app-role apply preserves provenance, hides originals, and exact deconsolid
         WHERE cm.canonical_id = $1::uuid ORDER BY cm.member_id`, [canonicalId]);
       assert.deepEqual(provenance.rows.map(row => row.member_id), [FIRST, SECOND]);
       assert.ok(provenance.rows.every(row => row.deconsolidated_at === null && row.agent_id));
+      const accessMetadata = await owner.query(`
+        SELECT
+          (SELECT access_level FROM memories WHERE id=$1::uuid) AS canonical_level,
+          (SELECT access_level FROM memory_consolidation_runs WHERE owner_key_id=$2::uuid ORDER BY started_at DESC LIMIT 1) AS run_level,
+          (SELECT access_level FROM memory_consolidation_checkpoints WHERE owner_key_id=$2::uuid LIMIT 1) AS checkpoint_level,
+          (SELECT min(access_level) FROM memory_consolidation_memberships WHERE canonical_id=$1::uuid) AS membership_level`,
+      [canonicalId, KEY]);
+      assert.deepEqual(accessMetadata.rows[0], {
+        canonical_level: 'secret', run_level: 'secret', checkpoint_level: 'secret', membership_level: 'secret',
+      });
       await assert.rejects(owner.query('DELETE FROM memories WHERE id = $1::uuid', [canonicalId]),
         error => (error as { code?: string }).code === '23503');
 

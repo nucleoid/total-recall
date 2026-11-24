@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { resolveAgent } from './agents.js';
+import { accessLevelSql, canAccessLevel } from './auth.js';
 import { logAudit } from './audit.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR } from './embedding-descriptor.js';
 import { QWEN_CONTRACT_ID } from './local-embedding-contract.js';
@@ -19,7 +20,8 @@ import {
   generateBounded,
   type GenerationProvider,
 } from './generation.js';
-import type { AuthContext } from './types.js';
+import type { AccessLevel, AuthContext } from './types.js';
+import { assertDerivedAccessNotDowngraded, assertSubscriptionGeneration, assertSynthesisAuthority, isSubscriptionUsage, maximumAccessLevel, synthesisAccessLevelSchema } from './synthesis-policy.js';
 
 export const CONSOLIDATION_SIMILARITY_THRESHOLD = 0.92;
 export const CONSOLIDATION_MIN_CLUSTER_SIZE = 2;
@@ -68,18 +70,43 @@ export const consolidationPolicySchema = z.object({
   }).strict(),
   scope: z.object({
     namespaces: z.tuple([z.string().trim().min(1).max(512)]),
-    accessLevel: z.literal('normal'),
+    accessLevel: synthesisAccessLevelSchema,
   }).strict(),
-  budget: z.object({
-    maxCallsPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT),
-    maxInputBytesPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT * MAX_CONSOLIDATION_INPUT_BYTES),
-    maxOutputBytesPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT * MAX_CONSOLIDATION_OUTPUT_BYTES),
-    maxCostUsdPerInvocation: z.number().positive().finite(),
-    estimatedRequestCostUsd: z.number().nonnegative().finite(),
-    estimatedInputCostUsdPerMillionBytes: z.number().nonnegative().finite(),
-    estimatedOutputCostUsdPerMillionBytes: z.number().nonnegative().finite(),
-    monthlyControlReference: z.string().trim().min(1).max(1024),
-  }).strict(),
+  budget: z.union([
+    z.object({
+      mode: z.literal('paid').optional(),
+      maxCallsPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT),
+      maxInputBytesPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT * MAX_CONSOLIDATION_INPUT_BYTES),
+      maxOutputBytesPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT * MAX_CONSOLIDATION_OUTPUT_BYTES),
+      maxCostUsdPerInvocation: z.number().positive().finite(),
+      estimatedRequestCostUsd: z.number().nonnegative().finite(),
+      estimatedInputCostUsdPerMillionBytes: z.number().nonnegative().finite(),
+      estimatedOutputCostUsdPerMillionBytes: z.number().nonnegative().finite(),
+      monthlyControlReference: z.string().trim().min(1).max(1024),
+    }).strict().transform(value => ({ ...value, mode: 'paid' as const })),
+    z.union([
+      z.object({
+        mode: z.literal('subscription'),
+        maxCallsPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT),
+        maxInputBytesPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT * MAX_CONSOLIDATION_INPUT_BYTES),
+        maxOutputBytesPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT * MAX_CONSOLIDATION_OUTPUT_BYTES),
+        usageControlReference: z.string().trim().min(1).max(1024),
+      }).strict().transform(value => ({ ...value, maxCostUsdPerInvocation: 0,
+        estimatedRequestCostUsd: 0, estimatedInputCostUsdPerMillionBytes: 0,
+        estimatedOutputCostUsdPerMillionBytes: 0, monthlyControlReference: value.usageControlReference })),
+      z.object({
+        mode: z.literal('subscription'),
+        maxCallsPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT),
+        maxInputBytesPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT * MAX_CONSOLIDATION_INPUT_BYTES),
+        maxOutputBytesPerInvocation: positiveInteger.max(HARD_CONSOLIDATION_CLUSTER_LIMIT * MAX_CONSOLIDATION_OUTPUT_BYTES),
+        usageControlReference: z.string().trim().min(1).max(1024),
+        maxCostUsdPerInvocation: z.literal(0), estimatedRequestCostUsd: z.literal(0),
+        estimatedInputCostUsdPerMillionBytes: z.literal(0), estimatedOutputCostUsdPerMillionBytes: z.literal(0),
+        monthlyControlReference: z.string().trim().min(1).max(1024),
+      }).strict().refine(value => value.monthlyControlReference === value.usageControlReference,
+        'Canonical subscription usage references must match'),
+    ]),
+  ]),
   generationApproval: approvalSchema,
   writeApproval: approvalSchema.optional(),
 }).strict();
@@ -95,6 +122,7 @@ export function parseConsolidationPolicy(
   if (policy.environment !== expectedEnvironment) {
     throw new Error('Consolidation policy environment does not match this deployment');
   }
+  assertSubscriptionGeneration(policy.generation, policy.budget);
   if (new Date(policy.generationApproval.approvedAt).getTime() > now.getTime()) {
     throw new Error('Consolidation generation approval is not yet effective');
   }
@@ -178,6 +206,7 @@ export function buildCompleteLinkCluster(
 
 export interface SelectConsolidationOptions {
   namespace: string;
+  accessLevel?: AccessLevel;
   anchorLimit?: number;
   clusterLimit?: number;
   cursor?: ConsolidationCursor | null;
@@ -199,23 +228,32 @@ interface PairRow {
   similarity: number;
 }
 
-const ELIGIBLE_SQL = `
-  m.namespace = $1
-  AND m.access_level = 'normal'
-  AND m.memory_kind = 'semantic'
-  AND m.deleted_at IS NULL
-  AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
-  AND m.superseded_at IS NULL
-  AND m.valid_to IS NULL
-  AND m.valid_from <= statement_timestamp()
-  AND m.consolidated_into_id IS NULL
-  AND m.document_id IS NULL
-  AND m.source_key IS NULL`;
+function exactAccessLevelSql(column: string, accessLevel: AccessLevel): string {
+  return `${column} = '${synthesisAccessLevelSchema.parse(accessLevel)}'`;
+}
+
+function eligibleSql(accessLevel: AccessLevel, alias = 'm'): string {
+  const level = synthesisAccessLevelSchema.parse(accessLevel);
+  return `
+  ${alias}.namespace = $1
+  AND ${alias}.access_level = '${level}'
+  AND ${alias}.memory_kind = 'semantic'
+  AND ${alias}.deleted_at IS NULL
+  AND (${alias}.expires_at IS NULL OR ${alias}.expires_at > statement_timestamp())
+  AND ${alias}.superseded_at IS NULL
+  AND ${alias}.valid_to IS NULL
+  AND ${alias}.valid_from <= statement_timestamp()
+  AND ${alias}.consolidated_into_id IS NULL
+  AND ${alias}.document_id IS NULL
+  AND ${alias}.source_key IS NULL`;
+}
 
 export async function consolidationReadiness(
   client: ScopedClient,
   namespace: string,
+  accessLevel: AccessLevel = 'normal',
 ): Promise<ConsolidationReadiness> {
+  accessLevel = synthesisAccessLevelSchema.parse(accessLevel);
   if (localServingEnabled()) {
     const serving = await client.query<{ active: boolean }>(`SELECT EXISTS(
       SELECT 1 FROM embedding_serving_settings WHERE singleton=true AND contract_id=$1
@@ -228,7 +266,7 @@ export async function consolidationReadiness(
         count(*) FILTER (WHERE f.parent_id IS NULL OR NOT f.is_current OR f.source_revision<>m.revision
           OR (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$2 AND c.parent_id=m.id)<>f.chunk_count)::text AS incomplete_count
       FROM memories m LEFT JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$2
-      WHERE ${ELIGIBLE_SQL}
+      WHERE ${eligibleSql(accessLevel)}
     `, [namespace, QWEN_CONTRACT_ID]);
     const row = result.rows[0];
     return { scopeCount: Number(row?.scope_count ?? 0), eligibleCount: Number(row?.eligible_count ?? 0),
@@ -251,7 +289,7 @@ export async function consolidationReadiness(
         AND embedding_provider IS NOT NULL AND embedding_model IS NOT NULL AND embedding_dimensions IS NOT NULL
         AND (embedding_provider <> $2 OR embedding_model <> $3 OR embedding_dimensions <> $4))::text AS foreign_identity_count
     FROM memories m
-    WHERE ${ELIGIBLE_SQL}
+    WHERE ${eligibleSql(accessLevel)}
   `, [namespace, descriptor.provider, descriptor.model, descriptor.dimensions]);
   const row = result.rows[0];
   return {
@@ -277,21 +315,22 @@ export async function selectConsolidationClusters(
     HARD_CONSOLIDATION_CLUSTER_LIMIT,
     'clusterLimit',
   );
+  const accessLevel = synthesisAccessLevelSchema.parse(options.accessLevel ?? 'normal');
   const local = localServingEnabled();
   const descriptor = ACTIVE_EMBEDDING_DESCRIPTOR;
-  const readiness = await consolidationReadiness(client, options.namespace);
+  const readiness = await consolidationReadiness(client, options.namespace, accessLevel);
   const cursor = options.cursor ?? null;
   const anchors = await client.query<AnchorRow>(local ? `
     SELECT m.id, m.created_at::text AS created_at, m.revision
     FROM memories m JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$2
-    WHERE ${ELIGIBLE_SQL} AND f.is_current AND f.source_revision=m.revision
+    WHERE ${eligibleSql(accessLevel)} AND f.is_current AND f.source_revision=m.revision
       AND (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$2 AND c.parent_id=m.id)=f.chunk_count
       AND ($3::timestamptz IS NULL OR (m.created_at, m.id) > ($3::timestamptz, $4::uuid))
     ORDER BY m.created_at, m.id LIMIT $5
   ` : `
     SELECT m.id, m.created_at::text AS created_at, m.revision
     FROM memories m
-    WHERE ${ELIGIBLE_SQL}
+    WHERE ${eligibleSql(accessLevel)}
       AND m.embedding IS NOT NULL
       AND m.embedding_provider = $2 AND m.embedding_model = $3 AND m.embedding_dimensions = $4
       AND ($5::timestamptz IS NULL OR (m.created_at, m.id) > ($5::timestamptz, $6::uuid))
@@ -331,7 +370,7 @@ export async function selectConsolidationClusters(
       JOIN memory_embedding_manifests candidate_manifest ON candidate_manifest.parent_id=candidate.id
         AND candidate_manifest.contract_id=$2 AND candidate_manifest.is_current AND candidate_manifest.source_revision=candidate.revision
       JOIN memory_embedding_chunks candidate_chunk ON candidate_chunk.parent_id=candidate.id AND candidate_chunk.contract_id=$2
-      WHERE anchor.id=$3::uuid AND ${ELIGIBLE_SQL.replaceAll('m.', 'candidate.')}
+      WHERE anchor.id=$3::uuid AND ${eligibleSql(accessLevel, 'candidate')}
         AND (candidate.created_at,candidate.id)>=(anchor.created_at,anchor.id)
       GROUP BY candidate.id,candidate.created_at,candidate.revision
       HAVING max(1-(candidate_chunk.embedding <=> anchor_chunk.embedding)) >= $4
@@ -342,7 +381,7 @@ export async function selectConsolidationClusters(
       FROM memories anchor
       JOIN memories candidate ON candidate.namespace = anchor.namespace
       WHERE anchor.id = $5::uuid
-        AND ${ELIGIBLE_SQL.replaceAll('m.', 'candidate.')}
+        AND ${eligibleSql(accessLevel, 'candidate')}
         AND candidate.embedding IS NOT NULL
         AND candidate.embedding_provider = $2 AND candidate.embedding_model = $3 AND candidate.embedding_dimensions = $4
         AND (candidate.created_at, candidate.id) >= (anchor.created_at, anchor.id)
@@ -447,6 +486,7 @@ interface LoadedMember {
   id: string;
   content: string;
   namespace: string;
+  access_level: AccessLevel;
   tags: string[];
   revision: number;
   created_at: string;
@@ -488,7 +528,11 @@ export interface RunConsolidationResult {
 }
 
 export async function runConsolidation(options: RunConsolidationOptions): Promise<RunConsolidationResult> {
-  assertConsolidationAuthority(options.auth, options.namespace, options.mode);
+  if (options.mode !== 'selection-only') {
+    options = { ...options, policy: parseConsolidationPolicy(options.policy, options.environment) };
+  }
+  const accessLevel = runAccessLevel(options);
+  assertConsolidationAuthority(options.auth, options.namespace, options.mode, accessLevel);
   if (options.mode !== 'selection-only') assertPolicyForRun(options);
   const scope = dbScopeFromAuth(options.auth);
   const policyHash = options.policy ? consolidationPolicyHash(options.policy) : undefined;
@@ -507,10 +551,10 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
     const mergedCanonicalIds: string[] = [];
     try {
       const effectiveCursor = options.cursor === undefined && options.mode === 'apply'
-        ? await loadCheckpoint(client, scope, options.auth.keyId, options.namespace)
+        ? await loadCheckpoint(client, scope, options.auth.keyId, options.namespace, accessLevel)
         : (options.cursor ?? null);
       const selection = await withScopedTransactionOnClient(client, scope, scoped =>
-        selectConsolidationClusters(scoped, { ...options, cursor: effectiveCursor }));
+        selectConsolidationClusters(scoped, { ...options, accessLevel, cursor: effectiveCursor }));
       if (options.mode === 'selection-only') {
         return { selection, previews: selection.clusters.map(cluster => ({
           sourceIds: cluster.members.map(member => member.id),
@@ -555,7 +599,7 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
           if (options.mode === 'apply') await advanceClusterCheckpoint(client, scope, options, cluster);
           continue;
         }
-        const members = await withScopedTransactionOnClient(client, scope, scoped => loadMembers(scoped, sourceIds));
+        const members = await withScopedTransactionOnClient(client, scope, scoped => loadMembers(scoped, sourceIds, accessLevel));
         if (!matchesSelection(members, cluster.members)) {
           previews.push({ sourceIds, decision: 'stale', reasonCode: 'stale' });
           if (options.mode === 'apply') await advanceClusterCheckpoint(client, scope, options, cluster);
@@ -575,8 +619,8 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
         if (calls + 1 > policy.budget.maxCallsPerInvocation ||
             inputBytes + bytes > policy.budget.maxInputBytesPerInvocation ||
             (calls + 1) * MAX_CONSOLIDATION_OUTPUT_BYTES > policy.budget.maxOutputBytesPerInvocation ||
-            reservedCostMicroUsd + requestReservationMicroUsd >
-              Math.floor(policy.budget.maxCostUsdPerInvocation * 1_000_000)) {
+            (!isSubscriptionUsage(policy.budget) && reservedCostMicroUsd + requestReservationMicroUsd >
+              Math.floor(policy.budget.maxCostUsdPerInvocation * 1_000_000))) {
           throw new GenerationLimitError('Consolidation invocation budget exhausted');
         }
         calls += 1;
@@ -647,7 +691,7 @@ export async function runConsolidation(options: RunConsolidationOptions): Promis
 
       if (options.mode === 'apply') {
         await withScopedTransactionOnClient(client, scope, async scoped => {
-          await saveCheckpoint(scoped, options.auth.keyId, options.namespace, selection.lastCursor);
+          await saveCheckpoint(scoped, options.auth.keyId, options.namespace, selection.lastCursor, accessLevel);
           await scoped.query(
             `UPDATE memory_consolidation_runs
              SET status = $2, provider_calls = $3, input_bytes = $4, output_bytes = $5,
@@ -685,7 +729,7 @@ function assertPolicyForRun(options: RunConsolidationOptions): void {
   const policy = options.policy;
   if (!policy) throw new Error('Consolidation policy is required before source content is loaded');
   if (policy.environment !== options.environment || policy.scope.namespaces[0] !== options.namespace ||
-      policy.scope.accessLevel !== 'normal') {
+      policy.scope.accessLevel !== runAccessLevel(options)) {
     throw new Error('Requested consolidation scope is not approved by policy');
   }
   if (new Date(policy.generationApproval.expiresAt).getTime() <= Date.now()) {
@@ -698,14 +742,20 @@ function assertPolicyForRun(options: RunConsolidationOptions): void {
   }
 }
 
-function assertConsolidationAuthority(auth: AuthContext, namespace: string, mode: ConsolidationMode): void {
+function runAccessLevel(options: RunConsolidationOptions): AccessLevel {
+  return synthesisAccessLevelSchema.parse(options.policy?.scope.accessLevel ?? options.accessLevel ?? 'normal');
+}
+
+export function assertConsolidationAuthority(
+  auth: AuthContext,
+  namespace: string,
+  mode: ConsolidationMode,
+  accessLevel: AccessLevel,
+): void {
+  assertSynthesisAuthority(auth, [namespace], accessLevel);
   if (!auth.permissions.includes('consolidate')) throw new Error("Permission denied: requires 'consolidate'");
   if (!auth.permissions.includes('read')) throw new Error("Permission denied: requires 'read'");
   if (mode === 'apply' && !auth.permissions.includes('write')) throw new Error("Permission denied: requires 'write'");
-  if (!auth.namespaces.includes(namespace)) throw new Error(`Access denied to namespace '${namespace}'`);
-  if (auth.maxAccessLevel !== 'normal') {
-    throw new Error('Initial consolidation requires a dedicated key with max_access_level=normal');
-  }
 }
 
 async function loadCheckpoint(
@@ -713,15 +763,16 @@ async function loadCheckpoint(
   scope: ReturnType<typeof dbScopeFromAuth>,
   ownerKeyId: string,
   namespace: string,
+  accessLevel: AccessLevel,
 ): Promise<ConsolidationCursor | null> {
   const descriptor = consolidationSemanticDescriptor();
   return withScopedTransactionOnClient(client, scope, async scoped => {
     const result = await scoped.query<{ cursor_created_at: string | null; cursor_id: string | null }>(`
       SELECT cursor_created_at::text, cursor_id
       FROM memory_consolidation_checkpoints
-      WHERE owner_key_id = $1::uuid AND namespace = $2 AND access_level = 'normal'
-        AND embedding_provider = $3 AND embedding_model = $4 AND embedding_dimensions = $5
-    `, [ownerKeyId, namespace, descriptor.provider, descriptor.model, descriptor.dimensions]);
+      WHERE owner_key_id = $1::uuid AND namespace = $2 AND access_level = $3
+        AND embedding_provider = $4 AND embedding_model = $5 AND embedding_dimensions = $6
+    `, [ownerKeyId, namespace, accessLevel, descriptor.provider, descriptor.model, descriptor.dimensions]);
     const row = result.rows[0];
     return row?.cursor_created_at && row.cursor_id
       ? { createdAt: row.cursor_created_at, id: row.cursor_id }
@@ -737,7 +788,7 @@ async function advanceClusterCheckpoint(
 ): Promise<void> {
   await withScopedTransactionOnClient(client, scope, scoped => saveCheckpoint(
     scoped, options.auth.keyId, options.namespace,
-    { createdAt: cluster.anchor.createdAt, id: cluster.anchor.id },
+    { createdAt: cluster.anchor.createdAt, id: cluster.anchor.id }, runAccessLevel(options),
   ));
 }
 
@@ -746,17 +797,18 @@ async function saveCheckpoint(
   ownerKeyId: string,
   namespace: string,
   cursor: ConsolidationCursor | null,
+  accessLevel: AccessLevel,
 ): Promise<void> {
   const descriptor = consolidationSemanticDescriptor();
   await client.query(`
     INSERT INTO memory_consolidation_checkpoints (
       owner_key_id, namespace, access_level, embedding_provider, embedding_model,
       embedding_dimensions, cursor_created_at, cursor_id, updated_at
-    ) VALUES ($1::uuid, $2, 'normal', $3, $4, $5, $6::timestamptz, $7::uuid, statement_timestamp())
+    ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::timestamptz, $8::uuid, statement_timestamp())
     ON CONFLICT (owner_key_id, namespace, access_level, embedding_provider, embedding_model, embedding_dimensions)
     DO UPDATE SET cursor_created_at = EXCLUDED.cursor_created_at, cursor_id = EXCLUDED.cursor_id,
                   updated_at = statement_timestamp()
-  `, [ownerKeyId, namespace, descriptor.provider, descriptor.model, descriptor.dimensions,
+  `, [ownerKeyId, namespace, accessLevel, descriptor.provider, descriptor.model, descriptor.dimensions,
     cursor?.createdAt ?? null, cursor?.id ?? null]);
 }
 
@@ -773,22 +825,22 @@ async function createRun(
       INSERT INTO memory_consolidation_runs (
         owner_key_id, namespace, access_level, embedding_provider, embedding_model,
         embedding_dimensions, mode, status, policy_hash, anchors_examined
-      ) VALUES ($1::uuid, $2, 'normal', $3, $4, $5, 'apply', 'running', $6, $7)
+      ) VALUES ($1::uuid, $2, $3, $4, $5, $6, 'apply', 'running', $7, $8)
       RETURNING id
-    `, [options.auth.keyId, options.namespace, descriptor.provider, descriptor.model, descriptor.dimensions,
-      policyHash, anchorsExamined]);
+    `, [options.auth.keyId, options.namespace, runAccessLevel(options), descriptor.provider, descriptor.model,
+      descriptor.dimensions, policyHash, anchorsExamined]);
     return result.rows[0].id;
   });
 }
 
-async function loadMembers(client: ScopedClient, ids: string[]): Promise<LoadedMember[]> {
+async function loadMembers(client: ScopedClient, ids: string[], accessLevel: AccessLevel): Promise<LoadedMember[]> {
   const local = localServingEnabled();
   const result = await client.query<Omit<LoadedMember, 'fingerprint'>>(local ? `
-    SELECT m.id,m.content,m.namespace,m.tags,m.revision,m.created_at::text AS created_at,
+    SELECT m.id,m.content,m.namespace,m.access_level,m.tags,m.revision,m.created_at::text AS created_at,
       m.embedding_provider,m.embedding_model,m.embedding_dimensions,m.embedding::text AS embedding,
       m.updated_at::text AS updated_at,f.source_revision AS target_source_revision,f.source_sha256 AS target_source_sha256
     FROM memories m JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$2
-    WHERE m.id=ANY($1::uuid[]) AND m.access_level='normal' AND m.memory_kind='semantic'
+    WHERE m.id=ANY($1::uuid[]) AND ${exactAccessLevelSql('m.access_level', accessLevel)} AND m.memory_kind='semantic'
       AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp())
       AND m.superseded_at IS NULL AND m.valid_to IS NULL AND m.valid_from<=statement_timestamp()
       AND m.consolidated_into_id IS NULL AND m.document_id IS NULL AND m.source_key IS NULL
@@ -796,12 +848,12 @@ async function loadMembers(client: ScopedClient, ids: string[]): Promise<LoadedM
       AND (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$2 AND c.parent_id=m.id)=f.chunk_count
     ORDER BY m.id
   ` : `
-    SELECT id, content, namespace, tags, revision, created_at::text AS created_at,
+    SELECT id, content, namespace, access_level, tags, revision, created_at::text AS created_at,
            embedding_provider, embedding_model, embedding_dimensions,
            embedding::text AS embedding, updated_at::text AS updated_at
     FROM memories
     WHERE id = ANY($1::uuid[])
-      AND access_level = 'normal' AND memory_kind = 'semantic'
+      AND ${exactAccessLevelSql('access_level', accessLevel)} AND memory_kind = 'semantic'
       AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())
       AND superseded_at IS NULL AND valid_to IS NULL
       AND valid_from <= statement_timestamp() AND consolidated_into_id IS NULL
@@ -820,6 +872,20 @@ function matchesSelection(members: LoadedMember[], selected: readonly Consolidat
   return members.every(member => revisions.get(member.id) === member.revision);
 }
 
+export function consolidationCanonicalAccessLevel(
+  promptMembers: readonly Pick<LoadedMember, 'id' | 'access_level'>[],
+  revalidatedMembers: readonly Pick<LoadedMember, 'id' | 'access_level'>[],
+): AccessLevel {
+  if (promptMembers.length !== revalidatedMembers.length ||
+      promptMembers.some(member => !revalidatedMembers.some(current => current.id === member.id))) {
+    throw new Error('Consolidation members changed during revalidation');
+  }
+  return maximumAccessLevel([
+    ...promptMembers.map(member => member.access_level),
+    ...revalidatedMembers.map(member => member.access_level),
+  ]);
+}
+
 async function applyCluster(
   client: ScopedClient,
   options: RunConsolidationOptions,
@@ -835,15 +901,15 @@ async function applyCluster(
   const ids = loaded.map(member => member.id).sort();
   const local = localServingEnabled();
   const locked = await client.query<{
-    id: string; content: string; namespace: string; tags: string[]; revision: number; created_at: string;
+    id: string; content: string; namespace: string; access_level: AccessLevel; tags: string[]; revision: number; created_at: string;
     embedding_provider: string | null; embedding_model: string | null; embedding_dimensions: number | null;
     embedding: string | null; updated_at: string; target_source_revision?: number; target_source_sha256?: string;
   }>(local ? `
-    SELECT m.id,m.content,m.namespace,m.tags,m.revision,m.created_at::text AS created_at,
+    SELECT m.id,m.content,m.namespace,m.access_level,m.tags,m.revision,m.created_at::text AS created_at,
       m.embedding_provider,m.embedding_model,m.embedding_dimensions,m.embedding::text AS embedding,
       m.updated_at::text AS updated_at,f.source_revision AS target_source_revision,f.source_sha256 AS target_source_sha256
     FROM memories m JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$3
-    WHERE m.id=ANY($1::uuid[]) AND m.namespace=$2 AND m.access_level='normal' AND m.memory_kind='semantic'
+    WHERE m.id=ANY($1::uuid[]) AND m.namespace=$2 AND ${exactAccessLevelSql('m.access_level', runAccessLevel(options))} AND m.memory_kind='semantic'
       AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp())
       AND m.superseded_at IS NULL AND m.valid_to IS NULL AND m.valid_from<=statement_timestamp()
       AND m.consolidated_into_id IS NULL AND m.document_id IS NULL AND m.source_key IS NULL
@@ -851,12 +917,12 @@ async function applyCluster(
       AND (SELECT count(*) FROM memory_embedding_chunks c WHERE c.contract_id=$3 AND c.parent_id=m.id)=f.chunk_count
     ORDER BY m.id FOR UPDATE OF m
   ` : `
-    SELECT id, content, namespace, tags, revision, created_at::text AS created_at,
+    SELECT id, content, namespace, access_level, tags, revision, created_at::text AS created_at,
            embedding_provider, embedding_model, embedding_dimensions,
            embedding::text AS embedding, updated_at::text AS updated_at
     FROM memories
     WHERE id = ANY($1::uuid[])
-      AND namespace = $2 AND access_level = 'normal' AND memory_kind = 'semantic'
+      AND namespace = $2 AND ${exactAccessLevelSql('access_level', runAccessLevel(options))} AND memory_kind = 'semantic'
       AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())
       AND superseded_at IS NULL AND valid_to IS NULL
       AND consolidated_into_id IS NULL AND document_id IS NULL AND source_key IS NULL
@@ -865,15 +931,16 @@ async function applyCluster(
   `, local ? [ids, options.namespace, QWEN_CONTRACT_ID] : [ids, options.namespace, ACTIVE_EMBEDDING_DESCRIPTOR.provider,
     ACTIVE_EMBEDDING_DESCRIPTOR.model, ACTIVE_EMBEDDING_DESCRIPTOR.dimensions]);
   if (locked.rows.length !== loaded.length) {
-    await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint);
+    await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint, runAccessLevel(options));
     return null;
   }
   const expected = new Map(loaded.map(member => [member.id, member.fingerprint]));
   const current = locked.rows.map(row => ({ ...row, fingerprint: memberFingerprint(row) }));
   if (current.some(member => expected.get(member.id) !== member.fingerprint)) {
-    await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint);
+    await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint, runAccessLevel(options));
     return null;
   }
+  const canonicalAccessLevel = consolidationCanonicalAccessLevel(loaded, current);
 
   const incompatible = await client.query<{ count: string }>(local ? `
     SELECT count(*)::text AS count FROM (
@@ -892,7 +959,7 @@ async function applyCluster(
       AND 1 - (left_memory.embedding <=> right_memory.embedding) < $2
   `, local ? [ids, QWEN_CONTRACT_ID, CONSOLIDATION_SIMILARITY_THRESHOLD] : [ids, CONSOLIDATION_SIMILARITY_THRESHOLD]);
   if (Number(incompatible.rows[0]?.count ?? 0) !== 0) {
-    await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint);
+    await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint, runAccessLevel(options));
     return null;
   }
 
@@ -905,7 +972,7 @@ async function applyCluster(
       source_key, embedding_provider, embedding_model, embedding_dimensions,
       memory_kind, valid_from, created_at
     ) VALUES (
-      $1, $2::vector, 'memory-consolidation', $3, $4::text[], $5::jsonb, 'normal', $6, $7::uuid,
+      $1, $2::vector, 'memory-consolidation', $3, $4::text[], $5::jsonb, $13, $6, $7::uuid,
       $8, $9, $10, $11, 'consolidation', $12::timestamptz, $12::timestamptz
     )
     ON CONFLICT (client_id, source_key) DO NOTHING
@@ -928,15 +995,17 @@ async function applyCluster(
     ACTIVE_EMBEDDING_DESCRIPTOR.model,
     ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
     timestamp,
+    canonicalAccessLevel,
   ]);
   let canonicalId = inserted.rows[0]?.id;
   if (canonicalId) await publishPreparedLocalDocument(client, canonicalId, localPrepared);
   if (!canonicalId) {
-    const existing = await client.query<{ id: string }>(`
-      SELECT id FROM memories
+    const existing = await client.query<{ id: string; access_level: AccessLevel }>(`
+      SELECT id, access_level FROM memories
       WHERE source_key = $1 AND client_id = $2 AND namespace = $3 AND memory_kind = 'consolidation'
     `, [sourceKey, options.auth.keyId, options.namespace]);
     if (existing.rows.length !== 1) throw new Error('Consolidation source-key conflict');
+    assertDerivedAccessNotDowngraded(existing.rows[0].access_level, canonicalAccessLevel);
     canonicalId = existing.rows[0].id;
     const memberships = await client.query<{ member_id: string; member_fingerprint: string }>(`
       SELECT member_id, member_fingerprint FROM memory_consolidation_memberships
@@ -947,7 +1016,7 @@ async function applyCluster(
     if (JSON.stringify(signature) !== JSON.stringify(expectedSignature)) {
       throw new Error('Consolidation source-key provenance conflict');
     }
-    await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint);
+    await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint, runAccessLevel(options));
     return canonicalId;
   }
 
@@ -958,9 +1027,10 @@ async function applyCluster(
         owner_key_id, namespace, access_level, run_id, canonical_id, member_id, member_revision,
         member_fingerprint, embedding_provider, embedding_model, embedding_dimensions,
         consolidated_at, policy_hash
-      ) VALUES ($1::uuid, $2, 'normal', $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11::timestamptz, $12)
+      ) VALUES ($1::uuid, $2, $13, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8, $9, $10, $11::timestamptz, $12)
     `, [options.auth.keyId, options.namespace, runId, canonicalId, member.id, member.revision,
-      member.fingerprint, semantic.provider, semantic.model, semantic.dimensions, timestamp, policyHash]);
+      member.fingerprint, semantic.provider, semantic.model, semantic.dimensions, timestamp, policyHash,
+      canonicalAccessLevel]);
   }
   const linked = await client.query(`
     UPDATE memories SET consolidated_into_id = $1::uuid, consolidated_at = $2::timestamptz,
@@ -973,7 +1043,7 @@ async function applyCluster(
     await logAudit({ clientId: options.auth.keyId, action: 'memory.consolidate',
       namespace: options.namespace, memoryId }, dbScopeFromAuth(options.auth), client);
   }
-  await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint);
+  await saveCheckpoint(client, options.auth.keyId, options.namespace, checkpoint, runAccessLevel(options));
   return canonicalId;
 }
 
@@ -1048,19 +1118,21 @@ export async function previewDeconsolidation(
   if (ids.length === 0 || ids.length > 100) throw new Error('Deconsolidation requires 1 to 100 canonical IDs');
   const rows = await client.query<{
     membership_id: string; canonical_id: string; canonical_revision: number; canonical_content: string;
-    member_id: string; member_revision: number; member_content: string; member_fingerprint: string;
+    canonical_access_level: AccessLevel; member_id: string; member_revision: number; member_content: string;
+    member_access_level: AccessLevel; member_fingerprint: string;
   }>(`
     SELECT cm.id AS membership_id, canonical.id AS canonical_id,
            canonical.revision AS canonical_revision, canonical.content AS canonical_content,
+           canonical.access_level AS canonical_access_level,
            member.id AS member_id, member.revision AS member_revision, member.content AS member_content,
-           cm.member_fingerprint
+           member.access_level AS member_access_level, cm.member_fingerprint
     FROM memory_consolidation_memberships cm
     JOIN memories canonical ON canonical.id = cm.canonical_id
     JOIN memories member ON member.id = cm.member_id
     WHERE cm.canonical_id = ANY($1::uuid[]) AND cm.namespace = $2 AND cm.deconsolidated_at IS NULL
-      AND cm.owner_key_id = $3::uuid
+      AND cm.owner_key_id = $3::uuid AND ${accessLevelSql('cm.access_level', '$4')}
     ORDER BY cm.canonical_id, cm.member_id
-  `, [ids, namespace, auth.keyId]);
+  `, [ids, namespace, auth.keyId, auth.maxAccessLevel]);
   const grouped = new Map<string, DeconsolidationManifestCanonical>();
   for (const row of rows.rows) {
     let canonical = grouped.get(row.canonical_id);
@@ -1068,7 +1140,7 @@ export async function previewDeconsolidation(
       canonical = {
         canonicalId: row.canonical_id,
         canonicalRevision: row.canonical_revision,
-        canonicalFingerprint: sha256(row.canonical_content),
+        canonicalFingerprint: sha256(stableJson({ content: row.canonical_content, accessLevel: row.canonical_access_level })),
         members: [],
       };
       grouped.set(row.canonical_id, canonical);
@@ -1077,7 +1149,7 @@ export async function previewDeconsolidation(
       membershipId: row.membership_id,
       memberId: row.member_id,
       memberRevision: row.member_revision,
-      memberFingerprint: sha256(row.member_content),
+      memberFingerprint: sha256(stableJson({ content: row.member_content, accessLevel: row.member_access_level })),
     });
   }
   if (grouped.size !== ids.length) throw new Error('Canonical not found, inactive, or not owned by this key');
@@ -1104,25 +1176,27 @@ export async function applyDeconsolidation(
   const timestamp = (await client.query<{ now: string }>('SELECT statement_timestamp()::text AS now')).rows[0].now;
   let memberCount = 0;
   for (const canonical of manifest.canonicals) {
-    const canonicalRow = await client.query<{ revision: number; content: string }>(`
-      SELECT revision, content FROM memories WHERE id = $1::uuid AND namespace = $2 AND memory_kind = 'consolidation'
+    const canonicalRow = await client.query<{ revision: number; content: string; access_level: AccessLevel }>(`
+      SELECT revision, content, access_level FROM memories WHERE id = $1::uuid AND namespace = $2 AND memory_kind = 'consolidation'
     `, [canonical.canonicalId, manifest.namespace]);
     const currentCanonical = canonicalRow.rows[0];
-    if (!currentCanonical || currentCanonical.revision !== canonical.canonicalRevision ||
-        sha256(currentCanonical.content) !== canonical.canonicalFingerprint) {
+    if (!currentCanonical || !canAccessLevel(currentCanonical.access_level, auth.maxAccessLevel) ||
+        currentCanonical.revision !== canonical.canonicalRevision ||
+        sha256(stableJson({ content: currentCanonical.content, accessLevel: currentCanonical.access_level })) !== canonical.canonicalFingerprint) {
       throw new Error('Deconsolidation canonical changed since preview');
     }
     for (const member of canonical.members) {
       const active = await client.query<{
-        revision: number; content: string; canonical_id: string; membership_id: string;
+        revision: number; content: string; access_level: AccessLevel; canonical_id: string; membership_id: string;
       }>(`
-        SELECT m.revision, m.content, cm.canonical_id, cm.id AS membership_id
+        SELECT m.revision, m.content, m.access_level, cm.canonical_id, cm.id AS membership_id
         FROM memories m JOIN memory_consolidation_memberships cm ON cm.member_id = m.id
         WHERE m.id = $1::uuid AND cm.id = $2::uuid AND cm.deconsolidated_at IS NULL
           AND m.consolidated_into_id = $3::uuid
       `, [member.memberId, member.membershipId, canonical.canonicalId]);
       const row = active.rows[0];
-      if (!row || row.revision !== member.memberRevision || sha256(row.content) !== member.memberFingerprint) {
+      if (!row || !canAccessLevel(row.access_level, auth.maxAccessLevel) || row.revision !== member.memberRevision ||
+          sha256(stableJson({ content: row.content, accessLevel: row.access_level })) !== member.memberFingerprint) {
         throw new Error('Deconsolidation member changed since preview');
       }
       memberCount += 1;
@@ -1150,13 +1224,11 @@ function assertDeconsolidationAuthority(auth: AuthContext, namespace: string): v
   for (const permission of ['consolidate', 'read', 'write', 'delete']) {
     if (!auth.permissions.includes(permission)) throw new Error(`Permission denied: requires '${permission}'`);
   }
-  if (!auth.namespaces.includes(namespace) || auth.maxAccessLevel !== 'normal') {
-    throw new Error('Deconsolidation scope is not authorized');
-  }
+  if (!auth.namespaces.includes(namespace)) throw new Error('Deconsolidation scope is not authorized');
 }
 
 function memberFingerprint(member: {
-  id: string; content: string; namespace: string; revision: number; created_at: string;
+  id: string; content: string; namespace: string; access_level: AccessLevel; revision: number; created_at: string;
   embedding_provider: string | null; embedding_model: string | null; embedding_dimensions: number | null;
   embedding: string | null; updated_at: string; target_source_revision?: number; target_source_sha256?: string;
 }): string {
@@ -1164,6 +1236,7 @@ function memberFingerprint(member: {
     id: member.id,
     content: member.content,
     namespace: member.namespace,
+    accessLevel: member.access_level,
     revision: member.revision,
     createdAt: member.created_at,
     embeddingProvider: member.embedding_provider,

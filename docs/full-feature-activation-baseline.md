@@ -8,7 +8,7 @@ This is an activation plan, not a claim that dormant features work in production
 |---|---|---|---|
 | Local embeddings/search | Yes | Active local Qwen contract | Keep unchanged; synthesis never replaces or exports embeddings |
 | Queue ingestion: store/update/document/session | Yes | Active after durable-ingestion repair | Session storage is active; distillation is separate |
-| Consolidation | Normal-level selection/preview/apply | Run table empty | Migration 054 makes run/checkpoint/member schema level-capable; runtime selection/apply remains normal-only pending a separate reviewed change |
+| Consolidation | Exact-level selection/preview/apply for normal, sensitive, or secret | Run table initially empty | Run one namespace and one access-level lane at a time with an authorized key; subscription preview before separate write-approved apply |
 | Reflection | Bounded weekly windows; all-level policy/read/output support in this branch | Run table empty | Apply migration 054; provision a dedicated `read,reflection` key with source namespaces + `insights`, no `write/admin/delete`; dry run first |
 | Session distillation | Durable queue worker | No completed runs observed | Still normal-only and uses cross-owner/admin semantics; not enabled by this stage |
 | Entity graph | Extraction queue, entities, links, graph query | Entity/link tables empty | Still normal-only; requires bounded backfill preview and all-level worker review |
@@ -63,7 +63,7 @@ Parent-owned deployment steps, in order:
 
 ## Other feature sequence
 
-- Consolidation: selection-only, then preview, then separately write-approved apply; runtime remains normal-only in this stage.
+- Consolidation: run `--selection-only`, preview, and separately write-approved apply for one exact namespace/access-level lane at a time; never combine levels in one cluster.
 - Entity: bounded backfill preview, then at most 10 jobs per invocation after all-level policy/query work lands.
 - Taste: dry run before apply; current media path remains normal-only.
 - Session distillation: do not schedule until owner/admin attribution semantics and all-level revalidation are redesigned without forging authority.
@@ -74,7 +74,7 @@ Parent-owned deployment steps, in order:
 
 ## Remaining implementation work
 
-This bounded stage completes shared authorization/subscription primitives and the reflection vertical slice. Consolidation, session distillation, entity extraction, and taste profiling still have normal-only policy/query/worker gates and legacy USD-only budget schemas. Migration 054 removes schema blockers for future consolidation work but intentionally does not imply its runtime is all-level-ready. Session distillation additionally needs a reviewed replacement for its current admin/cross-owner behavior before the non-admin synthesis key can run it. No schedule for those features should be enabled yet.
+This stage completes all-level, subscription-native reflection and consolidation vertical slices. Session distillation, entity extraction, and taste profiling still have normal-only policy/query/worker gates and legacy USD-only budget schemas. Session distillation additionally needs a reviewed replacement for its current admin/cross-owner behavior before the non-admin synthesis key can run it. No schedule for those features should be enabled yet.
 
 ## Acceptance gates
 
