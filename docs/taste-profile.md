@@ -99,6 +99,8 @@ npm run taste-profile -- --category all --access-level all --period 2026-10 --ap
 
 Apply rejects a changed aggregate/fingerprint, expired policy/preview/approval, wrong category/month/lane/policy, malformed output, disabled/revoked key, or changed scope. An unchanged replay returns `unchanged` before provider or embedding use. Apply months oldest-to-newest within each category/lane.
 
+The isolated PostgreSQL authority acceptance test exercises successful sensitive- and secret-lane derivation with genuine hashed worker, connector, linked-memory, and reader keys. It verifies worker ownership of derived memories, unchanged connector ownership, current event-owner and linked-memory-owner provenance, replay idempotence, and normal-reader isolation from protected results. It also rechecks that the taste worker cannot directly read raw memories, media events, agents, or audit rows after protected-lane writes.
+
 ## Rollback
 
 Disable/remove the external schedule, remove `TASTE_PROFILE_POLICY_FILE` and the adapter credential, and disable/revoke the taste key. Existing profile memories remain lifecycle-managed records. Use supported memory lifecycle operations to retire a bad profile; do not delete media events or hand-edit provenance. Code rollback is a branch/deploy rollback plus policy/schedule disablement; migration 058 is additive and may remain installed while the key is disabled.
