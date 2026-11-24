@@ -112,6 +112,7 @@ const MIGRATION_OWNED_TABLES = [
   'audit_log',
   'connector_credentials',
   'connector_sync_state',
+  'contradiction_shadow_receipts',
   'documents',
   'entities',
   'entity_enrichment_queue',

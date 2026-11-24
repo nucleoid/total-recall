@@ -115,12 +115,25 @@ export async function notifyFailure(
     '--message', message, '--json', ...(dryRun ? ['--dry-run'] : [])];
   try {
     const result = await runFile(OPENCLAW_CLI, args, 30_000);
-    const parsed = JSON.parse(result.stdout);
-    if (!parsed || typeof parsed !== 'object') throw new Error('notification_receipt_invalid');
+    const parsed: unknown = JSON.parse(result.stdout);
+    if (!isAcceptedNotificationReceipt(parsed, dryRun)) throw new Error('notification_receipt_invalid');
     return { status: dryRun ? 'dry_run_accepted' : 'cli_accepted' };
   } catch {
     return { status: 'refused', code: 'official_cli_refused' };
   }
+}
+
+export function isAcceptedNotificationReceipt(value: unknown, expectedDryRun: boolean): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  if (receipt.action !== 'send' || receipt.channel !== 'discord' || receipt.dryRun !== expectedDryRun) return false;
+  if ('error' in receipt || receipt.sentBeforeError === true) return false;
+  if (!receipt.payload || typeof receipt.payload !== 'object' || Array.isArray(receipt.payload)) return false;
+  if ((receipt.payload as Record<string, unknown>).ok === false) return false;
+  if (['failed', 'partial_failed', 'suppressed'].includes(String(receipt.deliveryStatus ?? ''))) return false;
+  if (expectedDryRun) return true;
+  return typeof receipt.messageId === 'string' && receipt.messageId.length > 0 &&
+    (receipt.deliveryStatus === undefined || receipt.deliveryStatus === 'sent');
 }
 
 export async function runNativeActivation(cli: Cli, dependencies: ControllerDependencies = {}): Promise<Receipt> {
@@ -230,6 +243,9 @@ async function preflight(
     try { value = JSON.parse(policyResult.stdout); }
     catch { throw new Error('policy_json_invalid'); }
     return validateNativePolicyForLane(config, lane, value, now);
+  }
+  if (config.feature === 'contradiction-shadow') {
+    return { generationCallHardMax: 1, scopeBinding: 'exact-lane' };
   }
   return { generationCallHardMax: 0, scopeBinding: 'not-applicable' };
 }

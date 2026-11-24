@@ -55,16 +55,17 @@ test('worker profiles enforce one job and one concurrency where supported', () =
   assert.ok(argv.includes('--max-jobs') && argv.includes('1'));
 });
 
-test('contradiction shadow cannot launch a competing ingestion worker', () => {
+test('contradiction shadow invokes only the bounded read-only auditor', () => {
   const raw = config('contradiction-shadow');
   delete raw.policyFile;
-  delete raw.policySha256;
   delete raw.policyEnvironment;
-  delete raw.adapterProfile;
-  raw.lanes = [{ namespace: 'shared', accessLevel: 'normal', profile: 'needs-native-auditor', mode: 'blocked' }];
+  raw.lanes = [{ namespace: 'shared', accessLevel: 'normal', profile: 'read-only-auditor', mode: 'once' }];
   const parsed = parseNativeActivationConfig(raw, NOW);
-  assert.deepEqual(buildInvocationPlan(parsed, 0).commands, []);
-  assert.throws(() => parseNativeActivationConfig({ ...raw, enabled: true }, NOW), /needs_native_auditor/);
+  assert.deepEqual(buildInvocationPlan(parsed, 0).commands[0].argv, ['/usr/bin/npm', 'run',
+    'contradiction:audit', '--', '--once', '--namespace', 'shared', '--access-level', 'normal',
+    '--expected-policy-hash', 'a'.repeat(64)]);
+  assert.throws(() => parseNativeActivationConfig({ ...raw, lanes: [{ ...raw.lanes[0],
+    accessLevel: 'sensitive' }] }, NOW), /requires normal/);
 });
 
 test('native policy binds the active session lane and derives the hard call reservation', () => {

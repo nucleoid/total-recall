@@ -49,6 +49,7 @@
     "reflect": "tsx scripts/reflect.ts",
     "contradiction:review": "tsx scripts/contradiction-review.ts",
     "taste-profile": "tsx scripts/taste-profile.ts",
+    "contradiction:audit": "tsx scripts/contradiction-shadow-audit.ts",
     "entity:enrich": "tsx scripts/entity-enrich.ts",
     "entity:backfill": "tsx scripts/entity-backfill.ts",
     "session:distill": "tsx scripts/session-distill.ts",
