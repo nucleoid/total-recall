@@ -78,15 +78,23 @@ test('subscription entity policy is idempotent, all-level, strict, and OpenClaw-
 
 test('entity backfill selects one exact namespace and access-level lane', () => {
   assert.deepEqual(parseEntityBackfillCli(['--namespace','financial','--access-level','secret','--preview']),
-    {namespace:'financial',accessLevel:'secret',mode:'preview',limit:1000,selection:'missing',memoryIds:[],completedBefore:null});
+    {namespace:'financial',accessLevel:'secret',mode:'preview',limit:1000,selection:'missing',memoryIds:[],
+      completedBefore:null,sourceBefore:null});
   assert.throws(() => parseEntityBackfillCli(['--namespace','financial','--access-level','root','--preview']), /access-level/);
   assert.throws(() => parseEntityBackfillCli(['--namespace','financial','--execute','--preview']), /exactly one/);
   const id='00000000-0000-4000-8000-000000000123';
   assert.deepEqual(parseEntityBackfillCli(['--namespace','financial','--access-level','sensitive',
     '--requeue-completed-without-links','--completed-before','2020-01-01T00:00:00Z','--memory-id',id,'--limit','1','--execute']),
   {namespace:'financial',accessLevel:'sensitive',mode:'execute',limit:1,
-    selection:'completed-without-links',memoryIds:[id],completedBefore:'2020-01-01T00:00:00.000Z'});
+    selection:'completed-without-links',memoryIds:[id],completedBefore:'2020-01-01T00:00:00.000Z',sourceBefore:null});
   assert.throws(() => parseEntityBackfillCli(['--namespace','financial','--requeue-completed-without-links','--preview']), /completed-before/);
+  assert.deepEqual(parseEntityBackfillCli(['--namespace','financial','--access-level','sensitive',
+    '--requeue-legacy-uncovered','--source-before','2026-11-24T11:40:00Z','--limit','2','--preview']),
+  {namespace:'financial',accessLevel:'sensitive',mode:'preview',limit:2,
+    selection:'legacy-uncovered',memoryIds:[],completedBefore:null,sourceBefore:'2026-11-24T11:40:00.000Z'});
+  assert.throws(() => parseEntityBackfillCli(['--namespace','financial','--requeue-legacy-uncovered','--preview']), /source-before/);
+  assert.throws(() => parseEntityBackfillCli(['--namespace','financial','--requeue-legacy-uncovered',
+    '--source-before','2026-11-24T11:41:00Z','--preview']), /must equal/);
   assert.deepEqual(parseEntityWorkerCli(['--once','--memory-id',id]),
     {once:true,maxJobs:100,pollMs:1000,memoryIds:[id]});
 });
