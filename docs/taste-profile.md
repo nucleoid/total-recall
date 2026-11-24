@@ -28,7 +28,7 @@ The runtime key must be genuine, enabled, unexpired, unrevoked, and have:
 - `max_access_level` exactly equal to the highest enabled lane (`secret` when all lanes are enabled);
 - permissions exactly `read,taste_profile`, with no ordinary `write`, `admin`, ingestion, delete, or scheduler permissions.
 
-Migration 058 provides the only cross-owner lane: bounded SECURITY DEFINER functions validate each existing event owner and linked-memory owner as live, readable, namespace-authorized, and sufficiently classified. Restrictive RLS policies deny the worker raw `media_events`, `memories`, `agents`, and `audit_log` access. The derived profile and its agent/audit provenance are owned by the worker key; connector `client_id` values are never forged or rewritten.
+Migration 058 provides the only cross-owner lane: bounded SECURITY DEFINER functions validate each existing event owner and linked-memory owner as live, readable, namespace-authorized, and sufficiently classified. Forward migration 063 repairs the existing-profile update branch by disambiguating its local agent identifier; it does not replay or weaken 058. Restrictive RLS policies deny the worker raw `media_events`, `memories`, `agents`, and `audit_log` access. Created and updated profiles plus their agent/audit provenance remain owned by the worker key; connector `client_id` values are never forged or rewritten.
 
 Minimal policy shape (approval objects omitted here but required):
 
@@ -78,8 +78,7 @@ Minimal policy shape (approval objects omitted here but required):
     "enabled": true,
     "ownerInstruction": {
       "reference": "private owner instruction record",
-      "effectiveAt": "...",
-      "expiresAt": "..."
+      "effectiveAt": "..."
     },
     "operator": {
       "identity": "service:taste-profile-recurring",
@@ -91,7 +90,7 @@ Minimal policy shape (approval objects omitted here but required):
 }
 ```
 
-`standingAutomation` is optional and absent by default. Manual dry-run, preview, and apply do not require it. Recurring execution requires both its owner-instruction window and operator-authorization window to be currently effective. Keep those windows and references independent: the operator can have a bounded operational term (for example, 90 days) without inventing a monthly owner approval or representing the service identity as the owner.
+`standingAutomation` is optional and absent by default. Manual dry-run, preview, and apply do not require it. The referenced owner instruction persists until the private policy is disabled/replaced; the implementation does not invent an owner expiry or require monthly reapproval. The automation operator is separate and must have a currently effective bounded lease (for example, 90 days). Never represent the service identity as the owner.
 
 ## Preview and apply
 
@@ -125,10 +124,10 @@ npm run taste-profile -- --category all --access-level all --run-reviewed
 
 For each exact category/access lane, `--run-reviewed` first checks for an unchanged existing profile. An unchanged replay returns without provider or embedding calls. Otherwise it runs the existing bounded preview (at most two provider attempts total), validates the fixed style/evidence-ID schema, and renders the profile locally. It then creates a short-lived approval receipt attributed to the configured automation service and private authorization references—not to a fabricated human identity—and passes that receipt through the existing apply path. Apply itself makes zero provider calls and rechecks the current key, policy, source fingerprint, aggregate, source-owner authorization, linked-memory lifecycle/classification, approval windows, and Qwen embedding contract before mutation.
 
-Stored provenance includes the approval mode, operator identity, operator authorization reference, owner-instruction reference, receipt expiry, and policy hash. The policy hash binds the independent authority windows. Raw source IDs, ownership IDs, credentials, memory text, and private authority references are never added to model input. Manual preview/apply remains unchanged.
+Stored provenance includes the approval mode, operator identity, operator authorization reference, owner-instruction reference, receipt expiry, and policy hash. The policy hash binds the persistent owner instruction and separate operator lease. Raw source IDs, ownership IDs, credentials, memory text, and private authority references are never added to model input. Manual preview/apply remains unchanged.
 
-The isolated PostgreSQL authority acceptance test exercises successful sensitive- and secret-lane derivation with genuine hashed worker, connector, linked-memory, and reader keys. It verifies worker ownership of derived memories, unchanged connector ownership, current event-owner and linked-memory-owner provenance, replay idempotence, and normal-reader isolation from protected results. It also rechecks that the taste worker cannot directly read raw memories, media events, agents, or audit rows after protected-lane writes.
+The isolated PostgreSQL authority acceptance test exercises successful sensitive- and secret-lane derivation with genuine hashed worker, connector, linked-memory, and reader keys. It verifies worker ownership of derived memories, unchanged connector ownership, current event-owner and linked-memory-owner provenance, changed-evidence update, replay idempotence, and normal-reader isolation from protected results. Source drift or owner-authority revocation between review and apply leaves the prior profile and audit history unchanged. It also rechecks that the taste worker cannot directly read raw memories, media events, agents, or audit rows after protected-lane writes.
 
 ## Rollback
 
-Disable/remove the external schedule, remove `TASTE_PROFILE_POLICY_FILE` and the adapter credential, and disable/revoke the taste key. Existing profile memories remain lifecycle-managed records. Use supported memory lifecycle operations to retire a bad profile; do not delete media events or hand-edit provenance. Code rollback is a branch/deploy rollback plus policy/schedule disablement; migration 058 is additive and may remain installed while the key is disabled.
+Disable/remove the external schedule, remove `TASTE_PROFILE_POLICY_FILE` and the adapter credential, and disable/revoke the taste key. Existing profile memories remain lifecycle-managed records. Use supported memory lifecycle operations to retire a bad profile; do not delete media events or hand-edit provenance. Code rollback is a branch/deploy rollback plus policy/schedule disablement; migrations 058 and 063 are additive and may remain installed while the key is disabled.
