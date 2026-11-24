@@ -56,13 +56,13 @@ Supported subprofiles/modes:
 | session | `queued-session` | `once` | exact policy namespace/access lane; `--once --max-jobs 1`, reserves one call |
 | entity | `entity-enrichment` | `once` | exact policy namespace/access lane; one job and at most one call |
 | taste | `monthly-media` | `dry-run`, `preview`, `apply` | policy source namespace plus selected access level; only preview reserves the policy's two-call validation allowance |
-| contradiction-shadow | `read-only-auditor` | `once` | exact normal-access namespace; latest 50 current Qwen sources, one subject, at most five candidates, at most one private-adapter call; no memory mutation |
+| contradiction-shadow | `read-only-auditor` | `once` | exact namespace/access lane; latest 50 current Qwen sources, one subject, at most five candidates, at most one private-adapter call; no memory mutation |
 | maintenance | `lifecycle-finalize`, `supersession-finalize` | `verify` | reviewed idempotent finalizer only |
 | webhook | `delivery` | `once` | one delivery, concurrency one |
 
 Taste and consolidation artifact paths are container paths to owner-controlled files. The controller does not create approvals or copy artifacts.
 
-Contradiction audit requires migration 062 and a dedicated environment file containing the existing `CONTRADICTION_REVIEW_API_KEY` plus the approved contradiction runtime policy. The key must currently authorize exactly `read,contradiction_resolve`, one namespace, and normal access. Migration 062 adds an append-only claim/outcome ledger and restrictive RLS; apply it once through the normal migration ledger after 061. Do not replay it, backfill the corpus, create new embeddings, or enable automatic resolution. Unchanged subject revision, evidence, and policy are never retried. A no-candidate claim makes zero provider calls.
+Contradiction audit requires migration 062 and a dedicated environment file containing `CONTRADICTION_REVIEW_API_KEY` plus the approved contradiction runtime policy. The auditor key must currently authorize exactly `read,contradiction_audit`, one namespace, and the selected maximum access level. A normal key cannot audit sensitive or secret evidence. The separate existing `read,contradiction_resolve` reviewer authority remains unchanged. Migration 062 adds an append-only claim/outcome ledger and auditor-only restrictive RLS; apply it once through the normal migration ledger after 061. Do not replay it, backfill the corpus, create new embeddings, or enable automatic resolution. Unchanged subject revision, evidence, and policy are never retried. A no-candidate claim makes zero provider calls.
 
 ### Entity historical recovery
 

@@ -11,7 +11,7 @@ CREATE TABLE public.contradiction_shadow_receipts (
     'provider_timeout', 'provider_error', 'invalid_output'
   )),
   namespace TEXT NOT NULL,
-  access_level TEXT NOT NULL CHECK (access_level = 'normal'),
+  access_level TEXT NOT NULL CHECK (access_level IN ('normal', 'sensitive', 'secret')),
   subject_id UUID NOT NULL REFERENCES public.memories(id) ON DELETE RESTRICT,
   subject_revision INTEGER NOT NULL CHECK (subject_revision >= 0),
   subject_content_sha256 TEXT NOT NULL CHECK (subject_content_sha256 ~ '^[a-f0-9]{64}$'),
@@ -45,10 +45,10 @@ ON public.contradiction_shadow_receipts(namespace, access_level, created_at DESC
 ALTER TABLE public.contradiction_shadow_receipts ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON public.contradiction_shadow_receipts FROM PUBLIC, total_recall_app;
 
-CREATE OR REPLACE FUNCTION public.app_contradiction_review_scope_allowed(
+CREATE OR REPLACE FUNCTION public.app_contradiction_audit_scope_allowed(
   p_namespace TEXT, p_access_level TEXT
 ) RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
-  SELECT p_access_level = 'normal'
+  SELECT p_access_level IN ('normal', 'sensitive', 'secret')
     AND p_namespace = ANY(public.app_allowed_namespaces())
     AND EXISTS (
       SELECT 1 FROM public.api_keys key
@@ -59,30 +59,30 @@ CREATE OR REPLACE FUNCTION public.app_contradiction_review_scope_allowed(
         AND key.max_access_level = p_access_level
         AND (SELECT array_agg(permission ORDER BY permission)
              FROM unnest(key.permissions) permission)
-          = ARRAY['contradiction_resolve', 'read']::text[]
+          = ARRAY['contradiction_audit', 'read']::text[]
     )
 $$;
-REVOKE ALL ON FUNCTION public.app_contradiction_review_scope_allowed(TEXT, TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.app_contradiction_review_scope_allowed(TEXT, TEXT) TO total_recall_app;
+REVOKE ALL ON FUNCTION public.app_contradiction_audit_scope_allowed(TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.app_contradiction_audit_scope_allowed(TEXT, TEXT) TO total_recall_app;
 
 -- The specialized key has genuine read authority, but raw table access is still
 -- denied so its database capability is exactly the two auditor functions.
-DROP POLICY IF EXISTS contradiction_review_raw_deny ON public.memories;
-CREATE POLICY contradiction_review_raw_deny ON public.memories AS RESTRICTIVE FOR ALL
-  USING (NOT public.app_current_key_has_permission('contradiction_resolve'))
-  WITH CHECK (NOT public.app_current_key_has_permission('contradiction_resolve'));
-DROP POLICY IF EXISTS contradiction_review_raw_deny ON public.documents;
-CREATE POLICY contradiction_review_raw_deny ON public.documents AS RESTRICTIVE FOR ALL
-  USING (NOT public.app_current_key_has_permission('contradiction_resolve'))
-  WITH CHECK (NOT public.app_current_key_has_permission('contradiction_resolve'));
-DROP POLICY IF EXISTS contradiction_review_raw_deny ON public.memory_embedding_manifests;
-CREATE POLICY contradiction_review_raw_deny ON public.memory_embedding_manifests AS RESTRICTIVE FOR ALL
-  USING (NOT public.app_current_key_has_permission('contradiction_resolve'))
-  WITH CHECK (NOT public.app_current_key_has_permission('contradiction_resolve'));
-DROP POLICY IF EXISTS contradiction_review_raw_deny ON public.memory_embedding_chunks;
-CREATE POLICY contradiction_review_raw_deny ON public.memory_embedding_chunks AS RESTRICTIVE FOR ALL
-  USING (NOT public.app_current_key_has_permission('contradiction_resolve'))
-  WITH CHECK (NOT public.app_current_key_has_permission('contradiction_resolve'));
+DROP POLICY IF EXISTS contradiction_audit_raw_deny ON public.memories;
+CREATE POLICY contradiction_audit_raw_deny ON public.memories AS RESTRICTIVE FOR ALL
+  USING (NOT public.app_current_key_has_permission('contradiction_audit'))
+  WITH CHECK (NOT public.app_current_key_has_permission('contradiction_audit'));
+DROP POLICY IF EXISTS contradiction_audit_raw_deny ON public.documents;
+CREATE POLICY contradiction_audit_raw_deny ON public.documents AS RESTRICTIVE FOR ALL
+  USING (NOT public.app_current_key_has_permission('contradiction_audit'))
+  WITH CHECK (NOT public.app_current_key_has_permission('contradiction_audit'));
+DROP POLICY IF EXISTS contradiction_audit_raw_deny ON public.memory_embedding_manifests;
+CREATE POLICY contradiction_audit_raw_deny ON public.memory_embedding_manifests AS RESTRICTIVE FOR ALL
+  USING (NOT public.app_current_key_has_permission('contradiction_audit'))
+  WITH CHECK (NOT public.app_current_key_has_permission('contradiction_audit'));
+DROP POLICY IF EXISTS contradiction_audit_raw_deny ON public.memory_embedding_chunks;
+CREATE POLICY contradiction_audit_raw_deny ON public.memory_embedding_chunks AS RESTRICTIVE FOR ALL
+  USING (NOT public.app_current_key_has_permission('contradiction_audit'))
+  WITH CHECK (NOT public.app_current_key_has_permission('contradiction_audit'));
 
 CREATE OR REPLACE FUNCTION public.contradiction_shadow_claim(
   p_namespace TEXT, p_access_level TEXT, p_policy_hash TEXT
@@ -93,7 +93,7 @@ CREATE OR REPLACE FUNCTION public.contradiction_shadow_claim(
 DECLARE selected RECORD;
 DECLARE inserted_id UUID;
 BEGIN
-  IF NOT public.app_contradiction_review_scope_allowed(p_namespace, p_access_level) THEN
+  IF NOT public.app_contradiction_audit_scope_allowed(p_namespace, p_access_level) THEN
     RAISE EXCEPTION 'contradiction review key is not authorized' USING ERRCODE = '42501';
   END IF;
   IF p_policy_hash IS NULL OR p_policy_hash !~ '^[a-f0-9]{64}$' THEN
@@ -211,7 +211,7 @@ DECLARE classification_digest TEXT;
 BEGIN
   SELECT * INTO claim_record FROM public.contradiction_shadow_receipts
   WHERE id = p_claim_id AND phase = 'claim' AND status = 'claimed';
-  IF NOT FOUND OR NOT public.app_contradiction_review_scope_allowed(
+  IF NOT FOUND OR NOT public.app_contradiction_audit_scope_allowed(
       claim_record.namespace, claim_record.access_level) THEN
     RAISE EXCEPTION 'contradiction claim is not authorized' USING ERRCODE = '42501';
   END IF;

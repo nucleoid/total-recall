@@ -39,7 +39,7 @@ function policy() {
 
 function auth(): AuthContext {
   return { keyId: KEY_ID, name: 'contradiction-review', namespaces: ['shared'],
-    permissions: ['read', 'contradiction_resolve'], maxAccessLevel: 'normal' };
+    permissions: ['read', 'contradiction_audit'], maxAccessLevel: 'normal' };
 }
 
 function options() {
@@ -61,12 +61,12 @@ function fakePool(claim: Record<string, unknown>, outcome = 'classified') {
   return { calls, pool: { connect: async () => client } as unknown as pg.Pool };
 }
 
-test('CLI is fixed to one normal-access lane and one expected runtime policy hash', () => {
+test('CLI is fixed to one exact access lane and one expected runtime policy hash', () => {
   const parsed = parseContradictionAuditCli(['--once', '--namespace', 'shared', '--access-level', 'normal',
     '--expected-policy-hash', HASH]);
   assert.equal(parsed.namespace, 'shared');
-  assert.throws(() => parseContradictionAuditCli(['--once', '--namespace', 'shared', '--access-level', 'secret',
-    '--expected-policy-hash', HASH]), /exactly normal/);
+  assert.equal(parseContradictionAuditCli(['--once', '--namespace', 'shared', '--access-level', 'secret',
+    '--expected-policy-hash', HASH]).accessLevel, 'secret');
   assert.throws(() => parseContradictionAuditCli(['--namespace', 'shared', '--access-level', 'normal',
     '--expected-policy-hash', HASH]), /--once/);
 });
@@ -79,7 +79,19 @@ test('policy fingerprint is hashed before PostgreSQL text use and authority is e
   assert.equal(hash.includes('\0'), false);
   assert.doesNotThrow(() => assertContradictionAuditAuthority(auth(), approved, options()));
   assert.throws(() => assertContradictionAuditAuthority({ ...auth(), permissions: ['read', 'write',
-    'contradiction_resolve'] }, approved, options()), /authority_mismatch/);
+    'contradiction_audit'] }, approved, options()), /authority_mismatch/);
+});
+
+test('auditor authority binds the selected sensitive or secret lane without downgrade', () => {
+  const secretPolicy = { ...policy(), accessLevel: 'secret' } as ReturnType<typeof policy> & { accessLevel: 'secret' };
+  const secretOptions = { ...options(), accessLevel: 'secret' as const,
+    expectedPolicyHash: contradictionAuditPolicyHash(secretPolicy) };
+  const secretAuth = { ...auth(), maxAccessLevel: 'secret' as const };
+  assert.doesNotThrow(() => assertContradictionAuditAuthority(secretAuth, secretPolicy, secretOptions));
+  assert.throws(() => assertContradictionAuditAuthority({ ...secretAuth, maxAccessLevel: 'normal' },
+    secretPolicy, secretOptions), /authority_mismatch/);
+  assert.throws(() => assertContradictionAuditAuthority(secretAuth, secretPolicy,
+    { ...secretOptions, accessLevel: 'normal' }), /policy_mismatch/);
 });
 
 test('no-candidate receipt performs zero provider calls and no memory mutation', async () => {

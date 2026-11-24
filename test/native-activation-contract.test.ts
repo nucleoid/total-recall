@@ -64,8 +64,8 @@ test('contradiction shadow invokes only the bounded read-only auditor', () => {
   assert.deepEqual(buildInvocationPlan(parsed, 0).commands[0].argv, ['/usr/bin/npm', 'run',
     'contradiction:audit', '--', '--once', '--namespace', 'shared', '--access-level', 'normal',
     '--expected-policy-hash', 'a'.repeat(64)]);
-  assert.throws(() => parseNativeActivationConfig({ ...raw, lanes: [{ ...raw.lanes[0],
-    accessLevel: 'sensitive' }] }, NOW), /requires normal/);
+  assert.equal(parseNativeActivationConfig({ ...raw, lanes: [{ ...raw.lanes[0],
+    accessLevel: 'sensitive' }] }, NOW).lanes[0].accessLevel, 'sensitive');
 });
 
 test('native policy binds the active session lane and derives the hard call reservation', () => {

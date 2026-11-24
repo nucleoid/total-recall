@@ -64,13 +64,21 @@ test('supported key management provisions a scoped contradiction reviewer', () =
   assert.equal(parsed.maxAccessLevel, 'secret');
 });
 
+test('supported key management provisions an exact contradiction audit credential', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'contradiction-auditor', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'financial', '--permissions', 'read,contradiction_audit', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'contradiction_audit']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
 test('supported key management provisions scoped taste-profile permission', () => {
   const parsed = parseCreateKeyArgs([
     '--name', 'taste-profile', '--rpm', '6', '--daily-quota', '100',
     '--namespaces', 'media,personal', '--permissions', 'read,taste_profile', '--max-access-level', 'secret',
   ], {}, now);
   assert.deepEqual(parsed.permissions, ['read', 'taste_profile']);
-
   assert.equal(parsed.maxAccessLevel, 'secret');
 });
 

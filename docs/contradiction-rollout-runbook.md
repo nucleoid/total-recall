@@ -79,7 +79,7 @@ Reversal never reopens or deletes immutable history. It closes the reviewed succ
 
 ## Native read-only auditor
 
-Migration 062 provides a separate, append-only shadow claim/outcome ledger for the scheduled native auditor. This auditor is not another ingestion worker and never resolves or mutates a memory. Its dedicated key must currently authorize exactly `read,contradiction_resolve`, one approved namespace, and `normal` access.
+Migration 062 provides a separate, append-only shadow claim/outcome ledger for the scheduled native auditor. This auditor is not another ingestion worker and never resolves or mutates a memory. Its dedicated key must currently authorize exactly `read,contradiction_audit`, one approved namespace, and the exact selected maximum access level (`normal`, `sensitive`, or `secret`). This authority is separate from the existing `read,contradiction_resolve` manual reviewer and does not change its preview, apply, or reversal path.
 
 Each `--once` invocation considers only the latest 50 current semantic memories backed by the active Qwen manifest contract, chooses one subject and at most five candidates, and makes at most one call through `openclaw/total-recall-synthesis`. It creates no embeddings and performs no corpus walk or historical backfill. Claims are unique by subject revision, approved policy hash, and evidence hash; unchanged evidence cannot retry. No-candidate claims are durably recorded with zero provider calls.
 
@@ -87,7 +87,7 @@ The controller command is fixed:
 
 ```sh
 npm run contradiction:audit -- --once --namespace EXACT_NAMESPACE \
-  --access-level normal --expected-policy-hash RUNTIME_POLICY_FINGERPRINT_SHA256
+  --access-level EXACT_LEVEL --expected-policy-hash RUNTIME_POLICY_FINGERPRINT_SHA256
 ```
 
 The CLI recomputes the approved runtime policy fingerprint before passing its hexadecimal hash to PostgreSQL; the imported fingerprint's NUL separators never reach a PostgreSQL text parameter. Receipts expose only fixed status, call count, classification/confidence, and hashes—never source text, candidate IDs, prompts, or model output. Apply only pending migration 062 through the migration ledger after 061; do not replay migrations or activate a timer as part of migration installation.
