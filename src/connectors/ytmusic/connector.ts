@@ -44,6 +44,52 @@ export interface YtmusicConnectorOptions {
   runHelper?: YtmusicHelperRunner;
 }
 
+export function createRemoteYtmusicHelperRunner(endpoint: string, apiKey: string): YtmusicHelperRunner {
+  const url = new URL(endpoint);
+  if (url.protocol !== 'https:' || url.pathname !== '/v1/ytmusic/fetch' ||
+      url.username || url.password || url.hash || url.search) {
+    throw new Error('YTMUSIC_HELPER_ENDPOINT must be a credential-free HTTPS URL');
+  }
+  if (!apiKey.trim()) throw new Error('YTMUSIC_HELPER_API_KEY is required for the remote helper');
+  return async (args, inheritStdio = false, stdinPayload) => {
+    if (inheritStdio || args.length !== 3 || args[0] !== 'fetch' || args[1] !== '--token-file' || !stdinPayload) {
+      throw new Error('Remote YouTube Music helper supports non-interactive fetch only');
+    }
+    let token: unknown;
+    try { token = JSON.parse(stdinPayload); } catch { throw new Error('Remote YouTube Music helper token payload is invalid'); }
+    const response = await fetch(url, {
+      method: 'POST',
+      signal: AbortSignal.timeout(60_000),
+      headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    if (!response.ok) throw new Error('Remote YouTube Music helper failed with status ' + response.status);
+    const body = await readBoundedResponse(response, 2 * 1024 * 1024);
+    const value = JSON.parse(body) as Partial<ChildResult>;
+    if (typeof value.stdout !== 'string' || typeof value.stderr !== 'string' ||
+        !Number.isSafeInteger(value.code)) throw new Error('Remote YouTube Music helper returned an invalid response');
+    return value as ChildResult;
+  };
+}
+
+async function readBoundedResponse(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > maxBytes) {
+      await reader.cancel();
+      throw new Error('Remote YouTube Music helper response exceeded byte limit');
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 const runPython: YtmusicHelperRunner = (args, inheritStdio = false, stdinPayload) => {
   return new Promise((resolve, reject) => {
     const stdinMode = stdinPayload !== undefined ? 'pipe' : (inheritStdio ? 'inherit' : 'pipe');
@@ -70,7 +116,10 @@ export class YtmusicConnector extends BaseConnector {
 
   constructor(options: YtmusicConnectorOptions = {}) {
     super();
-    this.runHelper = options.runHelper ?? runPython;
+    const remoteEndpoint = process.env.YTMUSIC_HELPER_ENDPOINT?.trim();
+    this.runHelper = options.runHelper ?? (remoteEndpoint
+      ? createRemoteYtmusicHelperRunner(remoteEndpoint, process.env.YTMUSIC_HELPER_API_KEY ?? '')
+      : runPython);
   }
 
   /**
@@ -137,7 +186,7 @@ export class YtmusicConnector extends BaseConnector {
 
       const args = buildYtmusicFetchArgs(tokenPath);
 
-      const result = await this.runHelper(args);
+      const result = await this.runHelper(args, false, JSON.stringify(stored));
       if (result.code !== 0) {
         throw new Error(`ytmusic fetch failed: ${result.stderr || 'exit ' + result.code}`);
       }

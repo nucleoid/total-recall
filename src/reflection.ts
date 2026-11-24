@@ -2,10 +2,12 @@ import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { resolveAgent } from './agents.js';
+import { accessLevelSql } from './auth.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR, embeddingDescriptorParams } from './embedding-descriptor.js';
 import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
 import { generateBounded, HttpJsonGenerationProvider, type GenerationProvider } from './generation.js';
 import type { AccessLevel, AuthContext } from './types.js';
+import { assertDerivedAccessNotDowngraded, assertSynthesisAuthority, assertSubscriptionGeneration, isSubscriptionUsage, maximumAccessLevel, synthesisAccessLevelSchema } from './synthesis-policy.js';
 
 export const REFLECTION_POLICY_VERSION = 1;
 export const DEFAULT_REFLECTION_CANDIDATE_LIMIT = 100;
@@ -51,25 +53,53 @@ export const reflectionPolicySchema = z.object({
   }).strict(),
   scope: z.object({
     namespaces: z.tuple([namespaceSchema]),
-    accessLevel: z.literal('normal'),
+    accessLevel: synthesisAccessLevelSchema,
   }).strict(),
   selection: z.object({
     maxCandidates: positiveInteger.min(2).max(HARD_REFLECTION_CANDIDATE_LIMIT),
     maxInputBytes: positiveInteger.min(1024).max(HARD_REFLECTION_INPUT_BYTES),
     maxInsights: positiveInteger.max(MAX_REFLECTION_INSIGHTS),
   }).strict(),
-  budget: z.object({
-    maxCallsPerRun: positiveInteger.max(10),
-    maxOutputBytesPerRun: positiveInteger.max(10 * MAX_REFLECTION_OUTPUT_BYTES),
-    maxCostUsdPerRun: z.number().finite().positive(),
-    maxCostUsdPerMonth: z.number().finite().positive(),
-    estimatedRequestCostUsd: nonnegativeFinite,
-    estimatedInputCostUsdPerMillionBytes: nonnegativeFinite,
-    estimatedOutputCostUsdPerMillionBytes: nonnegativeFinite,
-    monthlyControlReference: z.string().trim().min(1).max(1024),
-  }).strict().refine(value => value.maxCostUsdPerMonth >= value.maxCostUsdPerRun, {
-    message: 'Monthly reflection budget must be at least the per-run budget',
-  }),
+  budget: z.union([
+    z.object({
+      mode: z.literal('paid').optional(),
+      maxCallsPerRun: positiveInteger.max(10),
+      maxOutputBytesPerRun: positiveInteger.max(10 * MAX_REFLECTION_OUTPUT_BYTES),
+      maxCostUsdPerRun: z.number().finite().positive(),
+      maxCostUsdPerMonth: z.number().finite().positive(),
+      estimatedRequestCostUsd: nonnegativeFinite,
+      estimatedInputCostUsdPerMillionBytes: nonnegativeFinite,
+      estimatedOutputCostUsdPerMillionBytes: nonnegativeFinite,
+      monthlyControlReference: z.string().trim().min(1).max(1024),
+    }).strict().refine(value => value.maxCostUsdPerMonth >= value.maxCostUsdPerRun,
+      'Monthly reflection budget must be at least the per-run budget')
+      .transform(value => ({ ...value, mode: 'paid' as const })),
+    z.union([
+      z.object({
+        mode: z.literal('subscription'),
+        maxCallsPerRun: positiveInteger.max(10),
+        maxOutputBytesPerRun: positiveInteger.max(10 * MAX_REFLECTION_OUTPUT_BYTES),
+        usageControlReference: z.string().trim().min(1).max(1024),
+      }).strict().transform(value => ({
+        ...value, maxCostUsdPerRun: 0, maxCostUsdPerMonth: 0,
+        estimatedRequestCostUsd: 0, estimatedInputCostUsdPerMillionBytes: 0,
+        estimatedOutputCostUsdPerMillionBytes: 0, monthlyControlReference: value.usageControlReference,
+      })),
+      z.object({
+        mode: z.literal('subscription'),
+        maxCallsPerRun: positiveInteger.max(10),
+        maxOutputBytesPerRun: positiveInteger.max(10 * MAX_REFLECTION_OUTPUT_BYTES),
+        usageControlReference: z.string().trim().min(1).max(1024),
+        maxCostUsdPerRun: z.literal(0),
+        maxCostUsdPerMonth: z.literal(0),
+        estimatedRequestCostUsd: z.literal(0),
+        estimatedInputCostUsdPerMillionBytes: z.literal(0),
+        estimatedOutputCostUsdPerMillionBytes: z.literal(0),
+        monthlyControlReference: z.string().trim().min(1).max(1024),
+      }).strict().refine(value => value.monthlyControlReference === value.usageControlReference,
+        'Canonical subscription usage references must match'),
+    ]),
+  ]),
   providerModelApproval: approvalSchema,
   termsApproval: approvalSchema,
   scopeApproval: approvalSchema,
@@ -83,6 +113,7 @@ export function parseReflectionPolicy(input: unknown, expectedEnvironment: strin
   if (policy.environment !== expectedEnvironment) {
     throw new Error('Reflection policy environment does not match this deployment');
   }
+  assertSubscriptionGeneration(policy.generation, policy.budget);
   assertReflectionPolicyEffective(policy, now);
   return policy;
 }
@@ -103,6 +134,15 @@ export function assertReflectionPolicyEffective(policy: ReflectionPolicy, now = 
 
 export function reflectionPolicyHash(policy: ReflectionPolicy): string {
   return sha256(stableJson(policy));
+}
+
+export function reflectionRunLockKey(
+  namespace: string,
+  window: ReflectionWindow,
+  configHash: string,
+): string {
+  // PostgreSQL text parameters reject NUL. A JSON tuple is unambiguous and remains content-free.
+  return JSON.stringify([namespace, window.start.toISOString(), window.end.toISOString(), configHash]);
 }
 
 export interface ReflectionWindow { start: Date; end: Date }
@@ -136,7 +176,7 @@ export interface ReflectionCandidate {
 /** Select IDs and bounded metadata only; policy validation must precede loading content. */
 export async function selectReflectionCandidates(
   client: ScopedClient,
-  options: { namespace: string; window: ReflectionWindow; limit?: number },
+  options: { namespace: string; window: ReflectionWindow; accessLevel: AccessLevel; limit?: number },
 ): Promise<ReflectionCandidate[]> {
   const limit = boundedInteger(options.limit ?? DEFAULT_REFLECTION_CANDIDATE_LIMIT, 2,
     HARD_REFLECTION_CANDIDATE_LIMIT, 'candidate limit');
@@ -144,7 +184,7 @@ export async function selectReflectionCandidates(
     WITH recent AS (
       SELECT m.id, row_number() OVER (ORDER BY m.created_at DESC, m.id) AS recent_rank
       FROM memories m
-      WHERE m.namespace = $1 AND m.access_level = 'normal'
+      WHERE m.namespace = $1 AND ${accessLevelSql('m.access_level', '$5')}
         AND m.created_at >= $2::timestamptz AND m.created_at < $3::timestamptz
         AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
         AND m.superseded_at IS NULL AND m.valid_to IS NULL
@@ -155,7 +195,7 @@ export async function selectReflectionCandidates(
     ), active AS (
       SELECT m.id, row_number() OVER (ORDER BY m.access_count DESC, m.accessed_at DESC, m.id) AS active_rank
       FROM memories m
-      WHERE m.namespace = $1 AND m.access_level = 'normal'
+      WHERE m.namespace = $1 AND ${accessLevelSql('m.access_level', '$5')}
         AND m.accessed_at < $3::timestamptz AND m.access_count > 0
         AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
         AND m.superseded_at IS NULL AND m.valid_to IS NULL
@@ -177,7 +217,7 @@ export async function selectReflectionCandidates(
     ORDER BY LEAST(COALESCE(s.recent_rank * 2 - 1, 9223372036854775807),
       COALESCE(s.active_rank * 2, 9223372036854775807)), m.id
     LIMIT $4
-  `, [options.namespace, options.window.start.toISOString(), options.window.end.toISOString(), limit]);
+  `, [options.namespace, options.window.start.toISOString(), options.window.end.toISOString(), limit, options.accessLevel]);
   return result.rows.map((row: any) => ({
     id: row.id, revision: Number(row.revision), accessLevel: row.access_level,
     createdAt: row.created_at, accessedAt: row.accessed_at, accessCount: Number(row.access_count),
@@ -251,6 +291,22 @@ const insightSchema = z.object({
 const insightEnvelopeSchema = z.object({ insights: z.array(insightSchema).max(MAX_REFLECTION_INSIGHTS) }).strict();
 export type GeneratedReflectionInsight = z.infer<typeof insightSchema>;
 
+export function reflectionInsightAccessLevel(
+  promptCandidates: readonly Pick<ReflectionCandidate, 'id' | 'accessLevel'>[],
+  revalidatedAccessLevels: readonly AccessLevel[],
+  insight: Pick<GeneratedReflectionInsight, 'evidence_ids'>,
+): AccessLevel {
+  const promptIds = new Set(promptCandidates.map(candidate => candidate.id));
+  if (insight.evidence_ids.some(id => !promptIds.has(id))) throw new Error('invalid_reflection_evidence');
+  if (revalidatedAccessLevels.length !== promptCandidates.length) throw new Error('reflection_evidence_changed');
+  // Every materialized record may influence generation, whether or not the model cites it.
+  // Include both prompt-time and revalidated levels so a concurrent reclassification cannot downgrade output.
+  return maximumAccessLevel([
+    ...promptCandidates.map(candidate => candidate.accessLevel),
+    ...revalidatedAccessLevels,
+  ]);
+}
+
 export function validateReflectionOutput(
   output: string,
   sampledIds: readonly string[],
@@ -312,16 +368,17 @@ export async function runReflection(options: RunReflectionOptions): Promise<RunR
   // Re-parse at the execution boundary so a programmatic caller cannot bypass
   // any of the four approvals with a structurally cast object.
   options = { ...options, policy: parseReflectionPolicy(options.policy, options.environment) };
-  assertReflectionAuthority(options.auth, options.namespace);
-  if (options.policy.environment !== options.environment || options.policy.scope.namespaces[0] !== options.namespace ||
-      options.policy.scope.accessLevel !== 'normal') throw new Error('Requested reflection scope is not approved by policy');
+  assertReflectionAuthority(options.auth, options.namespace, options.policy.scope.accessLevel);
+  if (options.policy.environment !== options.environment || options.policy.scope.namespaces[0] !== options.namespace) {
+    throw new Error('Requested reflection scope is not approved by policy');
+  }
   if (options.force && options.dryRun) throw new Error('--force cannot be combined with --dry-run');
   const window = validateReflectionWindow(options.window);
   const scope = dbScopeFromAuth(options.auth);
 
   // Approval is checked before this transaction materializes any source text.
   const selected = await withScopedClient(scope, client => selectReflectionCandidates(client, {
-    namespace: options.namespace, window, limit: options.policy.selection.maxCandidates,
+    namespace: options.namespace, window, accessLevel: options.policy.scope.accessLevel, limit: options.policy.selection.maxCandidates,
   }));
   const materialized = await withScopedClient(scope, client =>
     materializeReflectionInput(client, selected, options.policy.selection.maxInputBytes));
@@ -405,15 +462,12 @@ export async function runReflection(options: RunReflectionOptions): Promise<RunR
   }
 }
 
-export function assertReflectionAuthority(auth: AuthContext, namespace: string): void {
-  const expectedNamespaces = [namespace, 'insights'].sort();
-  if (JSON.stringify([...auth.namespaces].sort()) !== JSON.stringify(expectedNamespaces) ||
-      auth.maxAccessLevel !== 'normal') {
-    throw new Error('Reflection requires a dedicated normal-only key for exactly the source and insights namespaces');
-  }
-  const expectedPermissions = ['read', 'reflection'];
-  if (JSON.stringify([...auth.permissions].sort()) !== JSON.stringify(expectedPermissions)) {
-    throw new Error("Reflection key permissions must be exactly 'read,reflection'");
+export function assertReflectionAuthority(auth: AuthContext, namespace: string, accessLevel: AccessLevel = 'normal'): void {
+  assertSynthesisAuthority(auth, [namespace, 'insights'], accessLevel);
+  const permissions = new Set(auth.permissions);
+  if (!permissions.has('read') || !permissions.has('reflection') || permissions.has('write') ||
+      permissions.has('admin') || permissions.has('delete')) {
+    throw new Error("Reflection key requires 'read,reflection' without write, admin, or delete");
   }
 }
 
@@ -423,7 +477,7 @@ async function claimReflectionRun(
 ): Promise<ClaimedRun> {
   return withScopedClient(dbScopeFromAuth(options.auth), async client => {
     await client.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [REFLECTION_LOCK_FEATURE,
-      `${options.namespace}\0${options.window.start.toISOString()}\0${options.window.end.toISOString()}\0${configHash}`]);
+      reflectionRunLockKey(options.namespace, options.window, configHash)]);
     const existing = await client.query<any>(`
       SELECT id, generation, status, provider_calls, insights_stored, estimated_cost_micro_usd, updated_at
       FROM memory_reflection_runs
@@ -474,16 +528,20 @@ async function reserveReflectionBudget(
   if (!row || row.status !== 'running') return { allowed: false, cost: 0, code: 'run_unavailable' };
   if (Number(row.provider_calls) + 1 > policy.budget.maxCallsPerRun ||
       Number(row.output_bytes) + MAX_REFLECTION_OUTPUT_BYTES > policy.budget.maxOutputBytesPerRun ||
-      Number(row.estimated_cost_micro_usd) + cost > Math.floor(policy.budget.maxCostUsdPerRun * 1_000_000)) {
+      (!isSubscriptionUsage(policy.budget) &&
+        Number(row.estimated_cost_micro_usd) + cost > Math.floor(policy.budget.maxCostUsdPerRun * 1_000_000))) {
     return { allowed: false, cost: 0, code: 'run_budget_exhausted' };
   }
-  const month = await client.query<{ spent: string }>(`
+  const month = isSubscriptionUsage(policy.budget)
+    ? { rows: [{ spent: '0' }] }
+    : await client.query<{ spent: string }>(`
     SELECT COALESCE(sum(estimated_cost_micro_usd), 0)::text AS spent FROM memory_reflection_runs
     WHERE origin_namespace = $1 AND provider = $2 AND model = $3
       AND started_at >= date_trunc('month', statement_timestamp())
       AND started_at < date_trunc('month', statement_timestamp()) + interval '1 month'
   `, [namespace, policy.generation.provider, policy.generation.model]);
-  if (Number(month.rows[0]?.spent ?? 0) + cost > Math.floor(policy.budget.maxCostUsdPerMonth * 1_000_000)) {
+  if (!isSubscriptionUsage(policy.budget) &&
+      Number(month.rows[0]?.spent ?? 0) + cost > Math.floor(policy.budget.maxCostUsdPerMonth * 1_000_000)) {
     return { allowed: false, cost: 0, code: 'monthly_budget_exhausted' };
   }
   await client.query(`UPDATE memory_reflection_runs SET provider_calls = provider_calls + 1,
@@ -508,22 +566,22 @@ async function applyReflectionInsights(client: ScopedClient, options: ApplyRefle
   const ids = options.candidates.map(candidate => candidate.id);
   const evidence = await client.query<any>(`
     SELECT id, revision, access_level, content FROM memories
-    WHERE id = ANY($1::uuid[]) AND namespace = $2 AND access_level = 'normal'
+    WHERE id = ANY($1::uuid[]) AND namespace = $2 AND ${accessLevelSql('access_level', '$3')}
       AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())
       AND superseded_at IS NULL AND valid_to IS NULL
       AND consolidated_into_id IS NULL AND document_id IS NULL
       AND memory_kind NOT IN ('document_chunk', 'episode_chunk', 'insight')
     ORDER BY id FOR SHARE
-  `, [ids, options.namespace]);
+  `, [ids, options.namespace, options.policy.scope.accessLevel]);
   const expected = new Map(options.candidates.map(candidate => [candidate.id,
     `${candidate.revision}\0${candidate.content}`]));
   if (evidence.rows.length !== ids.length || evidence.rows.some((row: any) =>
     expected.get(row.id) !== `${Number(row.revision)}\0${row.content}`)) throw new Error('reflection_evidence_changed');
-  const accessLevels = new Map(evidence.rows.map((row: any) => [row.id, row.access_level as AccessLevel]));
+  const revalidatedAccessLevels = evidence.rows.map((row: any) => row.access_level as AccessLevel);
   let stored = 0;
   for (let index = 0; index < options.insights.length; index += 1) {
     const insight = options.insights[index];
-    const accessLevel = maximumAccessLevel(insight.evidence_ids.map(id => accessLevels.get(id)!));
+    const accessLevel = reflectionInsightAccessLevel(options.candidates, revalidatedAccessLevels, insight);
     const hash = reflectionInsightHash(insight.content);
     const existing = await client.query<{ id: string; access_level: AccessLevel }>(`
       SELECT id, access_level FROM memories
@@ -532,9 +590,7 @@ async function applyReflectionInsights(client: ScopedClient, options: ApplyRefle
         AND deleted_at IS NULL FOR UPDATE
     `, [options.namespace, hash, ...embeddingDescriptorParams()]);
     let insightId = existing.rows[0]?.id;
-    if (insightId && accessRank(existing.rows[0].access_level) < accessRank(accessLevel)) {
-      throw new Error('existing_reflection_access_too_low');
-    }
+    if (insightId) assertDerivedAccessNotDowngraded(existing.rows[0].access_level, accessLevel);
     if (!insightId) {
       const inserted = await client.query<{ id: string }>(`
         INSERT INTO memories (
@@ -559,9 +615,8 @@ async function applyReflectionInsights(client: ScopedClient, options: ApplyRefle
             AND embedding_provider = $3 AND embedding_model = $4 AND embedding_dimensions = $5
             AND deleted_at IS NULL FOR UPDATE
         `, [options.namespace, hash, ...embeddingDescriptorParams()]);
-        if (!raced.rows[0] || accessRank(raced.rows[0].access_level) < accessRank(accessLevel)) {
-          throw new Error('reflection_content_identity_conflict');
-        }
+        if (!raced.rows[0]) throw new Error('reflection_content_identity_conflict');
+        assertDerivedAccessNotDowngraded(raced.rows[0].access_level, accessLevel);
         insightId = raced.rows[0].id;
       }
     }
@@ -585,10 +640,6 @@ async function applyReflectionInsights(client: ScopedClient, options: ApplyRefle
 function reflectionTags(tags: readonly string[]): string[] {
   return [...new Set([...tags, 'insight', 'reflection'])].sort().slice(0, 22);
 }
-function maximumAccessLevel(levels: readonly AccessLevel[]): AccessLevel {
-  return levels.reduce((maximum, level) => accessRank(level) > accessRank(maximum) ? level : maximum, 'normal');
-}
-function accessRank(level: AccessLevel): number { return level === 'secret' ? 2 : level === 'sensitive' ? 1 : 0; }
 function serializeVector(values: number[]): string {
   if (!Array.isArray(values) || values.length !== ACTIVE_EMBEDDING_DESCRIPTOR.dimensions ||
       values.some(value => typeof value !== 'number' || !Number.isFinite(value))) {

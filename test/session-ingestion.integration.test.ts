@@ -25,15 +25,15 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { registerTools } from '../src/tools/register.js';
 
-function policy() {
+function policy(accessLevel: 'normal' | 'sensitive' | 'secret' = 'normal') {
   const approval={ approved:true,approvedBy:'synthetic-test',approvedAt:'2020-01-01T00:00:00Z',expiresAt:'2099-01-01T00:00:00Z' };
   return parseSessionDistillationPolicy({
     version:1,feature:'memory-session-distillation',environment:'test',
-    generation:{ provider:'synthetic',model:'synthetic-model',endpoint:'https://example.test/generate',credentialEnv:'SESSION_TEST_KEY' },
+    generation:{ provider:'openclaw-adapter',model:'openclaw/total-recall-synthesis',endpoint:'https://example.test/generate',credentialEnv:'SESSION_TEST_KEY' },
     terms:{ reference:'synthetic/57',privacyApproved:true,retentionApproved:true,trainingApproved:true },
-    scope:{ namespaces:['shared'],accessLevel:'normal' },
-    budget:{ maxInputBytesPerSession:1100000,maxOutputBytesPerSession:65536,maxCostUsdPerSession:1,maxCostUsdPerMonth:100,
-      estimatedRequestCostUsd:0.001,estimatedInputCostUsdPerMillionBytes:1,estimatedOutputCostUsdPerMillionBytes:4,monthlyControlReference:'synthetic-budget' },
+    scope:{ namespaces:['shared'],accessLevel },
+    budget:{ mode:'subscription',maxInputBytesPerSession:1100000,maxOutputBytesPerSession:65536,
+      usageControlReference:'synthetic-subscription-quota' },
     providerModelApproval:approval,termsApproval:approval,scopeApproval:approval,budgetApproval:approval,
   },'test');
 }
@@ -85,9 +85,10 @@ test('queued sessions retain physical transcripts independently of embedding and
   await finalizeMemoryValidity(owner);
   app=new pg.Pool({ connectionString:`postgresql://total_recall_app:app-test-only@127.0.0.1:${port}/postgres` }); setPoolForTesting(app);
   const auth:AuthContext={ keyId:randomUUID(),name:'session-owner',namespaces:['shared'],permissions:['read','write','delete'],maxAccessLevel:'secret' };
-  const admin:AuthContext={ ...auth,keyId:randomUUID(),name:'session-worker',permissions:['read','write','admin'],maxAccessLevel:'normal' };
+  const admin:AuthContext={ ...auth,keyId:randomUUID(),name:'ingestion-worker',permissions:['read','write','admin'],maxAccessLevel:'secret' };
+  const distiller:AuthContext={ ...auth,keyId:randomUUID(),name:'session-distiller',permissions:['read','session_distill'],maxAccessLevel:'secret' };
   const other:AuthContext={ ...auth,keyId:randomUUID(),name:'session-other' };
-  for (const actor of [auth,admin,other]) await owner.query('INSERT INTO api_keys(id,key_hash,name,namespaces,permissions,max_access_level) VALUES($1,$2,$3,$4,$5,$6)',[actor.keyId,hashKey(`tr_${actor.name}`),actor.name,actor.namespaces,actor.permissions,actor.maxAccessLevel]);
+  for (const actor of [auth,admin,distiller,other]) await owner.query('INSERT INTO api_keys(id,key_hash,name,namespaces,permissions,max_access_level) VALUES($1,$2,$3,$4,$5,$6)',[actor.keyId,hashKey(`tr_${actor.name}`),actor.name,actor.namespaces,actor.permissions,actor.maxAccessLevel]);
   process.env.MEMORY_INGESTION_QUEUE_ENABLED='true'; process.env.MEMORY_INGESTION_SESSION_ENABLED='true';
   process.env.MEMORY_STORE_INLINE_EMBED_MS='100';
   const vector=Array.from({ length:768 },(_,i) => i===0 ? 1 : 0);
@@ -103,12 +104,12 @@ test('queued sessions retain physical transcripts independently of embedding and
   const status=(episode_id:string,actor=auth) => memorySessionStatus({ episode_id },actor);
   const claim=(documentId:string,limit=64) => claimIngestionJobs(dbScopeFromAuth(admin),{ documentId,limit });
   const facts=[{ content:'User prefers PostgreSQL.',kind:'preference' as const }];
-  const worker=(provider={ name:'synthetic',generate:async () => JSON.stringify({ facts }) },approved=policy()) =>
-    runSessionWorker({ once:true,maxJobs:1,pollMs:100 },new AbortController().signal,{ policy:approved,provider,auth:admin });
-  const prepare=async (episodeId:string) => withScopedClient(dbScopeFromAuth(admin),async client => {
-    const job=await claimSessionDistillationJob(client,'shared'); assert.ok(job); assert.equal(job.episodeId,episodeId);
+  const worker=(provider={ name:'openclaw-adapter',generate:async () => JSON.stringify({ facts }) },approved=policy()) =>
+    runSessionWorker({ once:true,maxJobs:1,pollMs:100 },new AbortController().signal,{ policy:approved,provider,auth:distiller });
+  const prepare=async (episodeId:string, approved=policy()) => withScopedClient(dbScopeFromAuth(distiller),async client => {
+    const job=await claimSessionDistillationJob(client,'shared',approved.scope.accessLevel); assert.ok(job); assert.equal(job.episodeId,episodeId);
     const loaded=await loadSessionTranscript(client,job); assert.ok(loaded);
-    assert.ok(await reserveSessionDistillationBudget(client,job,policy(),sessionDistillationInputBytes(loaded.transcript)));
+    assert.ok(await reserveSessionDistillationBudget(client,job,approved,sessionDistillationInputBytes(loaded.transcript)));
     return { job,loaded };
   });
   t.beforeEach(async () => {
@@ -183,7 +184,67 @@ test('queued sessions retain physical transcripts independently of embedding and
       assert.equal((await status(episode.episode_id)).embedding?.episode.state,'ready');
       assert.equal((await status(episode.episode_id)).status,'pending');
     }
-    let calls=0; await worker({ name:'synthetic',generate:async () => { calls++; return '{"facts":[]}'; } }); assert.equal(calls,0);
+    let calls=0; await worker({ name:'openclaw-adapter',generate:async () => { calls++; return '{"facts":[]}'; } }); assert.equal(calls,0);
+  });
+
+  await t.test('scoped cross-owner worker distills secret sessions without admin or owner impersonation', async () => {
+    const episode=await memoryStoreSession({ ...params(),access_level:'secret' },auth);
+    const result=await worker(undefined,policy('secret'));
+    assert.deepEqual(result,{ processed:1,providerCalls:1,factsStored:1 });
+    const stored=(await owner!.query(`SELECT m.access_level,m.client_id,d.access_level AS derivation_level
+      FROM memory_session_derivations d JOIN memories m ON m.id=d.memory_id WHERE d.run_id=$1`,[episode.run_id])).rows[0];
+    assert.deepEqual(stored,{ access_level:'secret',client_id:auth.keyId,derivation_level:'secret' });
+    assert.equal((await status(episode.episode_id)).status,'completed');
+  });
+
+  await t.test('scoped distiller cannot use its cross-owner lane for ordinary writes', async () => {
+    const episode=await memoryStoreSession(params(),auth);
+    await assert.rejects(withScopedClient(dbScopeFromAuth(distiller),client => client.query(`
+      INSERT INTO memories(content,source,namespace,access_level,client_id,memory_kind,valid_from)
+      VALUES('forged ordinary write','manual','shared','normal',$1,'semantic',statement_timestamp())`,[auth.keyId])),
+    error => (error as { code?:string }).code==='42501');
+    const updated=await withScopedClient(dbScopeFromAuth(distiller),client => client.query(`
+      UPDATE memories SET tags=ARRAY['forged'] WHERE document_id=$1::uuid RETURNING id`,[episode.episode_id]));
+    assert.equal(updated.rowCount,0);
+    const deleted=await withScopedClient(dbScopeFromAuth(distiller),client => client.query(`
+      DELETE FROM memories WHERE document_id=$1::uuid RETURNING id`,[episode.episode_id]));
+    assert.equal(deleted.rowCount,0);
+    await assert.rejects(withScopedClient(dbScopeFromAuth(distiller),client => client.query(`
+      INSERT INTO documents(title,source,namespace,chunk_count,client_id,access_level,document_kind)
+      VALUES('forged document','manual','shared',0,$1,'normal','document')`,[auth.keyId])));
+    const before=(await owner!.query(`
+      SELECT m.id,m.content,m.tags,d.session_request_hash FROM memories m JOIN documents d ON d.id=m.document_id
+      WHERE d.id=$1 ORDER BY m.chunk_index`,[episode.episode_id])).rows;
+    const claimed=await withScopedClient(dbScopeFromAuth(distiller),client =>
+      claimSessionDistillationJob(client,'shared','normal'));
+    assert.equal(claimed?.episodeId,episode.episode_id);
+    await assert.rejects(withScopedClient(dbScopeFromAuth(distiller),client => client.query(`
+      UPDATE memories SET tags=ARRAY['forged-processing'] WHERE document_id=$1::uuid`,[episode.episode_id])),
+    error => (error as { code?:string }).code==='42501');
+    await assert.rejects(withScopedClient(dbScopeFromAuth(distiller),client => client.query(`
+      UPDATE documents SET session_request_hash=session_request_hash WHERE id=$1::uuid`,[episode.episode_id])),
+    error => (error as { code?:string }).code==='42501');
+    const after=(await owner!.query(`
+      SELECT m.id,m.content,m.tags,d.session_request_hash FROM memories m JOIN documents d ON d.id=m.document_id
+      WHERE d.id=$1 ORDER BY m.chunk_index`,[episode.episode_id])).rows;
+    assert.deepEqual(after,before);
+    await assert.rejects(withScopedClient(dbScopeFromAuth(distiller),client => client.query(`
+      INSERT INTO memory_session_distillation_runs(
+        id,owner_key_id,episode_id,namespace,access_level,request_hash,provider,model,policy_hash,input_bytes
+      ) VALUES(gen_random_uuid(),$1,$2,'shared','normal',repeat('0',64),'openclaw-adapter',
+        'openclaw/total-recall-synthesis',repeat('0',64),0)`,[distiller.keyId,episode.episode_id])));
+  });
+
+  await t.test('owner access downgrade after materialization blocks apply without facts', async () => {
+    const approved=policy('secret');
+    const episode=await memoryStoreSession({ ...params(),access_level:'secret' },auth);
+    const { job,loaded }=await prepare(episode.episode_id,approved);
+    await owner!.query("UPDATE api_keys SET max_access_level='normal' WHERE id=$1",[auth.keyId]);
+    try {
+      assert.equal(await withScopedClient(dbScopeFromAuth(distiller),client =>
+        applySessionDistillation(client,job,loaded,facts,100,approved)),false);
+      assert.equal((await owner!.query('SELECT count(*)::int AS n FROM memory_session_derivations WHERE run_id=$1',[job.runId])).rows[0].n,0);
+    } finally { await owner!.query("UPDATE api_keys SET max_access_level='secret' WHERE id=$1",[auth.keyId]); }
   });
 
   await t.test('gate-off worker preserves synchronous facts without jobs or provider work inside transactions', async () => {
@@ -205,7 +266,7 @@ test('queued sessions retain physical transcripts independently of embedding and
 
   await t.test('one generation call completes unembedded transcript with durable facts before embedding outage', async () => {
     const episode=await memoryStoreSession(params(),auth); process.env.MEMORY_STORE_INLINE_EMBED_MS='100';
-    let calls=0; const provider={ name:'synthetic',generate:async () => { calls++; return JSON.stringify({ facts }); } };
+    let calls=0; const provider={ name:'openclaw-adapter',generate:async () => { calls++; return JSON.stringify({ facts }); } };
     const result=await worker(provider); assert.deepEqual(result,{ processed:1,providerCalls:1,factsStored:1 });
     const completed=await status(episode.episode_id); assert.equal(completed.status,'completed'); assert.equal(completed.facts_stored,1);
     assert.deepEqual(completed.embedding,{ episode:{ state:'queued',ready:0,queued:1,failed:0 },facts:{ state:'queued',ready:0,queued:1,failed:0 } });
@@ -217,7 +278,7 @@ test('queued sessions retain physical transcripts independently of embedding and
     assert.equal((await worker(provider)).providerCalls,0); assert.equal(calls,1);
     assert.deepEqual((await owner!.query('SELECT estimated_cost_micro_usd FROM memory_session_distillation_runs WHERE id=$1',[episode.run_id])).rows[0],budget);
     online=true; await owner!.query('UPDATE memory_ingestion_jobs SET next_attempt_at=now() WHERE memory_id=$1',[stored.id]);
-    process.env.INGESTION_WORKER_API_KEY='tr_session-worker';
+    process.env.INGESTION_WORKER_API_KEY='tr_ingestion-worker';
     await runIngestionWorker({ once:true,maxJobs:1000,pollMs:100,concurrency:2 },new AbortController().signal);
     assert.equal((await status(episode.episode_id)).embedding?.facts.state,'ready'); assert.equal(calls,1);
   });
@@ -241,26 +302,26 @@ test('queued sessions retain physical transcripts independently of embedding and
 
   await t.test('fact, derivation, job and run completion roll back together; source-key replay never reembeds ready facts', async () => {
     const episode=await memoryStoreSession(params(),auth), { job,loaded }=await prepare(episode.episode_id);
-    for (const boundary of ['INSERT INTO memories','INSERT INTO memory_session_derivations','INSERT INTO memory_ingestion_jobs',"SET status = 'completed'"]) {
+    for (const boundary of ['INSERT INTO memories','INSERT INTO memory_session_derivations','enqueue_session_distillation_fact',"SET status = 'completed'"]) {
       setPoolForTesting(faultingPool(app!,sql => sql.includes(boundary)));
-      try { await assert.rejects(withScopedClient(dbScopeFromAuth(admin),client => applySessionDistillation(client,job,loaded,facts,100,policy())),/synthetic database boundary/); }
+      try { await assert.rejects(withScopedClient(dbScopeFromAuth(distiller),client => applySessionDistillation(client,job,loaded,facts,100,policy())),/synthetic database boundary/); }
       finally { setPoolForTesting(app!); }
       assert.equal((await owner!.query("SELECT count(*)::int AS n FROM memories WHERE metadata->>'run_id'=$1",[job.runId])).rows[0].n,0,boundary);
       assert.equal((await status(episode.episode_id)).status,'processing');
     }
-    assert.ok(await withScopedClient(dbScopeFromAuth(admin),client => applySessionDistillation(client,job,loaded,facts,100,policy())));
+    assert.ok(await withScopedClient(dbScopeFromAuth(distiller),client => applySessionDistillation(client,job,loaded,facts,100,policy())));
     // Simulated process loss after commit: no inline phase ran. A replay is a no-op.
-    assert.equal(await withScopedClient(dbScopeFromAuth(admin),client => applySessionDistillation(client,job,loaded,facts,100,policy())),false);
+    assert.equal(await withScopedClient(dbScopeFromAuth(distiller),client => applySessionDistillation(client,job,loaded,facts,100,policy())),false);
     const memoryId=(await owner!.query('SELECT memory_id FROM memory_session_derivations WHERE run_id=$1',[job.runId])).rows[0].memory_id;
     await owner!.query("UPDATE memory_session_distillation_runs SET status='processing',locked_at=now(),completed_at=NULL WHERE id=$1",[job.runId]);
     const pendingJob=(await owner!.query('SELECT * FROM memory_ingestion_jobs WHERE memory_id=$1',[memoryId])).rows[0];
-    assert.ok(await withScopedClient(dbScopeFromAuth(admin),client => applySessionDistillation(client,job,loaded,facts,100,policy())));
+    assert.ok(await withScopedClient(dbScopeFromAuth(distiller),client => applySessionDistillation(client,job,loaded,facts,100,policy())));
     assert.deepEqual((await owner!.query('SELECT * FROM memory_ingestion_jobs WHERE memory_id=$1',[memoryId])).rows[0],pendingJob);
     const factJob=await claimIngestionJob(dbScopeFromAuth(admin),{ memoryId }); assert.ok(factJob);
     assert.ok(await finalizeIngestionJob(factJob,embedding));
     // Exercise the existing-source_key branch with an interrupted legacy run.
     await owner!.query("UPDATE memory_session_distillation_runs SET status='processing',locked_at=now(),completed_at=NULL WHERE id=$1",[job.runId]);
-    assert.ok(await withScopedClient(dbScopeFromAuth(admin),client => applySessionDistillation(client,job,loaded,facts,100,policy())));
+    assert.ok(await withScopedClient(dbScopeFromAuth(distiller),client => applySessionDistillation(client,job,loaded,facts,100,policy())));
     assert.equal((await owner!.query('SELECT count(*)::int AS n FROM memory_session_derivations WHERE run_id=$1',[job.runId])).rows[0].n,1);
     assert.equal(await claimIngestionJob(dbScopeFromAuth(admin),{ memoryId }),null);
     assert.equal((await owner!.query('SELECT status FROM memory_ingestion_jobs WHERE memory_id=$1',[memoryId])).rows[0].status,'ready');
@@ -269,7 +330,7 @@ test('queued sessions retain physical transcripts independently of embedding and
   await t.test('abandoned distillation claim recovers; lost completion acknowledgement cannot regenerate facts', async () => {
     const episode=await memoryStoreSession(params(),auth); await prepare(episode.episode_id);
     await owner!.query("UPDATE memory_session_distillation_runs SET locked_at=now()-interval '10 minutes' WHERE id=$1",[episode.run_id]);
-    let calls=0; const provider={ name:'synthetic',generate:async () => { calls++; return JSON.stringify({ facts }); } };
+    let calls=0; const provider={ name:'openclaw-adapter',generate:async () => { calls++; return JSON.stringify({ facts }); } };
     setPoolForTesting(lostCommitPool(app!,"SET status = 'completed'"));
     try { await worker(provider); } finally { setPoolForTesting(app!); }
     assert.equal((await status(episode.episode_id)).status,'completed'); assert.equal(calls,1);
@@ -291,19 +352,21 @@ test('queued sessions retain physical transcripts independently of embedding and
     assert.equal(replacement.content,'Changed transcript.'); assert.ok(await finalizeIngestionJob(replacement,embedding));
     const { job,loaded }=await prepare(changed.episode_id);
     await owner!.query('UPDATE memories SET content=$2 WHERE document_id=$1',[changed.episode_id,'Changed after generation.']);
-    assert.equal(await withScopedClient(dbScopeFromAuth(admin),client => applySessionDistillation(client,job,loaded,facts,100,policy())),false);
+    assert.equal(await withScopedClient(dbScopeFromAuth(distiller),client => applySessionDistillation(client,job,loaded,facts,100,policy())),false);
     assert.equal((await owner!.query('SELECT count(*)::int AS n FROM memory_session_derivations WHERE run_id=$1',[job.runId])).rows[0].n,0);
   });
 
   await t.test('generation remains fail-closed on budget, policy, secret output and changed or forgotten sources', async () => {
-    let calls=0; const provider={ name:'synthetic',generate:async () => { calls++; return JSON.stringify({ facts }); } };
-    const budgeted=await memoryStoreSession(params(),auth), approved=policy(); approved.budget.maxCostUsdPerSession=0.000001;
+    let calls=0; const provider={ name:'openclaw-adapter',generate:async () => { calls++; return JSON.stringify({ facts }); } };
+    const budgeted=await memoryStoreSession(params(),auth), raw=policy();
+    const approved=parseSessionDistillationPolicy({ ...raw, budget:{ mode:'subscription',maxInputBytesPerSession:1,
+      maxOutputBytesPerSession:65536,usageControlReference:'synthetic-subscription-quota' } },'test');
     assert.equal((await worker(provider,approved)).providerCalls,0); assert.equal(calls,0);
-    assert.equal((await status(budgeted.episode_id)).last_error_code,'session_budget_exhausted');
+    assert.equal((await status(budgeted.episode_id)).last_error_code,'input_too_large');
     const expired=policy(); expired.termsApproval.expiresAt='2020-01-02T00:00:00Z';
     await assert.rejects(worker(provider,expired),/expired/); assert.equal(calls,0);
     const changed=await memoryStoreSession(params(),auth);
-    await worker({ name:'synthetic',generate:async () => {
+    await worker({ name:'openclaw-adapter',generate:async () => {
       await owner!.query('UPDATE memories SET content=$2 WHERE document_id=$1',[changed.episode_id,'changed while generating']);
       return JSON.stringify({ facts });
     } });
@@ -312,7 +375,7 @@ test('queued sessions retain physical transcripts independently of embedding and
     await owner!.query('UPDATE memories SET deleted_at=now() WHERE document_id=$1',[forgotten.episode_id]);
     assert.equal((await worker(provider)).providerCalls,0); assert.equal((await status(forgotten.episode_id)).last_error_code,'source_unavailable');
     const credential=await memoryStoreSession(params(),auth);
-    await worker({ name:'synthetic',generate:async () => '{"facts":[{"kind":"fact","content":"api_key = synthetic-secret"}]}' });
+    await worker({ name:'openclaw-adapter',generate:async () => '{"facts":[{"kind":"fact","content":"api_key = synthetic-secret"}]}' });
     const rejected=await status(credential.episode_id); assert.equal(rejected.status,'retry'); assert.equal(rejected.facts_stored,0);
   });
 

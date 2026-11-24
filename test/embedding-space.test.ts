@@ -79,7 +79,7 @@ test('every memory vector writer stamps vector and canonical identity atomically
     assert.match(source, /embedding_provider/u, `${file} writes provider`);
     assert.match(source, /embedding_model/u, `${file} writes model`);
     assert.match(source, /embedding_dimensions/u, `${file} writes dimensions`);
-    assert.match(source, /ACTIVE_EMBEDDING_DESCRIPTOR|CANONICAL_EMBEDDING_DESCRIPTOR|embeddingDescriptorParams|prepareCanonicalEmbeddingBatch/u, `${file} uses canonical descriptor`);
+    assert.match(source, /ACTIVE_EMBEDDING_DESCRIPTOR|ACTIVE_EMBEDDING_PROFILE|CANONICAL_EMBEDDING_DESCRIPTOR|embeddingDescriptorParams|prepareCanonicalEmbeddingBatch/u, `${file} uses canonical descriptor`);
   }
 });
 

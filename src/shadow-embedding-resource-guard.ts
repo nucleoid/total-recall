@@ -99,11 +99,21 @@ export function createShadowResourceGuard(options: ShadowResourceGuardOptions): 
     const memory = meminfo(memoryText);
     const load = Number(loadText.trim().split(/\s+/u)[0]);
     if (!Number.isFinite(load)) throw new Error('embedding.host_metrics_unknown');
-    if (memory.availableMemoryBytes < options.plan.minAvailableMemoryBytes || availableDisk < options.plan.minAvailableDiskBytes
-      || memory.swapUsedBytes > options.plan.maxSwapUsedBytes || load / identity.cpus > options.plan.maxLoadPerCpu
-      || psi(memoryPsi) > options.plan.maxMemoryPsiAvg10 || psi(cpuPsi) > options.plan.maxCpuPsiAvg10) {
-      throw new Error('embedding.resource_guard');
-    }
+    const observed = { availableMemoryBytes: memory.availableMemoryBytes, availableDiskBytes: availableDisk,
+      swapUsedBytes: memory.swapUsedBytes, loadPerCpu: load / identity.cpus, memoryPsiAvg10: psi(memoryPsi), cpuPsiAvg10: psi(cpuPsi) };
+    const violations = [
+      observed.availableMemoryBytes < options.plan.minAvailableMemoryBytes && 'available_memory',
+      observed.availableDiskBytes < options.plan.minAvailableDiskBytes && 'available_disk',
+      observed.swapUsedBytes > options.plan.maxSwapUsedBytes && 'host_swap',
+      observed.loadPerCpu > options.plan.maxLoadPerCpu && 'host_load',
+      observed.memoryPsiAvg10 > options.plan.maxMemoryPsiAvg10 && 'memory_psi',
+      observed.cpuPsiAvg10 > options.plan.maxCpuPsiAvg10 && 'cpu_psi',
+    ].filter(Boolean);
+    if (violations.length) throw Object.assign(new Error('embedding.resource_guard'), {
+      diagnostic: { observed, violations, limits: { minAvailableMemoryBytes: options.plan.minAvailableMemoryBytes,
+        minAvailableDiskBytes: options.plan.minAvailableDiskBytes, maxSwapUsedBytes: options.plan.maxSwapUsedBytes,
+        maxLoadPerCpu: options.plan.maxLoadPerCpu, maxMemoryPsiAvg10: options.plan.maxMemoryPsiAvg10, maxCpuPsiAvg10: options.plan.maxCpuPsiAvg10 } },
+    });
     let response: Response;
     try { response = await fetcher(new URL('/health', url).toString(), { headers: { Authorization: `Bearer ${options.bearerToken}` }, signal: AbortSignal.timeout(5000), redirect: 'error' }); }
     catch { throw new Error('embedding.runtime_health'); }

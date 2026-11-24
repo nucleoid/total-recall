@@ -152,9 +152,11 @@ test('canonical tags and source keys are deterministic and bounded', () => {
 
 test('CLI modes are explicit, bounded, and keep previews out of stdout', () => {
   assert.deepEqual(parseConsolidationCli(['--namespace', 'work', '--selection-only']), {
-    namespace: 'work', mode: 'selection-only', anchorLimit: undefined, clusterLimit: undefined,
+    namespace: 'work', mode: 'selection-only', accessLevel: 'normal', anchorLimit: undefined, clusterLimit: undefined,
     previewOutput: undefined, cursor: undefined,
   });
+  assert.equal(parseConsolidationCli(['--namespace', 'work', '--access-level', 'secret', '--selection-only']).accessLevel, 'secret');
+  assert.throws(() => parseConsolidationCli(['--namespace', 'work', '--access-level', 'private', '--selection-only']), /normal, sensitive, or secret/);
   assert.throws(() => parseConsolidationCli(['--namespace', 'work', '--dry-run']), /preview-output/);
   assert.throws(() => parseConsolidationCli(['--namespace', 'work', '--apply', '--selection-only']), /mutually exclusive/);
   assert.throws(() => parseConsolidationCli(['--namespace', 'work', '--selection-only', '--max-anchors', 'nope']), /max-anchors/);

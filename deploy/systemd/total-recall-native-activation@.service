@@ -1,0 +1,30 @@
+[Unit]
+Description=Total Recall native feature owner (%i)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/.config/total-recall/native-activation/%i.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/share/total-recall-controller/current
+# Safe template: planning only. A reviewed per-feature execute drop-in must clear
+# ExecStart and add --execute; installing this template cannot activate a feature.
+ExecStart=/usr/bin/node --import tsx scripts/native-activation-controller.ts --config %h/.config/total-recall/native-activation/%i.json
+Environment=NATIVE_ACTIVATION_STATE_DIR=%h/.local/state/total-recall-native-activation
+CPUQuota=25%
+MemoryMax=384M
+MemorySwapMax=0
+TasksMax=64
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=240
+TimeoutStopSec=20
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/total-recall-native-activation
+
+[Install]
+WantedBy=default.target

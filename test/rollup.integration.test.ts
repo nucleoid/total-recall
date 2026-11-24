@@ -55,6 +55,7 @@ type FailureMode = 'link' | 'zero-row' | 'sql' | undefined;
 class FakeDatabase {
   events = [event()];
   memories: MemoryRow[] = [];
+  jobs: Array<{ memory_id: string; provider: string; model: string; dimensions: number }> = [];
   nextMemory = 1;
   private eventLock: Promise<void> = Promise.resolve();
 
@@ -70,6 +71,7 @@ class FakeDatabase {
 class FakeClient {
   readonly calls: QueryCall[] = [];
   private pendingMemories: MemoryRow[] = [];
+  private pendingJobs: Array<{ memory_id: string; provider: string; model: string; dimensions: number }> = [];
   private pendingLinks = new Map<string, string>();
   private releaseEventLock: (() => void) | undefined;
 
@@ -88,6 +90,7 @@ class FakeClient {
     if (sql === 'BEGIN' || sql.startsWith("SELECT set_config('app.")) return result([]);
     if (sql === 'ROLLBACK') {
       this.pendingMemories = [];
+      this.pendingJobs = [];
       this.pendingLinks.clear();
       this.releaseEventLock?.();
       this.releaseEventLock = undefined;
@@ -95,11 +98,13 @@ class FakeClient {
     }
     if (sql === 'COMMIT') {
       this.db.memories.push(...this.pendingMemories);
+      this.db.jobs.push(...this.pendingJobs);
       for (const [eventId, memoryId] of this.pendingLinks) {
         const row = this.db.events.find((candidate) => candidate.id === eventId);
         if (row) row.memory_id = memoryId;
       }
       this.pendingMemories = [];
+      this.pendingJobs = [];
       this.pendingLinks.clear();
       this.releaseEventLock?.();
       this.releaseEventLock = undefined;
@@ -118,7 +123,16 @@ class FakeClient {
         metadata: JSON.parse(String(params[5])) as Record<string, unknown>,
       };
       this.pendingMemories.push(row);
-      return result([{ id: row.id } as T]);
+      return result([{ id: row.id, revision: 0 } as T]);
+    }
+    if (/^INSERT INTO memory_ingestion_jobs/i.test(sql)) {
+      this.pendingJobs.push({
+        memory_id: String(params[0]),
+        provider: String(params[5]),
+        model: String(params[6]),
+        dimensions: Number(params[7]),
+      });
+      return result([], 1);
     }
     if (/^UPDATE media_events SET memory_id/i.test(sql)) {
       if (this.failureMode === 'link') throw new Error('link failed after insert');
@@ -265,6 +279,29 @@ test('successful rollup commits one exact memory and link on one media-scoped cl
     call.text.includes("set_config('app.allowed_namespaces'") && (call.params?.length ?? 0) > 0
   );
   assert.equal(namespaceCall?.params?.[0], JSON.stringify(['media']));
+});
+
+test('queue-enabled rollup atomically accepts local embedding work without connector inference', async () => {
+  const pool = new FakePool();
+  setPoolForTesting(pool as unknown as pg.Pool);
+  const previous = process.env.MEMORY_INGESTION_QUEUE_ENABLED;
+  process.env.MEMORY_INGESTION_QUEUE_ENABLED = 'true';
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error('connector inference must not run'); }) as typeof fetch;
+  try {
+    const { rollupPendingEvents } = await import('../src/rollup.js');
+    const outcome = await rollupPendingEvents(AUTH, SCOPE);
+    assert.deepEqual(outcome, { rolled: 1, failed: 0, errors: [] });
+    assert.equal(pool.db.memories.length, 1);
+    assert.equal(pool.db.jobs.length, 1);
+    assert.equal(pool.db.jobs[0].memory_id, pool.db.memories[0].id);
+    assert.equal(pool.db.jobs[0].dimensions, 768);
+    assert.equal(pool.db.events[0].memory_id, pool.db.memories[0].id);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previous === undefined) delete process.env.MEMORY_INGESTION_QUEUE_ENABLED;
+    else process.env.MEMORY_INGESTION_QUEUE_ENABLED = previous;
+  }
 });
 
 test('zero-row concurrent claim or deletion is a rolled-back no-op, while SQL errors fail', async () => {

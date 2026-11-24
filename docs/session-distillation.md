@@ -6,11 +6,11 @@ A supplied `session_id` is the caller/namespace idempotency identity. An identic
 
 ## Durable embedding ingestion (#161)
 
-Apply migrations through 053, deploy the API and session worker together, and start the shared ingestion worker before enabling both `MEMORY_INGESTION_QUEUE_ENABLED=true` and `MEMORY_INGESTION_SESSION_ENABLED=true` (default off). The session sub-gate is independent of the document sub-gate. No new key or generation approval is introduced. Migration 053 excludes episode chunks from local target subscription matching, including events captured by older builds; migrations 049–052 remain unchanged.
+Apply migrations through 056, deploy the API and session worker together, and start the shared ingestion worker before enabling both `MEMORY_INGESTION_QUEUE_ENABLED=true` and `MEMORY_INGESTION_SESSION_ENABLED=true` (default off). The session sub-gate is independent of the document sub-gate. Migration 053 excludes episode chunks from local target subscription matching, including events captured by older builds; migration 056 adds the dedicated, non-admin distillation lane without changing storage acceptance.
 
 With both gates enabled, one transaction persists the episode, all physical transcript chunks with NULL embedding/identity, one shared `kind=document` job per chunk, the existing distillation run, and the audit. Small episodes attempt one bounded inline batch using `MEMORY_STORE_INLINE_EMBED_MS` and `MEMORY_STORE_DOCUMENT_INLINE_MAX_CHUNKS` (default 8). Larger episodes return without provider work. The response adds `state: ready | queued | embedding_failed` independently of distillation `status`. Identical retries in pending, partial, ready or failed embedding states retain the episode/run IDs and add `idempotent_replay: true`; no chunks or jobs are duplicated. Existing backlog state remains visible when either acceptance gate is disabled.
 
-Distillation reads physical transcript text and never waits for chunk vectors. Generated facts, derivations, one shared `kind=store` job per unembedded fact, and run completion commit together before any fact embedding attempt. Post-commit embedding failure leaves the run `completed` and facts queued; it cannot retry generation or spend generation budget again. An existing ready fact is reused without resetting its job. Sensitive and secret episodes use the same embedding queue but remain undistilled.
+Distillation reads physical transcript text and never waits for chunk vectors. Generated facts, derivations, one shared `kind=store` job per unembedded fact, and run completion commit together before any fact embedding attempt. Post-commit embedding failure leaves the run `completed` and facts queued; it cannot retry generation or spend generation budget again. An existing ready fact is reused without resetting its job. Normal, sensitive, and secret episodes are processed only by a policy for that exact access-level lane, and every derived fact inherits the maximum level of all materialized and revalidated transcript chunks.
 
 `memory_session_status` is owner-only and content-free. With the queue schema installed it includes separate summaries, for example:
 
@@ -35,10 +35,10 @@ Episode storage does **not** enable generation. The worker refuses to start unle
 
 - `SESSION_DISTILLATION_POLICY_FILE`: an owner-controlled JSON approval artifact;
 - `DEPLOYMENT_ENVIRONMENT`: exactly matches the artifact;
-- `SESSION_DISTILLATION_API_KEY`: a dedicated key with exactly the approved namespace, `max_access_level=normal`, and `admin`, `read`, and `write` permissions;
+- `SESSION_DISTILLATION_API_KEY`: a dedicated enabled key containing the approved namespace, a sufficient `max_access_level`, the required worker capabilities `read` and `session_distill`, and no `write`, `admin`, or `delete` permission;
 - the credential named by the policy's `generation.credentialEnv`.
 
-Approval for embeddings, entity extraction, consolidation, contradiction handling, or any other feature does not apply. Episode chunks are excluded from entity extraction and subscription matching at the database trigger boundary. Initial generation supports exactly one approved namespace and `normal` access. Sensitive and secret episodes can be stored but remain pending and are never claimed by this worker.
+Approval for embeddings, entity extraction, consolidation, contradiction handling, or any other feature does not apply. Episode chunks are excluded from entity extraction and subscription matching at the database trigger boundary. Each worker policy supports exactly one approved namespace and one exact access-level lane (`normal`, `sensitive`, or `secret`). A multi-namespace key is allowed, but it does not widen the policy lane. The accepting owner key must remain enabled and retain `read`, `write`, the source namespace, and the episode level; no worker auth context is forged.
 
 Example policy shape (values are illustrative, not an approval):
 
@@ -48,10 +48,10 @@ Example policy shape (values are illustrative, not an approval):
   "feature": "memory-session-distillation",
   "environment": "production",
   "generation": {
-    "provider": "approved-transcript-gateway",
-    "model": "approved-model",
+    "provider": "openclaw-adapter",
+    "model": "openclaw/total-recall-synthesis",
     "endpoint": "https://gateway.example/generate",
-    "credentialEnv": "SESSION_GENERATION_KEY"
+    "credentialEnv": "GENERATION_API_KEY"
   },
   "terms": {
     "reference": "privacy-review/57",
@@ -61,14 +61,10 @@ Example policy shape (values are illustrative, not an approval):
   },
   "scope": { "namespaces": ["approved-low-risk"], "accessLevel": "normal" },
   "budget": {
+    "mode": "subscription",
     "maxInputBytesPerSession": 1100000,
     "maxOutputBytesPerSession": 65536,
-    "maxCostUsdPerSession": 0.25,
-    "maxCostUsdPerMonth": 25,
-    "estimatedRequestCostUsd": 0.001,
-    "estimatedInputCostUsdPerMillionBytes": 1,
-    "estimatedOutputCostUsdPerMillionBytes": 4,
-    "monthlyControlReference": "provider-budget/57"
+    "usageControlReference": "openclaw-subscription/session-distillation"
   },
   "providerModelApproval": {
     "approved": true, "approvedBy": "owner",
@@ -89,7 +85,7 @@ Example policy shape (values are illustrative, not an approval):
 }
 ```
 
-The gateway contract is the provider-neutral contract in `src/generation.ts`; tools are always sent as an empty array. The artifact enforces a conservative per-session reservation and a database-serialized calendar-month reservation before each provider call.
+The gateway contract is the bounded contract in `src/generation.ts`, routed only through `openclaw-adapter` to the isolated `openclaw/total-recall-synthesis` agent; tools are always sent as an empty array. Subscription mode enforces input/output byte bounds and records the external usage-control reference without inventing USD prices. The strict legacy paid schema and serialized monthly reservation remain available only for backward-compatible paid policies; no paid fallback is used by the approved subscription policy.
 
 ## Operation
 
@@ -98,13 +94,14 @@ npm run migrate
 SESSION_DISTILLATION_POLICY_FILE=/secure/session-policy.json \
 DEPLOYMENT_ENVIRONMENT=production \
 SESSION_DISTILLATION_API_KEY=tr_... \
-SESSION_GENERATION_KEY=... \
+GENERATION_API_KEY=... \
+NODE_EXTRA_CA_CERTS=/secure/synthesis-ca.crt \
 npm run session:distill -- --once --max-jobs 100
 ```
 
-The worker briefly claims a run, reads transcript chunks only after policy/scope checks, and calls generation outside transactions. Queued mode atomically inserts all semantic facts, lineage and embedding jobs with the completed run state, then attempts embeddings after commit. Gate-off mode embeds facts synchronously before inserting them. Output is strict JSON, capped at 50 facts, exact normalized duplicates are removed within a batch, control fields and likely credentials are rejected, and generated facts inherit the episode's owner, namespace, and exact access level.
+The worker briefly claims a run in the policy's exact namespace/access lane, reads transcript chunks only after worker and owner authorization checks, and calls generation outside transactions. Before apply it row-locks and revalidates every materialized chunk. Queued mode atomically inserts all semantic facts and lineage, uses a narrow provenance-bound database function to enqueue local embedding work, and completes the run before any embedding attempt. The dedicated worker cannot create source documents/runs or ordinarily insert, update, or delete memories. Gate-off mode embeds facts synchronously before inserting them. Output is strict JSON, capped at 50 facts, exact normalized duplicates are removed within a batch, control fields and likely credentials are rejected, and generated facts retain the episode owner and namespace at the maximum access level of all materialized/revalidated input.
 
-Failures retain the episode. Retryable failures use bounded exponential backoff and become dead after five attempts. Source/authorization changes and immutable policy mismatches fail terminally. Monthly budget exhaustion makes no provider call and defers the run to the next calendar month. Runs already completed are never claimed again.
+Failures retain the episode. Retryable failures use bounded exponential backoff and become dead after five attempts. Source/authorization changes and immutable policy mismatches fail terminally. Subscription input/output exhaustion makes no provider call; legacy paid monthly exhaustion defers the run to the next calendar month. Runs already completed are never claimed again.
 
 ## Rollback and retention
 

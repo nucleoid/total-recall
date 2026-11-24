@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  assertConsolidationAuthority,
+  consolidationCanonicalAccessLevel,
   consolidationPolicyHash,
   parseConsolidationPolicy,
   validateConsolidationGeneration,
@@ -42,4 +44,40 @@ test('policy is feature-specific, exact, unexpired, and hashes deterministically
   assert.throws(() => parseConsolidationPolicy({ ...policy(), feature: 'contradiction-classification' }, 'test'), /Invalid literal/);
   assert.throws(() => parseConsolidationPolicy(policy(), 'production'), /environment/);
   assert.throws(() => parseConsolidationPolicy(policy(), 'test', new Date('2028-01-01T00:00:00Z')), /expired/);
+});
+
+
+test('subscription policy is idempotent and restricted to the isolated OpenClaw adapter', () => {
+  const subscription = {
+    ...policy(),
+    generation: { provider: 'openclaw-adapter', model: 'openclaw/total-recall-synthesis',
+      endpoint: 'https://10.0.0.9:3012/v1/generate', credentialEnv: 'GENERATION_API_KEY' },
+    scope: { namespaces: ['financial'], accessLevel: 'secret' },
+    budget: { mode: 'subscription', maxCallsPerInvocation: 2, maxInputBytesPerInvocation: 131072,
+      maxOutputBytesPerInvocation: 32768, usageControlReference: 'dedicated subscription call quotas' },
+  };
+  const parsed = parseConsolidationPolicy(subscription, 'test', new Date('2026-07-01T00:00:00Z'));
+  assert.deepEqual(parseConsolidationPolicy(parsed, 'test', new Date('2026-07-01T00:00:00Z')), parsed);
+  assert.equal(parsed.budget.maxCostUsdPerInvocation, 0);
+  assert.throws(() => parseConsolidationPolicy({ ...subscription,
+    generation: { ...subscription.generation, provider: 'direct-openai' } }, 'test',
+  new Date('2026-07-01T00:00:00Z')), /approved OpenClaw agent adapter/);
+  assert.throws(() => parseConsolidationPolicy({ ...subscription,
+    budget: { ...subscription.budget, arbitrary: true } }, 'test', new Date('2026-07-01T00:00:00Z')));
+});
+
+test('all-access consolidation requires genuine namespace and level authority', () => {
+  const auth = { keyId: ids[0], name: 'consolidation', namespaces: ['work', 'financial'],
+    permissions: ['read', 'write', 'consolidate'], maxAccessLevel: 'secret' as const };
+  assert.doesNotThrow(() => assertConsolidationAuthority(auth, 'financial', 'apply', 'secret'));
+  assert.throws(() => assertConsolidationAuthority({ ...auth, maxAccessLevel: 'sensitive' },
+    'financial', 'apply', 'secret'), /does not authorize/);
+  assert.throws(() => assertConsolidationAuthority({ ...auth, namespaces: ['work'] },
+    'financial', 'dry-run', 'normal'), /does not authorize/);
+});
+
+test('canonical classification conservatively includes prompt and revalidated members', () => {
+  const prompt = [{ id: ids[0], access_level: 'normal' as const }, { id: ids[1], access_level: 'secret' as const }];
+  const current = [{ id: ids[0], access_level: 'normal' as const }, { id: ids[1], access_level: 'normal' as const }];
+  assert.equal(consolidationCanonicalAccessLevel(prompt, current), 'secret');
 });

@@ -1,67 +1,101 @@
-# Contradiction Classification Rollout Runbook
+# All-access reviewed contradiction rollout
 
-Contradiction classification and automatic belief revision are disabled by default. Do not reuse embedding credentials or approvals from another generative feature.
+Production contradiction synthesis is disabled by default. Generation uses only the private `openclaw-adapter` and `openclaw/total-recall-synthesis`; Qwen remains local embedding/candidate infrastructure and is never a generator. Migration 060 adds a dedicated reviewed-resolution lane. It does not classify, mutate, replay migrations, or schedule work.
 
-## Enablement gates
+## Policy and key prerequisites
 
-Before setting `CONTRADICTION_CLASSIFICATION_ENABLED=true`, record and review all of the following:
+Provision a supported key with the intended stored namespaces, `max_access_level=secret`, permissions `read,contradiction_resolve`, and no `write/admin/delete`. Historical memories do not require a live creator key and legacy non-UUID `client_id` provenance is preserved. Current reviewer key enabled/revoked/expiry, direct namespaces, and access ceiling are rechecked by PostgreSQL at apply/reversal.
 
+Set the following for one exact namespace policy:
+
+- `CONTRADICTION_CLASSIFICATION_ENABLED=true`
 - `CONTRADICTION_PROCESSING_APPROVED=true`
-- exact `CONTRADICTION_PROVIDER`, `CONTRADICTION_MODEL`, and `CONTRADICTION_GENERATION_ENDPOINT`
+- `CONTRADICTION_PROVIDER=openclaw-adapter`
+- `CONTRADICTION_MODEL=openclaw/total-recall-synthesis`
+- `CONTRADICTION_GENERATION_ENDPOINT=<private TLS adapter /v1/generate>`
+- `CONTRADICTION_GENERATION_API_KEY=<dedicated adapter bearer>`
 - `CONTRADICTION_PROVIDER_MODEL_APPROVED=true`
-- privacy, retention, and training approvals
-- exactly one approved namespace with `CONTRADICTION_SCOPE_APPROVED=true`; runtime egress remains restricted to `access_level=normal`
-- `CONTRADICTION_COST_BUDGET_APPROVED=true` and a positive `CONTRADICTION_COST_BUDGET_USD`
-- reviewed conservative upper bounds for all three estimate fields:
-  - `CONTRADICTION_ESTIMATED_REQUEST_COST_USD`
-  - `CONTRADICTION_ESTIMATED_INPUT_COST_USD_PER_MILLION_BYTES`
-  - `CONTRADICTION_ESTIMATED_OUTPUT_COST_USD_PER_MILLION_BYTES`
-- bounded `CONTRADICTION_SHADOW_MAX_IN_FLIGHT` and `CONTRADICTION_SHADOW_MAX_QUEUED`
+- all three privacy/retention/training approvals
+- `CONTRADICTION_APPROVED_NAMESPACE=<one namespace>`
+- `CONTRADICTION_APPROVED_ACCESS_LEVEL=secret`
+- `CONTRADICTION_SCOPE_APPROVED=true`
+- `CONTRADICTION_BUDGET_MODE=subscription`
+- `CONTRADICTION_BUDGET_APPROVED=true`
+- bounded `CONTRADICTION_MAX_CALLS_PER_INVOCATION`, `CONTRADICTION_MAX_INPUT_BYTES_PER_INVOCATION`, and `CONTRADICTION_MAX_OUTPUT_BYTES_PER_INVOCATION`
+- a reviewed `CONTRADICTION_USAGE_CONTROL_REFERENCE`
+- bounded shadow in-flight/queue limits and provider timeout
+- `CONTRADICTION_REVIEW_API_KEY`, `DEPLOYMENT_ENVIRONMENT`, and `NODE_EXTRA_CA_CERTS`
 
-Missing, malformed, zero-total estimate configuration disables classification. Automatic mutation remains independently disabled.
+Subscription mode rejects direct-provider models and never enables legacy automatic mutation, even if old auto-mutation flags are present. Its process-lifetime counters are an invocation safety bound, not a durable billing ledger or a cross-replica/cross-restart ceiling; the referenced subscription usage control remains the operator's durable limit. Legacy paid-budget parsing remains compatibility-only.
 
-## What the budget means
+## Shadow acceptance before mutation
 
-The approved gateway response is exactly `{output: string}` and contains no authoritative usage or cost. Total Recall therefore does **not** know exact provider spend.
+1. Deploy source and migration 060 with classification off.
+2. Enable subscription classification with mutation off.
+3. Review content-free counts for candidates, no candidates, classifications, invalid output, provider timeout/error, budget exhaustion, queue saturation, and shutdown.
+4. Confirm no source revisions, validity intervals, supersession links, or content hashes changed.
+5. Keep `CONTRADICTION_AUTO_MUTATION_ENABLED=false`; production mutation uses reviewed receipts only.
 
-`CONTRADICTION_COST_BUDGET_USD` is a process-lifetime conservative reservation cap. Before each provider request, the process atomically reserves integer micro-USD for:
+## Explicit preview and decision
 
-1. the configured fixed request estimate;
-2. actual bounded system-and-input bytes at the configured input rate; and
-3. the full allowed output bytes at the configured output rate.
+Preview materializes 2–6 exact active semantic sources through the genuine current reviewer key. It sends bounded text to the tool-denied OpenClaw synthesis agent, but writes no source rows. The receipt contains only source IDs, revisions, content hashes, access levels, classification, policy fingerprint, and the maximum sensitivity of **all** prompt inputs.
 
-A reservation is never refunded after dispatch, timeout, provider error, or ambiguous completion. The first approved provider/model/scope/budget/scheduler configuration is immutable for the process lifetime. In-process drift emits `runtime_config_changed` and performs no egress; it never creates a second budget or scheduler partition. Budget exhaustion emits only `budget_exhausted`, skips provider egress, and leaves the already committed store unlinked. No-candidate outcomes reserve nothing.
+```
+npm run contradiction:review -- preview \
+  --subject <proposed-successor-id> \
+  --candidate <possible-predecessor-id> \
+  --output receipt.json
+```
 
-The counter is process-local and resets on restart. It is suitable for this single-process deployment, but it is not a durable billing ledger or a cross-replica/cross-restart ceiling. If either property is required, enforce it at the approved gateway and keep this local conservative cap as defense in depth.
+Review the receipt independently. Generate an expiring decision file:
 
-## Shadow backpressure and shutdown
+```
+npm run contradiction:review -- decide --input receipt.json --decision apply \
+  --approved-by <operator-ledger-id> --approved-at <UTC> --expires-at <UTC> \
+  --output decision.json
+```
 
-The runtime admits at most `CONTRADICTION_SHADOW_MAX_IN_FLIGHT` active shadows and retains at most `CONTRADICTION_SHADOW_MAX_QUEUED` queued shadows. Defaults are 2 and 8. When full, new shadow work is skipped with `shadow_saturated`; the store response is unchanged.
+A reject decision is durable review evidence but cannot mutate. Malformed output, unknown candidate IDs, low confidence, non-contradictions, expired approvals, policy drift, source revision/hash/lifecycle drift, key drift, and sensitivity downgrade all fail closed.
 
-On shutdown, the runtime:
+## Apply, replay, and reversal
 
-1. rejects new shadow work with `shadow_shutdown`;
-2. drops queued work with `shadow_shutdown`;
-3. waits for active shadow and synchronous classification work; candidate SQL has a local statement timeout and provider egress receives only the remaining part of `CONTRADICTION_TIMEOUT_MS`; and
-4. closes the database pool after active work drains.
+Apply one reviewed decision:
 
-Metrics and logs contain fixed outcome codes only. They must never include prompts, candidate or memory IDs, namespaces, provider response bodies, SQL, endpoint credentials, or API keys.
+```
+npm run contradiction:review -- apply --input decision.json
+```
 
-## Rollout
+The fixed-shape database function locks and revalidates every materialized prompt source, closes the predecessor at the already-stored successor's `valid_from`, links the successor, records content-free provenance/audit, and never rewrites either source text. Replaying the same decision returns `alreadyApplied:true`.
 
-1. Complete migration 025, supersession finalization, migration 026, validity backfill, and validity finalization.
-2. Deploy with classification, mutation, and superseded-search demotion disabled.
-3. Verify ordinary search capability caching and `valid_at` finalization probes in the target environment.
-4. Configure every approval, conservative estimate, and backpressure setting above.
-5. Enable shadow classification only.
-6. Review content-free counts for `no_candidates`, provider outcomes, `budget_exhausted`, `shadow_saturated`, and `shadow_shutdown`.
-7. Re-price estimates or raise the process-lifetime cap only through a reviewed configuration change and process restart. A restart resets reservations; account for that operationally.
-8. Enable automatic mutation only after reviewed shadow metrics plus exact mutation/deployment environment approval.
+For a synthetic canary, use two isolated stored memories, one call, one receipt, and verify: predecessor closed; successor linked; both contents and original provenance unchanged; lower-clearance reads remain denied; raw INSERT/UPDATE/DELETE with the reviewer key fail; replay makes no new row.
+
+Reversal input is owner-created mode-0600 JSON containing the returned `resolutionId` and original `decisionFingerprint`:
+
+```
+npm run contradiction:review -- reverse --input reversal.json
+```
+
+Reversal never reopens or deletes immutable history. It closes the reviewed successor and appends a restoration revision copied from the preserved predecessor, linked after the successor. Local embedding capture queues the restored row. Reversal refuses if later history already depends on the successor.
+
+## Native read-only auditor
+
+Migration 062 provides a separate, append-only shadow claim/outcome ledger for the scheduled native auditor. This auditor is not another ingestion worker and never resolves or mutates a memory. Its dedicated key must currently authorize exactly `read,contradiction_audit`, one approved namespace, and the exact selected maximum access level (`normal`, `sensitive`, or `secret`). This authority is separate from the existing `read,contradiction_resolve` manual reviewer and does not change its preview, apply, or reversal path.
+
+Each `--once` invocation considers only the latest 50 current semantic memories backed by the active Qwen manifest contract, chooses one subject and at most five candidates, and makes at most one call through `openclaw/total-recall-synthesis`. It creates no embeddings and performs no corpus walk or historical backfill. Claims are unique by subject revision, approved policy hash, and evidence hash; unchanged evidence cannot retry. No-candidate claims are durably recorded with zero provider calls.
+
+The controller command is fixed:
+
+```sh
+npm run contradiction:audit -- --once --namespace EXACT_NAMESPACE \
+  --access-level EXACT_LEVEL --expected-policy-hash RUNTIME_POLICY_FINGERPRINT_SHA256
+```
+
+The CLI recomputes the approved runtime policy fingerprint before passing its hexadecimal hash to PostgreSQL; the imported fingerprint's NUL separators never reach a PostgreSQL text parameter. Receipts expose only fixed status, call count, classification/confidence, and hashes—never source text, candidate IDs, prompts, or model output. Apply only pending migration 062 through the migration ledger after 061; do not replay migrations or activate a timer as part of migration installation.
 
 ## Rollback
 
-1. Disable automatic mutation and drain mutation-capable requests.
-2. Disable classification.
-3. Reject new and drop queued shadows; wait up to the configured provider timeout for active shadows.
-4. Disable superseded-row demotion if required.
-5. Retain lifecycle columns, validity intervals, links, constraints, and indexes. Never reopen closed history or deploy a pre-#52 reader after links exist.
+1. Stop new previews/applies and drain in-flight provider calls.
+2. Disable classification; leave automatic mutation off.
+3. Reverse only individually reviewed resolutions whose successor has no later history.
+4. Retain migration 060, resolution receipts, source history, and audit rows.
+5. Never delete source history, forge auth context, grant broad writer/admin rights, or use Qwen as generation fallback.

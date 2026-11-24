@@ -2,39 +2,45 @@ import type { ScopedClient, DbScope } from './db.js';
 import { withScopedClient } from './db.js';
 import { accessLevelSql } from './auth.js';
 import type { AccessLevel } from './types.js';
-import { normalizeEntityName, type EntityType, type ExtractedEntity } from './entity-extractor.js';
+import { ENTITY_EXTRACTION_CONTRACT_ID, normalizeEntityName, type EntityType, type ExtractedEntity } from './entity-extractor.js';
 
 export const GRAPH_MAX_ENTITIES = 100;
 export const GRAPH_MAX_MEMORIES = 500;
 export const GRAPH_MAX_EDGES = 1_000;
 export const GRAPH_MAX_DEPTH = 3;
+export const GRAPH_INDEXING_SAMPLE_LIMIT = 1_000;
 export const ENTITY_JOB_MAX_ATTEMPTS = 5;
+export const ENTITY_LEGACY_COVERAGE_CUTOFF = '2026-11-24T11:40:00.000Z';
 
 export interface EntityEnrichmentJob {
   memoryId: string;
   namespace: string;
   sourceRevision: number;
   sourceContentHash: string;
-  sourceAccessLevel: string;
+  sourceAccessLevel: AccessLevel;
   attempts: number;
 }
 
 export async function claimEntityEnrichmentJob(
   client: ScopedClient,
   namespaces: readonly string[],
+  accessLevel: AccessLevel = 'normal',
   staleAfterMinutes = 5,
+  memoryIds: readonly string[] = [],
 ): Promise<EntityEnrichmentJob | null> {
+  if (memoryIds.length > 100) throw new Error('Entity claim memory ID filter is limited to 100 IDs');
   if (!Number.isInteger(staleAfterMinutes) || staleAfterMinutes < 1 || staleAfterMinutes > 60) {
     throw new Error('staleAfterMinutes must be an integer from 1 to 60');
   }
   const result = await client.query<{
     memory_id: string; namespace: string; source_revision: number;
-    source_content_hash: string; source_access_level: string; attempts: number;
+    source_content_hash: string; source_access_level: AccessLevel; attempts: number;
   }>(`
     WITH candidate AS (
       SELECT q.memory_id
       FROM entity_enrichment_queue q
-      WHERE q.namespace = ANY($1::text[])
+      WHERE q.namespace = ANY($1::text[]) AND q.source_access_level = $3
+        AND (cardinality($4::uuid[]) = 0 OR q.memory_id = ANY($4::uuid[]))
         AND ((q.status IN ('pending', 'retry') AND q.next_attempt_at <= statement_timestamp())
           OR (q.status = 'processing' AND q.locked_at < statement_timestamp() - ($2::int * interval '1 minute')))
       ORDER BY q.next_attempt_at, q.created_at, q.memory_id
@@ -47,7 +53,7 @@ export async function claimEntityEnrichmentJob(
     WHERE q.memory_id = candidate.memory_id
     RETURNING q.memory_id, q.namespace, q.source_revision, q.source_content_hash,
               q.source_access_level, q.attempts
-  `, [namespaces, staleAfterMinutes]);
+  `, [namespaces, staleAfterMinutes, accessLevel, memoryIds]);
   const row = result.rows[0];
   return row ? {
     memoryId: row.memory_id,
@@ -70,14 +76,14 @@ export async function loadEntityJobContent(
     JOIN memories m ON m.id = q.memory_id AND m.namespace = q.namespace
     WHERE q.memory_id = $1::uuid AND q.namespace = $2 AND q.status = 'processing'
       AND q.source_revision = $3 AND q.source_content_hash = $4
-      AND q.source_access_level = 'normal' AND m.memory_kind <> 'episode_chunk'
+      AND q.source_access_level = $5 AND m.memory_kind <> 'episode_chunk'
       AND m.entity_source_revision = q.source_revision AND md5(m.content) = q.source_content_hash
       AND COALESCE(m.access_level, 'normal') = q.source_access_level
       AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
       AND m.superseded_at IS NULL AND m.valid_to IS NULL
       AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
       AND m.consolidated_into_id IS NULL
-  `, [job.memoryId, job.namespace, job.sourceRevision, job.sourceContentHash]);
+  `, [job.memoryId, job.namespace, job.sourceRevision, job.sourceContentHash, job.sourceAccessLevel]);
   return result.rows[0]?.content ?? null;
 }
 
@@ -99,19 +105,18 @@ export async function replaceMemoryEntityLinks(
   await client.query('DELETE FROM memory_entities WHERE namespace = $1 AND memory_id = $2::uuid',
     [job.namespace, job.memoryId]);
   for (const entity of entities) {
-    const upserted = await client.query<{ id: string }>(`
-      INSERT INTO entities (namespace, type, normalized_name, display_name)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (namespace, type, normalized_name) DO UPDATE
-        SET display_name = EXCLUDED.display_name, updated_at = statement_timestamp()
-      RETURNING id
-    `, [job.namespace, entity.type, entity.normalizedName, entity.displayName]);
+    const resolved = await client.query<{ id: string }>(
+      'SELECT public.resolve_entity_extraction_identity($1, $2, $3, $4, $5) AS id',
+      [job.namespace, job.sourceAccessLevel, entity.type, entity.normalizedName, entity.displayName],
+    );
+    const entityId = resolved.rows[0]?.id;
+    if (!entityId) throw new Error('Entity identity lookup failed');
     await client.query(`
       INSERT INTO memory_entities (namespace, memory_id, entity_id, mention, aliases, confidence)
       VALUES ($1, $2::uuid, $3::uuid, $4, $5::text[], $6)
-    `, [job.namespace, job.memoryId, upserted.rows[0].id, entity.mention, entity.aliases, entity.confidence]);
+    `, [job.namespace, job.memoryId, entityId, entity.mention, entity.aliases, entity.confidence]);
   }
-  await markJobDone(client, job);
+  await markJobDone(client, job, entities.length === 0 ? 'empty' : 'entities');
   return true;
 }
 
@@ -151,7 +156,7 @@ async function lockFreshEntityJob(client: ScopedClient, job: EntityEnrichmentJob
   eligible: boolean;
 } | null> {
   const result = await client.query<{ eligible: boolean }>(`
-    SELECT (COALESCE(m.access_level, 'normal') = 'normal' AND m.memory_kind <> 'episode_chunk'
+    SELECT (COALESCE(m.access_level, 'normal') = q.source_access_level AND m.memory_kind <> 'episode_chunk'
       AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
       AND m.superseded_at IS NULL AND m.valid_to IS NULL
       AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
@@ -167,7 +172,16 @@ async function lockFreshEntityJob(client: ScopedClient, job: EntityEnrichmentJob
   return result.rows[0] ?? null;
 }
 
-async function markJobDone(client: ScopedClient, job: EntityEnrichmentJob): Promise<void> {
+async function markJobDone(
+  client: ScopedClient, job: EntityEnrichmentJob, resultKind?: 'entities' | 'empty',
+): Promise<void> {
+  if (resultKind) {
+    const completed = await client.query<{ completed: boolean }>(`
+      SELECT public.complete_entity_enrichment_job($1::uuid,$2,$3,$4,$5) AS completed
+    `, [job.memoryId, job.namespace, job.sourceRevision, job.sourceContentHash, resultKind]);
+    if (completed.rows[0]?.completed !== true) throw new Error('Entity enrichment source changed while completing');
+    return;
+  }
   const result = await client.query(`
     UPDATE entity_enrichment_queue SET status = 'done', locked_at = NULL, completed_at = statement_timestamp(),
       last_error_code = NULL, updated_at = statement_timestamp()
@@ -197,7 +211,9 @@ export interface MemoryGraphResult {
   edges: Array<{
     entity_id: string; memory_id: string; namespace: string; mention: string; aliases: string[]; confidence: number;
   }>;
-  indexing: { complete: boolean; pending: number; processing: number; retry: number; dead: number; unindexed: number };
+  indexing: { complete: boolean; pending: number; processing: number; retry: number; dead: number;
+    covered: number; legacy_skipped: number; unindexed: number; sampled: number; limit: number;
+    hasMore: boolean; countsExact: boolean };
   truncation: { entities: boolean; memories: boolean; edges: boolean };
 }
 
@@ -297,12 +313,12 @@ export async function traverseMemoryGraph(
     `, [entityIds, memoryIds, options.namespaces, GRAPH_MAX_EDGES + 1]);
     const edgesTruncated = edgeResult.rows.length > GRAPH_MAX_EDGES;
 
-    const indexing = await graphIndexingStatus(client, options.namespaces);
+    const indexing = await graphIndexingStatus(client, options.namespaces, options.maxAccessLevel);
     return {
       version: 1,
       seeds: seedResult.rows.slice(0, GRAPH_MAX_ENTITIES).map(row => row.id),
       entities: selected.map(row => ({ id: row.id, namespace: row.namespace, type: row.type,
-        name: row.display_name, normalized_name: row.normalized_name, distance: distances.get(row.id)! })),
+        name: row.normalized_name, normalized_name: row.normalized_name, distance: distances.get(row.id)! })),
       memories,
       edges: edgeResult.rows.slice(0, GRAPH_MAX_EDGES).map(row => ({ ...row, confidence: Number(row.confidence) })),
       indexing,
@@ -311,33 +327,60 @@ export async function traverseMemoryGraph(
   });
 }
 
-async function graphIndexingStatus(client: ScopedClient, namespaces: string[]): Promise<MemoryGraphResult['indexing']> {
+async function graphIndexingStatus(client: ScopedClient, namespaces: string[], maxAccessLevel: AccessLevel): Promise<MemoryGraphResult['indexing']> {
   const result = await client.query<{
-    pending: string; processing: string; retry: string; dead: string; unindexed: string;
+    pending: string; processing: string; retry: string; dead: string;
+    covered: string; legacy_skipped: string; unindexed: string; sampled: string; has_more: boolean;
   }>(`
+    WITH eligible AS MATERIALIZED (
+      SELECT m.id, m.namespace, m.entity_source_revision, m.content,
+             COALESCE(m.access_level, 'normal') AS access_level
+      FROM memories m
+      WHERE m.namespace = ANY($1::text[]) AND ${accessLevelSql('m.access_level', '$2')}
+        AND m.memory_kind <> 'episode_chunk' AND m.deleted_at IS NULL
+        AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+        AND m.superseded_at IS NULL AND m.valid_to IS NULL
+        AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
+        AND m.consolidated_into_id IS NULL
+      ORDER BY m.id
+      LIMIT ($4::int + 1)
+    ), sample AS MATERIALIZED (
+      SELECT id, namespace, entity_source_revision, md5(content) AS content_hash, access_level
+      FROM eligible ORDER BY id LIMIT $4
+    )
     SELECT
       count(*) FILTER (WHERE q.status = 'pending')::text AS pending,
       count(*) FILTER (WHERE q.status = 'processing')::text AS processing,
       count(*) FILTER (WHERE q.status = 'retry')::text AS retry,
       count(*) FILTER (WHERE q.status = 'dead')::text AS dead,
+      count(*) FILTER (WHERE q.status = 'done'
+        AND q.source_revision = m.entity_source_revision AND q.source_content_hash = m.content_hash
+        AND q.source_access_level = m.access_level
+        AND q.extraction_contract = $3)::text AS covered,
+      count(*) FILTER (WHERE q.status = 'done'
+        AND q.source_revision = m.entity_source_revision AND q.source_content_hash = m.content_hash
+        AND q.source_access_level = m.access_level
+        AND q.extraction_contract IS NULL)::text AS legacy_skipped,
       count(*) FILTER (WHERE q.memory_id IS NULL OR q.status <> 'done'
-        OR q.source_revision <> m.entity_source_revision OR q.source_content_hash <> md5(m.content)
-        OR q.source_access_level <> COALESCE(m.access_level, 'normal'))::text AS unindexed
-    FROM memories m
+        OR q.source_revision <> m.entity_source_revision OR q.source_content_hash <> m.content_hash
+        OR q.source_access_level <> m.access_level
+        OR q.extraction_contract IS DISTINCT FROM $3)::text AS unindexed,
+      count(*)::text AS sampled,
+      (SELECT count(*) > $4 FROM eligible) AS has_more
+    FROM sample m
     LEFT JOIN entity_enrichment_queue q ON q.memory_id = m.id AND q.namespace = m.namespace
-    WHERE m.namespace = ANY($1::text[]) AND COALESCE(m.access_level, 'normal') = 'normal'
-      AND m.memory_kind <> 'episode_chunk' AND m.deleted_at IS NULL
-      AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
-      AND m.superseded_at IS NULL AND m.valid_to IS NULL
-      AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
-      AND m.consolidated_into_id IS NULL
-  `, [namespaces]);
+  `, [namespaces, maxAccessLevel, ENTITY_EXTRACTION_CONTRACT_ID, GRAPH_INDEXING_SAMPLE_LIMIT]);
   const row = result.rows[0];
+  const hasMore = row?.has_more === true;
   const status = {
     pending: Number(row?.pending ?? 0), processing: Number(row?.processing ?? 0),
-    retry: Number(row?.retry ?? 0), dead: Number(row?.dead ?? 0), unindexed: Number(row?.unindexed ?? 0),
+    retry: Number(row?.retry ?? 0), dead: Number(row?.dead ?? 0),
+    covered: Number(row?.covered ?? 0), legacy_skipped: Number(row?.legacy_skipped ?? 0),
+    unindexed: Number(row?.unindexed ?? 0),
+    sampled: Number(row?.sampled ?? 0), limit: GRAPH_INDEXING_SAMPLE_LIMIT,
+    hasMore, countsExact: !hasMore,
   };
-  return { complete: status.unindexed === 0, ...status };
+  return { complete: !hasMore && status.unindexed === 0, ...status };
 }
 
 function activeMemorySql(alias: string, ceilingParameter: string): string {
@@ -350,7 +393,9 @@ function activeMemorySql(alias: string, ceilingParameter: string): string {
 
 function emptyGraph(): MemoryGraphResult {
   return { version: 1, seeds: [], entities: [], memories: [], edges: [],
-    indexing: { complete: true, pending: 0, processing: 0, retry: 0, dead: 0, unindexed: 0 },
+    indexing: { complete: true, pending: 0, processing: 0, retry: 0, dead: 0,
+      covered: 0, legacy_skipped: 0, unindexed: 0, sampled: 0,
+      limit: GRAPH_INDEXING_SAMPLE_LIMIT, hasMore: false, countsExact: true },
     truncation: { entities: false, memories: false, edges: false } };
 }
 
@@ -360,16 +405,20 @@ export interface EntityBackfillPreview {
   estimatedTokens: number;
 }
 
-export async function previewEntityBackfill(client: ScopedClient, namespace: string): Promise<EntityBackfillPreview> {
+export async function previewEntityBackfill(
+  client: ScopedClient, namespace: string, accessLevel: AccessLevel, memoryIds: readonly string[] = [],
+): Promise<EntityBackfillPreview> {
+  validateEntityTargetIds(memoryIds);
   const result = await client.query<{ rows: string; input_bytes: string }>(`
     SELECT count(*)::text AS rows, COALESCE(sum(octet_length(m.content)), 0)::text AS input_bytes
     FROM memories m LEFT JOIN entity_enrichment_queue q ON q.memory_id = m.id
-    WHERE m.namespace = $1 AND m.access_level = 'normal' AND m.memory_kind <> 'episode_chunk'
+    WHERE m.namespace = $1 AND m.access_level = $2 AND m.memory_kind <> 'episode_chunk'
       AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
       AND m.superseded_at IS NULL AND m.valid_to IS NULL
       AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
       AND m.consolidated_into_id IS NULL AND q.memory_id IS NULL
-  `, [namespace]);
+      AND (cardinality($3::uuid[]) = 0 OR m.id = ANY($3::uuid[]))
+  `, [namespace, accessLevel, memoryIds]);
   const rows = Number(result.rows[0]?.rows ?? 0);
   const inputBytes = Number(result.rows[0]?.input_bytes ?? 0);
   return { rows, inputBytes, estimatedTokens: Math.ceil(inputBytes / 4) };
@@ -378,8 +427,11 @@ export async function previewEntityBackfill(client: ScopedClient, namespace: str
 export async function enqueueEntityBackfill(
   client: ScopedClient,
   namespace: string,
+  accessLevel: AccessLevel,
   limit: number,
+  memoryIds: readonly string[] = [],
 ): Promise<{ enqueued: number; lastMemoryId: string | null }> {
+  validateEntityTargetIds(memoryIds);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error('Backfill limit must be 1 to 10000');
   const result = await client.query<{ enqueued: string; last_memory_id: string | null }>(`
     WITH candidates AS MATERIALIZED (
@@ -387,11 +439,12 @@ export async function enqueueEntityBackfill(
              COALESCE(m.updated_at, statement_timestamp()) AS updated_at,
              md5(m.content) AS content_hash, m.access_level, m.created_at
       FROM memories m LEFT JOIN entity_enrichment_queue q ON q.memory_id = m.id
-      WHERE m.namespace = $1 AND m.access_level = 'normal' AND m.memory_kind <> 'episode_chunk'
+      WHERE m.namespace = $1 AND m.access_level = $3 AND m.memory_kind <> 'episode_chunk'
         AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
         AND m.superseded_at IS NULL AND m.valid_to IS NULL
         AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
         AND m.consolidated_into_id IS NULL AND q.memory_id IS NULL
+        AND (cardinality($4::uuid[]) = 0 OR m.id = ANY($4::uuid[]))
       ORDER BY m.created_at, m.id LIMIT $2
     ), inserted AS (
       INSERT INTO entity_enrichment_queue (
@@ -402,6 +455,167 @@ export async function enqueueEntityBackfill(
     )
     SELECT (SELECT count(*)::text FROM inserted) AS enqueued,
       (SELECT memory_id FROM candidates ORDER BY created_at DESC NULLS FIRST, memory_id DESC LIMIT 1) AS last_memory_id
-  `, [namespace, limit]);
+  `, [namespace, limit, accessLevel, memoryIds]);
   return { enqueued: Number(result.rows[0]?.enqueued ?? 0), lastMemoryId: result.rows[0]?.last_memory_id ?? null };
+}
+
+
+export async function previewEntityRequeue(
+  client: ScopedClient, namespace: string, accessLevel: AccessLevel, completedBefore: string,
+  memoryIds: readonly string[] = [],
+): Promise<EntityBackfillPreview> {
+  validateEntityTargetIds(memoryIds);
+  const cutoff = validateCompletedBefore(completedBefore);
+  const result = await client.query<{ rows: string; input_bytes: string }>(`
+    SELECT count(*)::text AS rows, COALESCE(sum(octet_length(m.content)), 0)::text AS input_bytes
+    FROM entity_enrichment_queue q
+    JOIN memories m ON m.id = q.memory_id AND m.namespace = q.namespace
+    WHERE q.namespace = $1 AND q.source_access_level = $2 AND q.status = 'done' AND q.locked_at IS NULL
+      AND q.extraction_contract IS NULL AND q.extraction_result IS NULL
+      AND q.completed_at IS NOT NULL AND q.completed_at < $3::timestamptz
+      AND q.source_revision = m.entity_source_revision AND q.source_content_hash = md5(m.content)
+      AND q.source_access_level = m.access_level AND m.memory_kind <> 'episode_chunk'
+      AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+      AND m.superseded_at IS NULL AND m.valid_to IS NULL
+      AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
+      AND m.consolidated_into_id IS NULL
+      AND NOT public.app_entity_memory_has_links(q.memory_id, q.namespace, q.source_access_level)
+      AND (cardinality($4::uuid[]) = 0 OR q.memory_id = ANY($4::uuid[]))
+  `, [namespace, accessLevel, cutoff, memoryIds]);
+  const rows = Number(result.rows[0]?.rows ?? 0);
+  const inputBytes = Number(result.rows[0]?.input_bytes ?? 0);
+  return { rows, inputBytes, estimatedTokens: Math.ceil(inputBytes / 4) };
+}
+
+export async function enqueueEntityRequeue(
+  client: ScopedClient, namespace: string, accessLevel: AccessLevel, completedBefore: string, limit: number,
+  memoryIds: readonly string[] = [],
+): Promise<{ enqueued: number; lastMemoryId: string | null }> {
+  validateEntityTargetIds(memoryIds);
+  const cutoff = validateCompletedBefore(completedBefore);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error('Requeue limit must be 1 to 10000');
+  const result = await client.query<{ enqueued: string; last_memory_id: string | null }>(`
+    WITH candidates AS MATERIALIZED (
+      SELECT q.memory_id, m.created_at
+      FROM entity_enrichment_queue q
+      JOIN memories m ON m.id = q.memory_id AND m.namespace = q.namespace
+      WHERE q.namespace = $1 AND q.source_access_level = $3 AND q.status = 'done' AND q.locked_at IS NULL
+        AND q.extraction_contract IS NULL AND q.extraction_result IS NULL
+        AND q.completed_at IS NOT NULL AND q.completed_at < $4::timestamptz
+        AND q.source_revision = m.entity_source_revision AND q.source_content_hash = md5(m.content)
+        AND q.source_access_level = m.access_level AND m.memory_kind <> 'episode_chunk'
+        AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+        AND m.superseded_at IS NULL AND m.valid_to IS NULL
+        AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
+        AND m.consolidated_into_id IS NULL
+        AND NOT public.app_entity_memory_has_links(q.memory_id, q.namespace, q.source_access_level)
+        AND (cardinality($5::uuid[]) = 0 OR q.memory_id = ANY($5::uuid[]))
+      ORDER BY m.created_at, q.memory_id
+      FOR UPDATE OF q SKIP LOCKED LIMIT $2
+    ), reopened AS (
+      UPDATE entity_enrichment_queue q SET status = 'pending', attempts = 0,
+        next_attempt_at = statement_timestamp(), locked_at = NULL, last_error_code = NULL,
+        completed_at = NULL, updated_at = statement_timestamp()
+      FROM candidates c WHERE q.memory_id = c.memory_id AND q.namespace = $1
+        AND q.status = 'done' AND q.locked_at IS NULL
+      RETURNING q.memory_id
+    )
+    SELECT (SELECT count(*)::text FROM reopened) AS enqueued,
+      (SELECT memory_id FROM candidates ORDER BY created_at DESC NULLS FIRST, memory_id DESC LIMIT 1) AS last_memory_id
+  `, [namespace, limit, accessLevel, cutoff, memoryIds]);
+  return { enqueued: Number(result.rows[0]?.enqueued ?? 0), lastMemoryId: result.rows[0]?.last_memory_id ?? null };
+}
+
+/** Preview legacy done rows whose source predates a fixed cutoff but has no extraction receipt. */
+export async function previewLegacyEntityCoverage(
+  client: ScopedClient, namespace: string, accessLevel: AccessLevel, sourceBefore: string,
+  memoryIds: readonly string[] = [],
+): Promise<EntityBackfillPreview> {
+  validateEntityTargetIds(memoryIds);
+  const cutoff = validateHistoricalSourceCutoff(sourceBefore);
+  const result = await client.query<{ rows: string; input_bytes: string }>(`
+    SELECT count(*)::text AS rows, COALESCE(sum(octet_length(m.content)),0)::text AS input_bytes
+    FROM entity_enrichment_queue q
+    JOIN memories m ON m.id=q.memory_id AND m.namespace=q.namespace
+    WHERE q.namespace=$1 AND q.source_access_level=$2 AND q.status='done' AND q.locked_at IS NULL
+      AND q.extraction_contract IS NULL AND q.extraction_result IS NULL
+      AND q.source_updated_at<$3::timestamptz
+      AND q.source_revision=m.entity_source_revision AND q.source_content_hash=md5(m.content)
+      AND q.source_access_level=m.access_level AND m.memory_kind<>'episode_chunk'
+      AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp())
+      AND m.superseded_at IS NULL AND m.valid_to IS NULL
+      AND (m.valid_from IS NULL OR m.valid_from<=statement_timestamp())
+      AND m.consolidated_into_id IS NULL
+      AND (cardinality($4::uuid[])=0 OR q.memory_id=ANY($4::uuid[]))
+  `, [namespace,accessLevel,cutoff,memoryIds]);
+  const rows=Number(result.rows[0]?.rows??0),inputBytes=Number(result.rows[0]?.input_bytes??0);
+  return {rows,inputBytes,estimatedTokens:Math.ceil(inputBytes/4)};
+}
+
+/** Reopen at most limit legacy rows; no provider call occurs in this transaction. */
+export async function enqueueLegacyEntityCoverage(
+  client: ScopedClient, namespace: string, accessLevel: AccessLevel, sourceBefore: string, limit: number,
+  memoryIds: readonly string[] = [],
+): Promise<{ enqueued: number; lastMemoryId: string | null }> {
+  validateEntityTargetIds(memoryIds);
+  const cutoff=validateHistoricalSourceCutoff(sourceBefore);
+  if(!Number.isSafeInteger(limit)||limit<1||limit>10_000)throw new Error('Coverage backfill limit must be 1 to 10000');
+  const result=await client.query<{enqueued:string;last_memory_id:string|null}>(`
+    WITH candidates AS MATERIALIZED (
+      SELECT q.memory_id,m.created_at
+      FROM entity_enrichment_queue q JOIN memories m ON m.id=q.memory_id AND m.namespace=q.namespace
+      WHERE q.namespace=$1 AND q.source_access_level=$3 AND q.status='done' AND q.locked_at IS NULL
+        AND q.extraction_contract IS NULL AND q.extraction_result IS NULL
+        AND q.source_updated_at<$4::timestamptz
+        AND q.source_revision=m.entity_source_revision AND q.source_content_hash=md5(m.content)
+        AND q.source_access_level=m.access_level AND m.memory_kind<>'episode_chunk'
+        AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at>statement_timestamp())
+        AND m.superseded_at IS NULL AND m.valid_to IS NULL
+        AND (m.valid_from IS NULL OR m.valid_from<=statement_timestamp())
+        AND m.consolidated_into_id IS NULL
+        AND (cardinality($5::uuid[])=0 OR q.memory_id=ANY($5::uuid[]))
+      ORDER BY m.created_at,q.memory_id FOR UPDATE OF q SKIP LOCKED LIMIT $2
+    ),reopened AS (
+      UPDATE entity_enrichment_queue q SET status='pending',attempts=0,
+        next_attempt_at=statement_timestamp(),locked_at=NULL,last_error_code=NULL,
+        completed_at=NULL,updated_at=statement_timestamp()
+      FROM candidates c WHERE q.memory_id=c.memory_id AND q.namespace=$1
+        AND q.status='done' AND q.extraction_contract IS NULL
+      RETURNING q.memory_id
+    )
+    SELECT (SELECT count(*)::text FROM reopened) enqueued,
+      (SELECT memory_id FROM candidates ORDER BY created_at DESC NULLS FIRST,memory_id DESC LIMIT 1) last_memory_id
+  `,[namespace,limit,accessLevel,cutoff,memoryIds]);
+  return {enqueued:Number(result.rows[0]?.enqueued??0),lastMemoryId:result.rows[0]?.last_memory_id??null};
+}
+
+function validateEntityTargetIds(memoryIds: readonly string[]): void {
+  if (memoryIds.length > 100) throw new Error('Entity target list is limited to 100 memory IDs');
+  const seen = new Set<string>();
+  for (const id of memoryIds) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+      throw new Error('Entity target memory IDs must be UUIDs');
+    }
+    if (seen.has(id)) throw new Error('Entity target memory IDs must be unique');
+    seen.add(id);
+  }
+}
+
+
+function validateCompletedBefore(value: string): string {
+  const parsed = new Date(value);
+  if (!/^\d{4}-\d{2}-\d{2}T.*Z$/.test(value) || !Number.isFinite(parsed.getTime()) || parsed.getTime() >= Date.now()) {
+    throw new Error('Completed-before cutoff must be a valid UTC timestamp before the current time');
+  }
+  return parsed.toISOString();
+}
+
+function validateHistoricalSourceCutoff(value:string):string{
+  const parsed=new Date(value);
+  if(!/^\d{4}-\d{2}-\d{2}T.*Z$/.test(value)||!Number.isFinite(parsed.getTime())||parsed.getTime()>=Date.now()){
+    throw new Error('Source-before cutoff must be a valid UTC timestamp before the current time');
+  }
+  const canonical=parsed.toISOString();
+  if(canonical!==ENTITY_LEGACY_COVERAGE_CUTOFF)throw new Error(`Source-before cutoff must equal ${ENTITY_LEGACY_COVERAGE_CUTOFF}`);
+  return canonical;
 }

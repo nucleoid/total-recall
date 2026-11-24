@@ -31,6 +31,15 @@ lock_timeout=${LOCK_TIMEOUT_SECONDS:-10}
 stats_timeout=${STATS_TIMEOUT_SECONDS:-15}
 [[ $stats_timeout =~ ^[1-9][0-9]*$ ]] || die 'STATS_TIMEOUT_SECONDS must be a positive integer'
 
+required_user=${REQUIRED_RUN_AS_USER:-}
+if [[ -n $required_user ]]; then
+  [[ $required_user != *$'\n'* ]] || die 'REQUIRED_RUN_AS_USER must not contain a newline'
+  [[ $(id -un) == "$required_user" ]] || die "scheduler must run as account $required_user"
+fi
+watcher_ownership=${WATCHER_OWNERSHIP:-managed}
+[[ $watcher_ownership == managed || $watcher_ownership == external ]] ||
+  die 'WATCHER_OWNERSHIP must be managed or external'
+
 uid=$(id -u)
 validate_private_dir() {
   local dir=$1 owner mode
@@ -160,7 +169,11 @@ elif ((${#matches[@]} > 1)); then
   die "multiple matching watchers found (${matches[*]}); stop surplus processes and choose one owner"
 fi
 
-if [[ -n $owned_pid && ${#matches[@]} == 1 && ${matches[0]%%:*} == "$owned_pid" ]]; then
+if [[ $watcher_ownership == external ]]; then
+  ((${#matches[@]} == 1)) || die 'WATCHER_OWNERSHIP=external requires exactly one matching watcher'
+  owned_pid=${matches[0]%%:*}
+  log "Watcher externally managed and healthy (pid $owned_pid); scheduler will not adopt or start it"
+elif [[ -n $owned_pid && ${#matches[@]} == 1 && ${matches[0]%%:*} == "$owned_pid" ]]; then
   log "Watcher already running (pid $owned_pid)"
 else
   if [[ -n $owned_pid ]]; then

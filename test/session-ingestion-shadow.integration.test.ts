@@ -51,10 +51,11 @@ test('queued episodes and generated facts preserve local target publication and 
   } else delete process.env.SHADOW_EMBEDDING_ROLLBACK_WRITES;
   process.env.MEMORY_INGESTION_QUEUE_ENABLED='true'; process.env.MEMORY_INGESTION_SESSION_ENABLED='true';
   process.env.MEMORY_INGESTION_UPDATE_ENABLED='true'; process.env.MEMORY_STORE_INLINE_EMBED_MS='0';
-  const key=randomUUID(), adminKey=randomUUID();
+  const key=randomUUID(), adminKey=randomUUID(), distillerKey=randomUUID();
   const auth:AuthContext={ keyId:key,name:'shadow-session-owner',namespaces:['personal'],permissions:['read','write','delete','export'],maxAccessLevel:'normal' };
-  const admin:AuthContext={ ...auth,keyId:adminKey,name:'shadow-session-worker',permissions:['read','write','admin'] };
-  for (const actor of [auth,admin]) await owner.query('INSERT INTO api_keys(id,key_hash,name,namespaces,permissions,max_access_level) VALUES($1,$2,$3,$4,$5,$6)',[actor.keyId,hashKey(`tr_${actor.name}`),actor.name,actor.namespaces,actor.permissions,actor.maxAccessLevel]);
+  const admin:AuthContext={ ...auth,keyId:adminKey,name:'shadow-ingestion-worker',permissions:['read','write','admin'] };
+  const distiller:AuthContext={ ...auth,keyId:distillerKey,name:'shadow-session-distiller',permissions:['read','session_distill'] };
+  for (const actor of [auth,admin,distiller]) await owner.query('INSERT INTO api_keys(id,key_hash,name,namespaces,permissions,max_access_level) VALUES($1,$2,$3,$4,$5,$6)',[actor.keyId,hashKey(`tr_${actor.name}`),actor.name,actor.namespaces,actor.permissions,actor.maxAccessLevel]);
   app=new pg.Pool({ connectionString:`postgresql://total_recall_app:app-test-only@127.0.0.1:${port}/total_recall_reembedding_test` }); setPoolForTesting(app);
   const vector=Array.from({ length:768 },(_,index) => index===0 ? 1 : 0);
   let legacyCalls=0;
@@ -104,14 +105,13 @@ test('queued episodes and generated facts preserve local target publication and 
 
   const approval={ approved:true,approvedBy:'synthetic',approvedAt:'2020-01-01T00:00:00Z',expiresAt:'2099-01-01T00:00:00Z' };
   const policy=parseSessionDistillationPolicy({ version:1,feature:'memory-session-distillation',environment:'test',
-    generation:{ provider:'synthetic',model:'synthetic',endpoint:'https://example.test/generate',credentialEnv:'SESSION_TEST_KEY' },
+    generation:{ provider:'openclaw-adapter',model:'openclaw/total-recall-synthesis',endpoint:'https://example.test/generate',credentialEnv:'SESSION_TEST_KEY' },
     terms:{ reference:'synthetic/57',privacyApproved:true,retentionApproved:true,trainingApproved:true },
-    scope:{ namespaces:['personal'],accessLevel:'normal' },budget:{ maxInputBytesPerSession:1100000,maxOutputBytesPerSession:65536,
-      maxCostUsdPerSession:1,maxCostUsdPerMonth:100,estimatedRequestCostUsd:0.001,estimatedInputCostUsdPerMillionBytes:1,
-      estimatedOutputCostUsdPerMillionBytes:4,monthlyControlReference:'synthetic' },
+    scope:{ namespaces:['personal'],accessLevel:'normal' },budget:{ mode:'subscription',maxInputBytesPerSession:1100000,
+      maxOutputBytesPerSession:65536,usageControlReference:'synthetic-subscription-quota' },
     providerModelApproval:approval,termsApproval:approval,scopeApproval:approval,budgetApproval:approval },'test');
   const sessionWorker=() => runSessionWorker({ once:true,maxJobs:1,pollMs:100 },new AbortController().signal,{
-    policy,auth:admin,provider:{ name:'synthetic',generate:async () => JSON.stringify({ facts:[{ content:'f'.repeat(3000),kind:'fact' }] }) } });
+    policy,auth:distiller,provider:{ name:'openclaw-adapter',generate:async () => JSON.stringify({ facts:[{ content:'f'.repeat(3000),kind:'fact' }] }) } });
 
   await t.test('pending episodes capture target work, finalize all chunks atomically, and never notify',async () => {
     const input=params(3),episode=await memoryStoreSession(input,auth);
@@ -163,7 +163,7 @@ test('queued episodes and generated facts preserve local target publication and 
     await memoryUpdate({ id:current[0].memory_id,content:'new episode content' },auth);
     assert.equal(await finalizeIngestionBatch(current,currentPrepared),false);
     assert.ok((await manifests(episode.episode_id)).every(row => !row.is_current));
-    process.env.INGESTION_WORKER_API_KEY='tr_shadow-session-worker';
+    process.env.INGESTION_WORKER_API_KEY='tr_shadow-ingestion-worker';
     await runIngestionWorker({ once:true,maxJobs:10,pollMs:100,concurrency:1 },new AbortController().signal);
     assert.equal((await status(episode.episode_id)).embedding?.episode.state,'ready');
     assert.equal(await events(episode.episode_id),0);

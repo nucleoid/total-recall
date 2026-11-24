@@ -1,0 +1,14 @@
+name = "total-recall-webhook-acceptance-20261124"
+main = "src/index.mjs"
+compatibility_date = "2026-11-24"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "ACCEPTANCE_STATE"
+class_name = "AcceptanceState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AcceptanceState"]
+
+# Set non-secret values at deploy time; do not commit live acceptance IDs.

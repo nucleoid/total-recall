@@ -71,3 +71,9 @@ test('resource guard distinguishes only the exact bounded gateway busy response'
   await assert.rejects(make(new Response('not json',{status:429})),/runtime_health/);
   await assert.rejects(make(Response.json({error:'busy'},{status:503})),/runtime_health/);
 });
+
+
+test('resource guard retains triggering sample and exact violated limits without credentials', async () => {
+  const guard=createShadowResourceGuard({plan:plan(),runtime,baseUrl:'https://runtime.internal',bearerToken:'secret',expectedRuntimeHost:'gpu-1',expectedRuntimeMode:'gpu',host:()=>({platform:'linux',hostname:'worker-1',cpus:4}),readText:async path=>path==='/proc/pressure/cpu'?'some avg10=6.25 avg60=0.00 avg300=0.00 total=0':files[path],diskAvailable:async()=>1,fetch:async()=>{throw Error('must not reach inference');}});
+  await assert.rejects(guard(),(error:any)=>{assert.deepEqual(error.diagnostic.violations,['available_disk','cpu_psi']);assert.equal(error.diagnostic.observed.cpuPsiAvg10,6.25);assert.equal(error.diagnostic.limits.maxCpuPsiAvg10,5);assert.ok(!JSON.stringify(error.diagnostic).includes('secret'));return true;});
+});

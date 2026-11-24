@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {QWEN_CHUNK_CONTRACT,QWEN_CONTRACT_ID} from '../src/local-embedding-contract.js';
 import {CURRENT_PARENT_ELIGIBILITY} from '../src/shadow-embedding-store.js';
 import {hashOperationalManifest,validateOperationalManifest,type OperationalManifest} from '../src/shadow-embedding-control.js';
-import {enableSteadyWorker,pauseSteadyWorker} from '../src/shadow-embedding-steady.js';
+import {enableSteadyWorker,pauseSteadyWorker,recoverGuardPausedSteadyWorker} from '../src/shadow-embedding-steady.js';
 
 const resources={maxParentsPerBatch:2,maxSourceBytesPerBatch:100_000,maxTokensPerBatch:10_000,maxElapsedMsPerBatch:10_000,maxAttempts:2,
   host:{deploymentProfile:'linux-worker' as const,expectedHostname:'synthetic',diskPath:'/tmp',minAvailableMemoryBytes:2_147_483_648,
@@ -22,6 +22,7 @@ class FakeClient{
     if(text.includes('FROM pg_roles'))return{rows:[{db:'synthetic_db',operator:true}],rowCount:1};
     if(text.includes('FROM embedding_runs'))return{rows:this.row?[this.row]:[],rowCount:this.row?1:0};
     if(text.includes('FROM embedding_serving_settings'))return{rows:this.row?[this.row]:[],rowCount:this.row?1:0};
+    if(text.includes('UPDATE embedding_serving_settings')&&text.includes('updated_at::text=$4')){const matches=this.row.steady_worker_enabled===false&&this.row.steady_worker_last_error===values?.[2]&&this.row.updated_at_token===values?.[3];return{rows:matches?[{steady_worker_enabled:true,steady_worker_last_error:null}]:[],rowCount:matches?1:0};}
     if(text.includes('UPDATE embedding_serving_settings'))return{rows:[{steady_worker_enabled:text.includes('=true'),steady_worker_last_error:text.includes('=true')?null:values?.[2]}],rowCount:1};
     return{rows:[],rowCount:null};}}
 
@@ -45,4 +46,26 @@ test('steady controls require the attested serving fence and pause never rewrite
   const enabled=new FakeClient(row);assert.deepEqual(await enableSteadyWorker(enabled as never,'synthetic_db',run,envelope),{steady_worker_enabled:true,steady_worker_last_error:null});
   const paused=new FakeClient(row);assert.deepEqual(await pauseSteadyWorker(paused as never,'synthetic_db',run,envelope,'embedding.synthetic_pause'),{steady_worker_enabled:false,steady_worker_last_error:'embedding.synthetic_pause'});
   assert.equal(paused.calls.some(sql=>/UPDATE embedding_runs/i.test(sql)),false,'steady pause preserves completed historical run state');
+});
+
+
+test('guard recovery CAS preserves manual stops and changed pause generations',async()=>{
+  const value=manifest(),envelope=validateOperationalManifest(value,hashOperationalManifest(value)),run='00000000-0000-4000-8000-000000000001';
+  const token='2026-11-20 00:26:37.422445+00';
+  const row={status:'complete',release_sha:value.source.releaseSha,manifest:value,contract_id:QWEN_CONTRACT_ID,
+    capture_required:true,cutover_attestation_run_id:run,capture_enabled:true,steady_worker_enabled:false,
+    steady_worker_last_error:'embedding.resource_guard',updated_at_token:token};
+  const expected={error:'embedding.resource_guard',updatedAtToken:token};
+  const good=new FakeClient(row);
+  assert.deepEqual(await recoverGuardPausedSteadyWorker(good as never,'synthetic_db',run,envelope,expected),
+    {recovered:true,steady_worker_enabled:true,steady_worker_last_error:null});
+  assert.ok(good.calls.some(sql=>sql.includes('updated_at::text=$4')),'CAS uses exact database token, preserving microseconds');
+  for(const changed of [{...row,steady_worker_last_error:'embedding.operator_paused'},
+    {...row,updated_at_token:'2026-11-20 00:26:37.422446+00'},{...row,steady_worker_enabled:true}]){
+    const c=new FakeClient(changed);assert.deepEqual(await recoverGuardPausedSteadyWorker(c as never,'synthetic_db',run,envelope,expected),{recovered:false});
+  }
+  await assert.rejects(recoverGuardPausedSteadyWorker(new FakeClient({...row,cutover_attestation_run_id:'changed'}) as never,'synthetic_db',run,envelope,expected),/steady_fence/);
+  for(const error of ['embedding.operator_paused','embedding.cancelled','unknown']){
+    const c=new FakeClient(row);await assert.rejects(recoverGuardPausedSteadyWorker(c as never,'synthetic_db',run,envelope,{error,updatedAtToken:token}),/recovery_reason/);assert.equal(c.calls.length,0);
+  }
 });

@@ -18,25 +18,35 @@ import {
   replaceMemoryEntityLinks,
   type EntityEnrichmentJob,
 } from '../src/entities.js';
-import { HttpJsonGenerationProvider } from '../src/generation.js';
+import { HttpJsonGenerationProvider, type GenerationProvider } from '../src/generation.js';
 import type { AuthContext } from '../src/types.js';
+import { assertSynthesisAuthority, isSubscriptionUsage } from '../src/synthesis-policy.js';
 
 dotenv.config();
 
-interface WorkerOptions { once: boolean; maxJobs: number; pollMs: number }
+interface WorkerOptions { once: boolean; maxJobs: number; pollMs: number; memoryIds?: string[] }
 
 export function parseEntityWorkerCli(args: string[]): WorkerOptions {
   let once = false;
   let maxJobs = 100;
   let pollMs = 1_000;
+  const memoryIds: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === '--once') once = true;
-    else if (arg === '--max-jobs') maxJobs = integer(args[++index], arg, 1, 100_000);
+    else if (arg === '--memory-id') {
+      const value = args[++index];
+      if (!value || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+        throw new Error('--memory-id must be a UUID');
+      }
+      if (memoryIds.includes(value)) throw new Error('--memory-id values must be unique');
+      if (memoryIds.length >= 100) throw new Error('--memory-id is limited to 100 values');
+      memoryIds.push(value);
+    } else if (arg === '--max-jobs') maxJobs = integer(args[++index], arg, 1, 100_000);
     else if (arg === '--poll-ms') pollMs = integer(args[++index], arg, 100, 60_000);
     else throw new Error(`Unknown entity enrichment option: ${arg}`);
   }
-  return { once, maxJobs, pollMs };
+  return { once, maxJobs, pollMs, memoryIds };
 }
 
 async function loadPolicy(): Promise<EntityExtractionPolicy> {
@@ -51,13 +61,13 @@ async function loadPolicy(): Promise<EntityExtractionPolicy> {
   return parseEntityExtractionPolicy(parsed, environment);
 }
 
-function assertWorkerAuthority(auth: AuthContext, policy: EntityExtractionPolicy): void {
+export function assertEntityWorkerAuthority(auth: AuthContext, policy: EntityExtractionPolicy): void {
   const namespace = policy.scope.namespaces[0];
-  if (auth.namespaces.length !== 1 || auth.namespaces[0] !== namespace || auth.maxAccessLevel !== 'normal') {
-    throw new Error('Entity worker requires a dedicated normal-only key for the exact approved namespace');
-  }
-  for (const permission of ['read', 'write']) {
-    if (!auth.permissions.includes(permission)) throw new Error(`Entity worker key requires '${permission}' permission`);
+  assertSynthesisAuthority(auth, [namespace], policy.scope.accessLevel);
+  const permissions = new Set(auth.permissions);
+  if (!permissions.has('read') || !permissions.has('entity_extract') || permissions.has('write') ||
+      permissions.has('admin') || permissions.has('delete')) {
+    throw new Error("Entity worker requires 'read,entity_extract' without write, admin, or delete");
   }
 }
 
@@ -76,7 +86,8 @@ class InvocationBudget {
     if (this.calls + 1 > budget.maxCallsPerInvocation ||
         this.inputBytes + inputBytes > budget.maxInputBytesPerInvocation ||
         this.outputBytesReserved + MAX_ENTITY_EXTRACTION_OUTPUT_BYTES > budget.maxOutputBytesPerInvocation ||
-        this.costMicroUsd + cost > Math.floor(budget.maxCostUsdPerInvocation * 1_000_000)) return false;
+        (!isSubscriptionUsage(budget) &&
+          this.costMicroUsd + cost > Math.floor(budget.maxCostUsdPerInvocation * 1_000_000))) return false;
     this.calls += 1;
     this.inputBytes += inputBytes;
     this.outputBytesReserved += MAX_ENTITY_EXTRACTION_OUTPUT_BYTES;
@@ -88,35 +99,34 @@ class InvocationBudget {
 export async function runEntityWorker(
   options: WorkerOptions,
   signal: AbortSignal,
-  suppliedPolicy?: EntityExtractionPolicy,
+  supplied?: { policy?: EntityExtractionPolicy; provider?: GenerationProvider; auth?: AuthContext },
 ): Promise<{ processed: number; providerCalls: number }> {
-  const policy = suppliedPolicy ?? await loadPolicy();
+  const loadedPolicy = supplied?.policy ?? await loadPolicy();
+  const policy = parseEntityExtractionPolicy(loadedPolicy, loadedPolicy.environment);
   const rawKey = process.env.ENTITY_ENRICH_API_KEY?.trim();
-  if (!rawKey) throw new Error('ENTITY_ENRICH_API_KEY is required');
-  const auth = await validateKeyReadOnly(rawKey);
+  const auth = supplied?.auth ?? (rawKey ? await validateKeyReadOnly(rawKey) : null);
   if (!auth) throw new Error('Invalid or disabled entity worker API key');
-  assertWorkerAuthority(auth, policy);
+  assertEntityWorkerAuthority(auth, policy);
   const credential = process.env[policy.generation.credentialEnv]?.trim();
-  if (!credential) throw new Error(`Entity generation credential ${policy.generation.credentialEnv} is missing or blank`);
-  const provider = new HttpJsonGenerationProvider({
-    name: policy.generation.provider,
-    endpoint: policy.generation.endpoint,
-    apiKey: credential,
+  if (!supplied?.provider && !credential) throw new Error(`Entity generation credential ${policy.generation.credentialEnv} is missing or blank`);
+  const provider = supplied?.provider ?? new HttpJsonGenerationProvider({
+    name: policy.generation.provider, endpoint: policy.generation.endpoint, apiKey: credential!,
   });
+  if (provider.name !== policy.generation.provider) throw new Error('Entity generation provider does not match policy');
   const scope = dbScopeFromAuth(auth);
   const namespace = policy.scope.namespaces[0];
   const budget = new InvocationBudget(policy);
   let processed = 0;
 
   while (!signal.aborted && processed < options.maxJobs) {
-    const job = await withScopedClient(scope, client => claimEntityEnrichmentJob(client, [namespace]));
+    const job = await withScopedClient(scope, client => claimEntityEnrichmentJob(client, [namespace], policy.scope.accessLevel, 5, options.memoryIds ?? []));
     if (!job) {
       if (options.once) break;
       await sleep(options.pollMs, signal);
       continue;
     }
     processed += 1;
-    if (job.namespace !== namespace || job.sourceAccessLevel !== 'normal') {
+    if (job.namespace !== namespace || job.sourceAccessLevel !== policy.scope.accessLevel) {
       await withScopedClient(scope, client => removeEntityLinksForIneligibleJob(client, job));
       emitMetric('ineligible');
       continue;

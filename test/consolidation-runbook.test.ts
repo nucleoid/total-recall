@@ -6,11 +6,11 @@ import { parseDeconsolidationCli } from '../scripts/deconsolidate-memories.js';
 
 test('consolidation CLI modes and scope are explicit', () => {
   assert.deepEqual(parseConsolidationCli(['--namespace', 'work', '--access-level', 'normal', '--selection-only']), {
-    namespace: 'work', mode: 'selection-only', anchorLimit: undefined, clusterLimit: undefined, previewOutput: undefined, cursor: undefined,
+    namespace: 'work', mode: 'selection-only', accessLevel: 'normal', anchorLimit: undefined, clusterLimit: undefined, previewOutput: undefined, cursor: undefined,
   });
   assert.throws(() => parseConsolidationCli(['--namespace', 'work', '--dry-run']), /preview-output/);
   assert.throws(() => parseConsolidationCli(['--namespace', 'work', '--selection-only', '--apply']), /mutually exclusive/);
-  assert.throws(() => parseConsolidationCli(['--namespace', 'work', '--access-level', 'sensitive', '--selection-only']), /only/);
+  assert.equal(parseConsolidationCli(['--namespace', 'work', '--access-level', 'sensitive', '--selection-only']).accessLevel, 'sensitive');
 });
 
 test('deconsolidation is manifest-based and preview is the default approval boundary', () => {

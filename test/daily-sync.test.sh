@@ -74,6 +74,13 @@ PIDS+=("$pid")
 kill -0 "$pid" 2>/dev/null || fail "first run watcher is not alive"
 grep -q 'Watcher started' "$TMP/first.out" || fail "first run did not report successful start"
 
+rm -f -- "$pidfile"
+WATCHER_OWNERSHIP=external run_sync >"$TMP/external-owner.out"
+grep -q 'externally managed and healthy' "$TMP/external-owner.out" || fail "external ownership was not reported"
+[[ ! -e $pidfile ]] || fail "external ownership adopted the watcher into a pidfile"
+[[ $(wc -l <"$TMP/starts") -eq 1 ]] || fail "external ownership started a duplicate watcher"
+pass "external watcher ownership validates without adopting or starting"
+
 run_sync >"$TMP/repeat.out"
 grep -q 'Watcher already running' "$TMP/repeat.out" || fail "repeat did not recognize watcher"
 
@@ -290,4 +297,16 @@ grep -q '"test:daily-sync"' "$ROOT/package.json" || fail "daily sync test comman
 grep -q '"test:daily-sync": "node scripts/run-daily-sync-tests.mjs"' "$ROOT/package.json" || fail "daily sync test command is not portable to hosts without Bash"
 [[ -f "$ROOT/scripts/run-daily-sync-tests.mjs" ]] || fail "portable daily sync test runner is missing"
 grep -q 'test:daily-sync.*test:access-level:db' "$ROOT/package.json" || fail "the full test suite does not include Linux scheduler tests"
+CONNECTOR_LAUNCHER="$ROOT/scripts/run-connector-sync.sh"
+[[ -x $CONNECTOR_LAUNCHER ]] || fail "release-relative connector launcher is missing or not executable"
+bash -n "$CONNECTOR_LAUNCHER" || fail "connector launcher has invalid shell syntax"
+set +e
+"$CONNECTOR_LAUNCHER" pre-cutover >"$TMP/obsolete-connector.out" 2>&1
+obsolete_connector_rc=$?
+set -e
+[[ $obsolete_connector_rc -ne 0 ]] || fail "obsolete connector phase was accepted"
+grep -q 'obsolete phase arguments are not supported' "$TMP/obsolete-connector.out" ||
+  fail "obsolete connector phase failure is not actionable"
+pass "release-relative connector launcher rejects obsolete pre-cutover phase"
+
 pass "Linux scheduler ownership and absolute deployment paths are documented"

@@ -185,6 +185,37 @@ function unbracket(hostname: string): string {
   return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
 }
 
+/**
+ * Return exactly the already-reviewed address in the shape requested by Node.
+ * Node 24's connection auto-selection asks custom lookup functions for
+ * `{ all: true }`; returning the legacy scalar shape in that mode is interpreted
+ * as an undefined address and fails before any socket is opened.
+ */
+export function createPinnedWebhookLookup(pinned: { address: string; family: 4 | 6 }): net.LookupFunction {
+  return (_hostname, options, callback) => {
+    // Match real DNS lookup timing. A synchronous callback can let TLS socket
+    // setup run before https.request has attached its own error handlers.
+    queueMicrotask(() => {
+      if (options.all === true) callback(null, [{ address: pinned.address, family: pinned.family }]);
+      else callback(null, pinned.address, pinned.family);
+    });
+  };
+}
+
+export function selectPinnedWebhookAddress(
+  addresses: ReadonlyArray<{ address: string; family: 4 | 6 }>,
+  random = Math.random,
+): { address: string; family: 4 | 6 } {
+  if (addresses.length === 0) throw new Error('webhook_destination_has_no_validated_address');
+  // The production ingestion container currently has IPv4 egress only. Prefer
+  // IPv4 when DNS supplied both families, without resolving again or falling
+  // back to any address that was not already policy-validated.
+  const candidates = addresses.some(address => address.family === 4)
+    ? addresses.filter(address => address.family === 4)
+    : addresses;
+  return candidates[Math.floor(random() * candidates.length)];
+}
+
 async function withDeadline<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -204,7 +235,7 @@ export async function postWebhook(
   const timeoutMs = options.timeoutMs ?? 5_000;
   const maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES_DEFAULT;
   if (body.length > 64 * 1024) throw new Error('webhook_payload_too_large');
-  const pinned = destination.addresses[Math.floor(Math.random() * destination.addresses.length)];
+  const pinned = selectPinnedWebhookAddress(destination.addresses);
   return new Promise<WebhookResponse>((resolve, reject) => {
     let settled = false;
     let deadline: NodeJS.Timeout | undefined;
@@ -225,7 +256,10 @@ export async function postWebhook(
       },
       timeout: timeoutMs,
       maxRedirects: 0,
-      lookup: (_hostname, _options, callback) => callback(null, pinned.address, pinned.family),
+      // Keep TLS SNI/hostname validation bound to destination.url while the
+      // socket address remains pinned to the public DNS answer reviewed above.
+      autoSelectFamily: false,
+      lookup: createPinnedWebhookLookup(pinned),
     } as https.RequestOptions, response => {
       let bytes = 0;
       response.on('data', (chunk: Buffer) => {

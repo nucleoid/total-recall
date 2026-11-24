@@ -202,10 +202,13 @@ test('idempotent stores never classify and shadow classification starts only aft
     model: 'approved',
     endpoint: 'https://generation.example.test/v1',
     namespace: 'shared',
+    accessLevel: 'normal' as const,
     timeoutMs: 1000,
     mutationConfidence: 0.95,
     mutationEnabled: false,
   };
+  assert.equal(policy.mutationEnabled, false, 'store fixture must exercise shadow-only default behavior');
+  assert.equal(policy.accessLevel, 'normal');
   const runtime = {
     contradictionPolicy: policy,
     reviseBelief: async (_memory: unknown, _auth: unknown, options: { excludeCandidateId?: string }) => {

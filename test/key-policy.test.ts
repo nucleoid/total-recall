@@ -28,6 +28,70 @@ test('create-key requires explicit quota policy and validates ACL inputs', () =>
   ], {}, now), /nonempty/);
 });
 
+test('supported key management provisions the dedicated reflection permission', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'reflection', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'work,insights', '--permissions', 'read,reflection', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'reflection']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
+test('supported key management provisions scoped session distillation permission', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'session-distiller', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'financial,my-life', '--permissions', 'read,session_distill', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'session_distill']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
+test('supported key management provisions scoped entity extraction permission', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'entity-extractor', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'financial,my-life', '--permissions', 'read,entity_extract', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'entity_extract']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
+test('supported key management provisions a scoped contradiction reviewer', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'contradiction-reviewer', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'financial,my-life', '--permissions', 'read,contradiction_resolve', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'contradiction_resolve']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
+test('supported key management provisions an exact contradiction audit credential', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'contradiction-auditor', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'financial', '--permissions', 'read,contradiction_audit', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'contradiction_audit']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
+test('supported key management provisions scoped taste-profile permission', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'taste-profile', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'media,personal', '--permissions', 'read,taste_profile', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'taste_profile']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
+test('supported key management provisions a webhook-only worker credential', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'webhook-delivery', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'shared,work', '--permissions', 'webhook_worker', '--max-access-level', 'normal',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['webhook_worker']);
+  assert.equal(parsed.maxAccessLevel, 'normal');
+
+});
+
 test('expiry rejects past, loose, and offset-free timestamps', () => {
   assert.throws(() => parseExpiry('2025-12-31T23:59:59Z', now), /future/);
   assert.throws(() => parseExpiry('2026-01-02', now), /offset-aware/);

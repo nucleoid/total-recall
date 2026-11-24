@@ -1,0 +1,20 @@
+[Unit]
+Description=Total Recall private YouTube Music Python helper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fuego
+WorkingDirectory=%h/.local/share/total-recall/current
+EnvironmentFile=/etc/total-recall/ytmusic-helper.env
+ExecStart=/usr/bin/node %h/.local/share/total-recall/current/dist/ytmusic-helper-gateway-main.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

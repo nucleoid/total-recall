@@ -1,0 +1,14 @@
+[Unit]
+Description=Schedule Total Recall native feature owner (%i)
+
+[Timer]
+# Safe placeholder only. Set an explicit per-feature OnCalendar in a reviewed
+# drop-in before enabling. Persistent=false prevents unbounded catch-up replay.
+OnCalendar=daily
+RandomizedDelaySec=20m
+Persistent=false
+AccuracySec=1m
+Unit=total-recall-native-activation@%i.service
+
+[Install]
+WantedBy=timers.target

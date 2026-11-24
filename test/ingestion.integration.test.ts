@@ -587,7 +587,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
   await t.test('approved near-duplicate corrections revise before dedupe for inline and worker claims', async () => {
     const { prepareBeliefRevision, resetContradictionRuntimeForTesting } = await import('../src/contradictions.js');
     await resetContradictionRuntimeForTesting();
-    const policy = { classificationEnabled:true, mutationEnabled:true, provider:'test', model:'test', endpoint:'https://not-used.example', namespace:'private', timeoutMs:1000, mutationConfidence:0.95,
+    const policy = { classificationEnabled:true, mutationEnabled:true, accessLevel:'normal' as const, provider:'test', model:'test', endpoint:'https://not-used.example', namespace:'private', timeoutMs:1000, mutationConfidence:0.95,
       budget:{limitMicroUsd:100n,requestMicroUsd:1n,inputMicroUsdPerMillionBytes:0n,outputMicroUsdPerMillionBytes:0n,fingerprint:'approved-priority'},shadowMaxInFlight:2,shadowMaxQueued:8 };
     try {
       for (const [mode, axis] of [['inline',6],['worker',7]] as const) {
@@ -638,7 +638,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
       const predecessor=await acceptMemory(input(`${reason} canonical`,{namespace:'private'}),auth,agent);
       await finalizeIngestionJob(await claim(predecessor.id),exact);
       const accepted=await acceptMemory(input(`${reason} duplicate`,{namespace:'private',dedupe:true}),auth,agent);
-      const policy={classificationEnabled:true,mutationEnabled:true,provider:'test',model:'test',endpoint:'https://not-used.example',namespace:reason==='outside_scope'?'shared':'private',timeoutMs:1000,mutationConfidence:0.95,
+      const policy={classificationEnabled:true,mutationEnabled:true,accessLevel:'normal' as const,provider:'test',model:'test',endpoint:'https://not-used.example',namespace:reason==='outside_scope'?'shared':'private',timeoutMs:1000,mutationConfidence:0.95,
         budget:{limitMicroUsd:100n,requestMicroUsd:reason==='budget_exhausted'?101n:1n,inputMicroUsdPerMillionBytes:0n,outputMicroUsdPerMillionBytes:0n,fingerprint:reason},shadowMaxInFlight:2,shadowMaxQueued:8};
       let calls=0;
       const result=await finalizeIngestionJob(await claim(accepted.id),exact,{contradictionPolicy:policy,
@@ -694,7 +694,7 @@ test('durable ingestion on isolated PostgreSQL: leases, RLS, recovery and visibi
   await t.test('inline classifier deadline hands off pending and the worker applies the revision with its full budget', async () => {
     const {prepareBeliefRevision,resetContradictionRuntimeForTesting}=await import('../src/contradictions.js');
     await resetContradictionRuntimeForTesting();
-    const policy={classificationEnabled:true,mutationEnabled:true,provider:'test',model:'test',endpoint:'https://not-used.example',namespace:'private',timeoutMs:1000,mutationConfidence:0.95,
+    const policy={classificationEnabled:true,mutationEnabled:true,accessLevel:'normal' as const,provider:'test',model:'test',endpoint:'https://not-used.example',namespace:'private',timeoutMs:1000,mutationConfidence:0.95,
       budget:{limitMicroUsd:100n,requestMicroUsd:1n,inputMicroUsdPerMillionBytes:0n,outputMicroUsdPerMillionBytes:0n,fingerprint:'ingestion-deadline'},shadowMaxInFlight:2,shadowMaxQueued:8};
     const a=await acceptMemory(input('deadline predecessor',{namespace:'private'}),auth,agent);await finalizeIngestionJob(await claim(a.id),embedding);
     const b=await acceptMemory(input('deadline correction',{namespace:'private',dedupe:false}),auth,agent);const job=await claim(b.id);
