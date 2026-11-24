@@ -11,7 +11,6 @@ import {
   assertSessionPolicyEffective,
   claimSessionDistillationJob,
   distillSessionTranscript,
-  tryInlineSessionFacts,
   loadSessionTranscript,
   markSessionDistillationFailed,
   parseSessionDistillationPolicy,
@@ -22,6 +21,7 @@ import {
   type DistilledFact,
 } from '../src/session-distillation.js';
 import type { AuthContext } from '../src/types.js';
+import { assertSynthesisAuthority } from '../src/synthesis-policy.js';
 
 dotenv.config();
 
@@ -55,11 +55,11 @@ async function loadPolicy(): Promise<SessionDistillationPolicy> {
 
 export function assertSessionWorkerAuthority(auth: AuthContext, policy: SessionDistillationPolicy): void {
   const namespace = policy.scope.namespaces[0];
-  if (auth.namespaces.length !== 1 || auth.namespaces[0] !== namespace || auth.maxAccessLevel !== 'normal') {
-    throw new Error('Session worker requires a dedicated normal-only key for the exact approved namespace');
-  }
-  for (const permission of ['admin', 'read', 'write']) {
-    if (!auth.permissions.includes(permission)) throw new Error(`Session worker key requires '${permission}' permission`);
+  assertSynthesisAuthority(auth, [namespace], policy.scope.accessLevel);
+  const permissions = new Set(auth.permissions);
+  if (!permissions.has('read') || !permissions.has('session_distill') || permissions.has('admin') ||
+      permissions.has('write') || permissions.has('delete')) {
+    throw new Error("Session worker requires 'read,session_distill' without write, admin, or delete");
   }
 }
 
@@ -68,7 +68,8 @@ export async function runSessionWorker(
   signal: AbortSignal,
   supplied?: { policy?: SessionDistillationPolicy; provider?: GenerationProvider; auth?: AuthContext },
 ): Promise<{ processed: number; providerCalls: number; factsStored: number }> {
-  const policy = supplied?.policy ?? await loadPolicy();
+  const loadedPolicy = supplied?.policy ?? await loadPolicy();
+  const policy = parseSessionDistillationPolicy(loadedPolicy, loadedPolicy.environment);
   const rawKey = process.env.SESSION_DISTILLATION_API_KEY?.trim();
   const auth = supplied?.auth ?? (rawKey ? await validateKeyReadOnly(rawKey) : null);
   if (!auth) throw new Error('SESSION_DISTILLATION_API_KEY is required and must be valid');
@@ -94,7 +95,7 @@ export async function runSessionWorker(
 
   while (!signal.aborted && processed < options.maxJobs) {
     assertSessionPolicyEffective(policy);
-    const job = await withScopedClient(scope, client => claimSessionDistillationJob(client, namespace));
+    const job = await withScopedClient(scope, client => claimSessionDistillationJob(client, namespace, policy.scope.accessLevel));
     if (!job) {
       if (options.once) break;
       await sleep(options.pollMs, signal);
@@ -146,7 +147,6 @@ export async function runSessionWorker(
       if (signal.aborted) break;
       continue;
     }
-    await tryInlineSessionFacts(job, auth);
   }
   return { processed, providerCalls, factsStored };
 }

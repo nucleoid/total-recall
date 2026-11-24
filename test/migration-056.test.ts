@@ -1,0 +1,22 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+const sql = readFileSync(new URL('../migrations/056_scoped_session_distillation_worker.sql', import.meta.url), 'utf8');
+test('session worker migration is scoped, provenance-bound, and denies ordinary mutation', () => {
+  assert.match(sql, /key\.revoked_at IS NULL/);
+  assert.match(sql, /key\.expires_at IS NULL OR key\.expires_at > statement_timestamp\(\)/);
+  assert.match(sql, /p_namespace = ANY\(key\.namespaces\)/);
+  assert.match(sql, /app_current_key_has_permission\('session_distill'\)/);
+  assert.match(sql, /NOT public\.app_current_key_has_permission\('write'\)/);
+  assert.match(sql, /NOT public\.app_current_key_has_permission\('admin'\)/);
+  assert.match(sql, /session_distillation_document_lock[\s\S]*WITH CHECK \(false\)/);
+  assert.match(sql, /session_distillation_evidence_lock[\s\S]*WITH CHECK \(false\)/);
+  assert.match(sql, /session_distillation_fact_insert[\s\S]*run\.owner_key_id::text = memories\.client_id/);
+  assert.match(sql, /enqueue_session_distillation_fact[\s\S]*SECURITY DEFINER/);
+  assert.match(sql, /namespace_delete[\s\S]*NOT public\.app_current_key_has_permission\('session_distill'\)/);
+  assert.match(sql, /memory_session_runs_owner_insert[\s\S]*NOT public\.app_current_key_has_permission\('session_distill'\)/);
+  assert.match(sql, /namespace_insert ON public\.documents[\s\S]*NOT public\.app_current_key_has_permission\('session_distill'\)/);
+  assert.match(sql, /p_embedding_dimensions <> 768[\s\S]*p_embedding_provider = 'llama\.cpp'[\s\S]*d38fb12a/);
+  assert.match(sql, /preserve_session_distillation_run_identity/);
+  assert.doesNotMatch(sql, /GRANT\s+(?:INSERT|UPDATE|DELETE)\s+ON/i);
+});

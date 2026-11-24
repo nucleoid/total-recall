@@ -10,7 +10,7 @@ This is an activation plan, not a claim that dormant features work in production
 | Queue ingestion: store/update/document/session | Yes | Active after durable-ingestion repair | Session storage is active; distillation is separate |
 | Consolidation | Exact-level selection/preview/apply for normal, sensitive, or secret | Run table initially empty | Run one namespace and one access-level lane at a time with an authorized key; subscription preview before separate write-approved apply |
 | Reflection | Bounded weekly windows; all-level policy/read/output support in this branch | Run table empty | Apply migration 054; provision a dedicated `read,reflection` key with source namespaces + `insights`, no `write/admin/delete`; dry run first |
-| Session distillation | Durable queue worker | No completed runs observed | Still normal-only and uses cross-owner/admin semantics; not enabled by this stage |
+| Session distillation | Exact-lane all-level queue worker in this branch | No completed runs observed | Apply migration 056; provision a dedicated `read,session_distill` key without ordinary mutation permissions; canary one namespace/level lane |
 | Entity graph | Extraction queue, entities, links, graph query | Entity/link tables empty | Still normal-only; requires bounded backfill preview and all-level worker review |
 | Contradictions | Shadow classification and gated mutation | Classification/mutation gates off | Enable shadow classification only; mutation needs reviewed metrics and exact environment |
 | Supersession | Finalizer and reversible search demotion | Demotion not proven active | Finalize schema, verify, then separately enable score factor |
@@ -62,11 +62,19 @@ Parent-owned deployment steps, in order:
 6. Review content-free counts, access-level distribution, malformed-output rate, call/output-byte usage, and local embedding health. Only then schedule one completed ISO week at a time with no overlapping invocation.
 
 ## Other feature sequence
+Session distillation is a separate activation lane:
+
+1. Apply forward migration 056 after deploying the matching API/worker release; do not replay migrations 030, 053, 054, or 055.
+2. Provision `SESSION_DISTILLATION_API_KEY` through supported key management with the intended stored namespaces, `max_access_level=secret`, permissions `read,session_distill`, and no `write/admin/delete`. Source-owner keys remain independently enabled with `read,write` and the matching namespace/access ceiling.
+3. Review one subscription policy per exact namespace/access-level lane. Set `SESSION_DISTILLATION_POLICY_FILE`, `DEPLOYMENT_ENVIRONMENT`, `GENERATION_API_KEY`, and `NODE_EXTRA_CA_CERTS`; keep the adapter endpoint private.
+4. Keep the shared ingestion worker active so generated facts receive local embeddings. The distillation worker does not impersonate owners or embed through a remote generation provider.
+5. Run `npm run session:distill -- --once --max-jobs 1`, then verify content-free run/lineage/access-level counts and local embedding readiness before scheduling any additional lane.
+
 
 - Consolidation: run `--selection-only`, preview, and separately write-approved apply for one exact namespace/access-level lane at a time; never combine levels in one cluster.
 - Entity: bounded backfill preview, then at most 10 jobs per invocation after all-level policy/query work lands.
 - Taste: dry run before apply; current media path remains normal-only.
-- Session distillation: do not schedule until owner/admin attribution semantics and all-level revalidation are redesigned without forging authority.
+- Session distillation: apply migration 056, then canary one exact namespace/access-level lane with the dedicated non-admin key; derived facts remain owner-attributed and queue only local embedding work.
 - Contradiction: classification shadow only, in-flight 1 and queue 4; mutation remains off.
 - Supersession: run finalizer, inspect report, then canary search demotion.
 - Subscriptions: creation only after encryption/key backup review; delivery separately, concurrency 1 initially.
@@ -74,7 +82,7 @@ Parent-owned deployment steps, in order:
 
 ## Remaining implementation work
 
-This stage completes all-level, subscription-native reflection and consolidation vertical slices. Session distillation, entity extraction, and taste profiling still have normal-only policy/query/worker gates and legacy USD-only budget schemas. Session distillation additionally needs a reviewed replacement for its current admin/cross-owner behavior before the non-admin synthesis key can run it. No schedule for those features should be enabled yet.
+This stage completes all-level, subscription-native reflection, consolidation, and session-distillation vertical slices. Session distillation remains inactive until migration 056, dedicated key provisioning, deployment, and live canary acceptance. Entity extraction and taste profiling still have normal-only policy/query/worker gates and legacy USD-only budget schemas; do not schedule those features yet.
 
 ## Acceptance gates
 

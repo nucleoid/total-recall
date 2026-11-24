@@ -37,6 +37,15 @@ test('supported key management provisions the dedicated reflection permission', 
   assert.equal(parsed.maxAccessLevel, 'secret');
 });
 
+test('supported key management provisions scoped session distillation permission', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'session-distiller', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'financial,my-life', '--permissions', 'read,session_distill', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'session_distill']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
 test('expiry rejects past, loose, and offset-free timestamps', () => {
   assert.throws(() => parseExpiry('2025-12-31T23:59:59Z', now), /future/);
   assert.throws(() => parseExpiry('2026-01-02', now), /offset-aware/);

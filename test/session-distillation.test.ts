@@ -7,6 +7,7 @@ import {
   storeSessionSchema,
   validateSessionDistillationOutput,
 } from '../src/session-distillation.js';
+import { assertSessionWorkerAuthority } from '../scripts/session-distill.js';
 
 const approval = { approved: true as const, approvedBy: 'owner', approvedAt: '2026-01-01T00:00:00Z', expiresAt: '2027-01-01T00:00:00Z' };
 function policy() {
@@ -58,7 +59,7 @@ test('distillation output is strict, bounded, credential-rejecting, and batch-de
   ] })), /invalid_session/);
 });
 
-test('session policy requires four feature-specific effective approvals and exact one-namespace normal scope', () => {
+test('session policy requires four feature-specific effective approvals and exact one-namespace scope', () => {
   const parsed = parseSessionDistillationPolicy(policy(), 'test', new Date('2026-07-01T00:00:00Z'));
   assert.equal(parsed.scope.namespaces.length, 1);
   assert.equal(sessionDistillationPolicyHash(parsed), sessionDistillationPolicyHash(structuredClone(parsed)));
@@ -66,4 +67,41 @@ test('session policy requires four feature-specific effective approvals and exac
   assert.throws(() => parseSessionDistillationPolicy({ ...policy(), termsApproval: undefined }, 'test'), /Required/);
   assert.throws(() => parseSessionDistillationPolicy(policy(), 'production'), /environment/);
   assert.throws(() => parseSessionDistillationPolicy(policy(), 'test', new Date('2028-01-01T00:00:00Z')), /expired/);
+});
+
+
+test('subscription session policy is idempotent, all-level, strict, and OpenClaw-only', () => {
+  const subscription = {
+    ...policy(),
+    generation: { provider: 'openclaw-adapter', model: 'openclaw/total-recall-synthesis',
+      endpoint: 'https://10.0.0.9:3012/v1/generate', credentialEnv: 'GENERATION_API_KEY' },
+    scope: { namespaces: ['my-life'] as [string], accessLevel: 'secret' as const },
+    budget: { mode: 'subscription' as const, maxInputBytesPerSession: 1_100_000,
+      maxOutputBytesPerSession: 65_536, usageControlReference: 'dedicated subscription quota' },
+  };
+  const parsed = parseSessionDistillationPolicy(subscription, 'test', new Date('2026-07-01T00:00:00Z'));
+  assert.deepEqual(parseSessionDistillationPolicy(parsed, 'test', new Date('2026-07-01T00:00:00Z')), parsed);
+  assert.equal(parsed.budget.maxCostUsdPerSession, 0);
+  assert.throws(() => parseSessionDistillationPolicy({ ...subscription,
+    generation: { ...subscription.generation, provider: 'direct-openai' } }, 'test',
+  new Date('2026-07-01T00:00:00Z')), /approved OpenClaw agent adapter/);
+  assert.throws(() => parseSessionDistillationPolicy({ ...subscription,
+    budget: { ...subscription.budget, arbitrary: true } }, 'test', new Date('2026-07-01T00:00:00Z')));
+});
+
+test('session worker authority is scoped, non-admin, and access-ceiling aware', () => {
+  const secretPolicy = parseSessionDistillationPolicy({ ...policy(),
+    generation: { provider: 'openclaw-adapter', model: 'openclaw/total-recall-synthesis',
+      endpoint: 'https://10.0.0.9:3012/v1/generate', credentialEnv: 'GENERATION_API_KEY' },
+    scope: { namespaces: ['financial'], accessLevel: 'secret' },
+    budget: { mode: 'subscription', maxInputBytesPerSession: 1_100_000,
+      maxOutputBytesPerSession: 65_536, usageControlReference: 'dedicated subscription quota' },
+  }, 'test', new Date('2026-07-01T00:00:00Z'));
+  const auth = { keyId: '00000000-0000-4000-8000-000000000001', name: 'session-distiller',
+    namespaces: ['personal', 'financial', 'my-life'], permissions: ['read', 'session_distill'],
+    maxAccessLevel: 'secret' as const };
+  assert.doesNotThrow(() => assertSessionWorkerAuthority(auth, secretPolicy));
+  assert.throws(() => assertSessionWorkerAuthority({ ...auth, maxAccessLevel: 'sensitive' }, secretPolicy), /does not authorize/);
+  assert.throws(() => assertSessionWorkerAuthority({ ...auth, namespaces: ['personal'] }, secretPolicy), /does not authorize/);
+  assert.throws(() => assertSessionWorkerAuthority({ ...auth, permissions: ['read', 'session_distill', 'admin'] }, secretPolicy), /without write, admin, or delete/);
 });

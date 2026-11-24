@@ -23,5 +23,8 @@ test('session generation can be disabled without disabling episode retention in 
   const runbook = readFileSync(new URL('../docs/session-distillation.md', import.meta.url), 'utf8');
   assert.match(runbook, /does \*\*not\*\* enable generation/);
   assert.match(runbook, /MEMORY_SESSION_TOOLS_ENABLED=false/);
-  assert.match(runbook, /one approved namespace and `normal` access/);
+  const implementation = readFileSync(new URL('../src/session-distillation.ts', import.meta.url), 'utf8');
+  assert.match(implementation, /credentials and authentication secrets/);
+  assert.doesNotMatch(implementation, /credentials, secrets/);
+  assert.match(runbook, /one approved namespace and one exact access-level lane/);
 });
