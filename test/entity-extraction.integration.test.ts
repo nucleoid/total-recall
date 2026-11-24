@@ -11,7 +11,9 @@ import { finalizeMemoryValidity } from '../scripts/finalize-memory-validity.js';
 import { hashKey } from '../src/auth.js';
 import { dbScopeFromAuth, setPoolForTesting, withScopedClient } from '../src/db.js';
 import { parseEntityExtractionPolicy } from '../src/entity-extractor.js';
-import { claimEntityEnrichmentJob, enqueueEntityBackfill, enqueueEntityRequeue, loadEntityJobContent, previewEntityBackfill, previewEntityRequeue, replaceMemoryEntityLinks } from '../src/entities.js';
+import { claimEntityEnrichmentJob, enqueueEntityBackfill, enqueueEntityRequeue, enqueueLegacyEntityCoverage,
+  loadEntityJobContent, previewEntityBackfill, previewEntityRequeue, previewLegacyEntityCoverage,
+  replaceMemoryEntityLinks } from '../src/entities.js';
 import { runEntityWorker } from '../scripts/entity-enrich.js';
 import { memoryGraph } from '../src/tools/graph.js';
 import type { AuthContext } from '../src/types.js';
@@ -59,10 +61,13 @@ test('scoped entity worker extracts secret graph without source authority or rea
   assert.deepEqual(await runEntityWorker({once:true,maxJobs:1,pollMs:100},new AbortController().signal,{policy:policy(),provider,auth:worker}),{processed:1,providerCalls:1});
   assert.equal(calls,1);
   assert.equal((await owner.query('SELECT count(*)::int AS n FROM memory_entities WHERE memory_id=$1',[memoryId])).rows[0].n,2);
+  assert.deepEqual((await owner.query('SELECT extraction_contract,extraction_result FROM entity_enrichment_queue WHERE memory_id=$1',[memoryId])).rows[0],
+    {extraction_contract:'entity-extraction:v1',extraction_result:'entities'});
   assert.equal((await runEntityWorker({once:true,maxJobs:1,pollMs:100},new AbortController().signal,{policy:policy(),provider,auth:worker})).providerCalls,0);
   assert.equal(calls,1);
   await owner.query("UPDATE memories SET content=content || ' Durable replay.' WHERE id=$1",[memoryId]);
   assert.equal((await owner.query('SELECT count(*)::int AS n FROM memory_entities WHERE memory_id=$1',[memoryId])).rows[0].n,0);
+  assert.equal((await owner.query('SELECT extraction_contract FROM entity_enrichment_queue WHERE memory_id=$1',[memoryId])).rows[0].extraction_contract,null);
   assert.equal((await runEntityWorker({once:true,maxJobs:1,pollMs:100},new AbortController().signal,
     {policy:policy(),provider,auth:worker})).providerCalls,1);
   assert.equal(calls,2);
@@ -99,6 +104,36 @@ test('scoped entity worker extracts secret graph without source authority or rea
   const publicRawEntity=await withScopedClient(dbScopeFromAuth(normalReader),client => client.query<{display_name:string}>(
     "SELECT display_name FROM entities WHERE normalized_name='alice'"));
   assert.deepEqual(publicRawEntity.rows.map(row=>row.display_name),['alice']);
+
+  const legacyCoverage=await owner.query<{id:string}>(`INSERT INTO memories(content,source,namespace,access_level,client_id,memory_kind,valid_from)
+    VALUES('Legacy source without a proved extraction.','synthetic','my-life','sensitive',$1,'semantic',statement_timestamp()) RETURNING id`,['legacy-coverage']);
+  await owner.query("UPDATE entity_enrichment_queue SET status='done',completed_at=statement_timestamp(),source_updated_at='2019-01-01T00:00:00Z' WHERE memory_id=$1",[legacyCoverage.rows[0].id]);
+  const honestGraph=await memoryGraph({entity:'not-present',namespaces:['my-life'],depth:0},source);
+  assert.equal(honestGraph.indexing.complete,false);assert.ok(honestGraph.indexing.legacy_skipped>=1);
+  assert.ok(honestGraph.indexing.unindexed>=1);assert.ok(honestGraph.indexing.covered>=2);
+  const legacyPreview=await withScopedClient(dbScopeFromAuth(worker),client=>previewLegacyEntityCoverage(
+    client,'my-life','sensitive','2026-11-24T11:40:00Z',[legacyCoverage.rows[0].id]));
+  assert.equal(legacyPreview.rows,1);
+  const legacyQueued=await withScopedClient(dbScopeFromAuth(worker),client=>enqueueLegacyEntityCoverage(
+    client,'my-life','sensitive','2026-11-24T11:40:00Z',1,[legacyCoverage.rows[0].id]));
+  assert.equal(legacyQueued.enqueued,1);
+  const legacyEmptyProvider={name:'openclaw-adapter',generate:async()=>JSON.stringify({entities:[]})};
+  assert.equal((await runEntityWorker({once:true,maxJobs:1,pollMs:100,memoryIds:[legacyCoverage.rows[0].id]},
+    new AbortController().signal,{policy:policy('sensitive'),provider:legacyEmptyProvider,auth:worker})).providerCalls,1);
+  assert.deepEqual((await owner.query('SELECT extraction_contract,extraction_result FROM entity_enrichment_queue WHERE memory_id=$1',[legacyCoverage.rows[0].id])).rows[0],
+    {extraction_contract:'entity-extraction:v1',extraction_result:'empty'});
+  const expiredLegacy=await owner.query<{id:string}>(`INSERT INTO memories(content,source,namespace,access_level,client_id,memory_kind,valid_from,expires_at)
+    VALUES('Expired legacy source.','synthetic','my-life','sensitive',$1,'semantic','2018-01-01T00:00:00Z','2019-01-01T00:00:00Z') RETURNING id`,['legacy-expired']);
+  await owner.query("UPDATE entity_enrichment_queue SET status='done',completed_at=statement_timestamp(),source_updated_at='2018-01-01T00:00:00Z' WHERE memory_id=$1",[expiredLegacy.rows[0].id]);
+  assert.equal((await withScopedClient(dbScopeFromAuth(worker),client=>previewLegacyEntityCoverage(
+    client,'my-life','sensitive','2026-11-24T11:40:00Z',[expiredLegacy.rows[0].id]))).rows,0);
+  const normalLegacy=await owner.query<{id:string}>(`INSERT INTO memories(content,source,namespace,access_level,client_id,memory_kind,valid_from)
+    VALUES('Normal legacy uncovered source.','synthetic','my-life','normal',$1,'semantic',statement_timestamp()) RETURNING id`,['legacy-normal']);
+  await owner.query("UPDATE entity_enrichment_queue SET status='done',completed_at=statement_timestamp(),source_updated_at='2019-01-01T00:00:00Z' WHERE memory_id=$1",[normalLegacy.rows[0].id]);
+  assert.equal((await withScopedClient(dbScopeFromAuth(worker),client=>previewLegacyEntityCoverage(
+    client,'my-life','sensitive','2026-11-24T11:40:00Z',[normalLegacy.rows[0].id]))).rows,0);
+  assert.equal((await withScopedClient(dbScopeFromAuth(lowerWorker),client=>previewLegacyEntityCoverage(
+    client,'my-life','normal','2026-11-24T11:40:00Z',[normalLegacy.rows[0].id]))).rows,1);
   await owner.query("UPDATE entity_enrichment_queue SET completed_at='2019-01-01T00:00:00Z' WHERE memory_id=$1",[normal.rows[0].id]);
   const linkedRequeue=await withScopedClient(dbScopeFromAuth(lowerWorker),client => previewEntityRequeue(
     client,'my-life','normal','2020-01-01T00:00:00Z',[normal.rows[0].id]));
@@ -160,6 +195,8 @@ test('scoped entity worker extracts secret graph without source authority or rea
   const emptyProvider={name:'openclaw-adapter',generate:async()=>JSON.stringify({entities:[]})};
   assert.equal((await runEntityWorker({once:true,maxJobs:1,pollMs:100,memoryIds:[newlyEmpty.rows[0].id]},new AbortController().signal,
     {policy:policy('sensitive'),provider:emptyProvider,auth:worker})).providerCalls,1);
+  assert.deepEqual((await owner.query('SELECT extraction_contract,extraction_result FROM entity_enrichment_queue WHERE memory_id=$1',[newlyEmpty.rows[0].id])).rows[0],
+    {extraction_contract:'entity-extraction:v1',extraction_result:'empty'});
   const excludedNewEmpty=await withScopedClient(dbScopeFromAuth(worker),client => previewEntityRequeue(
     client,'my-life','sensitive','2020-01-01T00:00:00Z',[newlyEmpty.rows[0].id]));
   assert.equal(excludedNewEmpty.rows,0);
