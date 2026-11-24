@@ -25,6 +25,7 @@ Legacy paid-budget policy remains strict for compatibility, but the approved pro
 - The worker cannot ordinarily insert, update, or delete source memories or documents. Its queue insertion/update and graph-link writes are tied to matching source provenance and a genuine processing job.
 - Entity rows carry no independent lower classification. Raw entity and link `SELECT` policies require at least one active linked memory within the querying key's current namespace/access ceiling. Global `display_name` is stored as the safe normalized identity; source spelling, casing, mentions, and aliases remain only on access-filtered links, so a secret-first identity cannot leak its presentation metadata through a later normal link.
 - `memory_graph` rechecks active memory lifecycle and caller access on seed, traversal, memory, and indexing-status queries. Lower-clearance keys cannot receive entity names, memories, or edges backed only by higher-level links.
+- Indexing status examines a stable UUID-ordered page of at most 1,000 currently active, caller-visible source memories. `sampled` and `limit` describe that page. When `hasMore` is true, `countsExact` and `complete` are false and every status count is an observed lower bound; callers must never interpret a zero in that page as corpus-wide absence or coverage. The 1,001st eligible row is used only to detect truncation, before content hashing and queue joins.
 
 ## Historical backfill
 

@@ -111,6 +111,8 @@ test('scoped entity worker extracts secret graph without source authority or rea
   const honestGraph=await memoryGraph({entity:'not-present',namespaces:['my-life'],depth:0},source);
   assert.equal(honestGraph.indexing.complete,false);assert.ok(honestGraph.indexing.legacy_skipped>=1);
   assert.ok(honestGraph.indexing.unindexed>=1);assert.ok(honestGraph.indexing.covered>=2);
+  assert.equal(honestGraph.indexing.hasMore,false);assert.equal(honestGraph.indexing.countsExact,true);
+  assert.ok(honestGraph.indexing.sampled<honestGraph.indexing.limit);
   const legacyPreview=await withScopedClient(dbScopeFromAuth(worker),client=>previewLegacyEntityCoverage(
     client,'my-life','sensitive','2026-11-24T11:40:00Z',[legacyCoverage.rows[0].id]));
   assert.equal(legacyPreview.rows,1);
@@ -200,5 +202,29 @@ test('scoped entity worker extracts secret graph without source authority or rea
   const excludedNewEmpty=await withScopedClient(dbScopeFromAuth(worker),client => previewEntityRequeue(
     client,'my-life','sensitive','2020-01-01T00:00:00Z',[newlyEmpty.rows[0].id]));
   assert.equal(excludedNewEmpty.rows,0);
+
+  const sampledEmptyId='00000000-0000-4000-8000-000000000001';
+  await owner.query(`INSERT INTO memories(id,content,source,namespace,access_level,client_id,memory_kind,valid_from)
+    VALUES($1,'No named entity in this bounded sample.','synthetic','my-life','normal',$2,'semantic',statement_timestamp())`,
+  [sampledEmptyId,'bounded-status-empty']);
+  assert.equal((await runEntityWorker({once:true,maxJobs:1,pollMs:100,memoryIds:[sampledEmptyId]},new AbortController().signal,
+    {policy:policy('normal'),provider:emptyProvider,auth:lowerWorker})).providerCalls,1);
+  assert.deepEqual((await owner.query('SELECT extraction_contract,extraction_result FROM entity_enrichment_queue WHERE memory_id=$1',[sampledEmptyId])).rows[0],
+    {extraction_contract:'entity-extraction:v1',extraction_result:'empty'});
+  await owner.query(`INSERT INTO memories(id,content,source,namespace,access_level,client_id,memory_kind,valid_from)
+    SELECT ('70000000-0000-4000-8000-'||lpad(series::text,12,'0'))::uuid,
+      'Bounded graph status source '||series,'synthetic','my-life','normal','bounded-status','semantic',statement_timestamp()
+    FROM generate_series(1,1001) series`);
+  const boundedStatus=await memoryGraph({entity:'not-present',namespaces:['my-life'],depth:0},normalReader);
+  assert.equal(boundedStatus.indexing.sampled,1000);
+  assert.equal(boundedStatus.indexing.limit,1000);
+  assert.equal(boundedStatus.indexing.hasMore,true);
+  assert.equal(boundedStatus.indexing.countsExact,false);
+  assert.equal(boundedStatus.indexing.complete,false);
+  assert.ok(boundedStatus.indexing.covered>=1,'valid empty extraction must count as observed coverage');
+  assert.ok(boundedStatus.indexing.pending>0,'pending count must be an observed lower bound');
+  assert.deepEqual(boundedStatus.memories,[]);
+  assert.deepEqual(boundedStatus.entities,[]);
+  assert.deepEqual(boundedStatus.edges,[]);
 
 });

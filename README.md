@@ -302,7 +302,7 @@ Hybrid semantic + keyword search with filters. Every search is logged as a recal
 After memory-validity finalization, pass an offset-aware ISO-8601 `valid_at` to search the half-open interval `valid_from <= valid_at < valid_to` (or an open-ended interval). Historical search does not apply today's supersession demotion. Results, direct recall, and list output include `memory_kind`, `valid_from`, `valid_to`, and supersession fields.
 
 ### `memory_graph`
-Traverse exact normalized entity names and their co-occurring `person`, `project`, `tool`, and `place` entities. The optional namespace list is intersected with the caller ACL and `depth` is bounded from 0 to 3. Responses are versioned and capped at 100 entities, 500 active memories, and 1,000 edges, with explicit indexing-completeness and truncation flags.
+Traverse exact normalized entity names and their co-occurring `person`, `project`, `tool`, and `place` entities. The optional namespace list is intersected with the caller ACL and `depth` is bounded from 0 to 3. Responses are versioned and capped at 100 entities, 500 active memories, and 1,000 edges. Indexing status samples at most 1,000 active, caller-visible inputs in stable UUID order; `hasMore=true` makes counts lower bounds, `countsExact=false`, and `complete=false`.
 
 Entity extraction is eventually consistent and disabled until a separate #55 provider/model, terms, one-namespace `normal` scope, and cost policy is approved. See [`docs/entity-graph-rollout-runbook.md`](docs/entity-graph-rollout-runbook.md).
 

@@ -8,6 +8,7 @@ export const GRAPH_MAX_ENTITIES = 100;
 export const GRAPH_MAX_MEMORIES = 500;
 export const GRAPH_MAX_EDGES = 1_000;
 export const GRAPH_MAX_DEPTH = 3;
+export const GRAPH_INDEXING_SAMPLE_LIMIT = 1_000;
 export const ENTITY_JOB_MAX_ATTEMPTS = 5;
 export const ENTITY_LEGACY_COVERAGE_CUTOFF = '2026-11-24T11:40:00.000Z';
 
@@ -211,7 +212,8 @@ export interface MemoryGraphResult {
     entity_id: string; memory_id: string; namespace: string; mention: string; aliases: string[]; confidence: number;
   }>;
   indexing: { complete: boolean; pending: number; processing: number; retry: number; dead: number;
-    covered: number; legacy_skipped: number; unindexed: number };
+    covered: number; legacy_skipped: number; unindexed: number; sampled: number; limit: number;
+    hasMore: boolean; countsExact: boolean };
   truncation: { entities: boolean; memories: boolean; edges: boolean };
 }
 
@@ -328,42 +330,57 @@ export async function traverseMemoryGraph(
 async function graphIndexingStatus(client: ScopedClient, namespaces: string[], maxAccessLevel: AccessLevel): Promise<MemoryGraphResult['indexing']> {
   const result = await client.query<{
     pending: string; processing: string; retry: string; dead: string;
-    covered: string; legacy_skipped: string; unindexed: string;
+    covered: string; legacy_skipped: string; unindexed: string; sampled: string; has_more: boolean;
   }>(`
+    WITH eligible AS MATERIALIZED (
+      SELECT m.id, m.namespace, m.entity_source_revision, m.content,
+             COALESCE(m.access_level, 'normal') AS access_level
+      FROM memories m
+      WHERE m.namespace = ANY($1::text[]) AND ${accessLevelSql('m.access_level', '$2')}
+        AND m.memory_kind <> 'episode_chunk' AND m.deleted_at IS NULL
+        AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
+        AND m.superseded_at IS NULL AND m.valid_to IS NULL
+        AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
+        AND m.consolidated_into_id IS NULL
+      ORDER BY m.id
+      LIMIT ($4::int + 1)
+    ), sample AS MATERIALIZED (
+      SELECT id, namespace, entity_source_revision, md5(content) AS content_hash, access_level
+      FROM eligible ORDER BY id LIMIT $4
+    )
     SELECT
       count(*) FILTER (WHERE q.status = 'pending')::text AS pending,
       count(*) FILTER (WHERE q.status = 'processing')::text AS processing,
       count(*) FILTER (WHERE q.status = 'retry')::text AS retry,
       count(*) FILTER (WHERE q.status = 'dead')::text AS dead,
       count(*) FILTER (WHERE q.status = 'done'
-        AND q.source_revision = m.entity_source_revision AND q.source_content_hash = md5(m.content)
-        AND q.source_access_level = COALESCE(m.access_level, 'normal')
+        AND q.source_revision = m.entity_source_revision AND q.source_content_hash = m.content_hash
+        AND q.source_access_level = m.access_level
         AND q.extraction_contract = $3)::text AS covered,
       count(*) FILTER (WHERE q.status = 'done'
-        AND q.source_revision = m.entity_source_revision AND q.source_content_hash = md5(m.content)
-        AND q.source_access_level = COALESCE(m.access_level, 'normal')
+        AND q.source_revision = m.entity_source_revision AND q.source_content_hash = m.content_hash
+        AND q.source_access_level = m.access_level
         AND q.extraction_contract IS NULL)::text AS legacy_skipped,
       count(*) FILTER (WHERE q.memory_id IS NULL OR q.status <> 'done'
-        OR q.source_revision <> m.entity_source_revision OR q.source_content_hash <> md5(m.content)
-        OR q.source_access_level <> COALESCE(m.access_level, 'normal')
-        OR q.extraction_contract IS DISTINCT FROM $3)::text AS unindexed
-    FROM memories m
+        OR q.source_revision <> m.entity_source_revision OR q.source_content_hash <> m.content_hash
+        OR q.source_access_level <> m.access_level
+        OR q.extraction_contract IS DISTINCT FROM $3)::text AS unindexed,
+      count(*)::text AS sampled,
+      (SELECT count(*) > $4 FROM eligible) AS has_more
+    FROM sample m
     LEFT JOIN entity_enrichment_queue q ON q.memory_id = m.id AND q.namespace = m.namespace
-    WHERE m.namespace = ANY($1::text[]) AND ${accessLevelSql('m.access_level', '$2')}
-      AND m.memory_kind <> 'episode_chunk' AND m.deleted_at IS NULL
-      AND (m.expires_at IS NULL OR m.expires_at > statement_timestamp())
-      AND m.superseded_at IS NULL AND m.valid_to IS NULL
-      AND (m.valid_from IS NULL OR m.valid_from <= statement_timestamp())
-      AND m.consolidated_into_id IS NULL
-  `, [namespaces, maxAccessLevel, ENTITY_EXTRACTION_CONTRACT_ID]);
+  `, [namespaces, maxAccessLevel, ENTITY_EXTRACTION_CONTRACT_ID, GRAPH_INDEXING_SAMPLE_LIMIT]);
   const row = result.rows[0];
+  const hasMore = row?.has_more === true;
   const status = {
     pending: Number(row?.pending ?? 0), processing: Number(row?.processing ?? 0),
     retry: Number(row?.retry ?? 0), dead: Number(row?.dead ?? 0),
     covered: Number(row?.covered ?? 0), legacy_skipped: Number(row?.legacy_skipped ?? 0),
     unindexed: Number(row?.unindexed ?? 0),
+    sampled: Number(row?.sampled ?? 0), limit: GRAPH_INDEXING_SAMPLE_LIMIT,
+    hasMore, countsExact: !hasMore,
   };
-  return { complete: status.unindexed === 0, ...status };
+  return { complete: !hasMore && status.unindexed === 0, ...status };
 }
 
 function activeMemorySql(alias: string, ceilingParameter: string): string {
@@ -377,7 +394,8 @@ function activeMemorySql(alias: string, ceilingParameter: string): string {
 function emptyGraph(): MemoryGraphResult {
   return { version: 1, seeds: [], entities: [], memories: [], edges: [],
     indexing: { complete: true, pending: 0, processing: 0, retry: 0, dead: 0,
-      covered: 0, legacy_skipped: 0, unindexed: 0 },
+      covered: 0, legacy_skipped: 0, unindexed: 0, sampled: 0,
+      limit: GRAPH_INDEXING_SAMPLE_LIMIT, hasMore: false, countsExact: true },
     truncation: { entities: false, memories: false, edges: false } };
 }
 
