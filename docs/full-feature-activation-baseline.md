@@ -1,70 +1,81 @@
 # Full-feature activation baseline (2026-11-24)
 
-This is an activation plan, not a claim that dormant features work in production. It preserves local-only embeddings, normal-only synthesis scope, My Life exclusion, existing resource guards, and independent approval gates.
+This is an activation plan, not a claim that dormant features work in production. The owner-approved scope now includes **all already-stored memories**, including `financial`, `my-life`, `sensitive`, and `secret`, only when the executing API key genuinely authorizes both the namespace and access-level ceiling. This does not authorize new raw My Life acquisition. Local-only embeddings, per-key namespace isolation, source sensitivity, resource guards, and independent write approvals remain mandatory.
 
 ## Capability inventory
 
 | Capability | Supported in release | Observed production state | Activation boundary |
 |---|---|---|---|
-| Local embeddings/search | Yes | Active Qwen local contract; caught-up ingestion reported after repair | Keep unchanged; never route embeddings through synthesis |
-| Queue ingestion: store/update/document/session | Yes | Four gates active; worker ready/retry queue repaired | Session storage is active; distillation is separate |
-| Consolidation | Selection, preview and apply | Run table empty | Approved policy + normal-only key + adapter; preview before write approval |
-| Reflection | Bounded weekly windows | Run table empty | Approved policy + normal-only key + adapter; dry run first |
-| Session distillation | Durable queue worker | No completed runs observed | Approved policy + exact namespace normal-only key + adapter |
-| Entity graph | Extraction queue, entities, links, graph query | Entity/link tables empty | Approved policy + bounded backfill preview + worker |
-| Contradictions | Shadow classification and gated mutation | Classification/mutation gates off | Enable shadow classification only; mutation requires reviewed metrics and exact environment |
-| Supersession | Finalizer and reversible search demotion | No evidence demotion enabled | Finalize schema, verify, then separately enable score factor |
-| Subscriptions/webhooks | Creation and bounded public-HTTPS delivery | Creation/delivery off; table empty | Encryption ring + exact worker key; creation and delivery are separate gates |
-| Taste profile | Evidence-bounded preview/apply | No native run evidence | Approved policy + media evidence + adapter; preview first |
+| Local embeddings/search | Yes | Active local Qwen contract | Keep unchanged; synthesis never replaces or exports embeddings |
+| Queue ingestion: store/update/document/session | Yes | Active after durable-ingestion repair | Session storage is active; distillation is separate |
+| Consolidation | Normal-level selection/preview/apply | Run table empty | Migration 054 makes run/checkpoint/member schema level-capable; runtime selection/apply remains normal-only pending a separate reviewed change |
+| Reflection | Bounded weekly windows; all-level policy/read/output support in this branch | Run table empty | Apply migration 054; provision a dedicated `read,reflection` key with source namespaces + `insights`, no `write/admin/delete`; dry run first |
+| Session distillation | Durable queue worker | No completed runs observed | Still normal-only and uses cross-owner/admin semantics; not enabled by this stage |
+| Entity graph | Extraction queue, entities, links, graph query | Entity/link tables empty | Still normal-only; requires bounded backfill preview and all-level worker review |
+| Contradictions | Shadow classification and gated mutation | Classification/mutation gates off | Enable shadow classification only; mutation needs reviewed metrics and exact environment |
+| Supersession | Finalizer and reversible search demotion | Demotion not proven active | Finalize schema, verify, then separately enable score factor |
+| Subscriptions/webhooks | Creation and bounded public-HTTPS delivery | Creation/delivery off | Encryption ring + exact worker key; creation and delivery are separate gates |
+| Taste profile | Evidence-bounded preview/apply | No native run evidence | Media-derived path remains normal-only; all-level/subscription policy support remains to implement |
 | Decay/lifecycle | TTL/decay, validity, purge/finalizers | Supported; optional schedules not proven | Owner-only finalizers first, then small daily batch |
-| Archive/preseed | OpenClaw/Claude/Gemini/ChatGPT and archive gateway | My Life archive heavily populated; this is storage, not native understanding | No new raw archive scope; keep sensitive/secret/financial excluded |
-| Media connectors | Spotify, YouTube Music, Plex, browser history | Media rollups exist; old external pre-cutover cron is obsolete | Use tracked release-relative launcher; one owner per connector |
-| Existing Cass synthesis | Weekly OpenClaw user-model synthesis | Active and delivered | Keep as comparison baseline; it does not populate native run tables |
+| Archive/preseed | OpenClaw/Claude/Gemini/ChatGPT and archive gateway | Stored My Life archive exists | Existing stored records are eligible through authorized native synthesis; no new raw acquisition scope |
+| Media connectors | Spotify, YouTube Music, Plex, browser history | Parent reports media repaired/verified | Do not replay; one scheduler owner per connector |
+| Existing Cass synthesis | OpenClaw user-model synthesis | Active comparison baseline | Does not populate native run tables |
 
-Live evidence source: 'artifacts/total-recall-active-features-20261124.md' in the agent workspace. Counts are point-in-time and intentionally content-free.
+Point-in-time, content-free evidence is recorded in `artifacts/total-recall-active-features-20261124.md`.
 
-## OpenClaw synthesis dependency
+## Verified OpenClaw subscription dependency
 
-'src/generation-gateway-adapter.ts' converts the existing bounded Total Recall contract to OpenClaw's official 'POST /v1/chat/completions' API.
+`src/generation-gateway-adapter.ts` converts Total Recall's bounded generation contract to OpenClaw's official chat-completions endpoint through a dedicated isolated agent. Subscription-mode native policies must set:
 
-1. On Fuego, enable 'gateway.http.endpoints.chatCompletions.enabled'.
-2. Create dedicated agent 'total-recall-synthesis', backed by the owner-approved OpenClaw/Codex model.
-3. Deny **all internal tools** for that agent. 'tool_choice: none' only disables caller-supplied HTTP tools and is not an internal-tool sandbox.
-4. Install the adapter env/service templates on Fuego. Keep the OpenClaw bearer credential there, mode 0600.
-5. Allow only 'openclaw/total-recall-synthesis'. Do not use 'x-openclaw-model'; backend selection belongs to the reviewed agent config.
-6. Workers use only the adapter token. Either run synthesis workers on Fuego against approved private DB/embedding routes, or bind the adapter to a private firewalled interface for Dappnode. Never expose either endpoint publicly.
-7. Smoke test '/v1/models' and one synthetic, non-memory adapter request before any dry run.
+- `generation.provider: openclaw-adapter`
+- `generation.model: openclaw/total-recall-synthesis`
+- `generation.endpoint`: the private adapter URL
+- `generation.credentialEnv: GENERATION_API_KEY`
+- `budget.mode: subscription`, with explicit per-run call/output-byte limits and a usage-control reference
 
-The adapter accepts canonical loopback HTTP ('127.0.0.1') or HTTPS upstream only, requires the exact chat-completions path, bounds request/response bytes and time, rejects tools, and allowlists agent targets.
+Subscription mode forbids a direct provider/model bypass and does not require fabricated USD prices. Legacy paid-budget policy fields remain accepted for backward compatibility.
 
-**Current blocker:** endpoint enablement, the dedicated tool-denied agent, its approved OpenClaw/Codex backend, private Fuego-to-worker route, and provider cost terms/budgets have not been verified. Therefore no native synthesis schedule is ready to turn on merely by installing these files.
+The parent has verified the private TLS path from the real ingestion worker: health 200, missing bearer 401, and authenticated synthetic generation 200. The OpenClaw operator token remains only on Fuego. Workers receive only the adapter bearer and private CA. The isolated agent is pinned to the approved existing subscription with no fallback. This transport verification does **not** activate any native feature.
 
-## Activation sequence and bounded schedules
+## Reflection security contract in this stage
 
-Use one namespace with 'access_level=normal'. Explicitly exclude 'my-life', 'sensitive', 'secret', and financial scope in every policy/key.
+Reflection now:
 
-1. Verify migrations/finalizers and current release. Keep ingestion and local embeddings green.
-2. Install and test the OpenClaw adapter dependency above.
-3. Create native policy files using each feature's strict schema. Set 'generation.provider' to 'openclaw-adapter', 'generation.model' to 'openclaw/total-recall-synthesis', endpoint to the private adapter, and a dedicated credential env. Record exact privacy/retention/training, scope and conservative cost approvals; do not use placeholder estimates.
-4. Run content-free previews:
-   - consolidation: 'npm run consolidate -- --selection-only --namespace <approved>' then '--dry-run --preview-output <owner-file>';
-   - reflection: 'npm run reflect -- --namespace <approved> --dry-run';
-   - entity: 'npm run entity:backfill -- --namespace <approved>' preview, then 'entity:enrich -- --once --max-jobs 10';
-   - taste: 'npm run taste-profile -- --dry-run';
-   - session: 'npm run session:distill -- --once --max-jobs 5'.
-5. Review receipts, costs, malformed-output rates and local embedding health. Add bounded jobs only after clean previews:
-   - session/entity: every 10 minutes, max 10 jobs, no overlapping invocation;
-   - reflection: weekly, one completed ISO week;
-   - taste: weekly;
-   - consolidation: weekly selection/preview; apply remains separately write-approved;
-   - decay: daily with existing batch limits;
-   - webhook delivery: one worker, concurrency 1 initially.
-6. Enable contradiction **classification shadow only** with in-flight 1 and queue 4. Mutation stays false until shadow metrics are explicitly reviewed.
-7. Run supersession finalizer once, verify its report, then canary 'SUPERSEDED_SEARCH_DEMOTION_ENABLED=true' with default factor 0.25.
-8. Enable subscription creation only after encryption/key backup and endpoint ownership review; enable delivery separately.
-9. Connector schedules call 'scripts/run-connector-sync.sh <connector>' from the active release. Remove the obsolete '--phase pre-cutover' wrapper only during parent-owned scheduler cutover.
-10. Install the daily timer on the Dappnode 'cass' account with 'WATCHER_OWNERSHIP=external'; it must observe exactly one watcher and can never start/adopt another.
+1. selects source records only up to the policy access-level ceiling;
+2. requires every requested source namespace plus `insights` to exist on the executing key;
+3. requires the dedicated native `reflection` permission and forbids `write`, `admin`, and `delete`, preserving migration 031 RLS isolation;
+4. revalidates evidence content/revisions and access levels before applying output;
+5. classifies every derived insight at the maximum sensitivity of its cited evidence and refuses reuse of a lower-classified insight;
+6. uses bounded subscription calls/output bytes with zero fabricated USD accounting.
+
+Migration 054 is forward-only. It broadens consolidation metadata checks to the three existing access levels and replaces only the reflection insert policy's fixed-normal condition with a check against the current key's `max_access_level`. It does not grant a key, mutate memories, enable a worker, or relax namespace/permission/provenance guards.
+
+## Exact activation prerequisites
+
+Parent-owned deployment steps, in order:
+
+1. Deploy this release and apply migration 054 through the normal migration runner. Do not replay migration 027 or 031.
+2. Through supported key management, create or amend a **reflection-specific** key with all intended stored source namespaces plus `insights`, `max_access_level=secret`, permissions `read,reflection` (optionally `consolidate` only if another reviewed native path needs it), and no `write/admin/delete`. The previously created general synthesis key has `write` and lacks `insights`/`reflection`, so it must not run reflection as-is.
+3. Store that key only in `REFLECTION_API_KEY`. Keep the adapter bearer in `GENERATION_API_KEY`; these are different credentials.
+4. Set `REFLECTION_POLICY_FILE` to a reviewed subscription policy. Runtime also requires `DEPLOYMENT_ENVIRONMENT`, `GENERATION_ENDPOINT` mapped into policy JSON, `GENERATION_API_KEY`, and `NODE_EXTRA_CA_CERTS` for the private CA.
+5. Run `npm run reflect -- --namespace <authorized> --dry-run` independently for each namespace. A multi-namespace key does not merge namespaces: each run remains scoped to one origin namespace and writes origin-tagged insights.
+6. Review content-free counts, access-level distribution, malformed-output rate, call/output-byte usage, and local embedding health. Only then schedule one completed ISO week at a time with no overlapping invocation.
+
+## Other feature sequence
+
+- Consolidation: selection-only, then preview, then separately write-approved apply; runtime remains normal-only in this stage.
+- Entity: bounded backfill preview, then at most 10 jobs per invocation after all-level policy/query work lands.
+- Taste: dry run before apply; current media path remains normal-only.
+- Session distillation: do not schedule until owner/admin attribution semantics and all-level revalidation are redesigned without forging authority.
+- Contradiction: classification shadow only, in-flight 1 and queue 4; mutation remains off.
+- Supersession: run finalizer, inspect report, then canary search demotion.
+- Subscriptions: creation only after encryption/key backup review; delivery separately, concurrency 1 initially.
+- Decay/lifecycle: existing bounded daily batches only.
+
+## Remaining implementation work
+
+This bounded stage completes shared authorization/subscription primitives and the reflection vertical slice. Consolidation, session distillation, entity extraction, and taste profiling still have normal-only policy/query/worker gates and legacy USD-only budget schemas. Migration 054 removes schema blockers for future consolidation work but intentionally does not imply its runtime is all-level-ready. Session distillation additionally needs a reviewed replacement for its current admin/cross-owner behavior before the non-admin synthesis key can run it. No schedule for those features should be enabled yet.
 
 ## Acceptance gates
 
-For each feature: policy hash/expiry valid; dedicated key exact scope; no protected namespace; one scheduler owner; bounded no-overlap run; content-free metrics; no secret in logs; local embedding contract still active; rollback is disabling only that feature's schedule/gate. Mutation/apply jobs need their own write approval. Parent owns deployment, scheduler cutover, secrets, API keys, SQL/finalizers and live verification.
+For every feature: policy hash and approvals valid; executing key authorizes every namespace and the requested level; derived output is never lower-classified than evidence; one scheduler owner; bounded no-overlap execution; content-free metrics; no secrets in logs; local embeddings remain active; rollback disables only that feature. Mutation/apply operations retain separate write approval. Parent owns deployment, migration application, scheduler changes, secrets, keys, and live verification.

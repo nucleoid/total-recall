@@ -56,6 +56,25 @@ test('reflection policy requires every feature-specific approval', () => {
   assert.throws(() => parseReflectionPolicy(policy(), 'production', new Date('2026-06-01T00:00:00Z')), /environment/);
 });
 
+test('subscription policy uses only the approved OpenClaw agent adapter without fabricated USD prices', () => {
+  const subscription = {
+    ...policy(),
+    generation: {
+      provider: 'openclaw-adapter', model: 'openclaw/total-recall-synthesis',
+      endpoint: 'https://10.0.0.9:3012/v1/generate', credentialEnv: 'GENERATION_API_KEY',
+    },
+    scope: { namespaces: ['my-life'] as [string], accessLevel: 'secret' as const },
+    budget: { mode: 'subscription' as const, maxCallsPerRun: 2, maxOutputBytesPerRun: 131072,
+      usageControlReference: 'dedicated key: six calls/minute and one hundred/day' },
+  };
+  const parsed = parseReflectionPolicy(subscription, 'test', new Date('2026-06-01T00:00:00Z'));
+  assert.equal(parsed.budget.mode, 'subscription');
+  assert.equal(parsed.budget.maxCostUsdPerRun, 0);
+  assert.throws(() => parseReflectionPolicy({ ...subscription,
+    generation: { ...subscription.generation, provider: 'direct-openai' } }, 'test',
+  new Date('2026-06-01T00:00:00Z')), /approved OpenClaw agent adapter/);
+});
+
 test('strict reflection output accepts sampled evidence and rejects control fields, credentials, and invented IDs', () => {
   const valid = JSON.stringify({ insights: [{ content: 'The user consistently chooses explicit rollouts.',
     evidence_ids: ids.slice(0, 2), confidence: 0.8, tags: ['rollout', 'preference'] }] });
@@ -97,12 +116,19 @@ test('reflection CLI is strict and force cannot weaken dry-run', () => {
   assert.throws(() => parseReflectionCli(['--namespace', 'work', '--unknown']), /Unknown/);
 });
 
-test('reflection authority is narrow and origin-aware', () => {
-  const auth = { keyId: ids[0], name: 'reflection', namespaces: ['insights', 'work'],
-    permissions: ['read', 'reflection'], maxAccessLevel: 'normal' as const };
-  assert.doesNotThrow(() => assertReflectionAuthority(auth, 'work'));
-  assert.throws(() => assertReflectionAuthority({ ...auth, permissions: [...auth.permissions, 'write'] }, 'work'), /exactly/);
-  assert.throws(() => assertReflectionAuthority({ ...auth, namespaces: ['insights'] }, 'work'), /dedicated/);
+test('reflection authority permits sensitive input only within genuine key namespace and level grants', () => {
+  const auth = { keyId: ids[0], name: 'reflection', namespaces: ['insights', 'work', 'my-life', 'financial'],
+    permissions: ['read', 'reflection', 'consolidate'], maxAccessLevel: 'secret' as const };
+  assert.doesNotThrow(() => assertReflectionAuthority(auth, 'work', 'secret'));
+  assert.doesNotThrow(() => assertReflectionAuthority(auth, 'my-life', 'sensitive'));
+  assert.throws(() => assertReflectionAuthority({ ...auth, maxAccessLevel: 'sensitive' }, 'work', 'secret'),
+    /does not authorize/);
+  assert.throws(() => assertReflectionAuthority({ ...auth, namespaces: ['insights', 'work'] }, 'my-life', 'normal'),
+    /does not authorize/);
+  assert.throws(() => assertReflectionAuthority({ ...auth, permissions: ['read'] }, 'work', 'normal'),
+    /read,reflection/);
+  assert.throws(() => assertReflectionAuthority({ ...auth, permissions: [...auth.permissions, 'admin'] }, 'work', 'normal'),
+    /without write, admin, or delete/);
 });
 
 test('dry-run materializes a bounded estimate without provider calls or database writes', async () => {

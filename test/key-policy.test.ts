@@ -28,6 +28,15 @@ test('create-key requires explicit quota policy and validates ACL inputs', () =>
   ], {}, now), /nonempty/);
 });
 
+test('supported key management provisions the dedicated reflection permission', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'reflection', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'work,insights', '--permissions', 'read,reflection', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'reflection']);
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
 test('expiry rejects past, loose, and offset-free timestamps', () => {
   assert.throws(() => parseExpiry('2025-12-31T23:59:59Z', now), /future/);
   assert.throws(() => parseExpiry('2026-01-02', now), /offset-aware/);
