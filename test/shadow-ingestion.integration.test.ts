@@ -25,10 +25,12 @@ test('durable local writes publish complete chunks before readiness and fence qu
   process.env.MEMORY_STORE_INLINE_EMBED_MS = '0';
   let run: string | undefined;
   const subscription = randomUUID();
+  let providerUnavailable=false;
   const client = new LocalEmbeddingClient({ baseUrl: 'http://localhost:1234', bearerToken: 'synthetic',
     runtime: { contractId: QWEN_CONTRACT_ID, artifactSha256: QWEN_CHUNK_CONTRACT.artifactSha256,
       runtimeContract: QWEN_CHUNK_CONTRACT.runtimeContract, acceptanceReceiptSha256: 'e'.repeat(64) },
     beforeInference: async () => {}, fetch: (async (target: string | URL | Request, init?: RequestInit) => {
+      if (providerUnavailable) throw new Error('synthetic provider unavailable');
       const body = JSON.parse(String(init?.body));
       if (String(target).endsWith('/tokenize')) return Response.json({ tokens: Array(Math.max(1, Math.ceil(Buffer.byteLength(body.content)/8))).fill(1) });
       return Response.json({ data: body.input.map((_: string, index: number) => ({ index,
@@ -61,6 +63,7 @@ test('durable local writes publish complete chunks before readiness and fence qu
     const { publishPreparedLocalDocument } = await import('../src/local-embedding-consumers.js');
     const { memoryUpdate } = await import('../src/tools/update.js');
     const { claimIngestionJob, embedWithinBudget, finalizeIngestionJob } = await import('../src/ingestion.js');
+    const { processIngestionJob } = await import('../src/ingestion-worker.js');
     const content = `${'a'.repeat(2500)}\n\nlast paragraph`;
     const first = await memoryStore(storeSchema.parse({ content, namespace: 'personal', source, dedupe: true }), auth);
     const second = await memoryStore(storeSchema.parse({ content, namespace: 'personal', source, dedupe: true }), auth);
@@ -72,6 +75,28 @@ test('durable local writes publish complete chunks before readiness and fence qu
     const manifest = async (id: string) => (await owner.query(`SELECT f.is_current,f.source_revision,m.revision,f.chunk_count,
       (SELECT count(*)::int FROM memory_embedding_chunks c WHERE c.parent_id=m.id AND c.contract_id=f.contract_id) AS actual
       FROM memory_embedding_manifests f JOIN memories m ON m.id=f.parent_id WHERE f.parent_id=$1`, [id])).rows[0];
+    const recovered = await memoryStore(storeSchema.parse({ content: 'shadow completed before durable ingestion',
+      namespace: 'personal', source, dedupe: false }), auth);
+    const recoveredJob = await claim(recovered.id);
+    const recoveredPrepared = await embedWithinBudget(recoveredJob.content,5000);
+    await withScopedClient(dbScopeFromAuth(auth), db => publishPreparedLocalDocument(
+      db,recovered.id,recoveredPrepared.localPrepared,{ ingestionLease:recoveredJob.lease_token }));
+    const beforeRecovery = (await owner.query(`SELECT j.status,m.embedding IS NOT NULL AS compatibility_embedding,w.state AS shadow_state
+      FROM memory_ingestion_jobs j JOIN memories m ON m.id=j.memory_id
+      JOIN embedding_work_items w ON w.parent_id=m.id AND w.parent_type='memory' AND w.contract_id=$2
+      WHERE j.memory_id=$1`,[recovered.id,QWEN_CONTRACT_ID])).rows[0];
+    assert.deepEqual(beforeRecovery,{ status:'processing',compatibility_embedding:false,shadow_state:'complete' });
+    providerUnavailable=true;
+    try {
+      await assert.rejects(embedWithinBudget(recoveredJob.content,5000),/synthetic provider unavailable/);
+      await processIngestionJob(recoveredJob);
+    } finally { providerUnavailable=false; }
+    const afterRecovery = (await owner.query(`SELECT j.status,m.embedding IS NOT NULL AS compatibility_embedding,
+        f.is_current,f.source_revision=m.revision AS current_revision
+      FROM memory_ingestion_jobs j JOIN memories m ON m.id=j.memory_id
+      JOIN memory_embedding_manifests f ON f.parent_id=m.id AND f.contract_id=$2
+      WHERE j.memory_id=$1`,[recovered.id,QWEN_CONTRACT_ID])).rows[0];
+    assert.deepEqual(afterRecovery,{ status:'ready',compatibility_embedding:true,is_current:true,current_revision:true });
     const firstJob = await claim(first.id), prepared = await embedWithinBudget(firstJob.content, 5000);
     assert.ok(prepared.localPrepared!.vectors.length > 1, 'all long-parent chunks retained');
     await assert.rejects(withScopedClient(dbScopeFromAuth(auth), db => publishPreparedLocalDocument(db, first.id,

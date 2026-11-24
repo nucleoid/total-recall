@@ -1,4 +1,4 @@
-import { prepareLocalDocument, publishPreparedLocalDocument, findLocalDocumentDuplicate, type PreparedLocalDocument } from './local-embedding-consumers.js';
+import { prepareLocalDocument, loadPublishedLocalDocument, publishPreparedLocalDocument, findLocalDocumentDuplicate, type PreparedLocalDocument } from './local-embedding-consumers.js';
 import { localServingEnabled } from './local-embedding-runtime.js';
 import { isDeepStrictEqual } from 'node:util';
 import { MEMORY_DEDUPE_THRESHOLD } from './store-config.js';
@@ -491,6 +491,35 @@ export async function embedBatchWithinBudget(contents: string[], budget: number,
       timer=setTimeout(() => { controller.abort(); reject(new DOMException('Embedding budget exhausted','TimeoutError')); },budget);
     })]);
   } finally { if (timer) clearTimeout(timer); controller.abort(); }
+}
+async function reusePublishedIngestionEmbedding(job: IngestionJob): Promise<IngestionEmbeddingResult | undefined> {
+  if (!localServingEnabled() || ACTIVE_EMBEDDING_PROFILE.provider !== 'llama.cpp') return undefined;
+  const localPrepared = await withScopedClient(ownerScope(job), client =>
+    loadPublishedLocalDocument(client,job.memory_id,job.content,job.lease_token), { readOnly:true });
+  if (!localPrepared) return undefined;
+  return { ...ACTIVE_EMBEDDING_PROFILE,vector:localPrepared.vectors[0],localPrepared };
+}
+
+/** Prefer a current shadow-worker publication before asking the provider again. */
+export async function embedClaimedIngestionJobWithinBudget(job: IngestionJob, budget: number,
+  signal?: AbortSignal): Promise<IngestionEmbeddingResult> {
+  return await reusePublishedIngestionEmbedding(job) ?? await embedWithinBudget(job.content,budget,undefined,signal);
+}
+
+/** Reuse complete parents independently, while keeping missing provider work under one batch deadline. */
+export async function embedClaimedIngestionBatchWithinBudget(jobs: IngestionJob[], budget: number,
+  signal?: AbortSignal): Promise<IngestionEmbeddingResult[]> {
+  const deadline = Date.now()+budget;
+  const results: Array<IngestionEmbeddingResult | undefined> = [];
+  for (const job of jobs) results.push(await reusePublishedIngestionEmbedding(job));
+  const missing = jobs.map((job,index) => ({ job,index })).filter(item => !results[item.index]);
+  if (missing.length) {
+    const remaining = deadline-Date.now();
+    if (remaining<1) throw new DOMException('Embedding budget exhausted','TimeoutError');
+    const embedded = await embedBatchWithinBudget(missing.map(item => item.job.content),remaining,signal);
+    missing.forEach((item,index) => { results[item.index]=embedded[index]; });
+  }
+  return results as IngestionEmbeddingResult[];
 }
 
 export async function tryInlineDocument(documentId: string, count: number, auth: AuthContext): Promise<void> {

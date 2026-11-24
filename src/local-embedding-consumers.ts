@@ -1,7 +1,7 @@
 import { getPool, type ScopedClient } from './db.js';
 import type { AccessLevel } from './types.js';
 import { getLocalServingClient, localServingEnabled } from './local-embedding-runtime.js';
-import { planEmbeddingChunks, type ParentChunkPlan } from './embedding-chunks.js';
+import { planEmbeddingChunks, validateParentChunkPlan, type ParentChunkPlan } from './embedding-chunks.js';
 import { QWEN_CONTRACT_ID, sha256, validateLocalStoredVector } from './local-embedding-contract.js';
 
 export interface PreparedLocalDocument { plan: ParentChunkPlan; vectors: number[][] }
@@ -27,6 +27,54 @@ export async function prepareLocalDocument(text: string, signal?: AbortSignal): 
     vectors.push(...result.vectors);
   }
   return { plan, vectors };
+}
+/**
+ * Rehydrate an already-published current local embedding for a claimed durable
+ * ingestion job. The shadow worker and ingestion worker use separate queues,
+ * so the former can complete while inference is temporarily unavailable to
+ * the latter. Finalization republishes these exact chunks under the ingestion
+ * lease after the compatibility-vector update advances the parent revision.
+ */
+export async function loadPublishedLocalDocument(client: ScopedClient, parentId: string, text: string,
+  ingestionLease: string): Promise<PreparedLocalDocument | undefined> {
+  if (!localServingEnabled()) return undefined;
+  const source = Buffer.from(text, 'utf8');
+  const sourceSha256 = sha256(source);
+  const rows = (await client.query(`SELECT f.source_sha256,f.source_bytes,f.chunk_count,
+      c.ordinal,c.core_start,c.core_end,c.chunk_sha256,c.formatted_tokens,c.embedding::text AS embedding
+    FROM memory_embedding_manifests f
+    JOIN memories m ON m.id=f.parent_id
+    JOIN memory_embedding_chunks c ON c.contract_id=f.contract_id AND c.parent_id=f.parent_id
+    JOIN memory_ingestion_jobs j ON j.memory_id=m.id AND j.namespace=m.namespace
+    WHERE f.contract_id=$1 AND f.parent_id=$2 AND f.is_current
+      AND f.source_revision=m.revision AND f.source_sha256=$3 AND f.source_bytes=$4
+      AND m.content=$5 AND m.deleted_at IS NULL
+      AND j.status='processing' AND j.lease_token=$6::uuid AND j.lease_expires_at>statement_timestamp()
+    ORDER BY c.ordinal`, [QWEN_CONTRACT_ID,parentId,sourceSha256,source.length,text,ingestionLease])).rows;
+  if (!rows.length || rows.length !== rows[0].chunk_count) return undefined;
+  const plan: ParentChunkPlan = {
+    contractId: QWEN_CONTRACT_ID,
+    sourceSha256,
+    sourceBytes: source.length,
+    chunks: rows.map(row => ({
+      ordinal: row.ordinal,
+      coreStart: row.core_start,
+      coreEnd: row.core_end,
+      sha256: row.chunk_sha256,
+      tokens: row.formatted_tokens,
+      text: source.subarray(row.core_start,row.core_end).toString('utf8'),
+    })),
+  };
+  validateParentChunkPlan(text,plan);
+  const vectors = rows.map(row => {
+    const vector = JSON.parse(row.embedding) as unknown;
+    if (!Array.isArray(vector) || vector.some(value => typeof value !== 'number')) {
+      throw new Error('embedding.invalid_stored_vector');
+    }
+    validateLocalStoredVector(vector as number[]);
+    return vector as number[];
+  });
+  return { plan,vectors };
 }
 
 export async function prepareLocalQuery(text: string, signal?: AbortSignal): Promise<PreparedLocalQuery | undefined> {

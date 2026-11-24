@@ -2,8 +2,8 @@ import { isDirectExecution } from './entrypoint.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { validateKeyReadOnly } from './auth.js';
 import { dbScopeFromAuth, shutdown } from './db.js';
-import { claimIngestionJobs, embedWithinBudget, failIngestionJob, finalizeIngestionJob, ingestionInteger, ingestionMaxAttempts, workerIngestionLeaseMs,
-  embedBatchWithinBudget, failIngestionBatch, finalizeIngestionBatch,
+import { claimIngestionJobs, failIngestionJob, finalizeIngestionJob, ingestionInteger, ingestionMaxAttempts, workerIngestionLeaseMs,
+  embedClaimedIngestionJobWithinBudget, embedClaimedIngestionBatchWithinBudget, failIngestionBatch, finalizeIngestionBatch,
   type IngestionJob } from './ingestion.js';
 import type { DbScope } from './db.js';
 
@@ -27,7 +27,7 @@ export async function processIngestionBatch(jobs: IngestionJob[], signal?: Abort
   if (jobs[0].kind !== 'document' || !jobs[0].document_id) { await processIngestionJob(jobs[0],signal); return; }
   try {
     const timeout = ingestionInteger(process.env.EMBEDDING_TIMEOUT_MS,15000,'EMBEDDING_TIMEOUT_MS',100,120000);
-    const result = await embedBatchWithinBudget(jobs.map(job => job.content),timeout,signal);
+    const result = await embedClaimedIngestionBatchWithinBudget(jobs,timeout,signal);
     if (signal?.aborted) throw new DOMException('Ingestion worker stopping','AbortError');
     await finalizeIngestionBatch(jobs,result);
   } catch (error) { await failIngestionBatch(jobs,error); }
@@ -35,7 +35,7 @@ export async function processIngestionBatch(jobs: IngestionJob[], signal?: Abort
 export async function processIngestionJob(job: IngestionJob, signal?: AbortSignal): Promise<void> {
   try {
     const timeout = ingestionInteger(process.env.EMBEDDING_TIMEOUT_MS, 15000, 'EMBEDDING_TIMEOUT_MS', 100, 120000);
-    const result = await embedWithinBudget(job.content, timeout, undefined, signal);
+    const result = await embedClaimedIngestionJobWithinBudget(job,timeout,signal);
     if (signal?.aborted) throw new DOMException('Ingestion worker stopping','AbortError');
     await finalizeIngestionJob(job, result);
   } catch (error) { await failIngestionJob(job, error); }

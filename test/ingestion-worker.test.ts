@@ -20,6 +20,34 @@ test('ingestion classifies HTTP, invalid vectors and transport errors without re
     assert.doesNotMatch(JSON.stringify(classifyIngestionFailure(error)),/private/);
   }
 });
+test('published local chunks can be rehydrated without an inference call and incomplete sets fail closed', async () => {
+  const originalContract=process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+  try {
+    process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT=(await import('../src/local-embedding-contract.js')).QWEN_CONTRACT_ID;
+    const { loadPublishedLocalDocument }=await import('../src/local-embedding-consumers.js');
+    const { sha256 }=await import('../src/local-embedding-contract.js');
+    const text='first paragraph\n\nlast paragraph';
+    const source=Buffer.from(text,'utf8'), split=Buffer.byteLength('first paragraph\n\n','utf8');
+    const vector=`[1,${Array(767).fill(0).join(',')}]`;
+    const rows=[source.subarray(0,split),source.subarray(split)].map((chunk,index) => ({
+      source_sha256:sha256(source),source_bytes:source.length,chunk_count:2,ordinal:index,
+      core_start:index===0?0:split,core_end:index===0?split:source.length,
+      chunk_sha256:sha256(chunk),formatted_tokens:8,embedding:vector,
+    }));
+    let calls=0;
+    const client={ query:async () => { calls++; return { rows }; } };
+    const prepared=await loadPublishedLocalDocument(client as any,'00000000-0000-0000-0000-000000000001',text,
+      '00000000-0000-0000-0000-000000000002');
+    assert.equal(calls,1); assert.equal(prepared?.plan.chunks.length,2);
+    assert.deepEqual(prepared?.vectors[0].slice(0,2),[1,0]);
+    const incomplete={ query:async () => ({ rows:rows.slice(0,1) }) };
+    assert.equal(await loadPublishedLocalDocument(incomplete as any,'00000000-0000-0000-0000-000000000001',text,
+      '00000000-0000-0000-0000-000000000002'),undefined);
+  } finally {
+    if(originalContract===undefined) delete process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
+    else process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT=originalContract;
+  }
+});
 test('database contention has a content-free code distinct from provider failures', () => {
   for (const code of ['55P03','57014','40P01','40001']) {
     const failure = classifyIngestionFailure(Object.assign(new Error('private SQL content'), { code }));
