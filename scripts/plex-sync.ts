@@ -70,7 +70,7 @@ export async function runPlexSync(deps: PlexSyncScriptDeps = {}): Promise<number
       status = 'degraded';
     }
 
-    if (sync.events_ingested > 0) {
+    if (sync.errors.length === 0 || sync.events_ingested > 0) {
       const rollup = await rollupPending(auth, scope, 200);
       log(`[plex-sync] rollup: ${rollup.rolled} memories, ${rollup.failed} failed`);
       if (rollup.failed > 0 || rollup.errors.length) {
