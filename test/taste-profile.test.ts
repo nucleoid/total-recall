@@ -34,6 +34,13 @@ function policy() {
   };
 }
 
+const mockFingerprint = 'a'.repeat(64);
+const mockAggregateRows = [
+  { window_name: 'period', dimension: 'total', value: 'events', event_count: '20', rank: 1 },
+  { window_name: 'period', dimension: 'entity', value: 'Artist A', event_count: '12', rank: 1 },
+];
+const mockSnapshot = { rows: [{ snapshot: [], source_fingerprint: mockFingerprint, event_count: 20 }] };
+
 test('taste-profile month windows honor IANA DST and year boundaries', () => {
   const march = mediaMonthPeriod('2026-03', 'America/Chicago');
   assert.equal(march.window.start.toISOString(), '2026-03-01T06:00:00.000Z');
@@ -47,7 +54,7 @@ test('taste-profile policy requires independent approvals and exact environment'
   const parsed = parseTasteProfilePolicy(policy(), 'test', new Date('2026-06-01T00:00:00Z'));
   assert.equal(parsed.feature, 'media-taste-profile');
   const auth = { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
-    namespaces: ['media', 'personal'], permissions: ['read', 'write'], maxAccessLevel: 'normal' as const };
+    namespaces: ['media', 'personal'], permissions: ['read', 'taste_profile'], maxAccessLevel: 'normal' as const };
   assert.doesNotThrow(() => assertTasteProfileAuthority(auth, parsed));
   assert.throws(() => assertTasteProfileAuthority({ ...auth, permissions: [...auth.permissions, 'delete'] }, parsed), /exactly/);
   const missing = { ...policy() } as any;
@@ -66,7 +73,7 @@ test('all-access lane authority remains exact and least-privileged', () => {
     accessLevels: ['normal' as const, 'sensitive' as const, 'secret' as const] } };
   const parsed = parseTasteProfilePolicy(allAccess, 'test', new Date('2026-06-01T00:00:00Z'));
   const auth = { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
-    namespaces: ['financial', 'media', 'my-life', 'personal'], permissions: ['read', 'write'],
+    namespaces: ['financial', 'media', 'my-life', 'personal'], permissions: ['read', 'taste_profile'],
     maxAccessLevel: 'secret' as const };
   assert.doesNotThrow(() => assertTasteProfileAuthority(auth, parsed));
   assert.throws(() => assertTasteProfileAuthority({ ...auth, namespaces: ['media', 'personal'] }, parsed), /exactly/);
@@ -105,10 +112,8 @@ test('default dry-run reads bounded aggregates without provider, embedding, or m
   const client = {
     query: async (text: string) => {
       sql.push(text);
-      if (text.includes('WITH eligible AS')) return { rows: [
-        { window_name: 'period', dimension: 'total', value: 'events', event_count: '20', rank: 1 },
-        { window_name: 'period', dimension: 'entity', value: 'Artist A', event_count: '12', rank: 1 },
-      ] };
+      if (text.includes('taste_profile_load_snapshot')) return mockSnapshot;
+      if (text.includes('taste_profile_aggregate_source')) return { rows: mockAggregateRows };
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,
@@ -119,7 +124,7 @@ test('default dry-run reads bounded aggregates without provider, embedding, or m
   try {
     const result = await runTasteProfile({
       auth: { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
-        namespaces: ['media', 'personal'], permissions: ['read', 'write'], maxAccessLevel: 'normal' },
+        namespaces: ['media', 'personal'], permissions: ['read', 'taste_profile'], maxAccessLevel: 'normal' },
       category: 'music', period, timeZone: 'UTC', environment: 'test', policy: policy(), accessLevel: 'normal',
       provider: { name: 'openclaw-adapter', generate: async () => { providerCalls += 1; return '{}'; } },
       embedProfile: async () => { embeddingCalls += 1; return Array(768).fill(0); },
@@ -135,13 +140,7 @@ test('expired or revoked linked source evidence fails closed before generation',
   const period = mediaMonthPeriod('2026-06', 'UTC');
   const client = {
     query: async (text: string) => {
-      if (text.includes('m.id AS linked_memory_id')) return { rows: [{
-        id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', service: 'spotify', event_type: 'play',
-        title: 'Track', artist: 'Artist', show: null, genres: [], played_at: '2026-06-01T00:00:00Z',
-        memory_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', linked_memory_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-        memory_namespace: 'media', memory_revision: 1, access_level: 'normal', deleted_at: null,
-        expires_at: '2026-06-15T00:00:00Z', superseded_at: null, valid_to: null,
-      }] };
+      if (text.includes('taste_profile_load_snapshot')) throw new Error('taste_source_expired_or_revoked');
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,
@@ -150,7 +149,7 @@ test('expired or revoked linked source evidence fails closed before generation',
   try {
     await assert.rejects(runTasteProfile({
       auth: { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
-        namespaces: ['media', 'personal'], permissions: ['read', 'write'], maxAccessLevel: 'normal' },
+        namespaces: ['media', 'personal'], permissions: ['read', 'taste_profile'], maxAccessLevel: 'normal' },
       category: 'music', period, timeZone: 'UTC', environment: 'test', policy: policy(),
       accessLevel: 'normal', now: new Date('2026-07-01T00:00:00Z'),
       provider: { name: 'openclaw-adapter', generate: async () => { throw new Error('must not call'); } },
@@ -164,10 +163,8 @@ test('preview retries invalid structured output once and never embeds or mutates
   const client = {
     query: async (text: string) => {
       sql.push(text);
-      if (text.includes('WITH eligible AS')) return { rows: [
-        { window_name: 'period', dimension: 'total', value: 'events', event_count: '20', rank: 1 },
-        { window_name: 'period', dimension: 'entity', value: 'Artist A', event_count: '12', rank: 1 },
-      ] };
+      if (text.includes('taste_profile_load_snapshot')) return mockSnapshot;
+      if (text.includes('taste_profile_aggregate_source')) return { rows: mockAggregateRows };
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,
@@ -178,7 +175,7 @@ test('preview retries invalid structured output once and never embeds or mutates
   try {
     const result = await runTasteProfile({
       auth: { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
-        namespaces: ['media', 'personal'], permissions: ['read', 'write'], maxAccessLevel: 'normal' },
+        namespaces: ['media', 'personal'], permissions: ['read', 'taste_profile'], maxAccessLevel: 'normal' },
       category: 'music', period, timeZone: 'UTC', environment: 'test', policy: policy(), mode: 'preview', accessLevel: 'normal',
       provider: { name: 'openclaw-adapter', generate: async () => ++providerCalls === 1 ? '{"bad":true}' :
         '{"profile_style":"focused","evidence_ids":["E002"]}' },
@@ -204,26 +201,20 @@ test('apply embeds before one atomic agent/update/supersession/audit transaction
   const calls: Array<{ connection: number; text: string }> = [];
   let connections = 0;
   let embeddingDone = false;
-  const agentId = '22222222-2222-4222-8222-222222222222';
   const priorId = '33333333-3333-4333-8333-333333333333';
   const profileId = '44444444-4444-4444-8444-444444444444';
   const client = {
     query: async (text: string) => {
       calls.push({ connection: connections, text });
-      if (text.includes('WITH eligible AS')) return { rows: [
-        { window_name: 'period', dimension: 'total', value: 'events', event_count: '20', rank: 1 },
-        { window_name: 'period', dimension: 'entity', value: 'Artist A', event_count: '12', rank: 1 },
-      ] };
-      if (text.includes("SELECT id, metadata->>'aggregate_hash'")) return { rows: [] };
+      if (text.includes('taste_profile_load_snapshot')) return mockSnapshot;
+      if (text.includes('taste_profile_aggregate_source')) return { rows: mockAggregateRows };
+      if (text.includes('taste_profile_existing_revision')) return { rows: [] };
       if (text.includes('FROM api_keys WHERE id')) return { rows: [{ namespaces: ['media', 'personal'],
-        permissions: ['read', 'write'], max_access_level: 'normal', enabled: true,
+        permissions: ['read', 'taste_profile'], max_access_level: 'normal', enabled: true,
         expires_at: null, revoked_at: null }] };
-      if (text.startsWith('INSERT INTO agents')) return { rows: [{ id: agentId }] };
-      if (text.includes("metadata->>'source_fingerprint' AS source_fingerprint")) return { rows: [] };
-      if (text.includes('metadata->>$6 AS series_order')) return { rows: [{ id: priorId, series_order: '2026-05' }] };
-      if (text.includes('statement_timestamp()::text AS now')) return { rows: [{ now: '2026-07-01 00:00:00+00' }] };
-      if (text.includes('UPDATE memories SET superseded_at')) return { rows: [], rowCount: 1 };
-      if (text.includes('INSERT INTO memories')) return { rows: [{ id: profileId }], rowCount: 1 };
+      if (text.includes('taste_profile_apply_revision')) return {
+        rows: [{ id: profileId, outcome: 'created', superseded_id: priorId }],
+      };
       return { rows: [], rowCount: 1 };
     },
     release: () => undefined,
@@ -236,7 +227,7 @@ test('apply embeds before one atomic agent/update/supersession/audit transaction
   try {
     const preview = await runTasteProfile({
       auth: { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
-        namespaces: ['media', 'personal'], permissions: ['read', 'write'], maxAccessLevel: 'normal' },
+        namespaces: ['media', 'personal'], permissions: ['read', 'taste_profile'], maxAccessLevel: 'normal' },
       category: 'music', period, timeZone: 'UTC', environment: 'test', policy: policy(),
       mode: 'preview', accessLevel: 'normal', now: new Date('2026-07-01T00:00:00Z'),
       provider: { name: 'openclaw-adapter', generate: async () =>
@@ -247,7 +238,7 @@ test('apply embeds before one atomic agent/update/supersession/audit transaction
     calls.splice(0); connections = 0;
     const result = await runTasteProfile({
       auth: { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
-        namespaces: ['media', 'personal'], permissions: ['read', 'write'], maxAccessLevel: 'normal' },
+        namespaces: ['media', 'personal'], permissions: ['read', 'taste_profile'], maxAccessLevel: 'normal' },
       category: 'music', period, timeZone: 'UTC', environment: 'test', policy: policy(), mode: 'apply',
       accessLevel: 'normal', approvedSelection, now: new Date('2026-07-01T00:01:00Z'),
       embedProfile: async () => { embeddingDone = true; return Array(768).fill(0); },
@@ -256,10 +247,9 @@ test('apply embeds before one atomic agent/update/supersession/audit transaction
     assert.equal(result.memoryId, profileId);
     assert.equal(result.supersededId, priorId);
     const mutations = calls.filter(call => /^\s*(?:INSERT|UPDATE|DELETE)\b/i.test(call.text));
-    assert.ok(mutations.length >= 4);
-    assert.ok(mutations.every(call => call.connection === 3), JSON.stringify(mutations));
+    assert.equal(mutations.length, 0);
     const finalSql = calls.filter(call => call.connection === 3).map(call => call.text).join('\n');
-    assert.match(finalSql, /BEGIN[\s\S]*INSERT INTO agents[\s\S]*UPDATE memories SET superseded_at[\s\S]*INSERT INTO memories[\s\S]*INSERT INTO audit_log[\s\S]*COMMIT/);
+    assert.match(finalSql, /BEGIN[\s\S]*taste_profile_apply_revision[\s\S]*COMMIT/);
   } finally {
     setPoolForTesting(null);
     if (previousEmbeddingContract === undefined) delete process.env.SHADOW_EMBEDDING_CURRENT_CONTRACT;
@@ -280,28 +270,24 @@ test('apply rejects a source change after embedding and before any mutation', as
   const client = {
     query: async (text: string) => {
       sql.push(text);
-      if (text.includes('m.id AS linked_memory_id')) {
+      if (text.includes('taste_profile_load_snapshot')) {
         snapshots += 1;
-        return { rows: snapshots < 3 ? [] : [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-          service: 'spotify', event_type: 'play', title: 'Track', artist: 'Artist', show: null,
-          genres: [], played_at: '2026-06-02T00:00:00Z', memory_id: null, linked_memory_id: null,
-          memory_namespace: null, memory_revision: null, access_level: null, deleted_at: null,
-          expires_at: null, superseded_at: null, valid_to: null }] };
+        return snapshots < 3 ? mockSnapshot : {
+          rows: [{ snapshot: [{ id: 'changed' }], source_fingerprint: 'b'.repeat(64), event_count: 1 }],
+        };
       }
-      if (text.includes('WITH eligible AS')) return { rows: [
-        { window_name: 'period', dimension: 'total', value: 'events', event_count: '20', rank: 1 },
-        { window_name: 'period', dimension: 'entity', value: 'Artist A', event_count: '12', rank: 1 },
-      ] };
+      if (text.includes('taste_profile_aggregate_source')) return { rows: mockAggregateRows };
       if (text.includes('FROM api_keys WHERE id')) return { rows: [{ namespaces: ['media', 'personal'],
-        permissions: ['read', 'write'], max_access_level: 'normal', enabled: true,
+        permissions: ['read', 'taste_profile'], max_access_level: 'normal', enabled: true,
         expires_at: null, revoked_at: null }] };
+      if (text.includes('taste_profile_existing_revision')) return { rows: [] };
       return { rows: [], rowCount: 0 };
     },
     release: () => undefined,
   };
   setPoolForTesting({ connect: async () => client } as unknown as pg.Pool);
   const auth = { keyId: '11111111-1111-4111-8111-111111111111', name: 'taste',
-    namespaces: ['media', 'personal'], permissions: ['read', 'write'], maxAccessLevel: 'normal' as const };
+    namespaces: ['media', 'personal'], permissions: ['read', 'taste_profile'], maxAccessLevel: 'normal' as const };
   try {
     const preview = await runTasteProfile({ auth, category: 'music', period, timeZone: 'UTC',
       environment: 'test', policy: policy(), mode: 'preview', accessLevel: 'normal',

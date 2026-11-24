@@ -64,6 +64,16 @@ test('supported key management provisions a scoped contradiction reviewer', () =
   assert.equal(parsed.maxAccessLevel, 'secret');
 });
 
+test('supported key management provisions scoped taste-profile permission', () => {
+  const parsed = parseCreateKeyArgs([
+    '--name', 'taste-profile', '--rpm', '6', '--daily-quota', '100',
+    '--namespaces', 'media,personal', '--permissions', 'read,taste_profile', '--max-access-level', 'secret',
+  ], {}, now);
+  assert.deepEqual(parsed.permissions, ['read', 'taste_profile']);
+
+  assert.equal(parsed.maxAccessLevel, 'secret');
+});
+
 test('supported key management provisions a webhook-only worker credential', () => {
   const parsed = parseCreateKeyArgs([
     '--name', 'webhook-delivery', '--rpm', '6', '--daily-quota', '100',

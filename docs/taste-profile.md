@@ -10,7 +10,7 @@ Each run uses one exact `normal`, `sensitive`, or `secret` lane. An unlinked med
 
 The provider receives only bounded aggregate facts: category, month, accepted counts, bounded services/artists/shows/titles/genres, time-window context, qualified trends, and content-free quality warnings. It never receives raw events, IDs, timestamps, credentials, source keys, ownership IDs, memory text, or control metadata. It can return only a four-value style and supplied evidence IDs; profile prose is rendered locally.
 
-Local provenance records the source owner, source/target namespace, lane, materialized event count, aggregate hash, source fingerprint, policy hash, selection time/approval, adapter model, and active embedding descriptor. Before apply, the implementation re-reads every materialized source, the key, policy, and aggregate. Changed, missing, deleted, expired, superseded, out-of-scope, or revoked inputs fail without mutation.
+Local provenance records the worker owner, all event-owner and linked-memory-owner key IDs, source/target namespace, linked-memory revision/classification, lane, materialized event count, aggregate hash, source fingerprint, policy hash, selection time/approval, adapter model, and active embedding descriptor. Before apply, the implementation re-reads every materialized source, each source-owner key, the worker key, policy, and aggregate. Changed, missing, deleted, expired, superseded, out-of-scope, or revoked inputs fail without mutation.
 
 ## Policy and key requirements
 
@@ -24,12 +24,11 @@ Policy version 2 requires:
 
 The runtime key must be genuine, enabled, unexpired, unrevoked, and have:
 
-- namespaces **exactly equal** to policy `scope.namespaces` (for the owner deployment this is the complete stored namespace set, including `financial` and My Life);
+- namespaces **exactly equal** to policy `scope.namespaces`, containing only the approved source, target, and any namespace needed by linked source memories;
 - `max_access_level` exactly equal to the highest enabled lane (`secret` when all lanes are enabled);
-- permissions exactly `read,write`, with no `admin`, synthesis-worker, ingestion, delete, or scheduler permissions; and
-- ownership of the eligible `media_events`, because media-event RLS is owner-key isolated.
+- permissions exactly `read,taste_profile`, with no ordinary `write`, `admin`, ingestion, delete, or scheduler permissions.
 
-That final point is an operational prerequisite, not something the job forges or bypasses. If the current event owner key has broader permissions, do not weaken isolation in deployment: reconcile ownership/key design explicitly before activation. No migration is required by this implementation.
+Migration 058 provides the only cross-owner lane: bounded SECURITY DEFINER functions validate each existing event owner and linked-memory owner as live, readable, namespace-authorized, and sufficiently classified. Restrictive RLS policies deny the worker raw `media_events`, `memories`, `agents`, and `audit_log` access. The derived profile and its agent/audit provenance are owned by the worker key; connector `client_id` values are never forged or rewritten.
 
 Minimal policy shape (approval objects omitted here but required):
 
@@ -53,7 +52,7 @@ Minimal policy shape (approval objects omitted here but required):
     "trainingApproved": true
   },
   "scope": {
-    "namespaces": ["activity", "financial", "insights", "media", "my-life", "personal", "projects", "shared", "work"],
+    "namespaces": ["media", "personal"],
     "sourceNamespace": "media",
     "targetNamespace": "personal",
     "accessLevels": ["normal", "sensitive", "secret"]
@@ -102,4 +101,4 @@ Apply rejects a changed aggregate/fingerprint, expired policy/preview/approval, 
 
 ## Rollback
 
-Disable/remove the external schedule, remove `TASTE_PROFILE_POLICY_FILE` and the adapter credential, and disable/revoke the taste key. Existing profile memories remain lifecycle-managed records. Use supported memory lifecycle operations to retire a bad profile; do not delete media events or hand-edit provenance. Because this change adds no migration, code rollback is a branch/deploy rollback plus policy/schedule disablement.
+Disable/remove the external schedule, remove `TASTE_PROFILE_POLICY_FILE` and the adapter credential, and disable/revoke the taste key. Existing profile memories remain lifecycle-managed records. Use supported memory lifecycle operations to retire a bad profile; do not delete media events or hand-edit provenance. Code rollback is a branch/deploy rollback plus policy/schedule disablement; migration 058 is additive and may remain installed while the key is disabled.

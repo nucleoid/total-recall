@@ -1,8 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { upsertAgent } from './agents.js';
-import { logAudit } from './audit.js';
 import { ACTIVE_EMBEDDING_DESCRIPTOR } from './embedding-descriptor.js';
 import { dbScopeFromAuth, withScopedClient, type ScopedClient } from './db.js';
 import { generateBounded, HttpJsonGenerationProvider, type GenerationProvider } from './generation.js';
@@ -393,46 +391,15 @@ async function materializeTasteSource(
   policy: TasteProfilePolicy,
 ): Promise<TasteSourceSnapshot> {
   const end = options.period.window.end;
-  const rows = await client.query<any>(`
-    SELECT e.id, e.service, e.event_type, e.title, e.artist, e.show, e.genres,
-      e.played_at::text, e.memory_id, m.id AS linked_memory_id, m.namespace AS memory_namespace,
-      m.revision AS memory_revision, m.access_level, m.deleted_at::text, m.expires_at::text,
-      m.superseded_at::text, m.valid_to::text
-    FROM media_events e LEFT JOIN memories m ON m.id = e.memory_id
-    WHERE e.namespace = $1 AND e.played_at < $2::timestamptz
-      AND COALESCE(m.access_level, 'normal') = $3
-      AND CASE WHEN $4 = 'music' THEN (
-        NULLIF(btrim(e.artist), '') IS NOT NULL OR lower(e.service) IN ('spotify', 'ytmusic')
-      ) ELSE (
-        NOT (NULLIF(btrim(e.artist), '') IS NOT NULL OR lower(e.service) IN ('spotify', 'ytmusic'))
-        AND (NULLIF(btrim(e.show), '') IS NOT NULL OR e.season IS NOT NULL OR e.episode IS NOT NULL
-          OR lower(e.event_type) IN ('watch', 'watched', 'view', 'viewed', 'complete', 'completed'))
-      ) END
-    ORDER BY e.id
-    LIMIT $5
-  `, [policy.scope.sourceNamespace, end.toISOString(), options.accessLevel, options.category,
-    policy.selection.maxMaterializedEvents + 1]);
-  if (rows.rows.length > policy.selection.maxMaterializedEvents) throw new Error('taste_source_materialization_limit');
-  const now = Date.now();
-  for (const row of rows.rows) {
-    if (row.memory_id && !row.linked_memory_id) throw new Error('taste_source_unavailable');
-    if (row.memory_id && (row.deleted_at || row.superseded_at || row.valid_to ||
-        (row.expires_at && new Date(row.expires_at).getTime() <= now))) {
-      throw new Error('taste_source_expired_or_revoked');
-    }
-    if (row.memory_namespace && !policy.scope.namespaces.includes(row.memory_namespace)) {
-      throw new Error('taste_source_scope_changed');
-    }
-  }
+  const loaded = await client.query<{ snapshot: any[]; source_fingerprint: string; event_count: number }>(`
+    SELECT snapshot,source_fingerprint,event_count FROM taste_profile_load_snapshot($1,$2,$3,$4,$5)
+  `, [policy.scope.sourceNamespace, options.category, options.accessLevel, end.toISOString(),
+    policy.selection.maxMaterializedEvents]);
+  const source = loaded.rows[0];
+  if (!source || !Array.isArray(source.snapshot)) throw new Error('taste_source_unavailable');
 
   const aggregate = await tasteAggregateForLane(client, options, policy);
-  const fingerprint = sha256(stableJson(rows.rows.map(row => ({
-    id: row.id, service: row.service, eventType: row.event_type, title: row.title,
-    artist: row.artist, show: row.show, genres: row.genres, playedAt: row.played_at,
-    memoryId: row.memory_id, memoryNamespace: row.memory_namespace,
-    memoryRevision: row.memory_revision, accessLevel: row.access_level ?? 'normal',
-  }))));
-  return { aggregate, fingerprint, materializedEvents: rows.rows.length };
+  return { aggregate, fingerprint: source.source_fingerprint, materializedEvents: source.event_count };
 }
 
 async function tasteAggregateForLane(
@@ -446,49 +413,11 @@ async function tasteAggregateForLane(
     days365: new Date(end - 365 * 86_400_000),
   };
   const result = await client.query<any>(`
-    WITH eligible AS (
-      SELECT e.id, e.service, e.played_at,
-        CASE WHEN $7 = 'music' THEN NULLIF(btrim(e.artist), '')
-             ELSE COALESCE(NULLIF(btrim(e.show), ''), NULLIF(btrim(e.title), '')) END AS entity,
-        e.genres,
-        CASE WHEN e.metadata ? 'played_precision' AND e.metadata->>'played_precision' NOT IN ('exact', 'instant')
-          THEN true ELSE false END AS approximate_time
-      FROM media_events e LEFT JOIN memories m ON m.id = e.memory_id
-      WHERE e.namespace = $1 AND e.played_at < $3::timestamptz
-        AND COALESCE(m.access_level, 'normal') = $10
-        AND CASE WHEN $7 = 'music' THEN (
-          NULLIF(btrim(e.artist), '') IS NOT NULL OR lower(e.service) IN ('spotify', 'ytmusic')
-        ) ELSE (
-          NOT (NULLIF(btrim(e.artist), '') IS NOT NULL OR lower(e.service) IN ('spotify', 'ytmusic'))
-          AND (NULLIF(btrim(e.show), '') IS NOT NULL OR e.season IS NOT NULL OR e.episode IS NOT NULL
-            OR lower(e.event_type) IN ('watch', 'watched', 'view', 'viewed', 'complete', 'completed'))
-        ) END
-    ), windows(window_name, window_start, window_end) AS (VALUES
-      ('period', $2::timestamptz, $3::timestamptz), ('previous', $4::timestamptz, $2::timestamptz),
-      ('days30', $5::timestamptz, $3::timestamptz), ('days90', $6::timestamptz, $3::timestamptz),
-      ('days365', $8::timestamptz, $3::timestamptz), ('allTime', NULL::timestamptz, $3::timestamptz)
-    ), scoped AS (
-      SELECT w.window_name, e.* FROM windows w JOIN eligible e
-        ON (w.window_start IS NULL OR e.played_at >= w.window_start) AND e.played_at < w.window_end
-    ), facts AS (
-      SELECT window_name, 'total'::text AS dimension, 'events'::text AS value,
-        count(DISTINCT id)::bigint AS event_count FROM scoped GROUP BY window_name
-      UNION ALL SELECT window_name, 'service', service, count(DISTINCT id)::bigint FROM scoped GROUP BY window_name, service
-      UNION ALL SELECT window_name, 'entity', entity, count(DISTINCT id)::bigint FROM scoped WHERE entity IS NOT NULL GROUP BY window_name, entity
-      UNION ALL SELECT scoped.window_name, 'genre', genre, count(DISTINCT scoped.id)::bigint
-        FROM scoped CROSS JOIN LATERAL unnest(scoped.genres) genre WHERE NULLIF(btrim(genre), '') IS NOT NULL GROUP BY scoped.window_name, genre
-      UNION ALL SELECT window_name, 'quality', 'missing_entity', count(DISTINCT id)::bigint FROM scoped WHERE entity IS NULL GROUP BY window_name
-      UNION ALL SELECT window_name, 'quality', 'approximate_timestamps', count(DISTINCT id)::bigint FROM scoped WHERE approximate_time GROUP BY window_name
-    ), ranked AS (
-      SELECT *, row_number() OVER (PARTITION BY window_name, dimension ORDER BY event_count DESC, value COLLATE "C") AS rank FROM facts
-    )
-    SELECT window_name, dimension, value, event_count, rank FROM ranked
-    WHERE dimension IN ('total', 'quality') OR rank <= $9
-    ORDER BY CASE window_name WHEN 'period' THEN 1 WHEN 'previous' THEN 2 WHEN 'days30' THEN 3
-      WHEN 'days90' THEN 4 WHEN 'days365' THEN 5 ELSE 6 END, dimension, rank, value COLLATE "C"
+    SELECT * FROM taste_profile_aggregate_source($1,$7,$10,$2,$3,$4,$5,$6,$8,$9,$11)
   `, [policy.scope.sourceNamespace, options.period.window.start.toISOString(), options.period.window.end.toISOString(),
     options.period.previousWindow.start.toISOString(), starts.days30.toISOString(), starts.days90.toISOString(),
-    options.category, starts.days365.toISOString(), policy.aggregation.topLimit, options.accessLevel]);
+    options.category, starts.days365.toISOString(), policy.aggregation.topLimit, options.accessLevel,
+    policy.selection.maxMaterializedEvents]);
   return buildMediaTasteAggregate(result.rows, {
     category: options.category, sourceNamespace: policy.scope.sourceNamespace,
     period: options.period.window, previousPeriod: options.period.previousWindow,
@@ -531,10 +460,8 @@ export async function runTasteProfile(options: RunTasteProfileOptions): Promise<
   const existing = await withScopedClient(scope, client => client.query<{
     id: string; aggregate_hash: string | null; source_fingerprint: string | null; access_level: AccessLevel;
   }>(`
-    SELECT id, metadata->>'aggregate_hash' AS aggregate_hash,
-      metadata->>'source_fingerprint' AS source_fingerprint, access_level FROM memories
-    WHERE client_id = $1::uuid AND namespace = $2 AND source_key = $3 LIMIT 1
-  `, [options.auth.keyId, policy.scope.targetNamespace, sourceKey]));
+    SELECT * FROM taste_profile_existing_revision($1,$2,$3)
+  `, [policy.scope.targetNamespace, options.accessLevel, sourceKey]));
   if (existing.rows[0] && accessRank(existing.rows[0].access_level) < accessRank(options.accessLevel)) {
     throw new Error('existing_derived_access_too_low');
   }
@@ -624,7 +551,7 @@ export async function runTasteProfile(options: RunTasteProfileOptions): Promise<
     aggregate_hash: evidence.aggregateHash,
     source_fingerprint: materialized.fingerprint,
     materialized_event_count: materialized.materializedEvents,
-    source_owner_key_id: options.auth.keyId,
+    worker_key_id: options.auth.keyId,
     source_namespace: policy.scope.sourceNamespace,
     target_namespace: policy.scope.targetNamespace,
     access_level: options.accessLevel,
@@ -649,32 +576,16 @@ export async function runTasteProfile(options: RunTasteProfileOptions): Promise<
       throw new Error('taste_source_changed');
     }
     parseTasteProfilePolicy(policy, options.environment, options.now ?? new Date());
-    const agent = await upsertAgent({
-      name: 'media-taste-profile', type: 'system', model: policy.generation.model,
-      runtime: 'taste-profile-cli', api_key_id: options.auth.keyId,
-    }, scope, client);
-    return upsertTasteProfileRevision(client, options.auth, {
-      ownerKeyId: options.auth.keyId,
-      agentId: agent.id,
-      namespace: policy.scope.targetNamespace,
-      source: TASTE_PROFILE_SOURCE,
-      sourceKey,
-      content: profile,
-      embedding: vector,
-      embeddingProvider: ACTIVE_EMBEDDING_DESCRIPTOR.provider,
-      embeddingModel: ACTIVE_EMBEDDING_DESCRIPTOR.model,
-      embeddingDimensions: ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
-      tags: tasteProfileTags(options.category, options.period.label),
-      metadata,
-      accessLevel: options.accessLevel,
-      aggregateHash: evidence.aggregateHash,
-      auditAction: 'memory.taste-profile',
-      seriesField: 'series',
-      seriesValue: `${options.accessLevel}:${options.category}`,
-      seriesOrderField: 'period',
-      seriesOrderValue: options.period.label,
-      force: options.force,
-    });
+    const applied = await client.query<{ id: string; outcome: 'created'|'updated'|'unchanged'; superseded_id: string|null }>(`
+      SELECT * FROM taste_profile_apply_revision($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::vector,
+        $11::text[],$12::jsonb,$13,$14,$15,$16,$17,$18)
+    `, [policy.scope.sourceNamespace,policy.scope.targetNamespace,options.category,options.accessLevel,
+      options.period.window.end.toISOString(),policy.selection.maxMaterializedEvents,materialized.fingerprint,
+      sourceKey,profile,vector,tasteProfileTags(options.category, options.period.label),JSON.stringify(metadata),
+      ACTIVE_EMBEDDING_DESCRIPTOR.provider,ACTIVE_EMBEDDING_DESCRIPTOR.model,ACTIVE_EMBEDDING_DESCRIPTOR.dimensions,
+      `${options.accessLevel}:${options.category}`,options.period.label,options.force ?? false]);
+    const row=applied.rows[0]; if(!row) throw new Error('taste_profile_apply_missing_result');
+    return {id:row.id,outcome:row.outcome,supersededId:row.superseded_id};
   });
   return { ...base, status: written.outcome, providerCalls: calls,
     profile, memoryId: written.id, supersededId: written.supersededId };
@@ -703,80 +614,6 @@ async function assertTasteRuntimeAuthority(
     maxAccessLevel: row.max_access_level }, policy);
 }
 
-interface TasteRevisionInput {
-  ownerKeyId: string; agentId: string; namespace: string; source: string; sourceKey: string;
-  content: string; embedding: string; embeddingProvider: string; embeddingModel: string;
-  embeddingDimensions: number; tags: string[]; metadata: Record<string, unknown>;
-  aggregateHash: string; accessLevel: AccessLevel; auditAction: string;
-  seriesField: string; seriesValue: string; seriesOrderField: string; seriesOrderValue: string;
-  force?: boolean;
-}
-
-async function upsertTasteProfileRevision(
-  client: ScopedClient, auth: AuthContext, input: TasteRevisionInput,
-): Promise<{ id: string; outcome: 'created' | 'updated' | 'unchanged'; supersededId: string | null }> {
-  const existing = await client.query<any>(`
-    SELECT id, access_level, metadata->>'aggregate_hash' AS aggregate_hash,
-      metadata->>'source_fingerprint' AS source_fingerprint, deleted_at::text
-    FROM memories WHERE client_id = $1::uuid AND namespace = $2 AND source_key = $3 FOR UPDATE
-  `, [input.ownerKeyId, input.namespace, input.sourceKey]);
-  if (existing.rows.length > 1) throw new Error('taste_profile_identity_not_unique');
-  const current = existing.rows[0];
-  if (current && (current.deleted_at || accessRank(current.access_level) < accessRank(input.accessLevel))) {
-    throw new Error('existing_derived_access_too_low');
-  }
-  if (current && current.aggregate_hash === input.aggregateHash &&
-      current.source_fingerprint === input.metadata.source_fingerprint && !input.force) {
-    return { id: current.id, outcome: 'unchanged', supersededId: null };
-  }
-  if (current) {
-    const updated = await client.query<{ id: string }>(`
-      UPDATE memories SET content=$2, embedding=$3::vector, tags=$4::text[], metadata=$5::jsonb,
-        access_level=$6, embedding_provider=$7, embedding_model=$8, embedding_dimensions=$9,
-        agent_id=$10::uuid, updated_at=statement_timestamp()
-      WHERE id=$1::uuid AND client_id=$11::uuid AND namespace=$12 RETURNING id
-    `, [current.id, input.content, input.embedding, input.tags, JSON.stringify(input.metadata), input.accessLevel,
-      input.embeddingProvider, input.embeddingModel, input.embeddingDimensions, input.agentId,
-      input.ownerKeyId, input.namespace]);
-    if (updated.rows.length !== 1) throw new Error('taste_profile_changed_during_update');
-    await logAudit({ clientId: input.ownerKeyId, action: input.auditAction, namespace: input.namespace,
-      memoryId: current.id, details: { updated: 1 } }, dbScopeFromAuth(auth), client);
-    return { id: current.id, outcome: 'updated', supersededId: null };
-  }
-  const prior = await client.query<any>(`
-    SELECT id, metadata->>$6 AS series_order FROM memories
-    WHERE client_id=$1::uuid AND namespace=$2 AND source=$3 AND metadata->>$4=$5
-      AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > statement_timestamp())
-      AND superseded_at IS NULL AND valid_to IS NULL AND consolidated_into_id IS NULL
-    ORDER BY valid_from DESC NULLS LAST, created_at DESC, id DESC LIMIT 1 FOR UPDATE
-  `, [input.ownerKeyId, input.namespace, input.source, input.seriesField, input.seriesValue, input.seriesOrderField]);
-  if (prior.rows[0] && (!prior.rows[0].series_order || prior.rows[0].series_order >= input.seriesOrderValue)) {
-    throw new Error('Taste-profile revisions must be applied oldest to newest per access lane');
-  }
-  const clock = (await client.query<{ now: string }>('SELECT statement_timestamp()::text AS now')).rows[0].now;
-  const supersededId = prior.rows[0]?.id ?? null;
-  if (supersededId) {
-    const closed = await client.query(`UPDATE memories SET superseded_at=$2::timestamptz,
-      valid_to=$2::timestamptz, updated_at=$2::timestamptz WHERE id=$1::uuid
-      AND superseded_at IS NULL AND valid_to IS NULL`, [supersededId, clock]);
-    if (closed.rowCount !== 1) throw new Error('taste_profile_predecessor_changed');
-  }
-  const inserted = await client.query<{ id: string }>(`
-    INSERT INTO memories (content,embedding,source,namespace,tags,metadata,access_level,client_id,agent_id,
-      source_key,embedding_provider,embedding_model,embedding_dimensions,memory_kind,valid_from,supersedes_id,
-      created_at,updated_at)
-    VALUES($1,$2::vector,$3,$4,$5::text[],$6::jsonb,$7,$8::uuid,$9::uuid,$10,$11,$12,$13,
-      'semantic',$14::timestamptz,$15::uuid,$14::timestamptz,$14::timestamptz) RETURNING id
-  `, [input.content, input.embedding, input.source, input.namespace, input.tags, JSON.stringify(input.metadata),
-    input.accessLevel, input.ownerKeyId, input.agentId, input.sourceKey, input.embeddingProvider,
-    input.embeddingModel, input.embeddingDimensions, clock, supersededId]);
-  const id = inserted.rows[0]?.id;
-  if (!id) throw new Error('taste_profile_insert_missing_identity');
-  await logAudit({ clientId: input.ownerKeyId, action: input.auditAction, namespace: input.namespace,
-    memoryId: id, details: { created: 1 } }, dbScopeFromAuth(auth), client);
-  return { id, outcome: 'created', supersededId };
-}
-
 export function assertTasteProfileAuthority(auth: AuthContext, policy: TasteProfilePolicy): void {
   const expectedNamespaces = [...policy.scope.namespaces].sort();
   const requiredAccess = policy.scope.accessLevels.reduce<AccessLevel>(
@@ -785,8 +622,8 @@ export function assertTasteProfileAuthority(auth: AuthContext, policy: TasteProf
       accessRank(auth.maxAccessLevel) !== accessRank(requiredAccess)) {
     throw new Error('Taste profiles require a dedicated key for exactly the approved namespaces and access-level ceiling');
   }
-  if (JSON.stringify([...auth.permissions].sort()) !== JSON.stringify(['read', 'write'])) {
-    throw new Error("Taste-profile key requires exactly 'read,write'");
+  if (JSON.stringify([...auth.permissions].sort()) !== JSON.stringify(['read', 'taste_profile'])) {
+    throw new Error("Taste-profile key requires exactly 'read,taste_profile'");
   }
 }
 
