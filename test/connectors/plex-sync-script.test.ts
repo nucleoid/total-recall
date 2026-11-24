@@ -49,7 +49,7 @@ test('plex sync script rolls up successful inserts, cleans up, and exits nonzero
   );
 });
 
-test('plex sync script reports self-healing metadata warnings without a degraded exit', async () => {
+test('plex sync script reports self-healing metadata warnings and drains pending backlog without a degraded exit', async () => {
   const calls: string[] = [];
   const exitCode = await runPlexSync({
     log: (message) => calls.push(`log:${message}`),
@@ -76,6 +76,13 @@ test('plex sync script reports self-healing metadata warnings without a degraded
         duration_ms: 1,
       }),
     }),
+    rollupPending: async (auth, scope, batchSize) => {
+      assert.equal(auth.name, 'plex');
+      assert.deepEqual(scope.namespaces, ['media']);
+      assert.equal(batchSize, 200);
+      calls.push('rollup:pending-backlog');
+      return { rolled: 1, failed: 0, errors: [] };
+    },
     shutdownDb: async () => {
       calls.push('shutdown');
     },
@@ -83,6 +90,9 @@ test('plex sync script reports self-healing metadata warnings without a degraded
 
   assert.equal(exitCode, 0);
   assert.ok(calls.some((call) => call.includes('malformed cursor metadata')), JSON.stringify(calls));
+  assert.ok(calls.includes('rollup:pending-backlog'), JSON.stringify(calls));
+  assert.ok(calls.includes('log:[plex-sync] rollup: 1 memories, 0 failed'), JSON.stringify(calls));
+  assert.equal(calls.at(-2), 'shutdown');
   assert.equal(calls.at(-1), 'log:[plex-sync] completed status=ok exit_code=0');
 });
 
