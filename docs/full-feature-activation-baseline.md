@@ -45,7 +45,7 @@ Reflection now:
 2. requires every requested source namespace plus `insights` to exist on the executing key;
 3. requires the dedicated native `reflection` permission and forbids `write`, `admin`, and `delete`, preserving migration 031 RLS isolation;
 4. revalidates evidence content/revisions and access levels before applying output;
-5. classifies every derived insight at the maximum sensitivity of its cited evidence and refuses reuse of a lower-classified insight;
+5. classifies every derived insight at the maximum sensitivity of all materialized prompt inputs (plus revalidated current levels), regardless of which evidence IDs the model cites, and refuses reuse of a lower-classified insight;
 6. uses bounded subscription calls/output bytes with zero fabricated USD accounting.
 
 Migration 054 is forward-only. It broadens consolidation metadata checks to the three existing access levels and replaces only the reflection insert policy's fixed-normal condition with a check against the current key's `max_access_level`. It does not grant a key, mutate memories, enable a worker, or relax namespace/permission/provenance guards.

@@ -7,6 +7,7 @@ import {
   materializeReflectionInput,
   normalizeInsightContent,
   parseReflectionPolicy,
+  reflectionInsightAccessLevel,
   reflectionInsightHash,
   runReflection,
   validateReflectionOutput,
@@ -37,6 +38,19 @@ function policy() {
   };
 }
 
+function subscriptionPolicy(namespace = 'work', accessLevel: 'normal' | 'sensitive' | 'secret' = 'normal') {
+  return {
+    ...policy(),
+    generation: {
+      provider: 'openclaw-adapter', model: 'openclaw/total-recall-synthesis',
+      endpoint: 'https://10.0.0.9:3012/v1/generate', credentialEnv: 'GENERATION_API_KEY',
+    },
+    scope: { namespaces: [namespace] as [string], accessLevel },
+    budget: { mode: 'subscription' as const, maxCallsPerRun: 2, maxOutputBytesPerRun: 131072,
+      usageControlReference: 'dedicated key: six calls/minute and one hundred/day' },
+  };
+}
+
 test('last completed ISO week is a UTC Monday-to-Monday interval', () => {
   assert.deepEqual(lastCompletedIsoWeek(new Date('2026-07-16T23:30:00-07:00')), {
     start: new Date('2026-07-06T00:00:00.000Z'),
@@ -57,19 +71,15 @@ test('reflection policy requires every feature-specific approval', () => {
 });
 
 test('subscription policy uses only the approved OpenClaw agent adapter without fabricated USD prices', () => {
-  const subscription = {
-    ...policy(),
-    generation: {
-      provider: 'openclaw-adapter', model: 'openclaw/total-recall-synthesis',
-      endpoint: 'https://10.0.0.9:3012/v1/generate', credentialEnv: 'GENERATION_API_KEY',
-    },
-    scope: { namespaces: ['my-life'] as [string], accessLevel: 'secret' as const },
-    budget: { mode: 'subscription' as const, maxCallsPerRun: 2, maxOutputBytesPerRun: 131072,
-      usageControlReference: 'dedicated key: six calls/minute and one hundred/day' },
-  };
+  const subscription = subscriptionPolicy('my-life', 'secret');
   const parsed = parseReflectionPolicy(subscription, 'test', new Date('2026-06-01T00:00:00Z'));
+  const reparsed = parseReflectionPolicy(parsed, 'test', new Date('2026-06-01T00:00:00Z'));
+  assert.deepEqual(reparsed, parsed);
   assert.equal(parsed.budget.mode, 'subscription');
   assert.equal(parsed.budget.maxCostUsdPerRun, 0);
+  assert.throws(() => parseReflectionPolicy({ ...subscription,
+    budget: { ...subscription.budget, arbitraryField: true } }, 'test',
+  new Date('2026-06-01T00:00:00Z')));
   assert.throws(() => parseReflectionPolicy({ ...subscription,
     generation: { ...subscription.generation, provider: 'direct-openai' } }, 'test',
   new Date('2026-06-01T00:00:00Z')), /approved OpenClaw agent adapter/);
@@ -86,6 +96,20 @@ test('strict reflection output accepts sampled evidence and rejects control fiel
     evidence_ids: ids.slice(0, 2), confidence: 0.5, tags: [], namespace: 'secret' }] }), ids), /invalid_reflection_output/);
   assert.throws(() => validateReflectionOutput(JSON.stringify({ insights: [{ content: 'api_key=do-not-store',
     evidence_ids: ids.slice(0, 2), confidence: 0.5, tags: [] }] }), ids), /invalid_reflection_output/);
+});
+
+test('reflection output inherits the maximum sensitivity of every materialized prompt input', () => {
+  const candidates: ReflectionCandidate[] = [
+    { id: ids[0], revision: 0, accessLevel: 'normal', createdAt: '2026-07-01T00:00:00Z',
+      accessedAt: '2026-07-01T00:00:00Z', accessCount: 0 },
+    { id: ids[1], revision: 0, accessLevel: 'normal', createdAt: '2026-07-01T00:00:00Z',
+      accessedAt: '2026-07-01T00:00:00Z', accessCount: 0 },
+    { id: ids[2], revision: 0, accessLevel: 'secret', createdAt: '2026-07-01T00:00:00Z',
+      accessedAt: '2026-07-01T00:00:00Z', accessCount: 0 },
+  ];
+  const insight = { evidence_ids: ids.slice(0, 2), content: 'normal citations', confidence: 0.8, tags: [] };
+  assert.equal(reflectionInsightAccessLevel(candidates, ['normal', 'normal', 'secret'], insight), 'secret');
+  assert.equal(reflectionInsightAccessLevel(candidates, ['normal', 'normal', 'normal'], insight), 'secret');
 });
 
 test('normalization makes exact insight reuse deterministic', () => {
@@ -154,9 +178,11 @@ test('dry-run materializes a bounded estimate without provider calls or database
     const result = await runReflection({
       auth: { keyId: ids[0], name: 'reflection', namespaces: ['work', 'insights'],
         permissions: ['read', 'reflection'], maxAccessLevel: 'normal' },
-      namespace: 'work', environment: 'test', policy: policy(), dryRun: true,
+      namespace: 'work', environment: 'test',
+      policy: parseReflectionPolicy(subscriptionPolicy(), 'test', new Date('2026-06-01T00:00:00Z')),
+      dryRun: true,
       window: { start: new Date('2026-07-01T00:00:00Z'), end: new Date('2026-07-08T00:00:00Z') },
-      provider: { name: 'gateway', generate: async () => { providerCalls += 1; return '{"insights":[]}'; } },
+      provider: { name: 'openclaw-adapter', generate: async () => { providerCalls += 1; return '{"insights":[]}'; } },
     });
     assert.equal(result.materialized, 2);
     assert.equal(result.providerCalls, 0);

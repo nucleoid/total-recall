@@ -74,16 +74,31 @@ export const reflectionPolicySchema = z.object({
     }).strict().refine(value => value.maxCostUsdPerMonth >= value.maxCostUsdPerRun,
       'Monthly reflection budget must be at least the per-run budget')
       .transform(value => ({ ...value, mode: 'paid' as const })),
-    z.object({
-      mode: z.literal('subscription'),
-      maxCallsPerRun: positiveInteger.max(10),
-      maxOutputBytesPerRun: positiveInteger.max(10 * MAX_REFLECTION_OUTPUT_BYTES),
-      usageControlReference: z.string().trim().min(1).max(1024),
-    }).strict().transform(value => ({
-      ...value, maxCostUsdPerRun: 0, maxCostUsdPerMonth: 0,
-      estimatedRequestCostUsd: 0, estimatedInputCostUsdPerMillionBytes: 0,
-      estimatedOutputCostUsdPerMillionBytes: 0, monthlyControlReference: value.usageControlReference,
-    })),
+    z.union([
+      z.object({
+        mode: z.literal('subscription'),
+        maxCallsPerRun: positiveInteger.max(10),
+        maxOutputBytesPerRun: positiveInteger.max(10 * MAX_REFLECTION_OUTPUT_BYTES),
+        usageControlReference: z.string().trim().min(1).max(1024),
+      }).strict().transform(value => ({
+        ...value, maxCostUsdPerRun: 0, maxCostUsdPerMonth: 0,
+        estimatedRequestCostUsd: 0, estimatedInputCostUsdPerMillionBytes: 0,
+        estimatedOutputCostUsdPerMillionBytes: 0, monthlyControlReference: value.usageControlReference,
+      })),
+      z.object({
+        mode: z.literal('subscription'),
+        maxCallsPerRun: positiveInteger.max(10),
+        maxOutputBytesPerRun: positiveInteger.max(10 * MAX_REFLECTION_OUTPUT_BYTES),
+        usageControlReference: z.string().trim().min(1).max(1024),
+        maxCostUsdPerRun: z.literal(0),
+        maxCostUsdPerMonth: z.literal(0),
+        estimatedRequestCostUsd: z.literal(0),
+        estimatedInputCostUsdPerMillionBytes: z.literal(0),
+        estimatedOutputCostUsdPerMillionBytes: z.literal(0),
+        monthlyControlReference: z.string().trim().min(1).max(1024),
+      }).strict().refine(value => value.monthlyControlReference === value.usageControlReference,
+        'Canonical subscription usage references must match'),
+    ]),
   ]),
   providerModelApproval: approvalSchema,
   termsApproval: approvalSchema,
@@ -266,6 +281,22 @@ const insightSchema = z.object({
 });
 const insightEnvelopeSchema = z.object({ insights: z.array(insightSchema).max(MAX_REFLECTION_INSIGHTS) }).strict();
 export type GeneratedReflectionInsight = z.infer<typeof insightSchema>;
+
+export function reflectionInsightAccessLevel(
+  promptCandidates: readonly Pick<ReflectionCandidate, 'id' | 'accessLevel'>[],
+  revalidatedAccessLevels: readonly AccessLevel[],
+  insight: Pick<GeneratedReflectionInsight, 'evidence_ids'>,
+): AccessLevel {
+  const promptIds = new Set(promptCandidates.map(candidate => candidate.id));
+  if (insight.evidence_ids.some(id => !promptIds.has(id))) throw new Error('invalid_reflection_evidence');
+  if (revalidatedAccessLevels.length !== promptCandidates.length) throw new Error('reflection_evidence_changed');
+  // Every materialized record may influence generation, whether or not the model cites it.
+  // Include both prompt-time and revalidated levels so a concurrent reclassification cannot downgrade output.
+  return maximumAccessLevel([
+    ...promptCandidates.map(candidate => candidate.accessLevel),
+    ...revalidatedAccessLevels,
+  ]);
+}
 
 export function validateReflectionOutput(
   output: string,
@@ -537,11 +568,11 @@ async function applyReflectionInsights(client: ScopedClient, options: ApplyRefle
     `${candidate.revision}\0${candidate.content}`]));
   if (evidence.rows.length !== ids.length || evidence.rows.some((row: any) =>
     expected.get(row.id) !== `${Number(row.revision)}\0${row.content}`)) throw new Error('reflection_evidence_changed');
-  const accessLevels = new Map(evidence.rows.map((row: any) => [row.id, row.access_level as AccessLevel]));
+  const revalidatedAccessLevels = evidence.rows.map((row: any) => row.access_level as AccessLevel);
   let stored = 0;
   for (let index = 0; index < options.insights.length; index += 1) {
     const insight = options.insights[index];
-    const accessLevel = maximumAccessLevel(insight.evidence_ids.map(id => accessLevels.get(id)!));
+    const accessLevel = reflectionInsightAccessLevel(options.candidates, revalidatedAccessLevels, insight);
     const hash = reflectionInsightHash(insight.content);
     const existing = await client.query<{ id: string; access_level: AccessLevel }>(`
       SELECT id, access_level FROM memories
