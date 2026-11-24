@@ -9,6 +9,7 @@ import {
   parseReflectionPolicy,
   reflectionInsightAccessLevel,
   reflectionInsightHash,
+  reflectionRunLockKey,
   runReflection,
   validateReflectionOutput,
   type ReflectionCandidate,
@@ -50,6 +51,14 @@ function subscriptionPolicy(namespace = 'work', accessLevel: 'normal' | 'sensiti
       usageControlReference: 'dedicated key: six calls/minute and one hundred/day' },
   };
 }
+
+test('reflection advisory lock bind is unambiguous PostgreSQL text without NUL', () => {
+  const window = { start: new Date('2026-07-01T00:00:00Z'), end: new Date('2026-07-08T00:00:00Z') };
+  const key = reflectionRunLockKey('work', window, 'a'.repeat(64));
+  assert.equal(key.includes('\0'), false);
+  assert.deepEqual(JSON.parse(key), ['work', window.start.toISOString(), window.end.toISOString(), 'a'.repeat(64)]);
+  assert.notEqual(key, reflectionRunLockKey('work|2026-07-01', window, 'a'.repeat(64)));
+});
 
 test('last completed ISO week is a UTC Monday-to-Monday interval', () => {
   assert.deepEqual(lastCompletedIsoWeek(new Date('2026-07-16T23:30:00-07:00')), {

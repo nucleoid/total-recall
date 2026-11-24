@@ -136,6 +136,15 @@ export function reflectionPolicyHash(policy: ReflectionPolicy): string {
   return sha256(stableJson(policy));
 }
 
+export function reflectionRunLockKey(
+  namespace: string,
+  window: ReflectionWindow,
+  configHash: string,
+): string {
+  // PostgreSQL text parameters reject NUL. A JSON tuple is unambiguous and remains content-free.
+  return JSON.stringify([namespace, window.start.toISOString(), window.end.toISOString(), configHash]);
+}
+
 export interface ReflectionWindow { start: Date; end: Date }
 
 /** Last completed ISO week, represented as a half-open UTC interval. */
@@ -468,7 +477,7 @@ async function claimReflectionRun(
 ): Promise<ClaimedRun> {
   return withScopedClient(dbScopeFromAuth(options.auth), async client => {
     await client.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [REFLECTION_LOCK_FEATURE,
-      `${options.namespace}\0${options.window.start.toISOString()}\0${options.window.end.toISOString()}\0${configHash}`]);
+      reflectionRunLockKey(options.namespace, options.window, configHash)]);
     const existing = await client.query<any>(`
       SELECT id, generation, status, provider_calls, insights_stored, estimated_cost_micro_usd, updated_at
       FROM memory_reflection_runs
