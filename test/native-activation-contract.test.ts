@@ -39,7 +39,7 @@ test('entity recovery is cutoff-bound and commands remain fixed argv with one ge
     entityHistoricalRecovery: { completedBefore: '2026-11-01T00:00:00Z', limit: 7 } }, NOW);
   const plan = buildInvocationPlan(parsed, 0);
   assert.equal(plan.commands.length, 2);
-  assert.deepEqual(plan.commands[0].argv, ['/usr/bin/npm', 'run', 'entity:backfill', '--',
+  assert.deepEqual(plan.commands[0].argv, ['/usr/local/bin/npm', 'run', 'entity:backfill', '--',
     '--namespace', 'shared', '--access-level', 'normal', '--requeue-completed-without-links',
     '--completed-before', '2026-11-01T00:00:00.000Z', '--limit', '7', '--execute']);
   assert.deepEqual(plan.commands[1].argv.slice(-5), ['--once', '--max-jobs', '1', '--poll-ms', '100']);
@@ -103,7 +103,7 @@ test('contradiction shadow invokes only the bounded read-only auditor', () => {
   delete raw.policyEnvironment;
   raw.lanes = [{ namespace: 'shared', accessLevel: 'normal', profile: 'read-only-auditor', mode: 'once' }];
   const parsed = parseNativeActivationConfig(raw, NOW);
-  assert.deepEqual(buildInvocationPlan(parsed, 0).commands[0].argv, ['/usr/bin/npm', 'run',
+  assert.deepEqual(buildInvocationPlan(parsed, 0).commands[0].argv, ['/usr/local/bin/npm', 'run',
     'contradiction:audit', '--', '--once', '--namespace', 'shared', '--access-level', 'normal',
     '--expected-policy-hash', 'a'.repeat(64)]);
   assert.equal(parseNativeActivationConfig({ ...raw, lanes: [{ ...raw.lanes[0],

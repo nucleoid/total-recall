@@ -10,7 +10,8 @@ test('systemd templates are resource-bounded and planning-only', async () => {
   assert.match(service, /CPUQuota=25%/);
   assert.match(service, /MemoryMax=384M/);
   assert.match(service, /MemorySwapMax=0/);
-  assert.match(service, /RuntimeMaxSec=240/);
+  assert.match(service, /TimeoutStartSec=240/);
+  assert.doesNotMatch(service, /RuntimeMaxSec=/);
   assert.doesNotMatch(service, /ExecStart=.*--execute/);
   assert.match(timer, /Persistent=false/);
   assert.doesNotMatch(service + timer, /openclaw.*automation|cron/);
@@ -31,5 +32,7 @@ test('runbook keeps product scheduling separate from conversation continuation a
   assert.match(runbook, /do not create one service or timer per lane/i);
   assert.match(runbook, /native-maintenance-owner-launcher\.py/);
   assert.match(runbook, /run-reviewed/);
+  assert.match(runbook, /Type=oneshot.*TimeoutStartSec=240/i);
+  assert.match(runbook, /container-native command.*\/usr\/local\/bin\/npm/i);
   assert.match(runbook, /official_cli_timeout|timeout, nonzero exit/i);
 });
