@@ -193,9 +193,27 @@ function unbracket(hostname: string): string {
  */
 export function createPinnedWebhookLookup(pinned: { address: string; family: 4 | 6 }): net.LookupFunction {
   return (_hostname, options, callback) => {
-    if (options.all === true) callback(null, [{ address: pinned.address, family: pinned.family }]);
-    else callback(null, pinned.address, pinned.family);
+    // Match real DNS lookup timing. A synchronous callback can let TLS socket
+    // setup run before https.request has attached its own error handlers.
+    queueMicrotask(() => {
+      if (options.all === true) callback(null, [{ address: pinned.address, family: pinned.family }]);
+      else callback(null, pinned.address, pinned.family);
+    });
   };
+}
+
+export function selectPinnedWebhookAddress(
+  addresses: ReadonlyArray<{ address: string; family: 4 | 6 }>,
+  random = Math.random,
+): { address: string; family: 4 | 6 } {
+  if (addresses.length === 0) throw new Error('webhook_destination_has_no_validated_address');
+  // The production ingestion container currently has IPv4 egress only. Prefer
+  // IPv4 when DNS supplied both families, without resolving again or falling
+  // back to any address that was not already policy-validated.
+  const candidates = addresses.some(address => address.family === 4)
+    ? addresses.filter(address => address.family === 4)
+    : addresses;
+  return candidates[Math.floor(random() * candidates.length)];
 }
 
 async function withDeadline<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
@@ -217,7 +235,7 @@ export async function postWebhook(
   const timeoutMs = options.timeoutMs ?? 5_000;
   const maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES_DEFAULT;
   if (body.length > 64 * 1024) throw new Error('webhook_payload_too_large');
-  const pinned = destination.addresses[Math.floor(Math.random() * destination.addresses.length)];
+  const pinned = selectPinnedWebhookAddress(destination.addresses);
   return new Promise<WebhookResponse>((resolve, reject) => {
     let settled = false;
     let deadline: NodeJS.Timeout | undefined;
