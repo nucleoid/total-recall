@@ -239,7 +239,7 @@ export function buildInvocationPlan(config: NativeActivationConfig, laneIndex: n
   if (!Number.isSafeInteger(laneIndex) || laneIndex < 0 || laneIndex >= config.lanes.length) throw new Error('invalid lane index');
   const lane = config.lanes[laneIndex];
   const command = (script: string, args: string[], receiptKind: NativeCommand['receiptKind'] = config.feature): NativeCommand => ({
-    argv: ['/usr/bin/npm', 'run', script, '--', ...args], receiptKind, transport: 'container',
+    argv: ['/usr/local/bin/npm', 'run', script, '--', ...args], receiptKind, transport: 'container',
   });
   const exact = ['--namespace', lane.namespace, '--access-level', lane.accessLevel];
   let commands: NativeCommand[];

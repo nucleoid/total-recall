@@ -83,6 +83,8 @@ Supported subprofiles/modes:
 
 Taste and consolidation artifact paths are container paths to owner-controlled files. The controller does not create approvals or copy artifacts.
 
+Every container-native command uses the image's fixed `/usr/local/bin/npm` executable. The controller does not use `PATH`, probe alternate npm locations, or fall back to another command. Maintenance remains the separate fixed host `/usr/bin/python3` launcher described below.
+
 `run-reviewed` is the only routine taste mode. It requires the committed standing owner instruction to be effective, the bounded operator authorization lease to be current, and policy `maxCallsPerRun` to equal two. The CLI performs preview, schema/evidence-local validation, attributed service approval, full apply-time revalidation, and apply in one native operation. There is no unreviewed generation fallback. The controller fixes `NODE_OPTIONS=--v8-pool-size=1`; private lane environments retain the reviewed `GOMAXPROCS=2` and `UV_THREADPOOL_SIZE=1` resource settings. PID, memory, CPU, timeout, and no-restart guards are unchanged.
 
 Maintenance bypasses the ingestion-container dispatch path and invokes only the reviewed host launcher. That launcher independently enforces the fixed release, OS identity, passwordless local-trust database namespace, 256 MiB/0.25 CPU/64 PID container limits, one 100-row page, private cursor state, and no purge/global DDL contract. The controller does not accept a maintenance environment file or caller arguments.
@@ -123,7 +125,7 @@ The top-level `approval` is a bounded operator lease for this controller configu
 5. Run one manual service canary. Verify the ledger, generation reservation, native run tables, local embedding readiness, resource caps, and no overlap before enabling that one feature timer.
 6. Parent separately enables the reviewed timer. Do not touch existing connector, daily-sync, ingestion, watcher, OpenClaw, or ETH units.
 
-The unit template limits the local owner to 25% CPU, 384 MiB RAM, no swap, 64 tasks, and 240 seconds. The remote native command retains its 120-second default timeout and 15-second kill grace. The official gateway notification call has a 15-second gateway timeout and a 30-second process deadline. Raising any limit requires another review; it must not weaken validator/ETH guards or restart a stopped worker.
+The `Type=oneshot` unit template limits the local owner to 25% CPU, 384 MiB RAM, no swap, 64 tasks, and an enforced `TimeoutStartSec=240` start-job wall-clock bound. `RuntimeMaxSec` is intentionally absent because systemd ignores it for oneshot services. The remote native command retains its 120-second default timeout and 15-second kill grace. The official gateway notification call has a 15-second gateway timeout and a 30-second process deadline. Raising any limit requires another review; it must not weaken validator/ETH guards or restart a stopped worker.
 
 ## Failure-only notification and canary
 
