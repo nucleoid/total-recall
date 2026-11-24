@@ -20,6 +20,10 @@ dotenv.config();
 
 const TASTE_PROFILE_CLI_LOCK = 0x54525450; // "TRTP"
 
+export function tasteProfileLockIdentity(keyId: string, environment: string): string {
+  return JSON.stringify([keyId, environment]);
+}
+
 export interface TasteProfileCliOptions {
   mode: TasteProfileMode;
   category: MediaTasteCategory | 'all';
@@ -126,7 +130,7 @@ async function main(): Promise<void> {
   process.once('SIGTERM', cancel);
   try {
     const results = await withCheckedOutClient(async client => {
-      const lockIdentity = `${auth.keyId}\0${policy.environment}`;
+      const lockIdentity = tasteProfileLockIdentity(auth.keyId, policy.environment);
       const lock = await client.query<{ locked: boolean }>(
         'SELECT pg_try_advisory_lock($1, hashtext($2)) AS locked', [TASTE_PROFILE_CLI_LOCK, lockIdentity],
       );
