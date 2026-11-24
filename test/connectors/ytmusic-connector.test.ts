@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildYtmusicFetchArgs,
+  createRemoteYtmusicHelperRunner,
   YtmusicConnector,
   type YtmusicHelperRunner,
 } from '../../src/connectors/ytmusic/connector.js';
@@ -93,4 +94,30 @@ test('ytmusic transform rejects invalid resolved played timestamps', () => {
     }),
     null
   );
+});
+
+
+test('remote helper sends the token only to the approved HTTPS gateway with bounded fetch contract', async () => {
+  const originalFetch = globalThis.fetch;
+  let request: { url: string; authorization?: string; body?: Record<string, unknown> } | undefined;
+  globalThis.fetch = (async (input, init) => {
+    request = {
+      url: String(input),
+      authorization: (init?.headers as Record<string, string>).authorization,
+      body: JSON.parse(String(init?.body)),
+    };
+    return new Response(JSON.stringify({ stdout: '{"items":[]}', stderr: '', code: 0 }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const runner = createRemoteYtmusicHelperRunner('https://fuego.private/v1/ytmusic/fetch', 'helper-token');
+    const result = await runner(['fetch', '--token-file', '/tmp/redacted'], false, JSON.stringify({ cookie: 'secret' }));
+    assert.equal(result.code, 0);
+    assert.equal(request?.url, 'https://fuego.private/v1/ytmusic/fetch');
+    assert.equal(request?.authorization, 'Bearer helper-token');
+    assert.deepEqual(request?.body, { token: { cookie: 'secret' } });
+    await assert.rejects(runner(['auth-browser'], false, '{}'), /non-interactive fetch only/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.throws(() => createRemoteYtmusicHelperRunner('http://fuego.private/fetch', 'x'), /HTTPS URL/);
 });

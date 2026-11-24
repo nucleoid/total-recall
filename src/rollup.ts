@@ -1,7 +1,8 @@
 import { withScopedClient, type DbScope } from './db.js';
-import { embedWithProfile, serializeEmbeddingVector } from './embedding.js';
+import { ACTIVE_EMBEDDING_PROFILE, embedWithProfile, serializeEmbeddingVector } from './embedding.js';
 import { getRollupPendingEvents, linkEventToMemoryWithClient, type MediaEvent } from './media.js';
 import { checkPermission } from './auth.js';
+import { ingestionEnabled } from './ingestion.js';
 import type { AuthContext } from './types.js';
 
 const MEDIA_NAMESPACE = 'media';
@@ -39,17 +40,19 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
       const tags = buildTags(event);
       const metadata = buildMetadata(event);
 
-      // EmbeddingResult keeps ACTIVE_EMBEDDING_DESCRIPTOR and vector together.
-      const embedding = await embedWithProfile(summary);
-      const vecStr = serializeEmbeddingVector(embedding.vector);
+      // Queue-enabled deployments let the dedicated ingestion worker own local
+      // inference and manifest publication. Legacy deployments remain synchronous.
+      const queued = ingestionEnabled();
+      const embedding = queued ? undefined : await embedWithProfile(summary);
+      const vecStr = embedding ? serializeEmbeddingVector(embedding.vector) : null;
 
       await withScopedClient(
         { namespaces: [MEDIA_NAMESPACE], keyId: auth.keyId },
         async (client) => {
-          const insert = await client.query<{ id: string }>(
+          const insert = await client.query<{ id: string; revision: number }>(
             `INSERT INTO memories (content, embedding, source, namespace, tags, metadata, event_at, client_id, agent_id, embedding_provider, embedding_model, embedding_dimensions, memory_kind, valid_from)
              VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'media_rollup', statement_timestamp())
-             RETURNING id`,
+             RETURNING id, revision`,
             [
               summary,
               vecStr,
@@ -60,11 +63,22 @@ export async function rollupPendingEvents(auth: AuthContext, scope: DbScope, bat
               event.played_at,
               event.client_id,
               event.agent_id,
-              embedding.provider,
-              embedding.model,
-              embedding.dimensions,
+              embedding?.provider ?? null,
+              embedding?.model ?? null,
+              embedding?.dimensions ?? null,
             ]
           );
+
+          if (queued) {
+            const profile = ACTIVE_EMBEDDING_PROFILE;
+            await client.query(`INSERT INTO memory_ingestion_jobs
+              (memory_id,namespace,client_id,access_level,allowed_namespaces,agent_id,
+               dedupe,contradiction_eligible,embedding_provider,embedding_model,
+               embedding_dimensions,kind,source_revision,memory_created,creation_pending)
+              VALUES ($1,$2,$3,'normal',$4,$5,false,false,$6,$7,$8,'store',$9,true,true)`,
+            [insert.rows[0].id, MEDIA_NAMESPACE, auth.keyId, auth.namespaces, event.agent_id,
+              profile.provider, profile.model, profile.dimensions, insert.rows[0].revision]);
+          }
 
           const linked = await linkEventToMemoryWithClient(client, event.id, insert.rows[0].id, auth.keyId);
           if (!linked) throw new ConcurrentRollupNoOp();
