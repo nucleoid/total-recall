@@ -42,3 +42,11 @@ After checking selection size and budget estimates, schedule the normal command 
 ## Disable and rollback
 
 Disable the external schedule and remove the generation credential. Retain runs, insights, restrictive origin-aware RLS, and evidence links. Evidence foreign keys intentionally block hard purge until an explicit reviewed provenance teardown exists.
+
+## Output-limit contract and failure repair
+
+The system prompt must communicate the approved `selection.maxInsights`, and input-byte accounting includes that exact prompt. Strict output validation still rejects excess insights; do not truncate outputs or relax policy to hide a failure. Reflection algorithm 2 includes the effective prompt in its configuration identity, so changed prompt behavior cannot reuse an older completed result.
+
+When repairing an exhausted failed run after a diagnosed prompt change, retain the old run and spent call unchanged. A new algorithm identity is not a refund: any actual verification generation must still fit the shared daily controller reservation and its own unchanged per-run policy. Never create a new identity solely to evade a cap. Archive a diagnosed controller latch before a reviewed re-arm; preserve lane cursor, ledger and budget.
+
+Controller failure receipts include only stage, numeric exit status, allowlisted signal and stdout/stderr byte counts. Raw commands, process output, source content and credentials are deliberately excluded. Missing historical diagnostics must remain unknown, not be reconstructed from a healthy later sample.

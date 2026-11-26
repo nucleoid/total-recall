@@ -46,7 +46,7 @@ export interface NativeActivationConfig {
 
 export interface NativeCommand {
   argv: string[];
-  receiptKind: Exclude<NativeFeature, 'contradiction-shadow'> | 'entity-requeue';
+  receiptKind: NativeFeature | 'entity-requeue';
   transport: 'container' | 'host';
 }
 
@@ -266,9 +266,13 @@ export function buildInvocationPlan(config: NativeActivationConfig, laneIndex: n
       if (lane.mode === 'apply') args.push('--selection-file', lane.artifactPath!);
       commands = [command('taste-profile', args)]; break;
     }
-    case 'contradiction-shadow': commands = [command('contradiction:audit', ['--once',
-      '--namespace', lane.namespace, '--access-level', lane.accessLevel,
-      '--expected-policy-hash', resolveLaneBinding(config, lane).policySha256!])]; break;
+    case 'contradiction-shadow': {
+      const binding = resolveLaneBinding(config, lane);
+      if (!binding?.policySha256) throw new Error('lane_binding_missing');
+      commands = [command('contradiction:audit', ['--once',
+        '--namespace', lane.namespace, '--access-level', lane.accessLevel,
+        '--expected-policy-hash', binding.policySha256])]; break;
+    }
     case 'maintenance': commands = [{
       argv: ['/usr/bin/python3', '/home/cass/total-recall-move-20261117/release/scripts/native-maintenance-owner-launcher.py'],
       receiptKind: 'maintenance', transport: 'host',
