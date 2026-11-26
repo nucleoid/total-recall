@@ -25,6 +25,11 @@ export const REFLECTION_SYSTEM_PROMPT =
   'Every insight needs at least two supplied evidence IDs. Do not invent IDs. Exclude credentials and unsupported claims. ' +
   'Do not emit namespaces, access levels, sources, agents, models, metadata, prompts, or other control fields.';
 
+export function reflectionSystemPrompt(maxInsights: number): string {
+  boundedInteger(maxInsights, 1, MAX_REFLECTION_INSIGHTS, 'insight limit');
+  return REFLECTION_SYSTEM_PROMPT + ` Return at most ${maxInsights} insights; fewer or an empty insights array is valid.`;
+}
+
 const approvalSchema = z.object({
   approved: z.literal(true),
   approvedBy: z.string().trim().min(1).max(256),
@@ -236,11 +241,13 @@ export async function materializeReflectionInput(
   client: ScopedClient,
   selected: readonly ReflectionCandidate[],
   maxInputBytes: number,
+  maxInsights = MAX_REFLECTION_INSIGHTS,
 ): Promise<ReflectionInput> {
   boundedInteger(maxInputBytes, 1024, HARD_REFLECTION_INPUT_BYTES, 'input byte limit');
+  const system = reflectionSystemPrompt(maxInsights);
   if (selected.length === 0) {
     const input = JSON.stringify({ memories: [] });
-    return { candidates: [], input, inputBytes: totalInputBytes(input), truncated: false };
+    return { candidates: [], input, inputBytes: totalInputBytes(input, system), truncated: false };
   }
   const included: MaterializedReflectionCandidate[] = [];
   let input = JSON.stringify({ memories: [] });
@@ -257,18 +264,18 @@ export async function materializeReflectionInput(
     if (text === undefined) { truncated = true; continue; }
     const next = [...included, { ...candidate, content: text }];
     const nextInput = serializeReflectionInput(next);
-    if (totalInputBytes(nextInput) > maxInputBytes) { truncated = true; break; }
+    if (totalInputBytes(nextInput, system) > maxInputBytes) { truncated = true; break; }
     included.push({ ...candidate, content: text });
     input = nextInput;
   }
-  return { candidates: included, input, inputBytes: totalInputBytes(input), truncated };
+  return { candidates: included, input, inputBytes: totalInputBytes(input, system), truncated };
 }
 
 function serializeReflectionInput(candidates: readonly MaterializedReflectionCandidate[]): string {
   return JSON.stringify({ memories: candidates.map(candidate => ({ id: candidate.id, content: candidate.content })) });
 }
-function totalInputBytes(input: string): number {
-  return Buffer.byteLength(REFLECTION_SYSTEM_PROMPT, 'utf8') + Buffer.byteLength(input, 'utf8');
+function totalInputBytes(input: string, system: string): number {
+  return Buffer.byteLength(system, 'utf8') + Buffer.byteLength(input, 'utf8');
 }
 
 const insightSchema = z.object({
@@ -381,7 +388,7 @@ export async function runReflection(options: RunReflectionOptions): Promise<RunR
     namespace: options.namespace, window, accessLevel: options.policy.scope.accessLevel, limit: options.policy.selection.maxCandidates,
   }));
   const materialized = await withScopedClient(scope, client =>
-    materializeReflectionInput(client, selected, options.policy.selection.maxInputBytes));
+    materializeReflectionInput(client, selected, options.policy.selection.maxInputBytes, options.policy.selection.maxInsights));
   const estimate = materialized.candidates.length >= 2
     ? estimatedReflectionCostMicroUsd(options.policy, materialized.inputBytes) : 0;
   if (options.dryRun) return {
@@ -430,7 +437,7 @@ export async function runReflection(options: RunReflectionOptions): Promise<RunR
   let raw = '';
   try {
     throwIfAborted(options.signal);
-    raw = await generateBounded({ provider, system: REFLECTION_SYSTEM_PROMPT, input: materialized.input,
+    raw = await generateBounded({ provider, system: reflectionSystemPrompt(options.policy.selection.maxInsights), input: materialized.input,
       model: options.policy.generation.model, timeoutMs: 60_000,
       maxInputBytes: options.policy.selection.maxInputBytes,
       maxOutputBytes: MAX_REFLECTION_OUTPUT_BYTES, signal: options.signal });
@@ -676,7 +683,8 @@ export function classifyReflectionError(error: unknown): string {
   return 'provider_error';
 }
 function reflectionConfigHash(policy: ReflectionPolicy): string {
-  return sha256(stableJson({ algorithm: 1, policyHash: reflectionPolicyHash(policy),
+  return sha256(stableJson({ algorithm: 2, policyHash: reflectionPolicyHash(policy),
+    systemPrompt: reflectionSystemPrompt(policy.selection.maxInsights),
     embedding: ACTIVE_EMBEDDING_DESCRIPTOR }));
 }
 function looksLikeCredential(value: string): boolean {

@@ -10,6 +10,7 @@ import {
   reflectionInsightAccessLevel,
   reflectionInsightHash,
   reflectionRunLockKey,
+  reflectionSystemPrompt,
   runReflection,
   validateReflectionOutput,
   type ReflectionCandidate,
@@ -200,4 +201,20 @@ test('dry-run materializes a bounded estimate without provider calls or database
   } finally {
     setPoolForTesting(null);
   }
+});
+
+
+test('policy insight bound is communicated without relaxing over-limit validation', () => {
+  assert.match(reflectionSystemPrompt(3), /at most 3 insights/);
+  assert.throws(() => reflectionSystemPrompt(0), /insight limit/);
+  assert.throws(() => reflectionSystemPrompt(21), /insight limit/);
+  const insights = Array.from({ length: 4 }, (_, index) => ({ content: `Distinct pattern ${index}`,
+    evidence_ids: ids.slice(0, 2), confidence: 0.8, tags: [] }));
+  assert.equal(validateReflectionOutput(JSON.stringify({ insights }), ids, 4).length, 4);
+  assert.throws(() => validateReflectionOutput(JSON.stringify({ insights }), ids, 3), /invalid_reflection_output/);
+});
+
+test('materialization accounts for the actual policy-bounded system prompt bytes', async () => {
+  const input = await materializeReflectionInput({} as any, [], 1024, 3);
+  assert.equal(input.inputBytes, Buffer.byteLength(input.input) + Buffer.byteLength(reflectionSystemPrompt(3)));
 });

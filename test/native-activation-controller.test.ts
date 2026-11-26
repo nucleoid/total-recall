@@ -11,6 +11,7 @@ import {
   isAcceptedNotificationReceipt,
   notificationIdempotencyKey,
   notifyFailure,
+  nativeFailureDiagnostic,
   parseNativeActivationCli,
   quoteRemoteArg,
   reserveDailyGenerationCalls,
@@ -339,4 +340,12 @@ test('notification dry-run fails closed without invoking the live gateway method
     throw new Error('must not run');
   }), { status: 'refused', code: 'official_gateway_dry_run_unsupported' });
   assert.equal(invoked, false);
+});
+
+
+test('native failure diagnostics retain stage and exit metadata but no process content', () => {
+  const diagnostic = nativeFailureDiagnostic({ code: 255, signal: 'SIGTERM', stdout: 'private', stderr: 'token=secret' }, 'preflight');
+  assert.deepEqual(diagnostic, { stage: 'preflight', exitCode: 255, signal: 'SIGTERM', stdoutBytes: 7, stderrBytes: 12 });
+  assert.equal(JSON.stringify(diagnostic).includes('secret'), false);
+  assert.equal(nativeFailureDiagnostic(null, 'dispatch').exitCode, null);
 });

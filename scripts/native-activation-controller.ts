@@ -45,6 +45,7 @@ interface Receipt {
   feature: NativeFeature;
   status: 'planned' | 'disabled' | 'blocked' | 'succeeded' | 'failed';
   errorCode?: string;
+  failureDiagnostic?: ReturnType<typeof nativeFailureDiagnostic>;
   configHash: string;
   policyHash?: string;
   approvalReference: string;
@@ -203,6 +204,7 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
 
     let reserved = 0;
     let completed = 0;
+    let stage: 'preflight' | 'reservation' | 'dispatch' | 'receipt' = 'preflight';
     try {
       const policyBinding = await preflight(config, plan.lane, laneBinding, now(), runFile);
       receiptScopeBinding = policyBinding.scopeBinding;
@@ -210,13 +212,16 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
       if (generationCallHardMax > config.dailyGenerationCallCap) {
         throw new Error('generation_reservation_exceeds_daily_cap');
       }
+      stage = 'reservation';
       if (generationCallHardMax > 0) {
         const day = now().toISOString().slice(0, 10);
         await reserveDailyGenerationCalls(root, day, config.dailyGenerationCallCap, generationCallHardMax);
         reserved = generationCallHardMax;
       }
       for (const command of plan.commands) {
+        stage = 'dispatch';
         const result = await runRemoteFeature(config, laneBinding, command, runFile);
+        stage = 'receipt';
         validateKnownCliReceipt(command.receiptKind, result.stdout, result.stderr);
         completed += 1;
       }
@@ -236,7 +241,7 @@ export async function runNativeActivation(cli: Cli, dependencies: ControllerDepe
         blockedFailure: { fingerprint, configHash: hash, errorCode, stateToken } } satisfies FeatureState);
       const notification = duplicate ? undefined : await notifyFailure(
         config.feature, errorCode, fingerprint, cli.notificationDryRun, runFile);
-      const receipt = await writeReceipt(root, { ...base(), status: 'failed', errorCode,
+      const receipt = await writeReceipt(root, { ...base(), status: 'failed', errorCode, failureDiagnostic: nativeFailureDiagnostic(error, stage),
         generationCallsReserved: reserved, commandsCompleted: completed,
         finishedAt: now().toISOString(), notification });
       throw Object.assign(new Error(errorCode), { receipt });
@@ -374,6 +379,17 @@ async function writeReceipt(root: string, receipt: Receipt): Promise<Receipt> {
   const handle = await open(ledger, 'r');
   try { await handle.sync(); } finally { await handle.close(); }
   return receipt;
+}
+
+/** Persist structure only: commands, stderr, prompts and credentials are never copied. */
+export function nativeFailureDiagnostic(error: unknown, stage: 'preflight' | 'reservation' | 'dispatch' | 'receipt') {
+  const value = error as { code?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown } | null;
+  return { stage,
+    exitCode: typeof value?.code === 'number' && Number.isSafeInteger(value.code) ? value.code : null,
+    signal: typeof value?.signal === 'string' && /^SIG[A-Z0-9]+$/.test(value.signal) ? value.signal : null,
+    stdoutBytes: typeof value?.stdout === 'string' ? Buffer.byteLength(value.stdout) : 0,
+    stderrBytes: typeof value?.stderr === 'string' ? Buffer.byteLength(value.stderr) : 0,
+  };
 }
 
 function classifyControllerError(error: unknown): string {
