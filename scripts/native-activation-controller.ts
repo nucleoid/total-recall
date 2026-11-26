@@ -307,11 +307,12 @@ async function runRemoteFeature(
 }
 
 function nativePolicyEnvironmentKey(feature: NativeFeature): string | undefined {
-  return {
+  const keys: Partial<Record<NativeFeature, string>> = {
     reflection: 'REFLECTION_POLICY_FILE', consolidation: 'CONSOLIDATION_POLICY_FILE',
     session: 'SESSION_DISTILLATION_POLICY_FILE', entity: 'ENTITY_EXTRACTION_POLICY_FILE',
     taste: 'TASTE_PROFILE_POLICY_FILE',
-  }[feature];
+  };
+  return keys[feature];
 }
 
 async function runSsh(

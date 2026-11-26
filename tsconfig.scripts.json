@@ -47,7 +47,9 @@
     "test/repair-watcher-orphans.integration.test.ts",
     "test/migrate-runner.integration.test.ts",
     "test/provisioning.integration.test.ts",
-    "scripts/ingestion-worker.ts"
+    "scripts/ingestion-worker.ts",
+    "scripts/native-activation-controller.ts",
+    "scripts/native-activation-contract.ts"
   ],
   "exclude": [
     "node_modules",
